@@ -1,0 +1,394 @@
+-- Srand — Postgres-native durable workflow engine
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Fresh-install schema. Apply once against an empty database:
+--
+--   psql "$DATABASE_URL" -f strand.sql
+--
+-- Conventions:
+--   • All JSON stored as BYTEA — encoded/decoded in Swift, never parsed by Postgres.
+--   • Primary keys are UUIDs generated client-side as UUIDv7 (time-ordered),
+--     keeping B-tree inserts sequential and reducing page splits.
+--   • State values are UPPERCASE strings: 'PENDING', 'RUNNING', etc.
+--   • `kind` distinguishes orchestrators ('WORKFLOW') from leaf work ('ACTIVITY').
+--   • `namespace_id` scopes every row to a logical tenant. All queries must
+--     include namespace_id. Indexes follow namespace_id
+--     is the first column in every composite index.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE SCHEMA strand;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Namespaces — top-level isolation boundary.
+--
+-- Provides hard data isolation between tenants. Every execution table carries
+-- namespace_id so queries can be scoped, retention policies applied, and
+-- resource limits enforced per namespace.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.namespaces (
+    id             TEXT        NOT NULL,   -- slug: "default", "acme-corp", "team-payments"
+    display_name   TEXT,
+    retention_days INTEGER     NOT NULL DEFAULT 30,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_namespaces_pkey PRIMARY KEY (id)
+);
+
+-- Every fresh install gets a default namespace.
+INSERT INTO strand.namespaces (id, display_name) VALUES ('default', 'Default');
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Queue registry
+-- One row per (namespace, queue) pair. Created by workers at startup.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.queues (
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
+    name         TEXT        NOT NULL,
+    is_paused    BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_queues_pkey PRIMARY KEY (namespace_id, name)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Tasks — the logical unit of work.
+-- Append-mostly; rows are created at enqueue time and updated as state changes.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.tasks (
+    id           UUID        NOT NULL,
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
+    queue        TEXT        NOT NULL,
+    name         TEXT        NOT NULL,   -- registered workflow/activity name
+
+    -- Payloads: BYTEA blobs, never parsed by Postgres.
+    params          BYTEA       NOT NULL,
+    headers         BYTEA,
+    retry_strategy  BYTEA,
+    cancellation    BYTEA,
+
+    max_attempts    INTEGER,
+    timeout_seconds INTEGER,                  -- per-attempt execution cap in seconds; NULL = worker's claimTimeout
+    idempotency_key TEXT,
+
+    -- Dispatch routing
+    priority        INTEGER     NOT NULL DEFAULT 3,   -- 1 (critical) … 5 (minimal)
+    fairness_key    TEXT,                             -- tenant/group key for weighted dispatch
+    fairness_weight FLOAT       NOT NULL DEFAULT 1.0, -- throughput weight relative to 1.0
+
+    -- Execution classification
+    kind            TEXT        NOT NULL DEFAULT 'WORKFLOW',
+    --   'WORKFLOW'  — top-level orchestrator, enqueued directly by the client
+    --   'ACTIVITY'  — leaf unit of work, spawned by a workflow via runActivity
+    parent_task_id  UUID,  -- NULL for root; set when spawned by runActivity / runChildWorkflow
+
+    -- Lifecycle
+    state        TEXT        NOT NULL DEFAULT 'PENDING',
+    attempt      INTEGER     NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    first_run_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    -- maxDuration: hard wall-clock deadline across all attempts.
+    -- failRun refuses to retry after this timestamp regardless of remaining maxAttempts.
+    -- claimTasks skips tasks past this deadline so workers never start doomed work.
+    deadline_at  TIMESTAMPTZ,
+    result       BYTEA,                  -- JSON-encoded success payload
+
+    CONSTRAINT strand_tasks_pkey            PRIMARY KEY (id),
+    -- FK to strand.queues: tasks are always in a registered queue.
+    -- ON DELETE CASCADE means dropping a queue removes all its tasks,
+    -- which then cascades to runs, checkpoints, history, state, and signals.
+    CONSTRAINT strand_tasks_queue_fk        FOREIGN KEY (namespace_id, queue)
+                                            REFERENCES strand.queues(namespace_id, name)
+                                            ON DELETE CASCADE,
+    CONSTRAINT strand_tasks_idempotency_key UNIQUE (namespace_id, queue, idempotency_key),
+    CONSTRAINT strand_tasks_kind            CHECK (kind IN ('WORKFLOW', 'ACTIVITY')),
+    CONSTRAINT strand_tasks_state           CHECK (state IN (
+        'PENDING', 'RUNNING', 'SLEEPING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED'
+    ))
+);
+
+-- Hot management path: namespace_id first
+CREATE INDEX strand_tasks_ns_queue_state_idx
+    ON strand.tasks (namespace_id, queue, state);
+
+-- Kind-filtered queries (Workflows page, Activities page)
+CREATE INDEX strand_tasks_ns_kind_idx
+    ON strand.tasks (namespace_id, queue, kind, state);
+
+-- Most-recent-first task list (new API sort order)
+CREATE INDEX strand_tasks_ns_id_desc_idx
+    ON strand.tasks (namespace_id, queue, id DESC)
+    WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
+
+-- Parent-child lineage: "show all activities spawned by this workflow"
+CREATE INDEX strand_tasks_parent_idx
+    ON strand.tasks (parent_task_id)
+    WHERE parent_task_id IS NOT NULL;
+
+-- Skips tasks past their maxDuration deadline in claimTasks.
+CREATE INDEX strand_tasks_deadline_idx
+    ON strand.tasks (namespace_id, queue, deadline_at)
+    WHERE deadline_at IS NOT NULL AND state = 'PENDING';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Runs — individual execution attempts.
+-- High churn: rows transition through states frequently.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.runs (
+    id           UUID    NOT NULL,
+    namespace_id TEXT    NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
+    task_id      UUID    NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    queue        TEXT    NOT NULL,   -- denormalised for fast claim query
+    attempt      INTEGER NOT NULL,
+
+    -- Optimistic concurrency: incremented on every state transition.
+    -- completeRun / failRun must CAS on (id, state, version) to prevent
+    -- double-execution when multiple workers race (e.g. after lease expiry).
+    version      BIGINT  NOT NULL DEFAULT 0,
+
+    state            TEXT        NOT NULL DEFAULT 'PENDING',
+    worker_id        TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    available_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Re-activation metadata (set when woken from an event wait)
+    wake_event    TEXT,
+    event_payload BYTEA,
+
+    failure_reason BYTEA,
+
+    -- Inherited from strand.tasks at run creation
+    priority        INTEGER     NOT NULL DEFAULT 3,
+    fairness_key    TEXT,
+    fairness_weight FLOAT       NOT NULL DEFAULT 1.0,
+    kind            TEXT        NOT NULL DEFAULT 'WORKFLOW',
+    parent_task_id  UUID,
+
+    started_at  TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT strand_runs_pkey  PRIMARY KEY (id),
+    CONSTRAINT strand_runs_kind  CHECK (kind IN ('WORKFLOW', 'ACTIVITY')),
+    CONSTRAINT strand_runs_state CHECK (state IN (
+        'PENDING', 'RUNNING', 'SLEEPING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED'
+    ))
+);
+
+-- Aggressive autovacuum: runs accumulate many dead tuples from frequent updates.
+ALTER TABLE strand.runs SET (
+    autovacuum_vacuum_scale_factor  = '0.05',
+    autovacuum_analyze_scale_factor = '0.02',
+    autovacuum_vacuum_threshold     = '50',
+    autovacuum_analyze_threshold    = '50',
+    autovacuum_vacuum_cost_delay    = '2'
+);
+
+-- Hot claim path: namespace_id first, then priority ASC so critical tasks are never starved.
+CREATE INDEX strand_runs_claim_idx
+    ON strand.runs (namespace_id, queue, priority ASC, available_at, id)
+    WHERE state IN ('PENDING', 'SLEEPING');
+
+-- Supports the correlated NOT EXISTS subquery in claimTasks that enforces FIFO
+-- within a fairness key. Without this index the subquery degrades to a range scan
+-- over all PENDING/SLEEPING rows in the queue at high queue depth.
+CREATE INDEX strand_runs_fairness_idx
+    ON strand.runs (namespace_id, queue, fairness_key, available_at, priority, id)
+    WHERE state = ANY (ARRAY['PENDING'::text, 'SLEEPING'::text])
+      AND fairness_key IS NOT NULL;
+
+-- Added `queue` so leaseExpiryLoop seeks directly to the right queue instead of
+-- scanning all expired leases in the namespace and filtering as a recheck.
+CREATE INDEX strand_runs_lease_idx
+    ON strand.runs (namespace_id, queue, lease_expires_at)
+    WHERE state = 'RUNNING'::text AND lease_expires_at IS NOT NULL;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Checkpoints — sideEffect() / replay cache within a workflow activation.
+-- Keyed by (task_id, seq_num). Read at activation start; bypassed when hit.
+-- seq_num is a monotonic integer counter per workflow task,
+-- every checkpoint-producing operation gets a
+-- unique integer identity regardless of operation type.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.checkpoints (
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    seq_num      INTEGER     NOT NULL,                  -- global activation counter;
+    name         TEXT,                                  -- optional human-readable label for debugging only
+    state        BYTEA       NOT NULL,                  -- JSON-encoded cached value
+    run_id       UUID        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_checkpoints_pkey PRIMARY KEY (task_id, seq_num)
+);
+
+CREATE INDEX strand_checkpoints_ns_idx
+    ON strand.checkpoints (namespace_id, task_id, seq_num);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Events — named signals (first-write-wins semantics).
+-- Used by ctx.waitForEvent / ctx.emitEvent. Payload is NULL until emitted.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.events (
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    queue        TEXT        NOT NULL,
+    name         TEXT        NOT NULL,
+    payload      BYTEA,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_events_pkey PRIMARY KEY (namespace_id, queue, name)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Event waits — runs suspended waiting for a named event.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.event_waits (
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    run_id       UUID        NOT NULL REFERENCES strand.runs(id) ON DELETE CASCADE,
+    queue        TEXT        NOT NULL,
+    step_name    TEXT        NOT NULL,
+    event_name   TEXT        NOT NULL,
+    timeout_at   TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_event_waits_pkey PRIMARY KEY (run_id, step_name)
+);
+
+-- Wake-up lookup: namespace_id first
+CREATE INDEX strand_event_waits_event_idx
+    ON strand.event_waits (namespace_id, queue, event_name);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Task completions — permanent terminal record for every finished task.
+--
+-- Written atomically with completeRun / failRun / cancelTask.
+-- Read by runActivity / awaitActivity to handle the race where a child
+-- completes before the parent registers its event wait.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.task_completions (
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    state        TEXT        NOT NULL,   -- 'COMPLETED' | 'FAILED' | 'CANCELLED'
+    result       BYTEA,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_task_completions_pkey PRIMARY KEY (task_id)
+);
+
+-- Namespace-scoped completion lookups (used by management queries and UI)
+CREATE INDEX strand_task_completions_ns_idx
+    ON strand.task_completions (namespace_id, completed_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Workflow state — serialised @Workflow struct persisted between activations.
+--
+-- Loaded at activation start so the handler resumes with the correct state.
+-- Updated atomically with each run completion.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.workflow_state (
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    state        BYTEA       NOT NULL,  -- JSON-encoded @Workflow struct
+    state_seq    BIGINT      NOT NULL DEFAULT 0,  -- monotonic; updated each activation
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_workflow_state_pkey PRIMARY KEY (task_id)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Workflow signals — inbox for externally-delivered signals.
+--
+-- Inserted by client.signal(...) / handle.signal(...).
+-- Drained and applied to the workflow struct at the start of each activation.
+-- Deleted after application.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.workflow_signals (
+    id           UUID        NOT NULL DEFAULT gen_random_uuid(),
+    seq          BIGSERIAL   NOT NULL,   -- monotonic total order, unaffected by transaction commit ordering
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    signal_name  TEXT        NOT NULL,
+    payload      BYTEA,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_workflow_signals_pkey PRIMARY KEY (id)
+);
+
+-- Ordered drain: namespace_id first, then arrival order via monotonic sequence.
+-- BIGSERIAL seq is allocated at INSERT time (not commit time), giving a causal
+-- total order even when two concurrent transactions commit in the wrong wall-clock order.
+CREATE INDEX strand_workflow_signals_inbox_idx
+    ON strand.workflow_signals (namespace_id, task_id, seq ASC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Workflow history — append-only event log per workflow execution.
+--
+-- Every significant decision (activity scheduled, activity completed, signal
+-- received, timer fired, workflow completed, …) is appended here.
+-- Used by the UI timeline and future workflow-reset functionality.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.workflow_history (
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    seq          BIGINT      NOT NULL,  -- 1-based monotonic per workflow
+    event_type   TEXT        NOT NULL,  -- 'WORKFLOW_STARTED' | 'ACTIVITY_SCHEDULED' |
+                                        -- 'ACTIVITY_COMPLETED' | 'SIGNAL_RECEIVED' |
+                                        -- 'TIMER_FIRED' | 'CHILD_WORKFLOW_STARTED' |
+                                        -- 'WORKFLOW_COMPLETED' | 'WORKFLOW_FAILED' | …
+    event_data   BYTEA,                 -- JSON payload; schema depends on event_type
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_workflow_history_pkey PRIMARY KEY (task_id, seq)
+);
+
+-- Namespace-scoped history scan (UI timeline, reset, audit)
+CREATE INDEX strand_workflow_history_ns_idx
+    ON strand.workflow_history (namespace_id, task_id, seq ASC);
+
+-- ────────────────────────────────────────────────────────────────────────────────
+-- Schedules — cron/interval/one-shot task triggers.
+-- Polled by StrandScheduler. Fires WORKFLOW or ACTIVITY tasks into strand.tasks when due.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE strand.schedules (
+    id           UUID        NOT NULL,
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
+    queue        TEXT        NOT NULL,
+    name         TEXT        NOT NULL,   -- human-readable; unique per (namespace, queue)
+    task_name    TEXT        NOT NULL,   -- registered workflow name to fire
+
+    params         BYTEA       NOT NULL,  -- JSON-encoded workflow input
+    headers        BYTEA,
+    pattern        BYTEA       NOT NULL,  -- JSON-encoded SchedulePattern
+    retry_strategy BYTEA,
+    cancellation   BYTEA,
+    max_attempts   INTEGER,
+    accuracy       TEXT        NOT NULL DEFAULT 'latest',
+    kind           TEXT        NOT NULL DEFAULT 'WORKFLOW',  -- 'WORKFLOW' or 'ACTIVITY'
+
+    -- Airflow-style lifecycle
+    starts_at TIMESTAMPTZ,  -- NULL = active immediately
+    ends_at   TIMESTAMPTZ,  -- NULL = runs indefinitely
+
+    -- StandScheduler execution state
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+    next_run_at TIMESTAMPTZ,
+    last_run_at TIMESTAMPTZ,
+    last_task_id UUID,
+    run_count    INTEGER     NOT NULL DEFAULT 0,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT strand_schedules_pkey       PRIMARY KEY (id),
+    CONSTRAINT strand_schedules_ns_name    UNIQUE (namespace_id, queue, name)
+);
+
+-- Scheduler poll: namespace_id first, only active schedules with upcoming fire time
+CREATE INDEX strand_schedules_due_idx
+    ON strand.schedules (namespace_id, next_run_at)
+    WHERE is_active = TRUE AND next_run_at IS NOT NULL;

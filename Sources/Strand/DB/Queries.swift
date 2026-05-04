@@ -1,0 +1,1095 @@
+import Logging
+import NIOCore
+import PostgresNIO
+
+#if canImport(FoundationEssentials)
+    import FoundationEssentials
+#else
+    import Foundation
+#endif
+
+/// All SQL operations against Strand's own tables.
+enum Queries {
+
+    // MARK: - Schema
+
+    /// Verifies the Strand schema by checking for `strand.tasks`.
+    /// Throws ``StrandError/schemaMismatch`` if absent.
+    static func verifySchema(on client: PostgresClient, logger: Logger) async throws {
+        let stream = try await client.query(
+            """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'strand' AND table_name = 'tasks'
+            )
+            """,
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else {
+            throw StrandError.schemaMismatch(installed: "unknown", required: "1")
+        }
+        var col = row.makeIterator()
+        let exists = try col.next()!.decode(Bool.self, context: .default)
+        guard exists else {
+            throw StrandError.schemaMismatch(installed: "not installed", required: "1")
+        }
+    }
+
+    // MARK: - Namespaces
+
+    /// Ensures `namespaceID` exists in `strand.namespaces`.
+    /// Idempotent — safe to call on every worker start.
+    /// The `display_name` defaults to the namespace ID itself when auto-created.
+    static func registerNamespace(
+        on client: PostgresClient, namespaceID: String, logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            INSERT INTO strand.namespaces (id, display_name)
+            VALUES (\(namespaceID), \(namespaceID))
+            ON CONFLICT (id) DO NOTHING
+            """,
+            logger: logger)
+    }
+
+    // MARK: - Queues
+
+    static func createQueue(
+        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+    ) async throws {
+        try await client.query(
+            "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(name)) ON CONFLICT (namespace_id, name) DO NOTHING",
+            logger: logger)
+    }
+
+    static func dropQueue(
+        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+    ) async throws {
+        try await client.query(
+            "DELETE FROM strand.queues WHERE namespace_id = \(namespaceID) AND name = \(name)",
+            logger: logger)
+    }
+
+    // NOTE: requires the is_paused / updated_at columns added to strand.queues
+    static func pauseQueue(
+        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+    ) async throws {
+        try await client.query(
+            "UPDATE strand.queues SET is_paused = TRUE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND name = \(name)",
+            logger: logger)
+    }
+
+    static func resumeQueue(
+        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+    ) async throws {
+        try await client.query(
+            "UPDATE strand.queues SET is_paused = FALSE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND name = \(name)",
+            logger: logger)
+    }
+
+    static func listQueues(on client: PostgresClient, namespaceID: String, logger: Logger)
+        async throws -> [String]
+    {
+        let stream = try await client.query(
+            "SELECT name FROM strand.queues WHERE namespace_id = \(namespaceID) ORDER BY name",
+            logger: logger)
+        var names: [String] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            names.append(try col.next()!.decode(String.self, context: .default))
+        }
+        return names
+    }
+
+    // MARK: - Enqueue
+
+    /// Inserts a task and its first run atomically.
+    /// When `idempotencyKey` is non-nil and a conflict occurs, returns the existing IDs.
+    static func enqueueTask(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String, taskName: String,
+        paramsBuffer: ByteBuffer, headersBuffer: ByteBuffer?,
+        retryStrategyBuffer: ByteBuffer?, maxAttempts: Int?,
+        cancellationBuffer: ByteBuffer?, idempotencyKey: String?,
+        priority: Int = 3,
+        scheduledAt: Date? = nil,
+        timeoutSeconds: Int? = nil,
+        deadlineAt: Date? = nil,
+        fairnessKey: String? = nil,
+        fairnessWeight: Float = 1.0,
+        kind: TaskKind = .workflow,
+        parentTaskID: UUID? = nil,
+        logger: Logger
+    ) async throws -> EnqueueRow {
+        return try await client.withTransaction(logger: logger) { conn in
+            let taskID = UUID.v7()
+            let runID = UUID.v7()
+            // Auto-register the queue so strand.queues always reflects active queues.
+            // ON CONFLICT DO NOTHING makes this safe for concurrent enqueues.
+            try await conn.query(
+                "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(queue)) ON CONFLICT (namespace_id, name) DO NOTHING",
+                logger: logger
+            )
+            try await conn.query(
+                """
+                INSERT INTO strand.tasks
+                    (namespace_id, id, queue, name, params, headers, retry_strategy, max_attempts,
+                     timeout_seconds, cancellation, idempotency_key, priority, fairness_key,
+                     fairness_weight, state, kind, parent_task_id, deadline_at)
+                VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
+                        \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
+                        \(timeoutSeconds), \(cancellationBuffer), \(idempotencyKey), \(priority),
+                        \(fairnessKey), \(fairnessWeight), 'PENDING',
+                        \(kind), \(parentTaskID), \(deadlineAt))
+                ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
+                """,
+                logger: logger)
+            let checkStream = try await conn.query(
+                "SELECT id FROM strand.tasks WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND id = \(taskID)",
+                logger: logger)
+            if try await checkStream.first(where: { _ in true }) != nil {
+                try await conn.query(
+                    """
+                    INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at, priority,
+                                           fairness_key, fairness_weight, kind)
+                    VALUES (\(namespaceID), \(runID), \(taskID), \(queue), 1, 'PENDING',
+                            COALESCE(\(scheduledAt), NOW()), \(priority),
+                            \(fairnessKey), \(fairnessWeight), \(kind))
+                    """,
+                    logger: logger)
+                logger.debug(
+                    "task enqueued",
+                    metadata: [
+                        "strand.task_id": .string(taskID.uuidString),
+                        "strand.task_name": .string(taskName),
+                        "strand.queue": .string(queue),
+                        "strand.namespace": .string(namespaceID),
+                        "strand.kind": .string(kind.rawValue),
+                    ])
+                return EnqueueRow(taskID: taskID, runID: runID, attempt: 1, created: true)
+            } else {
+                let existStream = try await conn.query(
+                    """
+                    SELECT t.id, r.id, r.attempt
+                    FROM strand.tasks t
+                    JOIN strand.runs r ON r.task_id = t.id
+                    WHERE t.namespace_id = \(namespaceID) AND t.queue = \(queue) AND t.idempotency_key = \(idempotencyKey)
+                    ORDER BY r.attempt DESC LIMIT 1
+                    """,
+                    logger: logger)
+                guard let row = try await existStream.first(where: { _ in true }) else {
+                    throw StrandError.database(
+                        underlying: QueryError("idempotency lookup returned no rows"))
+                }
+                var col = row.makeIterator()
+                let eTaskID = try col.next()!.decode(UUID.self, context: .default)
+                let eRunID = try col.next()!.decode(UUID.self, context: .default)
+                let eAttempt = try col.next()!.decode(Int.self, context: .default)
+                return EnqueueRow(taskID: eTaskID, runID: eRunID, attempt: eAttempt, created: false)
+            }
+        }
+    }
+
+    // MARK: - Worker
+
+    /// Claims up to `qty` runs from `queue` atomically using `FOR UPDATE SKIP LOCKED`.
+    static func claimTasks(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String, workerID: String,
+        claimTimeoutSeconds: Int, qty: Int,
+        logger: Logger
+    ) async throws -> [ClaimedTask] {
+        let stream = try await client.query(
+            """
+            WITH candidate AS (
+                -- Fairness-key dispatch:
+                --   • Tasks WITH a fairness_key: only the highest-priority/oldest run per key
+                --     is eligible (FIFO within each group).
+                --   • Tasks WITHOUT a fairness_key: always eligible.
+                -- Both sets then compete via weighted-random ordering so no key starves others.
+                --
+                -- The correlated NOT EXISTS is an index seek via strand_runs_fairness_idx
+                -- on (namespace_id, queue, fairness_key, available_at, priority, id)
+                -- WHERE state IN ('PENDING','SLEEPING') AND fairness_key IS NOT NULL.
+                -- Cost is O(1) per candidate row regardless of queue depth.
+                SELECT r.id, t.timeout_seconds FROM strand.runs r
+                JOIN strand.tasks t ON t.id = r.task_id
+                WHERE r.queue = \(queue)
+                  AND r.namespace_id = \(namespaceID)
+                  AND r.state IN ('PENDING', 'SLEEPING')
+                  AND r.available_at <= NOW()
+                  AND (t.deadline_at IS NULL OR t.deadline_at > NOW())
+                  AND (
+                      r.fairness_key IS NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM strand.runs r2
+                          WHERE r2.queue        = r.queue
+                            AND r2.namespace_id = r.namespace_id
+                            AND r2.fairness_key = r.fairness_key
+                            AND r2.state IN ('PENDING', 'SLEEPING')
+                            AND r2.available_at <= NOW()
+                            AND (
+                                r2.priority < r.priority
+                                OR (r2.priority = r.priority AND r2.available_at < r.available_at)
+                                OR (r2.priority = r.priority AND r2.available_at = r.available_at
+                                    AND r2.id < r.id)
+                            )
+                      )
+                  )
+                ORDER BY r.priority ASC,
+                         (random() / GREATEST(r.fairness_weight, 0.001)) ASC,
+                         r.available_at,
+                         r.id
+                LIMIT \(qty)
+                FOR UPDATE SKIP LOCKED
+            ),
+            claimed AS (
+                UPDATE strand.runs r
+                SET state            = 'RUNNING',
+                    worker_id        = \(workerID),
+                    lease_expires_at = NOW() + COALESCE(NULLIF(c.timeout_seconds, 0), \(claimTimeoutSeconds)) * INTERVAL '1 second',
+                    started_at       = COALESCE(r.started_at, NOW())
+                FROM candidate c WHERE r.id = c.id
+                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload
+            ),
+            task_upd AS (
+                UPDATE strand.tasks t
+                SET state        = 'RUNNING',
+                    attempt      = GREATEST(t.attempt, c.attempt),
+                    first_run_at = COALESCE(t.first_run_at, NOW())
+                FROM claimed c WHERE t.id = c.task_id
+            )
+            SELECT c.id, c.task_id, c.attempt, c.version,
+                   t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
+                   c.wake_event, c.event_payload,
+                   t.parent_task_id, t.kind, t.timeout_seconds
+            FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
+            ORDER BY c.id
+            """,
+            logger: logger)
+        var tasks: [ClaimedTask] = []
+        for try await row in stream { tasks.append(try ClaimedTask(row: row)) }
+        return tasks
+    }
+
+    /// Marks a run as completed with optimistic concurrency (version CAS).
+    ///
+    /// The `version` parameter must match the value read at claim time
+    /// (`ClaimedTask.version`). If it doesn't — another worker already
+    /// completed this run — the function returns silently (idempotent).
+    static func completeRun(
+        on client: PostgresClient,
+        namespaceID: String,
+        runID: UUID,
+        version: Int,
+        resultBuffer: ByteBuffer?,
+        logger: Logger
+    ) async throws {
+        try await client.withTransaction(logger: logger) { conn in
+            // Fetch task state and ID — FOR UPDATE prevents concurrent completions.
+            let stateStream = try await conn.query(
+                "SELECT t.state, t.id FROM strand.runs r JOIN strand.tasks t ON t.id = r.task_id WHERE r.id = \(runID) AND r.namespace_id = \(namespaceID) FOR UPDATE",
+                logger: logger)
+            guard let row = try await stateStream.first(where: { _ in true }) else { return }
+            var col = row.makeIterator()
+            let taskState = try col.next()!.decode(TaskState.self, context: .default)
+            let taskID = try col.next()!.decode(UUID.self, context: .default)
+            if taskState == .cancelled { throw InternalError.cancelled }
+
+            // CAS on version — if another worker already wrote a completion, bail out.
+            let casStream = try await conn.query(
+                """
+                UPDATE strand.runs
+                SET state = 'COMPLETED', finished_at = NOW(), version = version + 1
+                WHERE id = \(runID) AND state = 'RUNNING' AND version = \(version)
+                  AND namespace_id = \(namespaceID)
+                RETURNING id
+                """,
+                logger: logger)
+            guard try await casStream.first(where: { _ in true }) != nil else { return }
+
+            try await conn.query(
+                "UPDATE strand.tasks SET state = 'COMPLETED', completed_at = NOW(), result = \(resultBuffer) WHERE id = \(taskID)",
+                logger: logger)
+            try await conn.query(
+                "DELETE FROM strand.event_waits WHERE run_id = \(runID)", logger: logger)
+            try await emitTaskCompletionSignal(
+                conn: conn, namespaceID: namespaceID, taskID: taskID, state: .completed,
+                resultBuffer: resultBuffer, logger: logger)
+        }
+    }
+
+    /// Marks a run as failed and schedules a retry if attempts remain.
+    static func failRun(
+        on client: PostgresClient, namespaceID: String, runID: UUID, reasonBuffer: ByteBuffer,
+        logger: Logger
+    ) async throws {
+        try await client.withTransaction(logger: logger) { conn in
+            let infoStream = try await conn.query(
+                """
+                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.queue, t.deadline_at
+                FROM strand.runs r JOIN strand.tasks t ON t.id = r.task_id
+                WHERE r.id = \(runID) FOR UPDATE OF t
+                """,
+                logger: logger)
+            guard let row = try await infoStream.first(where: { _ in true }) else { return }
+            var col = row.makeIterator()
+            let taskID = try col.next()!.decode(UUID.self, context: .default)
+            let attempt = try col.next()!.decode(Int.self, context: .default)
+            let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
+            let retryStrategyBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            _ = try col.next()!.decode(String.self, context: .default)
+            let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
+            // Guard: only fail if this run is still running.
+            // If another worker already processed it, bail out silently.
+            let failStream = try await conn.query(
+                "UPDATE strand.runs SET state = 'FAILED', failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = 'RUNNING' RETURNING id",
+                logger: logger)
+            guard try await failStream.first(where: { _ in true }) != nil else { return }
+            try await conn.query(
+                "DELETE FROM strand.event_waits WHERE run_id = \(runID)", logger: logger)
+
+            // ── Check 1: nonRetryableErrorTypes ──────────────────────────────────────
+            // Decode just the error type name from the failure payload.
+            struct _ErrorType: Decodable { let name: String? }
+            let errorTypeName = (try? JSON.decode(_ErrorType.self, from: reasonBuffer)).flatMap(
+                \.name)
+
+            if let strategy = retryStrategyBuf.flatMap({
+                try? JSON.decode(RetryStrategy.self, from: $0)
+            }),
+                let errorType = errorTypeName
+            {
+                let nret = strategy.nonRetryableErrorTypes
+                if !nret.isEmpty && nret.contains(errorType) {
+                    // Non-retryable error type — fail permanently, no retry
+                    try await conn.query(
+                        "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+                        logger: logger)
+                    try await emitTaskCompletionSignal(
+                        conn: conn, namespaceID: namespaceID, taskID: taskID,
+                        state: .failed, resultBuffer: nil, logger: logger)
+                    return
+                }
+            }
+
+            // ── Check 2: maxDuration deadline ────────────────────────────────────────
+            if let deadline = deadlineAt, Date.now >= deadline {
+                // Total wall-clock budget exhausted — fail permanently
+                try await conn.query(
+                    "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+                    logger: logger)
+                try await emitTaskCompletionSignal(
+                    conn: conn, namespaceID: namespaceID, taskID: taskID,
+                    state: .failed, resultBuffer: nil, logger: logger)
+                return
+            }
+
+            let nextAttempt = attempt + 1
+            guard maxAttempts == nil || nextAttempt <= maxAttempts! else {
+                try await conn.query(
+                    "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID)",
+                    logger: logger)
+                // Wake any awaitTaskResult callers.
+                try await emitTaskCompletionSignal(
+                    conn: conn, namespaceID: namespaceID, taskID: taskID, state: .failed,
+                    resultBuffer: nil, logger: logger)
+                return
+            }
+            let delay = retryDelay(strategy: retryStrategyBuf, attempt: attempt)
+            let wakeAt = Date.now.addingTimeInterval(delay)
+            let newState: TaskState = delay > 0 ? .sleeping : .pending
+            let newRunID = UUID.v7()
+            try await conn.query(
+                """
+                INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at, priority,
+                                       fairness_key, fairness_weight)
+                SELECT namespace_id, \(newRunID), task_id, queue, \(nextAttempt), \(newState), \(wakeAt),
+                       priority, fairness_key, fairness_weight
+                FROM strand.runs WHERE id = \(runID)
+                """,
+                logger: logger)
+            try await conn.query(
+                "UPDATE strand.tasks SET state = \(newState), attempt = \(nextAttempt) WHERE id = \(taskID)",
+                logger: logger)
+        }
+    }
+
+    /// Suspends a run until `wakeAt` (used by `sleepFor` / `sleepUntil`).
+    static func scheduleRun(
+        on client: PostgresClient, namespaceID: String, runID: UUID, taskID: UUID, wakeAt: Date,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            "UPDATE strand.runs SET state = 'SLEEPING', available_at = \(wakeAt), worker_id = NULL, lease_expires_at = NULL WHERE id = \(runID) AND namespace_id = \(namespaceID)",
+            logger: logger)
+        try await client.query(
+            "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+            logger: logger)
+    }
+
+    /// Extends the claim lease. Throws ``InternalError/cancelled`` if the run
+    /// is no longer in 'running' state (task was cancelled or failed externally).
+    static func extendClaim(
+        on client: PostgresClient, namespaceID: String, runID: UUID, extendBySeconds: Int,
+        logger: Logger
+    ) async throws {
+        let stream = try await client.query(
+            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = 'RUNNING' AND namespace_id = \(namespaceID) RETURNING id",
+            logger: logger)
+        if try await stream.first(where: { _ in true }) == nil {
+            throw InternalError.cancelled
+        }
+    }
+
+    /// `PostgresConnection` overload — used inside an open transaction (e.g. ``batchSetCheckpoints``).
+    /// Semantics are identical to the `PostgresClient` variant.
+    static func extendClaim(
+        on conn: PostgresConnection, namespaceID: String, runID: UUID, extendBySeconds: Int,
+        logger: Logger
+    ) async throws {
+        let stream = try await conn.query(
+            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = 'RUNNING' AND namespace_id = \(namespaceID) RETURNING id",
+            logger: logger)
+        if try await stream.first(where: { _ in true }) == nil {
+            throw InternalError.cancelled
+        }
+    }
+
+    /// Cancels a task and all its pending/sleeping runs.
+    static func cancelTask(
+        on client: PostgresClient, namespaceID: String, taskID: UUID, logger: Logger
+    ) async throws {
+        try await client.withTransaction(logger: logger) { conn in
+
+            // ── Step 1: Cancel the task row itself ────────────────────────────────
+            try await conn.query(
+                """
+                UPDATE strand.tasks
+                SET state = 'CANCELLED', cancelled_at = NOW()
+                WHERE id = \(taskID)
+                  AND namespace_id = \(namespaceID)
+                  AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                """,
+                logger: logger)
+
+            // ── Step 2: Cancel/interrupt this task's runs ─────────────────────────
+            // PENDING/SLEEPING/WAITING → CANCELLED immediately.
+            // RUNNING → also set to CANCELLED so the next extendClaim() call from
+            // the worker throws InternalError.cancelled, stopping the activity at
+            // its next heartbeat or checkpoint write.
+            try await conn.query(
+                """
+                UPDATE strand.runs
+                SET state = 'CANCELLED'
+                WHERE task_id = \(taskID)
+                  AND namespace_id = \(namespaceID)
+                  AND state IN ('PENDING', 'SLEEPING', 'WAITING', 'RUNNING')
+                """,
+                logger: logger)
+
+            // ── Step 3: Cascade to all descendant tasks (recursive) ───────────────
+            // Child activities and child workflows spawned by this workflow are also
+            // cancelled so they do not continue to consume worker slots after the
+            // parent is gone.
+            try await conn.query(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id FROM strand.tasks
+                    WHERE parent_task_id = \(taskID)
+                      AND namespace_id   = \(namespaceID)
+                    UNION ALL
+                    SELECT t.id
+                    FROM strand.tasks t
+                    JOIN descendants d ON t.parent_task_id = d.id
+                    WHERE t.namespace_id = \(namespaceID)
+                )
+                UPDATE strand.tasks
+                SET state = 'CANCELLED', cancelled_at = NOW()
+                WHERE id IN (SELECT id FROM descendants)
+                  AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                """,
+                logger: logger)
+
+            // ── Step 4: Cancel/interrupt all descendant runs ───────────────────────
+            try await conn.query(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id FROM strand.tasks
+                    WHERE parent_task_id = \(taskID)
+                      AND namespace_id   = \(namespaceID)
+                    UNION ALL
+                    SELECT t.id
+                    FROM strand.tasks t
+                    JOIN descendants d ON t.parent_task_id = d.id
+                    WHERE t.namespace_id = \(namespaceID)
+                )
+                UPDATE strand.runs
+                SET state = 'CANCELLED'
+                WHERE task_id IN (SELECT id FROM descendants)
+                  AND namespace_id = \(namespaceID)
+                  AND state IN ('PENDING', 'SLEEPING', 'WAITING', 'RUNNING')
+                """,
+                logger: logger)
+
+            // ── Step 5: Wake any awaitTaskResult callers ───────────────────────────
+            try await emitTaskCompletionSignal(
+                conn: conn, namespaceID: namespaceID, taskID: taskID,
+                state: .cancelled, resultBuffer: nil, logger: logger)
+        }
+
+        logger.debug(
+            "task cancelled",
+            metadata: ["strand.task_id": .string(taskID.uuidString)])
+    }
+
+    /// Returns the current state and result of a task.
+    static func fetchTaskResult(
+        on client: PostgresClient, namespaceID: String, taskID: UUID, logger: Logger
+    ) async throws -> TaskResultRow? {
+        let stream = try await client.query(
+            """
+            SELECT t.id, t.state, t.result, r.failure_reason
+            FROM strand.tasks t
+            LEFT JOIN strand.runs r ON r.id = (
+                SELECT id FROM strand.runs WHERE task_id = t.id ORDER BY attempt DESC LIMIT 1
+            )
+            WHERE t.id = \(taskID) AND t.namespace_id = \(namespaceID)
+            """,
+            logger: logger)
+        guard let row = try await stream.first(where: { _ in true }) else { return nil }
+        return try TaskResultRow(row: row)
+    }
+
+    // MARK: - Checkpoints
+
+    /// Bulk-loads all checkpoints for `taskID` written by `runID`.
+    ///
+    /// Keyed by `seq_num` (integer primary key) rather than name. Callers use the
+    /// returned `seqNum` to reconstruct the deterministic step counter cache.
+    static func getCheckpointStates(
+        on client: PostgresClient, taskID: UUID, runID: UUID, logger: Logger
+    ) async throws -> [CheckpointRow] {
+        let stream = try await client.query(
+            """
+            SELECT seq_num, name, state
+            FROM strand.checkpoints
+            WHERE task_id = \(taskID)
+              AND run_id  = \(runID)
+            ORDER BY created_at
+            """,
+            logger: logger)
+        var rows: [CheckpointRow] = []
+        for try await row in stream { rows.append(try CheckpointRow(row: row)) }
+        return rows
+    }
+
+    /// Upserts a step checkpoint keyed by `(task_id, seq_num)`; optionally extends the claim lease.
+    ///
+    /// `name` is an optional debug label stored as metadata — it is never used as a key.
+    /// On conflict, the attempt guard prevents a stale retry from overwriting a newer run's data.
+    static func setCheckpointState(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        seqNum: Int,
+        name: String?,
+        stateBuffer: ByteBuffer,
+        runID: UUID,
+        extendClaimBySeconds: Int?,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            INSERT INTO strand.checkpoints (task_id, seq_num, name, state, run_id)
+            VALUES (\(taskID), \(seqNum), \(name), \(stateBuffer), \(runID))
+            ON CONFLICT (task_id, seq_num) DO UPDATE
+                SET state      = EXCLUDED.state,
+                    run_id     = EXCLUDED.run_id,
+                    name       = COALESCE(EXCLUDED.name, strand.checkpoints.name),
+                    created_at = NOW()
+                WHERE (SELECT attempt FROM strand.runs WHERE id = strand.checkpoints.run_id)
+                   <= (SELECT attempt FROM strand.runs WHERE id = EXCLUDED.run_id)
+            """,
+            logger: logger)
+        if let secs = extendClaimBySeconds {
+            try await extendClaim(
+                on: client, namespaceID: namespaceID, runID: runID, extendBySeconds: secs,
+                logger: logger)
+        }
+    }
+
+    /// Writes multiple checkpoints in a single transaction.
+    ///
+    /// When there is only one checkpoint the call delegates to ``setCheckpointState`` so
+    /// the lease is extended via the same single-round-trip path. For two or more
+    /// checkpoints a transaction is opened and the lease is extended **once** at the end
+    /// — this is the key throughput optimisation over calling `setCheckpointState` N times.
+    static func batchSetCheckpoints(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        runID: UUID,
+        checkpoints: [(seqNum: Int, name: String?, state: ByteBuffer)],
+        extendClaimBySeconds: Int?,
+        logger: Logger
+    ) async throws {
+        guard !checkpoints.isEmpty else { return }
+        if checkpoints.count == 1 {
+            let c = checkpoints[0]
+            try await setCheckpointState(
+                on: client, namespaceID: namespaceID, taskID: taskID, seqNum: c.seqNum,
+                name: c.name, stateBuffer: c.state, runID: runID,
+                extendClaimBySeconds: extendClaimBySeconds, logger: logger)
+            return
+        }
+        try await client.withTransaction(logger: logger) { conn in
+            for c in checkpoints {
+                try await conn.query(
+                    """
+                    INSERT INTO strand.checkpoints (task_id, seq_num, name, state, run_id)
+                    VALUES (\(taskID), \(c.seqNum), \(c.name), \(c.state), \(runID))
+                    ON CONFLICT (task_id, seq_num) DO UPDATE
+                        SET state      = EXCLUDED.state,
+                            run_id     = EXCLUDED.run_id,
+                            created_at = NOW()
+                        WHERE (SELECT attempt FROM strand.runs WHERE id = strand.checkpoints.run_id)
+                           <= (SELECT attempt FROM strand.runs WHERE id = EXCLUDED.run_id)
+                    """,
+                    logger: logger)
+            }
+            if let secs = extendClaimBySeconds {
+                try await extendClaim(
+                    on: conn, namespaceID: namespaceID, runID: runID, extendBySeconds: secs,
+                    logger: logger)
+            }
+        }
+    }
+
+    // MARK: - Events
+
+    /// Checks for an existing event; if absent, registers a wait and suspends the run.
+    static func awaitEvent(
+        on client: PostgresClient,
+        queue: String, taskID: UUID, runID: UUID,
+        stepName: String, eventName: String,
+        timeoutSeconds: Int?,
+        currentWakeEvent: String?, currentEventPayload: ByteBuffer?,
+        logger: Logger
+    ) async throws -> AwaitEventResult {
+        if currentWakeEvent == eventName {
+            return currentEventPayload.map { .payload($0) } ?? .timedOut
+        }
+        return try await client.withTransaction(logger: logger) { conn in
+            let evtStream = try await conn.query(
+                "SELECT payload FROM strand.events WHERE queue = \(queue) AND name = \(eventName)",
+                logger: logger)
+            if let row = try await evtStream.first(where: { _ in true }) {
+                var col = row.makeIterator()
+                if let payload = try col.next()!.decode(ByteBuffer?.self, context: .default) {
+                    return .payload(payload)
+                }
+            }
+            let timeoutAt: Date? = timeoutSeconds.map { Date.now.addingTimeInterval(Double($0)) }
+            try await conn.query(
+                """
+                INSERT INTO strand.event_waits (task_id, run_id, queue, step_name, event_name, timeout_at)
+                VALUES (\(taskID), \(runID), \(queue), \(stepName), \(eventName), \(timeoutAt))
+                ON CONFLICT (run_id, step_name)
+                DO UPDATE SET event_name = EXCLUDED.event_name, timeout_at = EXCLUDED.timeout_at
+                """,
+                logger: logger)
+            // Timed waits use SLEEPING so the claim poll loop auto-wakes the run when
+            // available_at (= timeoutAt) is reached. Untimed waits use WAITING — the
+            // run is only woken by an explicit event emission or signal delivery.
+            if let timeoutAt {
+                try await conn.query(
+                    """
+                    UPDATE strand.runs
+                    SET state = 'SLEEPING', available_at = \(timeoutAt),
+                        wake_event = \(eventName), event_payload = NULL,
+                        worker_id = NULL, lease_expires_at = NULL
+                    WHERE id = \(runID)
+                    """,
+                    logger: logger)
+                try await conn.query(
+                    "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(taskID)",
+                    logger: logger
+                )
+            } else {
+                try await conn.query(
+                    """
+                    UPDATE strand.runs
+                    SET state = 'WAITING',
+                        wake_event = \(eventName), event_payload = NULL,
+                        worker_id = NULL, lease_expires_at = NULL
+                    WHERE id = \(runID)
+                    """,
+                    logger: logger)
+                try await conn.query(
+                    "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(taskID)", logger: logger
+                )
+            }
+            return .suspended
+        }
+    }
+
+    /// Emits an event (first-write-wins) and wakes any tasks waiting for it.
+    static func emitEvent(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String, eventName: String, payloadBuffer: ByteBuffer, logger: Logger
+    ) async throws {
+        try await client.withTransaction(logger: logger) { conn in
+            let insertStream = try await conn.query(
+                """
+                INSERT INTO strand.events (namespace_id, queue, name, payload)
+                VALUES (\(namespaceID), \(queue), \(eventName), \(payloadBuffer))
+                ON CONFLICT (namespace_id, queue, name) DO UPDATE
+                SET payload = EXCLUDED.payload, created_at = NOW()
+                WHERE strand.events.payload IS NULL
+                RETURNING 1
+                """,
+                logger: logger)
+            guard try await insertStream.first(where: { _ in true }) != nil else { return }
+            let waitsStream = try await conn.query(
+                "SELECT task_id, run_id FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
+                logger: logger)
+            var waits: [(taskID: UUID, runID: UUID)] = []
+            for try await row in waitsStream {
+                var col = row.makeIterator()
+                waits.append(
+                    (
+                        try col.next()!.decode(UUID.self, context: .default),
+                        try col.next()!.decode(UUID.self, context: .default)
+                    ))
+            }
+            for wait in waits {
+                try await conn.query(
+                    "UPDATE strand.runs SET state = 'PENDING', available_at = NOW(), event_payload = \(payloadBuffer), wake_event = \(eventName), lease_expires_at = NULL WHERE id = \(wait.runID) AND state IN ('SLEEPING', 'WAITING') AND namespace_id = \(namespaceID)",
+                    logger: logger)
+                try await conn.query(
+                    "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(wait.taskID) AND namespace_id = \(namespaceID)",
+                    logger: logger)
+            }
+            try await conn.query(
+                "DELETE FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
+                logger: logger)
+        }
+    }
+
+    // MARK: - Lease expiry sweep
+
+    /// Finds runs whose claim lease has expired and fails them so they are
+    /// retried. 
+    /// `FOR UPDATE SKIP LOCKED` ensures each expired run is processed by
+    /// exactly one worker even when multiple workers share a queue.
+    ///
+    /// `failRun` guards on `state = 'running'` internally, so concurrent
+    /// calls on the same run are safely idempotent.
+    static func sweepExpiredLeases(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        logger: Logger
+    ) async throws {
+        let stream = try await client.query(
+            """
+            SELECT id FROM strand.runs
+            WHERE namespace_id = \(namespaceID)
+              AND queue        = \(queue)
+              AND state        = 'RUNNING'
+              AND lease_expires_at <= NOW()
+            ORDER BY lease_expires_at, id
+            LIMIT 50
+            FOR UPDATE SKIP LOCKED
+            """,
+            logger: logger
+        )
+        var expiredIDs: [UUID] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            expiredIDs.append(try col.next()!.decode(UUID.self, context: .default))
+        }
+        guard !expiredIDs.isEmpty else { return }
+
+        logger.warning(
+            "sweeping \(expiredIDs.count) expired lease(s)",
+            metadata: ["queue": "\(queue)"]
+        )
+        let reason = try JSON.encode(ClaimTimeoutReason())
+        for runID in expiredIDs {
+            do {
+                try await failRun(
+                    on: client, namespaceID: namespaceID, runID: runID, reasonBuffer: reason,
+                    logger: logger)
+            } catch {
+                logger.error("error expiring run \(runID): \(String(reflecting: error))")
+            }
+        }
+    }
+
+    // MARK: - Retry
+
+    /// Re-enqueues a failed task by inserting a new pending run.
+    /// Bumps `max_attempts` if necessary so the retry is allowed.
+    /// Returns the new run's ID and attempt number.
+    static func retryTask(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        resetHistory: Bool = false,
+        logger: Logger
+    ) async throws -> (runID: UUID, attempt: Int) {
+        return try await client.withTransaction(logger: logger) { conn in
+            let stream = try await conn.query(
+                """
+                SELECT attempt, max_attempts FROM strand.tasks
+                WHERE id = \(taskID) AND state IN ('FAILED', 'CANCELLED')
+                  AND namespace_id = \(namespaceID)
+                FOR UPDATE
+                """,
+                logger: logger
+            )
+            guard let row = try await stream.first(where: { _ in true }) else {
+                throw StrandError.database(
+                    underlying: QueryError("task not found or not in failed state"))
+            }
+            var col = row.makeIterator()
+            let attempt = try col.next()!.decode(Int.self, context: .default)
+            let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
+
+            let nextAttempt: Int
+            let newMaxAttempts: Int?
+            if resetHistory {
+                // Clean slate: reset to attempt 1, keep max_attempts unchanged.
+                nextAttempt = 1
+                newMaxAttempts = maxAttempts
+            } else {
+                // Continuing: bump attempt counter, ensure max_attempts allows this retry.
+                nextAttempt = attempt + 1
+                newMaxAttempts = maxAttempts.map { Swift.max($0, nextAttempt) }
+            }
+            let newRunID = UUID.v7()
+
+            try await conn.query(
+                """
+                INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
+                                       priority, fairness_key, fairness_weight,
+                                       kind, parent_task_id)
+                SELECT namespace_id, \(newRunID), id, queue, \(nextAttempt), 'PENDING', NOW(),
+                       priority, fairness_key, fairness_weight,
+                       kind, parent_task_id
+                FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
+                """,
+                logger: logger
+            )
+            try await conn.query(
+                """
+                UPDATE strand.tasks
+                SET state = 'PENDING', attempt = \(nextAttempt), max_attempts = \(newMaxAttempts)
+                WHERE id = \(taskID)
+                """,
+                logger: logger
+            )
+            if resetHistory {
+                // Clear failure_reason on all prior FAILED/CANCELLED runs for a clean slate.
+                try await conn.query(
+                    """
+                    UPDATE strand.runs
+                    SET failure_reason = NULL
+                    WHERE task_id = \(taskID) AND state IN ('FAILED', 'CANCELLED')
+                    """,
+                    logger: logger
+                )
+            }
+            return (newRunID, nextAttempt)
+        }
+    }
+
+    // MARK: - Re-run (COMPLETED tasks)
+
+    /// Creates a fresh new task from an existing COMPLETED one, copying its
+    /// name, queue, params, priority, and kind. The original task is unchanged.
+    /// Use this when the user wants to re-run a workflow that already succeeded.
+    static func reRunTask(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> EnqueueRow {
+        return try await client.withTransaction(logger: logger) { conn in
+            // Read the original task's metadata.
+            let src = try await conn.query(
+                """
+                SELECT name, queue, params, headers, retry_strategy, max_attempts,
+                       cancellation, priority, fairness_key, fairness_weight, kind
+                FROM strand.tasks WHERE id = \(taskID) AND state = 'COMPLETED'
+                  AND namespace_id = \(namespaceID)
+                FOR UPDATE
+                """,
+                logger: logger
+            )
+            guard let row = try await src.first(where: { _ in true }) else {
+                throw StrandError.database(
+                    underlying: QueryError("task not found or not in completed state"))
+            }
+            var col = row.makeIterator()
+            let name = try col.next()!.decode(String.self, context: .default)
+            let queue = try col.next()!.decode(String.self, context: .default)
+            let params = try col.next()!.decode(ByteBuffer.self, context: .default)
+            let headers = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let retryStrategy = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
+            let cancellation = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let priority = try col.next()!.decode(Int.self, context: .default)
+            let fairnessKey = try col.next()!.decode(String?.self, context: .default)
+            let fairnessWeight = try col.next()!.decode(Float.self, context: .default)
+            let kind = try col.next()!.decode(TaskKind.self, context: .default)
+
+            let newTaskID = UUID.v7()
+            let newRunID = UUID.v7()
+
+            // Create the queue row if not present (idempotent).
+            try await conn.query(
+                "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(queue)) ON CONFLICT DO NOTHING",
+                logger: logger)
+
+            try await conn.query(
+                """
+                INSERT INTO strand.tasks
+                    (id, namespace_id, queue, name, params, headers, retry_strategy,
+                     max_attempts, cancellation, priority, fairness_key, fairness_weight,
+                     kind, state)
+                VALUES (\(newTaskID), \(namespaceID), \(queue), \(name), \(params),
+                        \(headers), \(retryStrategy), \(maxAttempts), \(cancellation),
+                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind), 'PENDING')
+                """,
+                logger: logger)
+
+            try await conn.query(
+                """
+                INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
+                                        priority, fairness_key, fairness_weight, kind)
+                VALUES (\(namespaceID), \(newRunID), \(newTaskID), \(queue), 1, 'PENDING', NOW(),
+                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind))
+                """,
+                logger: logger)
+
+            return EnqueueRow(taskID: newTaskID, runID: newRunID, attempt: 1, created: true)
+        }
+    }
+
+    // MARK: - Task completion signals (for awaitTaskResult suspension)
+
+    /// Emits a synthetic `$strand:task:{taskID}` event and wakes every task
+    /// that was suspended in `awaitTaskResult` waiting for this task.
+    ///
+    /// Cross-queue safe: looks up waiters across ALL queues in
+    /// `strand.event_waits`, so a task on queue "default" can await a task
+    /// on queue "gpu" without any extra configuration.
+    ///
+    /// Must be called inside an existing transaction (`conn`).
+    static func emitTaskCompletionSignal(
+        conn: PostgresConnection,
+        namespaceID: String,
+        taskID: UUID,
+        state: TaskState,
+        resultBuffer: ByteBuffer?,
+        logger: Logger
+    ) async throws {
+        let eventName = "$strand:task:\(taskID.uuidString)"
+        let payloadBuf = try JSON.encode(["state": state.rawValue])
+
+        // Always persist to the permanent completion store so that
+        // awaitTaskResult finds the result even when called AFTER the
+        // task finishes (late subscriber — the original event is gone).
+        try await conn.query(
+            """
+            INSERT INTO strand.task_completions (task_id, state, result)
+            VALUES (\(taskID), \(state.rawValue), \(resultBuffer))
+            ON CONFLICT (task_id) DO NOTHING
+            """,
+            logger: logger
+        )
+
+        // Find every task waiting for this completion, across all queues.
+        let waitsStream = try await conn.query(
+            """
+            SELECT queue, task_id, run_id FROM strand.event_waits
+            WHERE event_name = \(eventName)
+            FOR UPDATE SKIP LOCKED
+            """,
+            logger: logger
+        )
+        var waits: [(queue: String, taskID: UUID, runID: UUID)] = []
+        for try await row in waitsStream {
+            var col = row.makeIterator()
+            waits.append(
+                (
+                    try col.next()!.decode(String.self, context: .default),
+                    try col.next()!.decode(UUID.self, context: .default),
+                    try col.next()!.decode(UUID.self, context: .default)
+                ))
+        }
+        guard !waits.isEmpty else { return }
+
+        for wait in waits {
+            // Insert event on the WAITER's queue (not the completing task's queue).
+            try await conn.query(
+                """
+                INSERT INTO strand.events (namespace_id, queue, name, payload)
+                VALUES (\(namespaceID), \(wait.queue), \(eventName), \(payloadBuf))
+                ON CONFLICT (namespace_id, queue, name) DO UPDATE
+                SET payload = EXCLUDED.payload, created_at = NOW()
+                WHERE strand.events.payload IS NULL
+                """,
+                logger: logger
+            )
+            // Wake the suspended run.
+            try await conn.query(
+                """
+                UPDATE strand.runs
+                SET state = 'PENDING', available_at = NOW(),
+                    event_payload = \(payloadBuf), wake_event = NULL,
+                    lease_expires_at = NULL
+                WHERE id = \(wait.runID) AND state IN ('SLEEPING', 'WAITING')
+                  AND namespace_id = \(namespaceID)
+                """,
+                logger: logger
+            )
+            try await conn.query(
+                "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(wait.taskID) AND state IN ('SLEEPING', 'WAITING') AND namespace_id = \(namespaceID)",
+                logger: logger
+            )
+        }
+        // Remove processed waits.
+        try await conn.query(
+            "DELETE FROM strand.event_waits WHERE event_name = \(eventName)",
+            logger: logger
+        )
+    }
+}
+
+// MARK: - Internal helpers
+
+/// Computes the retry delay from the task's encoded retry strategy.
+private func retryDelay(strategy buf: ByteBuffer?, attempt: Int) -> TimeInterval {
+    guard let buf, let s = try? JSON.decode(RetryStrategy.self, from: buf) else { return 0 }
+    let initial = Double(s.initialDelay.components.seconds)
+    let cap = Double(s.maxDelay.components.seconds)
+    guard initial > 0 || cap > 0 else { return 0 }
+    return Swift.min(initial * pow(s.multiplier, Double(Swift.max(attempt - 1, 0))), cap)
+}
+
+private struct QueryError: Error, CustomStringConvertible {
+    let description: String
+    init(_ msg: String) { self.description = msg }
+}
+
+private struct ClaimTimeoutReason: Encodable, Sendable {
+    let name = "ClaimTimeout"
+    let message = "Worker did not complete the task within the claim timeout"
+}
