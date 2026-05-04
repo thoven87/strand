@@ -3,9 +3,9 @@ import NIOCore
 public import ServiceLifecycle
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 /// A `Service`-conformant scheduler that fires durable workflow tasks on a
@@ -78,7 +78,8 @@ public struct StrandScheduler: Service {
             // 1. Fire anything that is already due.
             do { try await fireSchedules() } catch {
                 client.logger.info(
-                    "scheduler fire error: \(String(reflecting: error))")
+                    "scheduler fire error: \(String(reflecting: error))"
+                )
             }
 
             // 2. Find the next scheduled fire time across all active schedules.
@@ -119,14 +120,19 @@ public struct StrandScheduler: Service {
         let now = Date.now
 
         let rows = try await ScheduleQueries.pollDueSchedules(
-            on: postgres, namespaceID: client.namespaceID, now: now, logger: logger)
+            on: postgres,
+            namespaceID: client.namespaceID,
+            now: now,
+            logger: logger
+        )
 
         for row in rows {
             do {
                 try await fire(row, now: now)
             } catch {
                 logger.error(
-                    "failed to fire schedule '\(row.name)': \(String(reflecting: error))")
+                    "failed to fire schedule '\(row.name)': \(String(reflecting: error))"
+                )
             }
         }
     }
@@ -142,7 +148,10 @@ public struct StrandScheduler: Service {
         // late on every poll shifts every subsequent slot by 30 s. Using
         // `row.scheduledAt` keeps fire times pinned to the original cadence.
         var nextRunAt = try ScheduleCalculator.nextRunTime(
-            for: pattern, after: row.scheduledAt, timezone: pattern.timezone)
+            for: pattern,
+            after: row.scheduledAt,
+            timezone: pattern.timezone
+        )
 
         // Respect ends_at: disable the schedule once no more valid runs exist.
         if let endsAt = row.endsAt, let next = nextRunAt, next >= endsAt {
@@ -188,7 +197,8 @@ public struct StrandScheduler: Service {
             scheduledBy: row.name
         )
         headers[SchedulingMetadata.headerKey] = try String(
-            buffer: JSON.encode(schedulingMeta))
+            buffer: JSON.encode(schedulingMeta)
+        )
         let headersBuf = try JSON.encode(headers)
 
         // Idempotency key: schedule_id + scheduled fire time.
@@ -212,8 +222,13 @@ public struct StrandScheduler: Service {
         )
 
         try await ScheduleQueries.markScheduleFired(
-            on: postgres, namespaceID: client.namespaceID, id: row.id,
-            firedAt: now, nextRunAt: nextRunAt, logger: logger)
+            on: postgres,
+            namespaceID: client.namespaceID,
+            id: row.id,
+            firedAt: now,
+            nextRunAt: nextRunAt,
+            logger: logger
+        )
 
         logger.debug(
             "schedule fired",
@@ -223,6 +238,7 @@ public struct StrandScheduler: Service {
                 "strand.task_name": .string(row.taskName),
                 "strand.queue": .string(row.queue),
                 "strand.scheduled_at": .string(row.scheduledAt.ISO8601Format()),
-            ])
+            ]
+        )
     }
 }

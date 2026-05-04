@@ -1,7 +1,7 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 /// Scheduling metadata injected into every task fired by ``StrandScheduler``.

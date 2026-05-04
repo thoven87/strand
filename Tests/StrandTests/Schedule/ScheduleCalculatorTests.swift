@@ -127,7 +127,9 @@ struct ScheduleCalculatorTests {
         #expect(nextExecution != nil)
 
         let nextComponents = utcCalendar.dateComponents(
-            [.hour, .minute, .weekday], from: nextExecution!)
+            [.hour, .minute, .weekday],
+            from: nextExecution!
+        )
         #expect(nextComponents.hour == 10)
         #expect(nextComponents.minute == 0)
     }
@@ -155,7 +157,9 @@ struct ScheduleCalculatorTests {
         #expect(nextExecution != nil)
 
         let nextComponents = utcCalendar.dateComponents(
-            [.hour, .minute, .day], from: nextExecution!)
+            [.hour, .minute, .day],
+            from: nextExecution!
+        )
         #expect(nextComponents.hour == 12)
         #expect(nextComponents.minute == 0)
     }

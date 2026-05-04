@@ -7,9 +7,9 @@ import Synchronization
 import Tracing
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - _WorkerExec
@@ -28,8 +28,7 @@ package struct _WorkerExec: Sendable {
     let options: WorkerOptions
     /// Runners for local activities registered on this worker.
     /// Keyed by activity name; each closure executes the activity in-process.
-    let localActivityLookup:
-        [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer]
+    let localActivityLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer]
 }
 
 // MARK: - WorkerOptions
@@ -147,15 +146,21 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── 1. Checkpoint cache ───────────────────────────────────────────────────
         let checkpointRows = try await Queries.getCheckpointStates(
-            on: exec.postgres, taskID: claimed.taskID,
-            runID: claimed.runID, logger: exec.logger)
+            on: exec.postgres,
+            taskID: claimed.taskID,
+            runID: claimed.runID,
+            logger: exec.logger
+        )
         var cache: [Int: ByteBuffer] = [:]
         for row in checkpointRows { cache[row.seqNum] = row.stateBuffer }
 
         // ── 2. Workflow state ────────────────────────────────────────────────────
         let storedStateBuf = try await WorkflowStateQueries.loadState(
-            on: exec.postgres, taskID: claimed.taskID,
-            namespaceID: exec.namespace, logger: exec.logger)
+            on: exec.postgres,
+            taskID: claimed.taskID,
+            namespaceID: exec.namespace,
+            logger: exec.logger
+        )
         var workflowState: W
         if let buf = storedStateBuf {
             // Restore the struct exactly as it was at the end of the previous activation.
@@ -173,21 +178,31 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // delivery or completion, so storedStateBuf is nil on every pure activity-wait
         // re-activation — causing a duplicate WORKFLOW_STARTED event.
         var historySeq = try await WorkflowStateQueries.nextHistorySeq(
-            on: exec.postgres, taskID: claimed.taskID,
-            logger: exec.logger)
+            on: exec.postgres,
+            taskID: claimed.taskID,
+            logger: exec.logger
+        )
         let isFirstActivation = historySeq == 1
         if isFirstActivation {
             try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                seq: historySeq, eventType: .workflowStarted,
-                eventData: nil, logger: exec.logger)
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .workflowStarted,
+                eventData: nil,
+                logger: exec.logger
+            )
             historySeq += 1
         }
 
         // ── 3. Signals ────────────────────────────────────────────────────────────
         let signals = try await WorkflowStateQueries.loadPendingSignals(
-            on: exec.postgres, taskID: claimed.taskID,
-            namespaceID: exec.namespace, logger: exec.logger)
+            on: exec.postgres,
+            taskID: claimed.taskID,
+            namespaceID: exec.namespace,
+            logger: exec.logger
+        )
         for signal in signals {
             try workflowState.handleSignal(name: signal.name, payload: signal.payload)
         }
@@ -195,18 +210,29 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             for signal in signals {
                 let sigData = try? JSON.encode(["name": signal.name])
                 try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                    seq: historySeq, eventType: .signalReceived,
-                    eventData: sigData, logger: exec.logger)
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    taskID: claimed.taskID,
+                    seq: historySeq,
+                    eventType: .signalReceived,
+                    eventData: sigData,
+                    logger: exec.logger
+                )
                 historySeq += 1
             }
             let postSignalBuf = try JSON.encode(workflowState)
             try await WorkflowStateQueries.saveState(
-                on: exec.postgres, taskID: claimed.taskID,
+                on: exec.postgres,
+                taskID: claimed.taskID,
                 namespaceID: exec.namespace,
-                stateBuffer: postSignalBuf, logger: exec.logger)
+                stateBuffer: postSignalBuf,
+                logger: exec.logger
+            )
             try await WorkflowStateQueries.deleteSignals(
-                on: exec.postgres, ids: signals.map { $0.id }, logger: exec.logger)
+                on: exec.postgres,
+                ids: signals.map { $0.id },
+                logger: exec.logger
+            )
         }
 
         // ── 4. Pre-load results the executor needs for fast-path replay ───────────
@@ -215,16 +241,23 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // 4a. Terminal child activities — runActivity / runChildWorkflow returns or
         //     throws immediately for these (COMPLETED = return, FAILED = throw).
         let completedChildren = try await WorkflowStateQueries.loadCompletedChildActivities(
-            on: exec.postgres, parentTaskID: claimed.taskID, logger: exec.logger)
+            on: exec.postgres,
+            parentTaskID: claimed.taskID,
+            logger: exec.logger
+        )
         executor.resolveCompleted(completedChildren)
         for (seqNum, _, _, state, kind, name) in completedChildren
         where kind == .workflow && state == .completed {
             try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                seq: historySeq, eventType: .childWorkflowCompleted,
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .childWorkflowCompleted,
                 // seq_num is a String for consistency with CHILD_WORKFLOW_STARTED
                 eventData: try? JSON.encode(["workflow": name, "seq_num": String(seqNum)]),
-                logger: exec.logger)
+                logger: exec.logger
+            )
             historySeq += 1
         }
 
@@ -293,18 +326,24 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             for (id, entry) in entries {
                 guard let runner = exec.localActivityLookup[entry.name] else {
                     executor.failLocalActivity(
-                        id: id, error: StrandError.unknownTask(name: entry.name))
+                        id: id,
+                        error: StrandError.unknownTask(name: entry.name)
+                    )
                     continue
                 }
                 do {
                     let result = try await runner(entry.input, exec, claimed.taskID)
                     try await Queries.setCheckpointState(
-                        on: exec.postgres, namespaceID: exec.namespace,
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
                         taskID: claimed.taskID,
-                        seqNum: entry.seqNum, name: entry.name,
+                        seqNum: entry.seqNum,
+                        name: entry.name,
                         stateBuffer: result,
-                        runID: claimed.runID, extendClaimBySeconds: claimTimeoutSecs,
-                        logger: exec.logger)
+                        runID: claimed.runID,
+                        extendClaimBySeconds: claimTimeoutSecs,
+                        logger: exec.logger
+                    )
                     activation.cacheCheckpoint(seqNum: entry.seqNum, buffer: result)
                     executor.resolveLocalActivity(id: id, result: result)
                 } catch {
@@ -349,16 +388,25 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             switch cmd {
             case .timerFired(_):
                 try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                    seq: historySeq, eventType: .timerFired,
-                    eventData: nil, logger: exec.logger)
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    taskID: claimed.taskID,
+                    seq: historySeq,
+                    eventType: .timerFired,
+                    eventData: nil,
+                    logger: exec.logger
+                )
                 historySeq += 1
             case .eventReceived(let eventName):
                 try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                    seq: historySeq, eventType: .eventReceived,
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    taskID: claimed.taskID,
+                    seq: historySeq,
+                    eventType: .eventReceived,
                     eventData: try? JSON.encode(["event_name": eventName]),
-                    logger: exec.logger)
+                    logger: exec.logger
+                )
                 historySeq += 1
             default:
                 break
@@ -375,13 +423,21 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             executor.cancelPending()
             let finalStateBuf = try JSON.encode(stateBox.value)
             try await WorkflowStateQueries.saveState(
-                on: exec.postgres, taskID: claimed.taskID,
+                on: exec.postgres,
+                taskID: claimed.taskID,
                 namespaceID: exec.namespace,
-                stateBuffer: finalStateBuf, logger: exec.logger)
+                stateBuffer: finalStateBuf,
+                logger: exec.logger
+            )
             try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                seq: historySeq, eventType: .workflowCompleted,
-                eventData: nil, logger: exec.logger)
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .workflowCompleted,
+                eventData: nil,
+                logger: exec.logger
+            )
             return try JSON.encode(output)
 
         case .failure(let error):
@@ -393,15 +449,23 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             executor.cancelPending()
             let errData = try? JSON.encode(["error": String(describing: error)])
             try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                seq: historySeq, eventType: .workflowFailed,
-                eventData: errData, logger: exec.logger)
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .workflowFailed,
+                eventData: errData,
+                logger: exec.logger
+            )
             // Stamp the last WorkflowContext call site onto the error.
             // This is the outermost escape point — user catch clauses have already had a
             // chance to handle the error inside run(); wrapping here does not break them.
             if let site = activation.lastCallSite {
                 throw CallSiteAnnotatedError(
-                    underlying: error, fileID: site.fileID, line: site.line)
+                    underlying: error,
+                    fileID: site.fileID,
+                    line: site.line
+                )
             }
             throw error
 
@@ -426,7 +490,12 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             for cmd in scheduleCommands {
                 switch cmd {
                 case .scheduleActivity(
-                    let name, let actInput, let options, let seqNum, let idKey):
+                    let name,
+                    let actInput,
+                    let options,
+                    let seqNum,
+                    let idKey
+                ):
                     let row = try await Queries.enqueueTask(
                         on: exec.postgres,
                         namespaceID: exec.namespace,
@@ -456,12 +525,18 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     )
                     let eventName = "$strand:task:\(row.taskID.uuidString)"
                     enqueued.append(
-                        (seqNum: seqNum, taskID: row.taskID, eventName: eventName))
+                        (seqNum: seqNum, taskID: row.taskID, eventName: eventName)
+                    )
                     let actData = try? JSON.encode(["activity": name, "seq_num": String(seqNum)])
                     try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                        seq: historySeq, eventType: .activityScheduled,
-                        eventData: actData, logger: exec.logger)
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        seq: historySeq,
+                        eventType: .activityScheduled,
+                        eventData: actData,
+                        logger: exec.logger
+                    )
                     historySeq += 1
 
                 case .startTimer(let wakeAt, _):
@@ -472,18 +547,26 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                             UPDATE strand.runs SET state = 'SLEEPING', available_at = \(wakeAt),
                                 worker_id = NULL, lease_expires_at = NULL
                             WHERE id = \(claimed.runID)
-                            """, logger: exec.logger)
+                            """,
+                            logger: exec.logger
+                        )
                         try await conn.query(
                             "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(claimed.taskID)",
-                            logger: exec.logger)
+                            logger: exec.logger
+                        )
                     }
                     let timerData = try? JSON.encode([
                         "duration_ms": Int(wakeAt.timeIntervalSinceNow * 1000)
                     ])
                     try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                        seq: historySeq, eventType: .timerStarted,
-                        eventData: timerData, logger: exec.logger)
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        seq: historySeq,
+                        eventType: .timerStarted,
+                        eventData: timerData,
+                        logger: exec.logger
+                    )
                     historySeq += 1
 
                 case .awaitEvent(let eventName, let seqNum, let timeoutAt):
@@ -513,7 +596,9 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                             VALUES (\(taskID), \(runID), \(queueName), \(stepName), \(eventName), \(timeoutAt))
                             ON CONFLICT (run_id, step_name) DO UPDATE
                                 SET event_name = EXCLUDED.event_name, timeout_at = EXCLUDED.timeout_at
-                            """, logger: exec.logger)
+                            """,
+                            logger: exec.logger
+                        )
 
                         // Check if the event was already emitted (race window detection).
                         let evtStream = try await conn.query(
@@ -523,13 +608,17 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                               AND queue = \(queueName)
                               AND name  = \(eventName)
                               AND payload IS NOT NULL
-                            """, logger: exec.logger)
+                            """,
+                            logger: exec.logger
+                        )
 
                         if let evtRow = try await evtStream.first(where: { _ in true }) {
                             // Event already in strand.events — wake the run immediately.
                             var col = evtRow.makeIterator()
                             let existingPayload = try col.next()!.decode(
-                                ByteBuffer?.self, context: .default)
+                                ByteBuffer?.self,
+                                context: .default
+                            )
 
                             // Transition to PENDING with the event payload so the next
                             // activation’s waitForEvent fast-path (wakeEvent == name) fires.
@@ -543,10 +632,13 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                                     worker_id     = NULL,
                                     lease_expires_at = NULL
                                 WHERE id = \(runID)
-                                """, logger: exec.logger)
+                                """,
+                                logger: exec.logger
+                            )
                             try await conn.query(
                                 "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(taskID)",
-                                logger: exec.logger)
+                                logger: exec.logger
+                            )
                         } else {
                             // Event not yet emitted — set run to WAITING (or SLEEPING for timed waits).
                             let availableAt =
@@ -562,41 +654,70 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                                     worker_id     = NULL,
                                     lease_expires_at = NULL
                                 WHERE id = \(runID)
-                                """, logger: exec.logger)
+                                """,
+                                logger: exec.logger
+                            )
                             try await conn.query(
                                 "UPDATE strand.tasks SET state = \(runState) WHERE id = \(taskID)",
-                                logger: exec.logger)
+                                logger: exec.logger
+                            )
                         }
                     }
                     let eventWaitData = try? JSON.encode(["event_name": eventName])
                     try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                        seq: historySeq, eventType: .eventWaitStarted,
-                        eventData: eventWaitData, logger: exec.logger)
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        seq: historySeq,
+                        eventType: .eventWaitStarted,
+                        eventData: eventWaitData,
+                        logger: exec.logger
+                    )
                     historySeq += 1
 
                 case .scheduleChildWorkflow(
-                    let name, let childQueue, let wfInput, let seqNum, let idKey):
+                    let name,
+                    let childQueue,
+                    let wfInput,
+                    let seqNum,
+                    let idKey
+                ):
                     let targetQueue = childQueue ?? exec.queue  // use child's queue or inherit
                     let row = try await Queries.enqueueTask(
-                        on: exec.postgres, namespaceID: exec.namespace,
-                        queue: targetQueue, taskName: name,
-                        paramsBuffer: wfInput, headersBuffer: nil,
-                        retryStrategyBuffer: nil, maxAttempts: nil,
-                        cancellationBuffer: nil, idempotencyKey: idKey,
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        queue: targetQueue,
+                        taskName: name,
+                        paramsBuffer: wfInput,
+                        headersBuffer: nil,
+                        retryStrategyBuffer: nil,
+                        maxAttempts: nil,
+                        cancellationBuffer: nil,
+                        idempotencyKey: idKey,
                         priority: TaskPriority.normal.rawValue,
-                        scheduledAt: nil, fairnessKey: nil, fairnessWeight: 1.0,
-                        kind: .workflow, parentTaskID: claimed.taskID, logger: exec.logger)
+                        scheduledAt: nil,
+                        fairnessKey: nil,
+                        fairnessWeight: 1.0,
+                        kind: .workflow,
+                        parentTaskID: claimed.taskID,
+                        logger: exec.logger
+                    )
                     let eventName = "$strand:task:\(row.taskID.uuidString)"
                     enqueued.append(
-                        (seqNum: seqNum, taskID: row.taskID, eventName: eventName))
+                        (seqNum: seqNum, taskID: row.taskID, eventName: eventName)
+                    )
                     let childData = try? JSON.encode([
                         "workflow": name, "seq_num": String(seqNum),
                     ])
                     try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                        seq: historySeq, eventType: .childWorkflowStarted,
-                        eventData: childData, logger: exec.logger)
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        seq: historySeq,
+                        eventType: .childWorkflowStarted,
+                        eventData: childData,
+                        logger: exec.logger
+                    )
                     historySeq += 1
 
                 case .writeCheckpoint, .timerFired, .eventReceived:
@@ -616,17 +737,22 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                             VALUES (\(claimed.taskID), \(claimed.runID), \(exec.queue), \(itemStepName), \(item.eventName), NULL)
                             ON CONFLICT (run_id, step_name) DO UPDATE
                                 SET event_name = EXCLUDED.event_name, timeout_at = NULL
-                            """, logger: exec.logger)
+                            """,
+                            logger: exec.logger
+                        )
                     }
                     try await conn.query(
                         """
                         UPDATE strand.runs
                         SET state = 'WAITING', worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(claimed.runID)
-                        """, logger: exec.logger)
+                        """,
+                        logger: exec.logger
+                    )
                     try await conn.query(
                         "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(claimed.taskID)",
-                        logger: exec.logger)
+                        logger: exec.logger
+                    )
                 }
             }
         }
@@ -650,10 +776,13 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                         SET state = 'SLEEPING', available_at = \(wakeAt),
                             worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
-                        """, logger: exec.logger)
+                        """,
+                        logger: exec.logger
+                    )
                     try await conn.query(
                         "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(condTaskID)",
-                        logger: exec.logger)
+                        logger: exec.logger
+                    )
                 }
             } else {
                 // All conditions are indefinite — wait for a signal.
@@ -663,16 +792,24 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                         UPDATE strand.runs
                         SET state = 'WAITING', worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
-                        """, logger: exec.logger)
+                        """,
+                        logger: exec.logger
+                    )
                     try await conn.query(
                         "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(condTaskID)",
-                        logger: exec.logger)
+                        logger: exec.logger
+                    )
                 }
             }
             try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres, namespaceID: exec.namespace, taskID: claimed.taskID,
-                seq: historySeq, eventType: .conditionWaiting,
-                eventData: nil, logger: exec.logger)
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .conditionWaiting,
+                eventData: nil,
+                logger: exec.logger
+            )
             historySeq += 1
         }
         // No else branch: if scheduleCommands is empty and no conditions remain,
@@ -788,8 +925,7 @@ public struct StrandWorker: Service {
         // Build local-activity lookup FIRST so it can be embedded in exec.
         // The lookup maps activity name → in-process runner closure (no DB row).
         let allActivities = activityContainers.flatMap { $0.activities } + activities
-        var localLookup:
-            [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer] = [:]
+        var localLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer] = [:]
         for box in allActivities {
             let token = box._makeToken()
             localLookup[token.name] = token.runLocal
@@ -817,7 +953,8 @@ public struct StrandWorker: Service {
                     name: token.name,
                     queueName: queue,
                     run: { [token, exec] claimed, _ in try await token.activate(claimed, exec) }
-                ))
+                )
+            )
         }
 
         for box in allActivities {
@@ -830,7 +967,8 @@ public struct StrandWorker: Service {
                     run: { [token, exec] claimed, deadline in
                         try await token.run(claimed, exec, deadline)
                     }
-                ))
+                )
+            )
         }
 
         self._registry = Registry(registrations)
@@ -843,13 +981,17 @@ public struct StrandWorker: Service {
             options.workerID
             ?? "\(ProcessInfo.processInfo.hostName):\(ProcessInfo.processInfo.processIdentifier)"
         let scopedLogger = logger.withWorkerContext(
-            queue: options.queue, namespace: namespace, workerID: workerID)
+            queue: options.queue,
+            namespace: namespace,
+            workerID: workerID
+        )
         scopedLogger.info(
             "worker starting",
             metadata: [
                 "strand.concurrency.workflow": .stringConvertible(options.workflowConcurrency),
                 "strand.concurrency.activity": .stringConvertible(options.activityConcurrency),
-            ])
+            ]
+        )
         defer { scopedLogger.info("worker stopped") }
 
         // One-time: ensure the namespace and queue rows exist before polling.
@@ -857,9 +999,16 @@ public struct StrandWorker: Service {
         // "default" namespace is never duplicated, and any custom namespace
         // declared by an application is auto-created without manual SQL.
         try await Queries.registerNamespace(
-            on: postgres, namespaceID: namespace, logger: logger)
+            on: postgres,
+            namespaceID: namespace,
+            logger: logger
+        )
         try await Queries.createQueue(
-            on: postgres, namespaceID: namespace, name: options.queue, logger: logger)
+            on: postgres,
+            namespaceID: namespace,
+            name: options.queue,
+            logger: logger
+        )
 
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
 
@@ -963,7 +1112,8 @@ public struct StrandWorker: Service {
                     } else {
                         logger.error(
                             "poll error",
-                            metadata: .forError(error) + ["strand.queue": .string(queueName)])
+                            metadata: .forError(error) + ["strand.queue": .string(queueName)]
+                        )
                     }
                     try Task.checkCancellation()
                     try await Task.sleep(for: options.pollInterval)
@@ -984,7 +1134,8 @@ public struct StrandWorker: Service {
 
                 _metrics.value
                     .makeCounter(
-                        label: StrandMetrics.tasksClaimed, dimensions: [("queue", queueName)]
+                        label: StrandMetrics.tasksClaimed,
+                        dimensions: [("queue", queueName)]
                     )
                     .increment(by: Int64(claimed.count))
 
@@ -1016,12 +1167,16 @@ public struct StrandWorker: Service {
             try await Task.sleep(for: options.leaseExpiryInterval)
             do {
                 try await Queries.sweepExpiredLeases(
-                    on: postgres, namespaceID: namespace,
-                    queue: queueName, logger: logger)
+                    on: postgres,
+                    namespaceID: namespace,
+                    queue: queueName,
+                    logger: logger
+                )
             } catch {
                 logger.error(
                     "lease sweep error",
-                    metadata: .forError(error) + ["strand.queue": .string(queueName)])
+                    metadata: .forError(error) + ["strand.queue": .string(queueName)]
+                )
             }
         }
     }
@@ -1092,14 +1247,18 @@ public struct StrandWorker: Service {
                         : "RunWorkflow:\(claimed.taskName)"
                     return try await withSpan(spanName, ofKind: .internal) { span in
                         span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(
-                            claimed.taskName)
+                            claimed.taskName
+                        )
                         span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
-                            claimed.taskID.uuidString.lowercased())
+                            claimed.taskID.uuidString.lowercased()
+                        )
                         span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
-                            claimed.runID.uuidString.lowercased())
+                            claimed.runID.uuidString.lowercased()
+                        )
                         span.attributes[StrandLogKeys.queue] = SpanAttribute.string(options.queue)
                         span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(
-                            Int64(claimed.attempt))
+                            Int64(claimed.attempt)
+                        )
                         return try await reg.run(claimed, fatalDeadline)
                     }
                 }
@@ -1170,7 +1329,8 @@ public struct StrandWorker: Service {
             // Clean lifecycle transitions — WorkflowContext already updated the DB state.
         } catch let signal as _ContinueAsNewSignal {
             _metrics.value.makeCounter(
-                label: StrandMetrics.tasksContinuedAsNew, dimensions: taskDims
+                label: StrandMetrics.tasksContinuedAsNew,
+                dimensions: taskDims
             ).increment(by: 1)
             // Workflow called context.continueAsNew(input:). Enqueue a fresh task with the
             // new input, then complete the current run cleanly. The old task's checkpoints

@@ -5,9 +5,9 @@ import PostgresNIO
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 struct WorkflowResponse: Codable, Sendable {
@@ -46,7 +46,10 @@ struct WorkflowRoutes {
         // GET /api/:namespace/workflows
         router.get("workflows") { _, ctx -> [WorkflowResponse] in
             let rows = try await ManagementQueries.listWorkflows(
-                on: self.postgres, namespaceID: ctx.namespaceID, logger: self.logger)
+                on: self.postgres,
+                namespaceID: ctx.namespaceID,
+                logger: self.logger
+            )
             return rows.map(WorkflowResponse.init)
         }
 

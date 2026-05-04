@@ -3,9 +3,9 @@ import PostgresNIO
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 struct EventRoutes {
@@ -37,7 +37,9 @@ struct EventRoutes {
                 logger: self.client.logger
             )
             return CursorPageResponse(
-                items: page.items.map(EventResponse.init), nextCursor: page.nextCursor)
+                items: page.items.map(EventResponse.init),
+                nextCursor: page.nextCursor
+            )
         }
 
         router.get("queues/:queue/events") { req, ctx -> CursorPageResponse<EventResponse> in
@@ -48,11 +50,16 @@ struct EventRoutes {
                 .flatMap { Double($0) }
                 .map { Date(timeIntervalSince1970: $0) }
             let page = try await ManagementQueries.listEvents(
-                on: self.postgres, queue: queue,
-                cursor: cursor, limit: min(limit, 200), logger: self.client.logger)
+                on: self.postgres,
+                queue: queue,
+                cursor: cursor,
+                limit: min(limit, 200),
+                logger: self.client.logger
+            )
             return CursorPageResponse(
                 items: page.items.map(EventResponse.init),
-                nextCursor: page.nextCursor)
+                nextCursor: page.nextCursor
+            )
         }
         router.post("queues/:queue/events") { req, ctx -> SimpleResponse in
             let queue = try ctx.parameters.require("queue")

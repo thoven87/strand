@@ -1,7 +1,7 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 extension UUID {
@@ -55,7 +55,8 @@ extension UUID {
             uuid: (
                 b0, b1, b2, b3, b4, b5, b6, b7,
                 b8, b9, b10, b11, b12, b13, b14, b15
-            ))
+            )
+        )
     }
 
     /// Extracts the creation timestamp embedded in a UUIDv7.
@@ -71,7 +72,8 @@ extension UUID {
         guard (b.6 & 0xF0) == 0x70 else { return nil }
         let ms: UInt64 =
             UInt64(b.0) << 40 | UInt64(b.1) << 32 | UInt64(b.2) << 24 | UInt64(b.3) << 16 | UInt64(
-                b.4) << 8 | UInt64(b.5)
+                b.4
+            ) << 8 | UInt64(b.5)
         return Date(timeIntervalSince1970: Double(ms) / 1_000)
     }
 }

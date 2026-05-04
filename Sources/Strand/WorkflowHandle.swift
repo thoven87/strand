@@ -3,9 +3,9 @@ package import NIOCore
 import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials  // UUID in public taskID
+public import FoundationEssentials  // UUID in public taskID
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - WorkflowHandle

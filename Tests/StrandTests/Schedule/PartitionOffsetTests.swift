@@ -236,17 +236,23 @@ struct PartitionOffsetCoreTests {
         // Test getting default offsets for well-known schedules
 
         let dailySchedule = SchedulePattern.daily(
-            offset: "PT2H", timezone: TimeZone(identifier: "UTC")!)
+            offset: "PT2H",
+            timezone: TimeZone(identifier: "UTC")!
+        )
         let dailyOffset = ScheduleCalculator.getDefaultPartitionOffset(for: dailySchedule)
         #expect(dailyOffset == .oneDay)
 
         let weeklySchedule = SchedulePattern.weekly(
-            offset: "PT0H", timezone: TimeZone(identifier: "UTC")!)
+            offset: "PT0H",
+            timezone: TimeZone(identifier: "UTC")!
+        )
         let weeklyOffset = ScheduleCalculator.getDefaultPartitionOffset(for: weeklySchedule)
         #expect(weeklyOffset == ISO8601Duration(days: 7))
 
         let monthlySchedule = SchedulePattern.monthly(
-            offset: "PT0H", timezone: TimeZone(identifier: "UTC")!)
+            offset: "PT0H",
+            timezone: TimeZone(identifier: "UTC")!
+        )
         let monthlyOffset = ScheduleCalculator.getDefaultPartitionOffset(for: monthlySchedule)
         #expect(monthlyOffset == .oneMonth)
 

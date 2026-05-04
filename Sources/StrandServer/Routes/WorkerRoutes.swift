@@ -3,9 +3,9 @@ import PostgresNIO
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 struct WorkerResponse: Codable, Sendable {
@@ -35,7 +35,10 @@ struct WorkerRoutes {
         // GET /api/:namespace/workers
         router.get("workers") { _, ctx -> [WorkerResponse] in
             let rows = try await ManagementQueries.listWorkers(
-                on: self.postgres, namespaceID: ctx.namespaceID, logger: self.logger)
+                on: self.postgres,
+                namespaceID: ctx.namespaceID,
+                logger: self.logger
+            )
             return rows.map(WorkerResponse.init)
         }
 

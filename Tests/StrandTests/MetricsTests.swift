@@ -9,9 +9,9 @@ import Tracing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - TestMetricsFactory
@@ -32,7 +32,11 @@ final class TestMetricsFactory: MetricsFactory, @unchecked Sendable {
     func makeCounter(label: String, dimensions: [(String, String)]) -> CounterHandler {
         _Counter(factory: self, label: label)
     }
-    func makeRecorder(label: String, dimensions: [(String, String)], aggregate: Bool)
+    func makeRecorder(
+        label: String,
+        dimensions: [(String, String)],
+        aggregate: Bool
+    )
         -> RecorderHandler
     {
         _Recorder()
@@ -118,10 +122,14 @@ final class TestTracer: Tracer, @unchecked Sendable {
 
     func forceFlush() {}
     func extract<Carrier, Extract>(
-        _ carrier: Carrier, into context: inout ServiceContext, using extractor: Extract
+        _ carrier: Carrier,
+        into context: inout ServiceContext,
+        using extractor: Extract
     ) where Carrier == Extract.Carrier, Extract: Extractor {}
     func inject<Carrier, Inject>(
-        _ context: ServiceContext, into carrier: inout Carrier, using injector: Inject
+        _ context: ServiceContext,
+        into carrier: inout Carrier,
+        using injector: Inject
     ) where Carrier == Inject.Carrier, Inject: Injector {}
 }
 
@@ -142,7 +150,8 @@ final class TestSpan: Tracing.Span, @unchecked Sendable {
     func addEvent(_ event: SpanEvent) {}
     func addLink(_ link: SpanLink) {}
     func recordError<Instant>(
-        _ error: any Error, attributes: SpanAttributes,
+        _ error: any Error,
+        attributes: SpanAttributes,
         at instant: @autoclosure () -> Instant
     ) where Instant: TracerInstant {
         setStatus(.init(code: .error))
@@ -188,13 +197,19 @@ struct MetricsTests {
 
         try await withTestEnvironment { client in
             let workerTask = startWorker(
-                postgres: client.postgres, queueName: client.queueName,
-                logger: client.logger, workflows: [SimpleWorkflow.self],
-                metricsFactory: metrics)
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [SimpleWorkflow.self],
+                metricsFactory: metrics
+            )
             defer { workerTask.cancel() }
 
             let handle = try await client.startWorkflow(
-                SimpleWorkflow.self, options: .init(), input: "ping")
+                SimpleWorkflow.self,
+                options: .init(),
+                input: "ping"
+            )
             let result = try await handle.result(timeout: .seconds(10))
             #expect(result == "ping-ok")
         }
@@ -213,23 +228,31 @@ struct MetricsTests {
             typealias Input = String
             typealias Output = String
             struct Boom: Error {}
-            mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String
-            {
+            mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String {
                 throw Boom()
             }
         }
 
         try await withTestEnvironment { client in
             let workerTask = startWorker(
-                postgres: client.postgres, queueName: client.queueName,
-                logger: client.logger, workflows: [FailingWorkflow.self],
-                metricsFactory: metrics)
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [FailingWorkflow.self],
+                metricsFactory: metrics
+            )
             defer { workerTask.cancel() }
 
             let handle = try await client.startWorkflow(
-                FailingWorkflow.self, options: .init(), input: "x")
+                FailingWorkflow.self,
+                options: .init(),
+                input: "x"
+            )
             let snap = try await awaitTerminal(
-                client: client, taskID: handle.taskID, timeout: .seconds(10))
+                client: client,
+                taskID: handle.taskID,
+                timeout: .seconds(10)
+            )
             #expect(snap.state == .failed)
         }
 
@@ -244,13 +267,20 @@ struct MetricsTests {
 
         try await withTestEnvironment { client in
             let workerTask = startWorker(
-                postgres: client.postgres, queueName: client.queueName,
-                logger: client.logger, workflows: [ActivityWorkflowM.self],
-                activities: [SimpleActivity()], metricsFactory: metrics)
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [ActivityWorkflowM.self],
+                activities: [SimpleActivity()],
+                metricsFactory: metrics
+            )
             defer { workerTask.cancel() }
 
             let handle = try await client.startWorkflow(
-                ActivityWorkflowM.self, options: .init(), input: "hello")
+                ActivityWorkflowM.self,
+                options: .init(),
+                input: "hello"
+            )
             let result = try await handle.result(timeout: .seconds(10))
             #expect(result == "HELLO")
         }
@@ -277,11 +307,17 @@ struct TracingTests {
         // ── Workflow span ─────────────────────────────────────────────────────
         try await withTestEnvironment { client in
             let workerTask = startWorker(
-                postgres: client.postgres, queueName: client.queueName,
-                logger: client.logger, workflows: [SimpleWorkflow.self])
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [SimpleWorkflow.self]
+            )
             defer { workerTask.cancel() }
             let handle = try await client.startWorkflow(
-                SimpleWorkflow.self, options: .init(), input: "trace-test")
+                SimpleWorkflow.self,
+                options: .init(),
+                input: "trace-test"
+            )
             _ = try await handle.result(timeout: .seconds(10))
         }
 
@@ -300,12 +336,18 @@ struct TracingTests {
         // ── Activity span ─────────────────────────────────────────────────────
         try await withTestEnvironment { client in
             let workerTask = startWorker(
-                postgres: client.postgres, queueName: client.queueName,
-                logger: client.logger, workflows: [ActivityWorkflowM.self],
-                activities: [SimpleActivity()])
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [ActivityWorkflowM.self],
+                activities: [SimpleActivity()]
+            )
             defer { workerTask.cancel() }
             let handle = try await client.startWorkflow(
-                ActivityWorkflowM.self, options: .init(), input: "span-test")
+                ActivityWorkflowM.self,
+                options: .init(),
+                input: "span-test"
+            )
             _ = try await handle.result(timeout: .seconds(10))
         }
 

@@ -7,9 +7,9 @@ import Testing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Test-local error types
@@ -114,7 +114,8 @@ private struct EventWaitWorkflow: Workflow {
     typealias Output = EventPayload
 
     mutating func run(
-        context: WorkflowContext<Self>, input: EventWaitInput
+        context: WorkflowContext<Self>,
+        input: EventWaitInput
     ) async throws -> EventPayload {
         try await context.waitForEvent(input.eventName, as: EventPayload.self)
     }
@@ -133,11 +134,15 @@ private struct TimeoutEventWorkflow: Workflow {
     typealias Output = String
 
     mutating func run(
-        context: WorkflowContext<Self>, input: TimeoutEventInput
+        context: WorkflowContext<Self>,
+        input: TimeoutEventInput
     ) async throws -> String {
         do {
             return try await context.waitForEvent(
-                input.eventName, as: String.self, timeout: .seconds(1))
+                input.eventName,
+                as: String.self,
+                timeout: .seconds(1)
+            )
         } catch let err as StrandError {
             if case .timeout = err { return "timed-out" }
             throw err
@@ -223,7 +228,8 @@ private struct ActivityRetryWorkflow: Workflow {
 
     mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String {
         try await context.runActivity(
-            FlakyActivity.self, input: input,
+            FlakyActivity.self,
+            input: input,
             options: .init(maxAttempts: 3, retryStrategy: .constant(.zero))
         )
     }
@@ -741,9 +747,15 @@ struct StandaloneActivityTests {
 
             // High priority should complete before low priority
             let highSnap = try await awaitTerminal(
-                client: client, taskID: high.taskID, timeout: .seconds(5))
+                client: client,
+                taskID: high.taskID,
+                timeout: .seconds(5)
+            )
             let lowSnap = try await awaitTerminal(
-                client: client, taskID: low.taskID, timeout: .seconds(5))
+                client: client,
+                taskID: low.taskID,
+                timeout: .seconds(5)
+            )
             #expect(highSnap.state == .completed)
             #expect(lowSnap.state == .completed)
             // Both tasks completed; priority ordering is enforced by the claim query.

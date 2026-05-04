@@ -1,9 +1,9 @@
 public import Hummingbird
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 /// Custom Hummingbird request context for the Strand dashboard API.

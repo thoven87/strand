@@ -2,9 +2,9 @@ import DequeModule
 import NIOCore
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - WorkflowCommand
@@ -294,7 +294,9 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     /// `seqNum`, or `nil` if the activity succeeded or hasn't completed yet.
     /// Fast path 2a in `runActivity` / `runChildWorkflow` uses this to throw the
     /// correct typed error instead of registering an event_wait that never fires.
-    func preloadedNonCompletion(for seqNum: Int) -> (
+    func preloadedNonCompletion(
+        for seqNum: Int
+    ) -> (
         state: TaskState, failureReason: ByteBuffer?
     )? {
         preloadedNonCompletions[seqNum]
@@ -318,14 +320,18 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
         let id = nextLocalActivityID
         nextLocalActivityID += 1
         localActivityEntries[id] = LocalActivityEntry(
-            name: name, input: input, seqNum: seqNum)
+            name: name,
+            input: input,
+            seqNum: seqNum
+        )
         return id
     }
 
     /// Attach the continuation immediately after the task suspends
     /// (called synchronously from within `withCheckedThrowingContinuation`).
     func linkLocalActivityContinuation(
-        _ cont: CheckedContinuation<ByteBuffer, Error>, forID id: Int
+        _ cont: CheckedContinuation<ByteBuffer, Error>,
+        forID id: Int
     ) {
         localActivityEntries[id]?.continuation = cont
     }

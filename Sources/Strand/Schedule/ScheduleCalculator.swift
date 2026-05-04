@@ -1,7 +1,7 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 /// Centralized calculator for all schedule-related time calculations
@@ -12,7 +12,8 @@ public struct ScheduleCalculator {
 
     /// Calculate the next run time for a schedule after a given date
     public static func nextRunTime(
-        for schedule: SchedulePattern, after date: Date,
+        for schedule: SchedulePattern,
+        after date: Date,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) throws -> Date? {
         try schedule.nextRunTime(after: date, timezone: timezone)
@@ -20,13 +21,18 @@ public struct ScheduleCalculator {
 
     /// Calculate the previous/current scheduled time for a given execution time
     /// This finds the scheduled time that corresponds to when a job should execute
-    public static func scheduledTime(for schedule: SchedulePattern, at executionTime: Date) throws
+    public static func scheduledTime(
+        for schedule: SchedulePattern,
+        at executionTime: Date
+    ) throws
         -> Date?
     {
         switch schedule {
         case .cron(let expression, _, _):
             return try calculateCronScheduledTime(
-                expression: expression, executionTime: executionTime)
+                expression: expression,
+                executionTime: executionTime
+            )
         case .interval(let interval, _, _):
             // Use epoch-aligned boundaries so the result is deterministic
             // regardless of when the schedule was created or what time it is now.
@@ -46,10 +52,18 @@ public struct ScheduleCalculator {
                 let hour = (totalMinutes / 60) % 24
                 let minute = totalMinutes % 60
                 return calculateDailyScheduledTime(
-                    hour: hour, minute: minute, executionTime: executionTime, timezone: tz)
+                    hour: hour,
+                    minute: minute,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
             } catch {
                 return calculateDailyScheduledTime(
-                    hour: 0, minute: 0, executionTime: executionTime, timezone: tz)
+                    hour: 0,
+                    minute: 0,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
             }
         case .weekly(let offset, let tz):
             do {
@@ -60,12 +74,20 @@ public struct ScheduleCalculator {
                 let hour = remainingMinutes / 60
                 let minute = remainingMinutes % 60
                 return calculateWeeklyScheduledTime(
-                    dayOfWeek: dayOfWeek, hour: hour, minute: minute,
-                    executionTime: executionTime, timezone: tz)
+                    dayOfWeek: dayOfWeek,
+                    hour: hour,
+                    minute: minute,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
             } catch {
                 return calculateWeeklyScheduledTime(
-                    dayOfWeek: 0, hour: 0, minute: 0,
-                    executionTime: executionTime, timezone: tz)
+                    dayOfWeek: 0,
+                    hour: 0,
+                    minute: 0,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
             }
         case .monthly(let offset, let tz):
             do {
@@ -74,12 +96,20 @@ public struct ScheduleCalculator {
                 let hour = duration.hours
                 let minute = duration.minutes
                 return calculateMonthlyScheduledTime(
-                    day: day, hour: hour, minute: minute,
-                    executionTime: executionTime, timezone: tz)
+                    day: day,
+                    hour: hour,
+                    minute: minute,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
             } catch {
                 return calculateMonthlyScheduledTime(
-                    day: 1, hour: 0, minute: 0,
-                    executionTime: executionTime, timezone: tz)
+                    day: 1,
+                    hour: 0,
+                    minute: 0,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
             }
         }
     }
@@ -100,7 +130,10 @@ public struct ScheduleCalculator {
         // Calculate the next run time after the current execution time
         guard
             let nextRunTime = try nextRunTime(
-                for: schedule, after: executionTime, timezone: timezone)
+                for: schedule,
+                after: executionTime,
+                timezone: timezone
+            )
         else {
             return nil
         }
@@ -110,7 +143,10 @@ public struct ScheduleCalculator {
 
     // MARK: - Schedule Type Specific Calculations
 
-    private static func calculateCronScheduledTime(expression: String, executionTime: Date) throws
+    private static func calculateCronScheduledTime(
+        expression: String,
+        executionTime: Date
+    ) throws
         -> Date?
     {
         let cronExpr = try CronExpression(expression)
@@ -146,7 +182,9 @@ public struct ScheduleCalculator {
     }
 
     private static func calculateIntervalScheduledTime(
-        interval: TimeInterval, executionTime: Date, createdAt: Date
+        interval: TimeInterval,
+        executionTime: Date,
+        createdAt: Date
     ) -> Date? {
         let elapsed = executionTime.timeIntervalSince(createdAt)
         let intervals = floor(elapsed / interval)
@@ -154,13 +192,17 @@ public struct ScheduleCalculator {
     }
 
     private static func calculateDailyScheduledTime(
-        hour: Int, minute: Int, executionTime: Date,
+        hour: Int,
+        minute: Int,
+        executionTime: Date,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> Date? {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timezone
         let executionComponents = calendar.dateComponents(
-            [.year, .month, .day], from: executionTime)
+            [.year, .month, .day],
+            from: executionTime
+        )
 
         var scheduledComponents = executionComponents
         scheduledComponents.hour = hour
@@ -180,7 +222,10 @@ public struct ScheduleCalculator {
     }
 
     private static func calculateWeeklyScheduledTime(
-        dayOfWeek: Int, hour: Int, minute: Int, executionTime: Date,
+        dayOfWeek: Int,
+        hour: Int,
+        minute: Int,
+        executionTime: Date,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> Date? {
         var calendar = Calendar(identifier: .gregorian)
@@ -190,7 +235,9 @@ public struct ScheduleCalculator {
         var searchDate = executionTime
         for _ in 0..<7 {
             let components = calendar.dateComponents(
-                [.weekday, .year, .month, .day], from: searchDate)
+                [.weekday, .year, .month, .day],
+                from: searchDate
+            )
 
             if components.weekday == dayOfWeek + 1 {  // Calendar weekday is 1-based
                 var scheduledComponents = components
@@ -212,7 +259,10 @@ public struct ScheduleCalculator {
     }
 
     private static func calculateMonthlyScheduledTime(
-        day: Int, hour: Int, minute: Int, executionTime: Date,
+        day: Int,
+        hour: Int,
+        minute: Int,
+        executionTime: Date,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> Date? {
         var calendar = Calendar(identifier: .gregorian)
@@ -302,7 +352,8 @@ public struct ScheduleCalculator {
         // Basic ISO 8601 duration format validation
         guard offset.hasPrefix("P") || offset.hasPrefix("PT") else {
             throw SchedulingError.invalidSchedule(
-                "Offset must be in ISO 8601 duration format (e.g., PT2H, P1D)")
+                "Offset must be in ISO 8601 duration format (e.g., PT2H, P1D)"
+            )
         }
 
         // Try to parse the offset to ensure it's valid
@@ -395,21 +446,30 @@ public struct ScheduleCalculator {
             // Example: Job runs 2017-06-30T02:00 with PT0M -> partition time is 2017-06-29T00:00
             // Example: Job runs 2017-06-30T02:00 with P1D -> partition time is 2017-06-28T00:00
             let basePartitionTime = partitionOffset.offset.subtract(
-                from: executionTime, calendar: utcCalendar)
+                from: executionTime,
+                calendar: utcCalendar
+            )
             let dayComponents = utcCalendar.dateComponents(
-                [.year, .month, .day], from: basePartitionTime)
+                [.year, .month, .day],
+                from: basePartitionTime
+            )
             guard let result = utcCalendar.date(from: dayComponents) else {
                 throw SchedulingError.invalidSchedule(
-                    "could not construct date from calendar components")
+                    "could not construct date from calendar components"
+                )
             }
             return result
 
         case .weekly(_, _):
             // For weekly schedules, apply partition offset then get start of that week
             let basePartitionTime = partitionOffset.offset.subtract(
-                from: executionTime, calendar: utcCalendar)
+                from: executionTime,
+                calendar: utcCalendar
+            )
             let weekComponents = utcCalendar.dateComponents(
-                [.yearForWeekOfYear, .weekOfYear], from: basePartitionTime)
+                [.yearForWeekOfYear, .weekOfYear],
+                from: basePartitionTime
+            )
             var startOfWeek = weekComponents
             startOfWeek.weekday = 1  // Sunday
             startOfWeek.hour = 0
@@ -417,16 +477,21 @@ public struct ScheduleCalculator {
             startOfWeek.second = 0
             guard let result = utcCalendar.date(from: startOfWeek) else {
                 throw SchedulingError.invalidSchedule(
-                    "could not construct date from calendar components")
+                    "could not construct date from calendar components"
+                )
             }
             return result
 
         case .monthly(_, _):
             // For monthly schedules, apply partition offset then get start of that month
             let basePartitionTime = partitionOffset.offset.subtract(
-                from: executionTime, calendar: utcCalendar)
+                from: executionTime,
+                calendar: utcCalendar
+            )
             let monthComponents = utcCalendar.dateComponents(
-                [.year, .month], from: basePartitionTime)
+                [.year, .month],
+                from: basePartitionTime
+            )
             var startOfMonth = monthComponents
             startOfMonth.day = 1
             startOfMonth.hour = 0
@@ -434,18 +499,22 @@ public struct ScheduleCalculator {
             startOfMonth.second = 0
             guard let result = utcCalendar.date(from: startOfMonth) else {
                 throw SchedulingError.invalidSchedule(
-                    "could not construct date from calendar components")
+                    "could not construct date from calendar components"
+                )
             }
             return result
 
         case .interval(let duration, _, _):
             // For interval schedules, apply partition offset then round to interval boundary
             let basePartitionTime = partitionOffset.offset.subtract(
-                from: executionTime, calendar: utcCalendar)
+                from: executionTime,
+                calendar: utcCalendar
+            )
             let intervalSeconds = duration.components.seconds
             // Round down to the nearest interval boundary
             let intervalsSinceEpoch = Int(
-                basePartitionTime.timeIntervalSince1970 / Double(intervalSeconds))
+                basePartitionTime.timeIntervalSince1970 / Double(intervalSeconds)
+            )
             return Date(timeIntervalSince1970: Double(intervalsSinceEpoch * Int(intervalSeconds)))
 
         case .cron(_, _, _), .once(_, _, _):
@@ -460,8 +529,7 @@ public struct ScheduleCalculator {
     /// - Hourly jobs process previous hour's data
     /// - Weekly jobs process previous week's data
     /// - Monthly jobs process previous month's data
-    public static func getDefaultPartitionOffset(for schedule: SchedulePattern) -> ISO8601Duration?
-    {
+    public static func getDefaultPartitionOffset(for schedule: SchedulePattern) -> ISO8601Duration? {
         switch schedule {
         case .daily(_, _):
             return .oneDay  // P1D - daily jobs process previous day's data

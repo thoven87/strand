@@ -3,9 +3,9 @@ package import NIOCore
 package import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    package import FoundationEssentials
+package import FoundationEssentials
 #else
-    package import Foundation
+package import Foundation
 #endif
 
 // MARK: - Row types
@@ -26,7 +26,7 @@ package struct ScheduleRow: Sendable {
     let retryStrategyBuffer: ByteBuffer?
     let cancellationBuffer: ByteBuffer?
     let accuracy: ScheduleAccuracy  // catch-up behaviour
-    let kind: TaskKind               // 'WORKFLOW' or 'ACTIVITY'
+    let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
 }
 
 /// A schedule summary row returned by ``ScheduleQueries/listSchedules``.
@@ -43,7 +43,7 @@ package struct ScheduleSummaryRow: Sendable {
     let lastRunAt: Date?
     let runCount: Int
     let accuracy: ScheduleAccuracy
-    let kind: TaskKind          // 'WORKFLOW' or 'ACTIVITY'
+    let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
     let createdAt: Date
 }
 
@@ -96,12 +96,17 @@ package enum ScheduleQueries {
                     endsAt: try col.next()!.decode(Date?.self, context: .default),
                     maxAttempts: try col.next()!.decode(Int?.self, context: .default),
                     retryStrategyBuffer: try col.next()!.decode(
-                        ByteBuffer?.self, context: .default),
+                        ByteBuffer?.self,
+                        context: .default
+                    ),
                     cancellationBuffer: try col.next()!.decode(
-                        ByteBuffer?.self, context: .default),
+                        ByteBuffer?.self,
+                        context: .default
+                    ),
                     accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
                     kind: try col.next()!.decode(TaskKind.self, context: .default)
-                ))
+                )
+            )
         }
         return rows
     }
@@ -164,15 +169,19 @@ package enum ScheduleQueries {
         on client: PostgresClient,
         namespaceID: String,
         id: UUID,
-        queue: String, name: String, taskName: String,
-        paramsBuffer: ByteBuffer, headersBuffer: ByteBuffer?,
+        queue: String,
+        name: String,
+        taskName: String,
+        paramsBuffer: ByteBuffer,
+        headersBuffer: ByteBuffer?,
         patternBuffer: ByteBuffer,
         maxAttempts: Int?,
         retryStrategyBuffer: ByteBuffer?,
         cancellationBuffer: ByteBuffer?,
         accuracy: ScheduleAccuracy,
         kind: TaskKind,
-        startsAt: Date?, endsAt: Date?,
+        startsAt: Date?,
+        endsAt: Date?,
         nextRunAt: Date?,
         logger: Logger
     ) async throws -> UUID {
@@ -214,7 +223,10 @@ package enum ScheduleQueries {
     }
 
     package static func pauseSchedule(
-        on client: PostgresClient, namespaceID: String, id: UUID, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        id: UUID,
+        logger: Logger
     ) async throws {
         try await client.query(
             "UPDATE strand.schedules SET is_active = FALSE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND id = \(id)",
@@ -223,7 +235,10 @@ package enum ScheduleQueries {
     }
 
     package static func resumeSchedule(
-        on client: PostgresClient, namespaceID: String, id: UUID, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        id: UUID,
+        logger: Logger
     ) async throws {
         try await client.query(
             "UPDATE strand.schedules SET is_active = TRUE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND id = \(id)",
@@ -232,7 +247,10 @@ package enum ScheduleQueries {
     }
 
     package static func deleteSchedule(
-        on client: PostgresClient, namespaceID: String, id: UUID, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        id: UUID,
+        logger: Logger
     ) async throws {
         try await client.query(
             "DELETE FROM strand.schedules WHERE namespace_id = \(namespaceID) AND id = \(id)",
@@ -276,7 +294,8 @@ package enum ScheduleQueries {
                     accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
                     kind: try col.next()!.decode(TaskKind.self, context: .default),
                     createdAt: try col.next()!.decode(Date.self, context: .default)
-                ))
+                )
+            )
         }
         return rows
     }

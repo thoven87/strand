@@ -1,9 +1,9 @@
 public import NIOCore  // ByteBuffer in public handleSignal(name:payload:ByteBuffer?)
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials  // Date in WorkflowOptions.delayUntil
+public import FoundationEssentials  // Date in WorkflowOptions.delayUntil
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - Registration tokens
@@ -177,7 +177,9 @@ extension Workflow {
         _WorkflowToken(name: workflowName, preferredQueue: nil) { claimed, exec in
             do {
                 return try await WorkflowRegistration<Self>().activate(
-                    claimed: claimed, exec: exec)
+                    claimed: claimed,
+                    exec: exec
+                )
             } catch InternalError.suspend {
                 return nil
             }

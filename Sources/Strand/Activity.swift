@@ -4,9 +4,9 @@ import PostgresNIO  // PostgresClient captured in heartbeatImpl closure; interna
 import Tracing
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials  // UUID in ActivityContext.activityID, Date in ActivityOptions are public API
+public import FoundationEssentials  // UUID in ActivityContext.activityID, Date in ActivityOptions are public API
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - StrandVoid
@@ -304,7 +304,11 @@ extension ActivityDefinition {
     }
 
     /// Decode → run → encode. Used by both _makeToken and StrandWorkerBuilder.buildExpression.
-    func _run(claimed: ClaimedTask, exec: _WorkerExec, fatalDeadline: TaskDeadline? = nil)
+    func _run(
+        claimed: ClaimedTask,
+        exec: _WorkerExec,
+        fatalDeadline: TaskDeadline? = nil
+    )
         async throws -> ByteBuffer
     {
         let input = try JSON.decode(Input.self, from: claimed.paramsBuffer)
@@ -351,9 +355,11 @@ extension ActivityDefinition {
         let output = try await withSpan("RunActivity:\(Self.name)", ofKind: .internal) { span in
             span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(Self.name)
             span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
-                claimed.taskID.uuidString.lowercased())
+                claimed.taskID.uuidString.lowercased()
+            )
             span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
-                claimed.runID.uuidString.lowercased())
+                claimed.runID.uuidString.lowercased()
+            )
             span.attributes[StrandLogKeys.queue] = SpanAttribute.string(exec.queue)
             span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(Int64(claimed.attempt))
             return try await self.run(input: input, context: ctx)

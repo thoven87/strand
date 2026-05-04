@@ -8,9 +8,9 @@ import Testing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Tag
@@ -91,13 +91,16 @@ func withTestEnvironment<T: Sendable>(
     func cleanup() async {
         _ = try? await postgres.query(
             "DELETE FROM strand.tasks       WHERE queue = \(queueName)",
-            logger: logger)
+            logger: logger
+        )
         _ = try? await postgres.query(
             "DELETE FROM strand.events      WHERE queue = \(queueName)",
-            logger: logger)
+            logger: logger
+        )
         _ = try? await postgres.query(
             "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
-            logger: logger)
+            logger: logger
+        )
         try? await client.dropQueue(queueName)
     }
 
