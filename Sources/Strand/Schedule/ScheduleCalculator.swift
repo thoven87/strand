@@ -187,7 +187,7 @@ public struct ScheduleCalculator {
         createdAt: Date
     ) -> Date? {
         let elapsed = executionTime.timeIntervalSince(createdAt)
-        let intervals = floor(elapsed / interval)
+        let intervals = (elapsed / interval).rounded(.down)
         return createdAt.addingTimeInterval(intervals * interval)
     }
 

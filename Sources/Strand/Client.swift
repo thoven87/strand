@@ -858,10 +858,9 @@ public struct StrandClient: Sendable {
                     // Iterating one step at a time would be O(n) — e.g. a 60-second
                     // interval with startsAt a year ago loops ~525,600 times.
                     let secs = Double(duration.components.seconds)
-                    let steps = floor(
-                        (registrationTime.timeIntervalSince1970 - first.timeIntervalSince1970)
-                            / secs
-                    )
+                    let steps =
+                        ((registrationTime.timeIntervalSince1970 - first.timeIntervalSince1970)
+                        / secs).rounded(.down)
                     nextRunAt = Date(
                         timeIntervalSince1970: first.timeIntervalSince1970 + steps * secs
                     )
