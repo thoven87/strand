@@ -53,6 +53,9 @@ struct OrderWorkflow: Workflow {
 ### Recipes
 - <doc:BuildingDataPipelines>
 
+### Examples
+- <doc:Examples>
+
 ### Operations
 - <doc:WorkerTuning>
 - <doc:Migrations>

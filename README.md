@@ -32,7 +32,7 @@ struct OrderWorkflow: Workflow {
 If a worker crashes mid-workflow the next worker that picks it up resumes from the last checkpoint. No work is duplicated, no state is lost.
 
 <p align="center">
-  <img src="screeshot.png" alt="Strand dashboard" width="900">
+  <img src="loom/screenshot.png" alt="Strand dashboard" width="900">
 </p>
 
 ## Documentation
