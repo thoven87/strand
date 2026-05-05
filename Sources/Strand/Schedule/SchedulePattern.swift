@@ -95,7 +95,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
                     // Add a small epsilon to ensure we go to NEXT boundary if exactly on current one
                     let epsilon = 0.001  // 1ms to handle floating point precision
                     let nextBoundary =
-                        ceil((adjustedTime + epsilon) / intervalSeconds) * intervalSeconds
+                        ((adjustedTime + epsilon) / intervalSeconds).rounded(.up) * intervalSeconds
                     let boundaryTime = Date(timeIntervalSince1970: nextBoundary - timezoneOffset)
                     return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
                 }

@@ -38,7 +38,7 @@ public struct ScheduleCalculator {
             // regardless of when the schedule was created or what time it is now.
             // e.g. a 90-minute interval snaps to 00:00, 01:30, 03:00 UTC…
             let secs = Double(interval.components.seconds)
-            let epochBoundary = floor(executionTime.timeIntervalSince1970 / secs) * secs
+            let epochBoundary = (executionTime.timeIntervalSince1970 / secs).rounded(.down) * secs
             return Date(timeIntervalSince1970: epochBoundary)
         case .once(let runDate, _, _):
             return runDate <= executionTime ? runDate : nil
@@ -374,21 +374,20 @@ public struct ScheduleCalculator {
             return "Schedule will not run again"
         }
 
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        formatter.timeZone = timezone  // use the schedule's timezone, not the server's
-        formatter.locale = Locale(identifier: "en_US_POSIX")  // consistent locale for server output
+        let style = Date.FormatStyle(
+            locale: Locale(identifier: "en_US_POSIX"),
+            timeZone: timezone
+        ).month(.abbreviated).day().year().hour().minute()
 
         let interval = nextRun.timeIntervalSince(date)
         if interval < 3600 {
             let minutes = Int(interval / 60)
-            return "Next run in \(minutes) minutes at \(formatter.string(from: nextRun))"
+            return "Next run in \(minutes) minutes at \(nextRun.formatted(style))"
         } else if interval < 86400 {
             let hours = Int(interval / 3600)
-            return "Next run in \(hours) hours at \(formatter.string(from: nextRun))"
+            return "Next run in \(hours) hours at \(nextRun.formatted(style))"
         } else {
-            return "Next run at \(formatter.string(from: nextRun))"
+            return "Next run at \(nextRun.formatted(style))"
         }
     }
 
