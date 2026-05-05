@@ -138,4 +138,4 @@ See [`Examples/`](Examples/) for complete runnable examples:
 
 ## License
 
-MIT
+Apache 2.0
