@@ -19,3 +19,5 @@ node_modules/
 Sources/StrandServer/Resources/ui/*.html
 Sources/StrandServer/Resources/ui/**/*.css
 Sources/StrandServer/Resources/ui/**/*.js
+
+loom/.vite/
