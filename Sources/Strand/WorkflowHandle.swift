@@ -228,7 +228,38 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
     }
 }
 
-// MARK: - StrandClient signal extension
+// MARK: - StrandClient public signal API
+
+extension StrandClient {
+
+    /// Sends a type-safe signal with a typed payload to any workflow task identified by `taskID`.
+    ///
+    /// Use this when you have a ``WorkflowSignalDefinition`` type but only a raw task UUID
+    /// (not a typed ``WorkflowHandle``). The signal name is derived from `S.signalName`
+    /// and the payload is JSON-encoded automatically.
+    ///
+    /// ```swift
+    /// try await client.signal(
+    ///     RoomMonitorWorkflow.UpdateThresholds.self,
+    ///     taskID: roomTaskID,
+    ///     payload: ThresholdUpdate(newThresholds: raised, reason: "post-incident")
+    /// )
+    /// ```
+    ///
+    /// > Note: Unlike `handle.signal(_:payload:)`, this overload does not enforce `S.W`
+    /// > at compile time — you are responsible for ensuring `taskID` belongs to
+    /// > a workflow that handles the signal.
+    public func signal<S: WorkflowSignalDefinition>(
+        _ definition: S.Type,
+        taskID: UUID,
+        payload: S.Input
+    ) async throws {
+        let buf = try JSON.encode(payload)
+        try await _sendSignal(name: S.signalName, payload: buf, toWorkflowTaskID: taskID)
+    }
+}
+
+// MARK: - StrandClient internal signal transport
 
 extension StrandClient {
 

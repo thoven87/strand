@@ -161,3 +161,11 @@ let normalized = try await context.runLocalActivity(
 Use local activities only for fast, idempotent, side-effect-free transformations.
 Any I/O should remain in a regular (non-local) activity so it can be retried
 independently.
+
+## See also
+
+- <doc:Examples#GroundwaterPipeline-—-6.2M-row-data-pipeline> — a working
+  example against a real 6.2M-row dataset with runtime fan-out, cursor recovery,
+  and multi-queue routing.
+- <doc:Examples#SmartBuilding-—-IoT-sensor-monitoring> — per-entity child
+  workflows fanned out in parallel, each sleeping between sensor cycles.

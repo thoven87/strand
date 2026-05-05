@@ -150,3 +150,10 @@ try await context.condition { $0.approvedCount >= $0.requiredApprovals }
 // With timeout — throws StrandError.timeout if not satisfied in time
 try await context.condition({ $0.approved }, timeout: .hours(24))
 ```
+
+A practical use of this pattern is a **deployment approval gate**: the pipeline
+workflow suspends after the build stage and waits indefinitely for an operator
+to send an `approve` signal before proceeding to deploy. If the process is
+restarted while waiting, the workflow resumes at exactly this suspension point.
+See <doc:Examples#CIPipeline-—-durable-CI/CD-with-an-approval-gate> for the
+full working example.
