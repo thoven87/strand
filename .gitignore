@@ -16,4 +16,6 @@ Examples/**/*.ts
 Examples/**/node_modules
 node_modules/
 
-Sources/StrandServer/Resources/ui/
+Sources/StrandServer/Resources/ui/*.html
+Sources/StrandServer/Resources/ui/**/*.css
+Sources/StrandServer/Resources/ui/**/*.js
