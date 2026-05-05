@@ -1,9 +1,9 @@
 package import NIOCore
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - ActivityError

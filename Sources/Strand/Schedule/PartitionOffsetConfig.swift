@@ -1,7 +1,7 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - Partition Offset Configuration
@@ -17,7 +17,8 @@ public struct PartitionOffsetConfig: Codable, Sendable {
     public let timezone: TimeZone
 
     public init(
-        offset: ISO8601Duration, useDefaultOffsets: Bool = true,
+        offset: ISO8601Duration,
+        useDefaultOffsets: Bool = true,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) {
         self.offset = offset
@@ -27,7 +28,8 @@ public struct PartitionOffsetConfig: Codable, Sendable {
 
     /// Create with ISO 8601 duration string
     public init(
-        offset: String, useDefaultOffsets: Bool = true,
+        offset: String,
+        useDefaultOffsets: Bool = true,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) throws {
         self.offset = try ISO8601Duration(offset)

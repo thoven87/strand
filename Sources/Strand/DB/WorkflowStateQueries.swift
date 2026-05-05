@@ -3,9 +3,9 @@ package import NIOCore
 package import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    package import FoundationEssentials
+package import FoundationEssentials
 #else
-    package import Foundation
+package import Foundation
 #endif
 
 // MARK: - PendingSignal
@@ -244,7 +244,8 @@ package enum WorkflowStateQueries {
                 (
                     seqNum: seqNum, result: result, failureReason: failureReason,
                     state: state, kind: kind, name: taskName
-                ))
+                )
+            )
         }
         return completions
     }
@@ -260,7 +261,8 @@ package enum WorkflowStateQueries {
     ) async throws -> Int {
         let stream = try await postgres.query(
             "SELECT COALESCE(MAX(seq), 0) FROM strand.workflow_history WHERE task_id = \(taskID)",
-            logger: logger)
+            logger: logger
+        )
         guard let row = try await stream.first(where: { _ in true }) else { return 1 }
         var col = row.makeIterator()
         let max = try col.next()!.decode(Int.self, context: .default)
@@ -306,7 +308,8 @@ package enum WorkflowStateQueries {
             VALUES (\(namespaceID), \(taskID), \(seq), \(rawType), \(eventData))
             ON CONFLICT (task_id, seq) DO NOTHING
             """,
-            logger: logger)
+            logger: logger
+        )
     }
 
     // MARK: - listHistory
@@ -343,7 +346,8 @@ package enum WorkflowStateQueries {
                     eventType: try col.next()!.decode(String.self, context: .default),
                     eventData: try col.next()!.decode(ByteBuffer?.self, context: .default),
                     createdAt: try col.next()!.decode(Date.self, context: .default)
-                ))
+                )
+            )
         }
         return events
     }
@@ -369,8 +373,14 @@ package enum WorkflowStateQueries {
         if events.count == 1 {
             let e = events[0]
             try await appendHistory(
-                on: postgres, namespaceID: namespaceID, taskID: taskID,
-                seq: e.seq, eventType: e.eventType, eventData: e.eventData, logger: logger)
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seq: e.seq,
+                eventType: e.eventType,
+                eventData: e.eventData,
+                logger: logger
+            )
             return
         }
         try await postgres.withTransaction(logger: logger) { conn in
@@ -382,7 +392,8 @@ package enum WorkflowStateQueries {
                     VALUES (\(namespaceID), \(taskID), \(e.seq), \(rawType), \(e.eventData))
                     ON CONFLICT (task_id, seq) DO NOTHING
                     """,
-                    logger: logger)
+                    logger: logger
+                )
             }
         }
     }

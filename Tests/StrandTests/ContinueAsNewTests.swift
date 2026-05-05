@@ -6,9 +6,9 @@ import Testing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Workflow fixtures
@@ -28,7 +28,8 @@ private struct ContinueWorkflow: Workflow {
     typealias Output = Int
 
     mutating func run(
-        context: WorkflowContext<Self>, input: ContinueInput
+        context: WorkflowContext<Self>,
+        input: ContinueInput
     ) async throws -> Int {
         let next = input.count + 1
         if next < input.limit {
@@ -54,7 +55,8 @@ private struct InfiniteWorkflow: Workflow {
     typealias Output = Int
 
     mutating func run(
-        context: WorkflowContext<Self>, input: InfiniteInput
+        context: WorkflowContext<Self>,
+        input: InfiniteInput
     ) async throws -> Int {
         if input.generation == 0 {
             try context.continueAsNew(input: InfiniteInput(generation: 1))
@@ -101,7 +103,8 @@ struct ContinueAsNewTests {
             if let snap = try await client.fetchTaskResult(id: handle.taskID) {
                 #expect(
                     snap.state == .completed || snap.state == .continuedAsNew,
-                    "original task should be terminal, got \(snap.state)")
+                    "original task should be terminal, got \(snap.state)"
+                )
             }
         }
     }

@@ -18,7 +18,8 @@ struct NamespaceRoutes {
         router.get("api/namespaces") { _, _ -> [NamespaceResponse] in
             let stream = try await self.postgres.query(
                 "SELECT id, display_name FROM strand.namespaces ORDER BY id",
-                logger: self.logger)
+                logger: self.logger
+            )
             var rows: [NamespaceResponse] = []
             for try await row in stream {
                 var col = row.makeIterator()

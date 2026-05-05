@@ -5,9 +5,9 @@ import NIOCore
 public import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - StrandClient
@@ -34,7 +34,9 @@ public struct StrandClient: Sendable {
     ) {
         precondition(!queue.isEmpty, "Queue name must not be empty")
         precondition(
-            queue.utf8.count <= 57, "Queue name \"\(queue)\" exceeds 57 UTF-8 bytes")
+            queue.utf8.count <= 57,
+            "Queue name \"\(queue)\" exceeds 57 UTF-8 bytes"
+        )
         self.postgres = postgres
         self.queueName = queue
         self.namespaceID = namespace
@@ -56,7 +58,7 @@ public struct StrandClient: Sendable {
         params: P,
         options enqueueOpts: EnqueueOptions = .init()
     ) async throws -> EnqueueResult {
-        return try await _enqueue(
+        try await _enqueue(
             queue: enqueueOpts.queue ?? queueName,
             taskName: taskName,
             params: params,
@@ -92,7 +94,7 @@ public struct StrandClient: Sendable {
         params: P,
         options: ActivityOptions = .init()
     ) async throws -> EnqueueResult {
-        return try await _enqueue(
+        try await _enqueue(
             queue: options.queue ?? activity.queue ?? queueName,
             taskName: activity.name,
             params: params,
@@ -281,7 +283,8 @@ public struct StrandClient: Sendable {
             workflowID: taskID.uuidString,
             taskID: taskID,
             initialRunID: taskID,  // placeholder — initial run not needed for signal-only usage
-            client: self)
+            client: self
+        )
     }
 
     /// Looks up a workflow by the custom string ID set via ``WorkflowOptions/id`` and
@@ -323,7 +326,8 @@ public struct StrandClient: Sendable {
             ORDER BY r.attempt DESC
             LIMIT 1
             """,
-            logger: logger)
+            logger: logger
+        )
         guard let row = try await stream.first(where: { _ in true }) else { return nil }
         var col = row.makeIterator()
         let taskID = try col.next()!.decode(UUID.self, context: .default)
@@ -332,7 +336,8 @@ public struct StrandClient: Sendable {
             workflowID: workflowID,
             taskID: taskID,
             initialRunID: runID,
-            client: self)
+            client: self
+        )
     }
 
     // MARK: - awaitWorkflowResult (package)
@@ -349,7 +354,9 @@ public struct StrandClient: Sendable {
         let snap = try await pollTerminalSnapshot(id: taskID, options: options)
         guard snap.state == .completed else {
             throw StrandError.activityFailed(
-                name: taskID.uuidString, state: snap.state.rawValue)
+                name: taskID.uuidString,
+                state: snap.state.rawValue
+            )
         }
         return try snap.decodeResult(as: type)
     }
@@ -357,10 +364,14 @@ public struct StrandClient: Sendable {
     // MARK: - Internal enqueue helper
 
     private func _enqueue<P: Codable & Sendable>(
-        queue: String, taskName: String, params: P,
-        maxAttempts: Int?, retryStrategy: RetryStrategy,
+        queue: String,
+        taskName: String,
+        params: P,
+        maxAttempts: Int?,
+        retryStrategy: RetryStrategy,
         cancellation: CancellationPolicy?,
-        headers: [String: String], idempotencyKey: String?,
+        headers: [String: String],
+        idempotencyKey: String?,
         priority: TaskPriority = .normal,
         delayUntil: Date? = nil,
         maxDuration: Duration? = nil,
@@ -396,8 +407,10 @@ public struct StrandClient: Sendable {
             logger: logger
         )
         return EnqueueResult(
-            taskID: row.taskID, runID: row.runID,
-            attempt: row.attempt, createdAt: Date.now
+            taskID: row.taskID,
+            runID: row.runID,
+            attempt: row.attempt,
+            createdAt: Date.now
         )
     }
 
@@ -410,8 +423,12 @@ public struct StrandClient: Sendable {
         queue: String? = nil
     ) async throws {
         try await Queries.emitEvent(
-            on: postgres, namespaceID: namespaceID, queue: queue ?? queueName,
-            eventName: name, payloadBuffer: try JSON.encode(payload), logger: logger
+            on: postgres,
+            namespaceID: namespaceID,
+            queue: queue ?? queueName,
+            eventName: name,
+            payloadBuffer: try JSON.encode(payload),
+            logger: logger
         )
     }
 
@@ -437,7 +454,11 @@ public struct StrandClient: Sendable {
 
     public func cancelTask(id taskID: UUID) async throws {
         try await Queries.cancelTask(
-            on: postgres, namespaceID: namespaceID, taskID: taskID, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            taskID: taskID,
+            logger: logger
+        )
     }
 
     /// Requeues a task for execution regardless of its current terminal state.
@@ -447,13 +468,20 @@ public struct StrandClient: Sendable {
     /// - COMPLETED or CONTINUED_AS_NEW: brand-new task ID with identical params.
     ///   The original completed cleanly; this starts genuinely new work.
     @discardableResult
-    public func requeueTask(id taskID: UUID, options: RetryOptions = .init()) async throws
+    public func requeueTask(
+        id taskID: UUID,
+        options: RetryOptions = .init()
+    ) async throws
         -> EnqueueResult
     {
         // Peek at state to choose the right path.
         guard
             let snap = try await ManagementQueries.getTask(
-                on: postgres, namespaceID: namespaceID, taskID: taskID, logger: logger)
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                logger: logger
+            )
         else {
             throw StrandError.unknownTask(name: taskID.uuidString)
         }
@@ -462,24 +490,43 @@ public struct StrandClient: Sendable {
             // Fresh task — original succeeded, this is new work.
             // The reRunTask path is unaffected by RetryOptions.
             let row = try await Queries.reRunTask(
-                on: postgres, namespaceID: namespaceID, taskID: taskID, logger: logger)
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                logger: logger
+            )
             return EnqueueResult(
-                taskID: row.taskID, runID: row.runID,
-                attempt: row.attempt, createdAt: Date.now)
+                taskID: row.taskID,
+                runID: row.runID,
+                attempt: row.attempt,
+                createdAt: Date.now
+            )
         default:
             // FAILED, CANCELLED, or any other terminal state — same task, next attempt.
             let (runID, attempt) = try await Queries.retryTask(
-                on: postgres, namespaceID: namespaceID, taskID: taskID,
-                resetHistory: options.resetHistory, logger: logger)
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                resetHistory: options.resetHistory,
+                logger: logger
+            )
             return EnqueueResult(
-                taskID: taskID, runID: runID, attempt: attempt, createdAt: Date.now)
+                taskID: taskID,
+                runID: runID,
+                attempt: attempt,
+                createdAt: Date.now
+            )
         }
     }
 
     public func fetchTaskResult(id taskID: UUID) async throws -> TaskResultSnapshot? {
         guard
             let row = try await Queries.fetchTaskResult(
-                on: postgres, namespaceID: namespaceID, taskID: taskID, logger: logger)
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                logger: logger
+            )
         else { return nil }
         return taskSnapshot(from: row)
     }
@@ -513,8 +560,11 @@ public struct StrandClient: Sendable {
         var delay: Duration = .milliseconds(50)
         while true {
             if let row = try await Queries.fetchTaskResult(
-                on: postgres, namespaceID: namespaceID, taskID: taskID, logger: logger)
-            {
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                logger: logger
+            ) {
                 let state = TaskState(rawValue: row.state) ?? .pending
                 if state == .completed || state == .failed || state == .cancelled {
                     return taskSnapshot(from: row)
@@ -548,22 +598,38 @@ public struct StrandClient: Sendable {
 
     public func createQueue(_ name: String) async throws {
         try await Queries.createQueue(
-            on: postgres, namespaceID: namespaceID, name: name, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            name: name,
+            logger: logger
+        )
     }
 
     public func dropQueue(_ name: String) async throws {
         try await Queries.dropQueue(
-            on: postgres, namespaceID: namespaceID, name: name, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            name: name,
+            logger: logger
+        )
     }
 
     public func pauseQueue(_ name: String) async throws {
         try await Queries.pauseQueue(
-            on: postgres, namespaceID: namespaceID, name: name, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            name: name,
+            logger: logger
+        )
     }
 
     public func resumeQueue(_ name: String) async throws {
         try await Queries.resumeQueue(
-            on: postgres, namespaceID: namespaceID, name: name, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            name: name,
+            logger: logger
+        )
     }
 
     /// Enqueues a workflow task using a pre-encoded raw JSON `ByteBuffer` as params.
@@ -594,8 +660,10 @@ public struct StrandClient: Sendable {
             logger: logger
         )
         return EnqueueResult(
-            taskID: row.taskID, runID: row.runID,
-            attempt: row.attempt, createdAt: Date.now
+            taskID: row.taskID,
+            runID: row.runID,
+            attempt: row.attempt,
+            createdAt: Date.now
         )
     }
 
@@ -762,7 +830,10 @@ public struct StrandClient: Sendable {
 
         let base = startsAt ?? Date.now
         var nextRunAt = try ScheduleCalculator.initialNextRunTime(
-            for: pattern, createdAt: base, timezone: pattern.timezone)
+            for: pattern,
+            createdAt: base,
+            timezone: pattern.timezone
+        )
 
         // When startsAt is in the past, advance nextRunAt to the most recent
         // elapsed slot rather than the oldest one. This fires the freshest
@@ -787,17 +858,21 @@ public struct StrandClient: Sendable {
                     // Iterating one step at a time would be O(n) — e.g. a 60-second
                     // interval with startsAt a year ago loops ~525,600 times.
                     let secs = Double(duration.components.seconds)
-                    let steps = floor(
-                        (registrationTime.timeIntervalSince1970 - first.timeIntervalSince1970)
-                            / secs)
+                    let steps =
+                        ((registrationTime.timeIntervalSince1970 - first.timeIntervalSince1970)
+                        / secs).rounded(.down)
                     nextRunAt = Date(
-                        timeIntervalSince1970: first.timeIntervalSince1970 + steps * secs)
+                        timeIntervalSince1970: first.timeIntervalSince1970 + steps * secs
+                    )
                 } else {
                     // daily/weekly/monthly: bounded iterations (≤365/52/12 steps from any
                     // reasonable startsAt), so the loop is acceptable.
                     var candidate = first
                     while let next = try ScheduleCalculator.nextRunTime(
-                        for: pattern, after: candidate, timezone: pattern.timezone),
+                        for: pattern,
+                        after: candidate,
+                        timezone: pattern.timezone
+                    ),
                         next <= registrationTime
                     {
                         candidate = next
@@ -825,7 +900,10 @@ public struct StrandClient: Sendable {
                     window.append(first)
                     var candidate = first
                     while let next = try ScheduleCalculator.nextRunTime(
-                        for: pattern, after: candidate, timezone: pattern.timezone),
+                        for: pattern,
+                        after: candidate,
+                        timezone: pattern.timezone
+                    ),
                         next <= registrationTime
                     {
                         window.append(next)
@@ -842,15 +920,23 @@ public struct StrandClient: Sendable {
         }
 
         return try await ScheduleQueries.upsertSchedule(
-            on: postgres, namespaceID: namespaceID, id: UUID.v7(),
-            queue: targetQueue, name: name, taskName: taskName,
-            paramsBuffer: paramsBuffer, headersBuffer: headersBuf,
+            on: postgres,
+            namespaceID: namespaceID,
+            id: UUID.v7(),
+            queue: targetQueue,
+            name: name,
+            taskName: taskName,
+            paramsBuffer: paramsBuffer,
+            headersBuffer: headersBuf,
             patternBuffer: patternBuf,
             maxAttempts: options.maxAttempts,
-            retryStrategyBuffer: retryBuf, cancellationBuffer: cancelBuf,
+            retryStrategyBuffer: retryBuf,
+            cancellationBuffer: cancelBuf,
             accuracy: options.accuracy,
             kind: kind,
-            startsAt: startsAt, endsAt: endsAt, nextRunAt: nextRunAt,
+            startsAt: startsAt,
+            endsAt: endsAt,
+            nextRunAt: nextRunAt,
             logger: logger
         )
     }
@@ -858,19 +944,31 @@ public struct StrandClient: Sendable {
     /// Pauses a schedule — stops it from firing, preserves its state.
     public func pauseSchedule(id: UUID) async throws {
         try await ScheduleQueries.pauseSchedule(
-            on: postgres, namespaceID: namespaceID, id: id, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            id: id,
+            logger: logger
+        )
     }
 
     /// Resumes a previously paused schedule.
     public func resumeSchedule(id: UUID) async throws {
         try await ScheduleQueries.resumeSchedule(
-            on: postgres, namespaceID: namespaceID, id: id, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            id: id,
+            logger: logger
+        )
     }
 
     /// Permanently deletes a schedule.
     public func deleteSchedule(id: UUID) async throws {
         try await ScheduleQueries.deleteSchedule(
-            on: postgres, namespaceID: namespaceID, id: id, logger: logger)
+            on: postgres,
+            namespaceID: namespaceID,
+            id: id,
+            logger: logger
+        )
     }
 
     /// Lists schedules for `queue` (or all queues when `queue` is `nil`).
@@ -882,15 +980,26 @@ public struct StrandClient: Sendable {
     ) async throws -> [ScheduleSummary] {
         let ns = overrideNS ?? namespaceID
         let rows = try await ScheduleQueries.listSchedules(
-            on: postgres, namespaceID: ns, queue: queue, logger: logger)
+            on: postgres,
+            namespaceID: ns,
+            queue: queue,
+            logger: logger
+        )
         return try rows.map { row in
             let pattern = try JSON.decode(SchedulePattern.self, from: row.patternBuffer)
             return ScheduleSummary(
-                id: row.id, name: row.name, queue: row.queue,
-                taskName: row.taskName, pattern: pattern,
-                isActive: row.isActive, startsAt: row.startsAt, endsAt: row.endsAt,
-                nextRunAt: row.nextRunAt, lastRunAt: row.lastRunAt,
-                runCount: row.runCount, accuracy: row.accuracy,
+                id: row.id,
+                name: row.name,
+                queue: row.queue,
+                taskName: row.taskName,
+                pattern: pattern,
+                isActive: row.isActive,
+                startsAt: row.startsAt,
+                endsAt: row.endsAt,
+                nextRunAt: row.nextRunAt,
+                lastRunAt: row.lastRunAt,
+                runCount: row.runCount,
+                accuracy: row.accuracy,
                 kind: row.kind,
                 createdAt: row.createdAt
             )
@@ -1047,7 +1156,10 @@ public struct StrandOptions: Sendable {
     public init(
         defaultMaxAttempts: Int = 5,
         defaultRetryStrategy: RetryStrategy = .backoff(
-            initial: .seconds(2), multiplier: 2, cap: .seconds(300)),
+            initial: .seconds(2),
+            multiplier: 2,
+            cap: .seconds(300)
+        ),
         logger: Logger = Logger(label: "dev.strand"),
         onTaskStarted: (@Sendable (TaskInfo) async -> Void)? = nil,
         onTaskFinished: (@Sendable (TaskInfo, Result<Void, any Error>) async -> Void)? = nil

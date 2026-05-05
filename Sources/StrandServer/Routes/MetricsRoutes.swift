@@ -4,9 +4,9 @@ import PostgresNIO
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 struct MetricsResponse: Codable, Sendable {
@@ -53,7 +53,8 @@ struct MetricsRoutes {
                 WHERE namespace_id = \(ns)
                   AND created_at >= NOW() - INTERVAL '24 hours'
                 """,
-                logger: self.logger)
+                logger: self.logger
+            )
 
             var completed = 0
             var failed = 0
@@ -84,7 +85,8 @@ struct MetricsRoutes {
                 GROUP BY 1
                 ORDER BY 1
                 """,
-                logger: self.logger)
+                logger: self.logger
+            )
             var throughput: [MetricsResponse.Bucket] = []
             for try await row in throughputStream {
                 var col = row.makeIterator()
@@ -106,7 +108,8 @@ struct MetricsRoutes {
                 GROUP BY 1
                 ORDER BY 1
                 """,
-                logger: self.logger)
+                logger: self.logger
+            )
             var errors: [MetricsResponse.Bucket] = []
             for try await row in errorStream {
                 var col = row.makeIterator()

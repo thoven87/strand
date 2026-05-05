@@ -1,7 +1,7 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - Partition Offset Support
@@ -17,7 +17,11 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
     public let seconds: Int
 
     public init(
-        years: Int = 0, months: Int = 0, days: Int = 0, hours: Int = 0, minutes: Int = 0,
+        years: Int = 0,
+        months: Int = 0,
+        days: Int = 0,
+        hours: Int = 0,
+        minutes: Int = 0,
         seconds: Int = 0
     ) {
         self.years = years
@@ -64,24 +68,28 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
                 inTimePart = true
                 if !currentNumber.isEmpty {
                     throw PartitionOffsetError.invalidDuration(
-                        "Unexpected number before T: \(string)")
+                        "Unexpected number before T: \(string)"
+                    )
                 }
             } else {
                 guard !currentNumber.isEmpty else {
                     throw PartitionOffsetError.invalidDuration(
-                        "Missing number before unit '\(char)': \(string)")
+                        "Missing number before unit '\(char)': \(string)"
+                    )
                 }
 
                 guard let value = Int(currentNumber) else {
                     throw PartitionOffsetError.invalidDuration(
-                        "Invalid number '\(currentNumber)': \(string)")
+                        "Invalid number '\(currentNumber)': \(string)"
+                    )
                 }
 
                 switch char {
                 case "Y":
                     guard !inTimePart else {
                         throw PartitionOffsetError.invalidDuration(
-                            "Years cannot be in time part: \(string)")
+                            "Years cannot be in time part: \(string)"
+                        )
                     }
                     years = value
                 case "M":
@@ -93,19 +101,22 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
                 case "D":
                     guard !inTimePart else {
                         throw PartitionOffsetError.invalidDuration(
-                            "Days cannot be in time part: \(string)")
+                            "Days cannot be in time part: \(string)"
+                        )
                     }
                     days = value
                 case "H":
                     guard inTimePart else {
                         throw PartitionOffsetError.invalidDuration(
-                            "Hours must be in time part after T: \(string)")
+                            "Hours must be in time part after T: \(string)"
+                        )
                     }
                     hours = value
                 case "S":
                     guard inTimePart else {
                         throw PartitionOffsetError.invalidDuration(
-                            "Seconds must be in time part after T: \(string)")
+                            "Seconds must be in time part after T: \(string)"
+                        )
                     }
                     seconds = value
                 default:
@@ -119,12 +130,18 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
         // Check for leftover number
         if !currentNumber.isEmpty {
             throw PartitionOffsetError.invalidDuration(
-                "Incomplete duration, missing unit: \(string)")
+                "Incomplete duration, missing unit: \(string)"
+            )
         }
 
         return ISO8601Duration(
-            years: years, months: months, days: days, hours: hours, minutes: minutes,
-            seconds: seconds)
+            years: years,
+            months: months,
+            days: days,
+            hours: hours,
+            minutes: minutes,
+            seconds: seconds
+        )
     }
 
     /// Convert to TimeInterval approximation (useful for simple offsets)

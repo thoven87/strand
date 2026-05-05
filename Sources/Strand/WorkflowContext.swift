@@ -3,9 +3,9 @@ import NIOCore
 import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - Private helpers
@@ -352,7 +352,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 options: options,
                 seqNum: seqNum,
                 idempotencyKey: idempotencyKey
-            ))
+            )
+        )
 
         // Suspend via continuation. The executor stores this continuation; after
         // drain() the worker applies the command to Postgres, then calls cancelPending()
@@ -385,7 +386,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         line: Int = #line
     ) async throws -> A.Output where A.Input == StrandVoid {
         try await runActivity(
-            type, input: StrandVoid(), options: options, fileID: fileID, line: line)
+            type,
+            input: StrandVoid(),
+            options: options,
+            fileID: fileID,
+            line: line
+        )
     }
 
     // MARK: - Deterministic values
@@ -461,7 +467,11 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///
     /// The worker slot is released during the sleep. On re-activation the sleep
     /// is skipped instantly (the stored wake time is read from the checkpoint cache).
-    public func sleep(for duration: Duration, fileID: String = #fileID, line: Int = #line)
+    public func sleep(
+        for duration: Duration,
+        fileID: String = #fileID,
+        line: Int = #line
+    )
         async throws
     {
         _impl.lastCallSite = (fileID, line)
@@ -474,8 +484,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// Suspends the workflow until at least `wakeAt` before continuing.
     ///
     /// If `wakeAt` is already in the past the call returns immediately.
-    public func sleep(until wakeAt: Date, fileID: String = #fileID, line: Int = #line) async throws
-    {
+    public func sleep(until wakeAt: Date, fileID: String = #fileID, line: Int = #line) async throws {
         _impl.lastCallSite = (fileID, line)
         let seqNum = _impl.nextSeqNum()
 
@@ -534,7 +543,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         if let cached = _impl.checkpointCache[seqNum] {
             if TimeoutSentinel.detect(in: cached) {
                 throw StrandError.timeout(
-                    message: "Timed out waiting for event \"\(name)\" (replayed)")
+                    message: "Timed out waiting for event \"\(name)\" (replayed)"
+                )
             }
             return try JSON.decode(T.self, from: cached)
         }
@@ -544,7 +554,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             if let payload = _impl.eventPayload {
                 _impl.checkpointCache[seqNum] = payload
                 _impl.executor.emit(
-                    .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: payload))
+                    .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: payload)
+                )
                 _impl.executor.emit(.eventReceived(eventName: name))
                 return try JSON.decode(T.self, from: payload)
             } else {
@@ -552,7 +563,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 let sentinel = try JSON.encode(TimeoutSentinel())
                 _impl.checkpointCache[seqNum] = sentinel
                 _impl.executor.emit(
-                    .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: sentinel))
+                    .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: sentinel)
+                )
                 throw StrandError.timeout(message: "Timed out waiting for event \"\(name)\"")
             }
         }
@@ -570,7 +582,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 eventName: name,  // raw name — no prefix
                 seqNum: seqNum,
                 timeoutAt: timeoutAt
-            ))
+            )
+        )
 
         let resultBuffer = try await withCheckedThrowingContinuation {
             (cont: CheckedContinuation<ByteBuffer, Error>) in
@@ -717,7 +730,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             let buf = try JSON.encode(wakeAt.timeIntervalSince1970)
             _impl.checkpointCache[seqNum] = buf
             _impl.executor.emit(
-                .writeCheckpoint(seqNum: seqNum, name: "conditionDeadline", value: buf))
+                .writeCheckpoint(seqNum: seqNum, name: "conditionDeadline", value: buf)
+            )
         }
 
         // Deadline already passed — this is a re-activation after the sleep timer fired
@@ -891,7 +905,9 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
         if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
             throw StrandError.childWorkflowFailed(
-                name: CW.workflowName, state: nonSuccess.state.rawValue)
+                name: CW.workflowName,
+                state: nonSuccess.state.rawValue
+            )
         }
 
         // Fast path 2: pre-loaded by executor (child workflow completed before this activation).
@@ -899,7 +915,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         if let preloaded = _impl.executor.preloadedResult(for: seqNum) {
             _impl.checkpointCache[seqNum] = preloaded
             _impl.executor.emit(
-                .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded))
+                .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded)
+            )
             return try JSON.decode(CW.Output.self, from: preloaded)
         }
 
@@ -916,7 +933,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 input: inputBuffer,
                 seqNum: seqNum,
                 idempotencyKey: idempotencyKey
-            ))
+            )
+        )
 
         let _ = try await withCheckedThrowingContinuation {
             (cont: CheckedContinuation<ByteBuffer, Error>) in

@@ -6,9 +6,9 @@ import Testing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Activity fixtures
@@ -195,7 +195,10 @@ struct LocalActivityTests {
                 input: "trigger"
             )
             let snap = try await awaitTerminal(
-                client: client, taskID: handle.taskID, timeout: .seconds(10))
+                client: client,
+                taskID: handle.taskID,
+                timeout: .seconds(10)
+            )
             #expect(snap.state == .failed)
         }
     }

@@ -12,7 +12,10 @@ struct QueueRoutes {
 
         router.get("queues") { _, ctx -> [QueueResponse] in
             let rows = try await ManagementQueries.listQueueStats(
-                on: self.postgres, namespaceID: ctx.namespaceID, logger: self.client.logger)
+                on: self.postgres,
+                namespaceID: ctx.namespaceID,
+                logger: self.client.logger
+            )
             return rows.map(QueueResponse.init)
         }
 
@@ -26,8 +29,11 @@ struct QueueRoutes {
             let queue = try ctx.parameters.require("queue")
             guard
                 let row = try await ManagementQueries.queueStats(
-                    on: self.postgres, namespaceID: ctx.namespaceID, queue: queue,
-                    logger: self.client.logger)
+                    on: self.postgres,
+                    namespaceID: ctx.namespaceID,
+                    queue: queue,
+                    logger: self.client.logger
+                )
             else {
                 throw HTTPError(.notFound, message: "Queue '\(queue)' not found")
             }

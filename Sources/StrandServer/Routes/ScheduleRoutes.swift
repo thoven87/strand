@@ -2,9 +2,9 @@ import Hummingbird
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - SchedulePattern helpers (local extension)
@@ -111,7 +111,9 @@ struct ScheduleRoutes {
         router.get("schedules") { req, ctx -> [ScheduleSummaryResponse] in
             let queue = req.uri.queryParameters.get("queue")
             let summaries = try await self.client.listSchedules(
-                queue: queue, namespaceID: ctx.namespaceID)
+                queue: queue,
+                namespaceID: ctx.namespaceID
+            )
             return summaries.map(ScheduleSummaryResponse.init)
         }
 
@@ -119,7 +121,9 @@ struct ScheduleRoutes {
         router.get("schedules/:id") { _, ctx -> ScheduleDetailResponse in
             let uuid = try ctx.parameters.require("id", as: UUID.self)
             let summaries = try await self.client.listSchedules(
-                queue: nil, namespaceID: ctx.namespaceID)
+                queue: nil,
+                namespaceID: ctx.namespaceID
+            )
             guard let s = summaries.first(where: { $0.id == uuid }) else {
                 throw HTTPError(.notFound, message: "Schedule not found")
             }
@@ -130,8 +134,11 @@ struct ScheduleRoutes {
         router.post("schedules/:id/pause") { _, ctx -> SimpleResponse in
             let uuid = try ctx.parameters.require("id", as: UUID.self)
             try await ScheduleQueries.pauseSchedule(
-                on: self.client.postgres, namespaceID: ctx.namespaceID,
-                id: uuid, logger: self.client.logger)
+                on: self.client.postgres,
+                namespaceID: ctx.namespaceID,
+                id: uuid,
+                logger: self.client.logger
+            )
             return SimpleResponse(message: "paused", id: uuid.uuidString)
         }
 
@@ -139,8 +146,11 @@ struct ScheduleRoutes {
         router.post("schedules/:id/resume") { _, ctx -> SimpleResponse in
             let uuid = try ctx.parameters.require("id", as: UUID.self)
             try await ScheduleQueries.resumeSchedule(
-                on: self.client.postgres, namespaceID: ctx.namespaceID,
-                id: uuid, logger: self.client.logger)
+                on: self.client.postgres,
+                namespaceID: ctx.namespaceID,
+                id: uuid,
+                logger: self.client.logger
+            )
             return SimpleResponse(message: "resumed", id: uuid.uuidString)
         }
 
@@ -176,7 +186,8 @@ struct ScheduleRoutes {
                         attempt: attempt,
                         createdAt: createdAt,
                         completedAt: completedAt
-                    ))
+                    )
+                )
             }
             return rows
         }
@@ -185,8 +196,11 @@ struct ScheduleRoutes {
         router.delete("schedules/:id") { _, ctx -> SimpleResponse in
             let uuid = try ctx.parameters.require("id", as: UUID.self)
             try await ScheduleQueries.deleteSchedule(
-                on: self.client.postgres, namespaceID: ctx.namespaceID,
-                id: uuid, logger: self.client.logger)
+                on: self.client.postgres,
+                namespaceID: ctx.namespaceID,
+                id: uuid,
+                logger: self.client.logger
+            )
             return SimpleResponse(message: "deleted", id: uuid.uuidString)
         }
     }

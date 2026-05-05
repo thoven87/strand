@@ -2,9 +2,9 @@ import NIOCore
 import NIOFoundationCompat
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 /// Namespace for JSON helpers that encode and decode directly to/from
@@ -26,7 +26,10 @@ enum JSON {
 
     /// Decode `type` from `buffer` without copying to `Data` first.
     /// - Throws: `StrandError.serialization` if `JSONDecoder` fails.
-    static func decode<T: Decodable>(_ type: T.Type, from buffer: ByteBuffer) throws(StrandError)
+    static func decode<T: Decodable>(
+        _ type: T.Type,
+        from buffer: ByteBuffer
+    ) throws(StrandError)
         -> T
     {
         do {

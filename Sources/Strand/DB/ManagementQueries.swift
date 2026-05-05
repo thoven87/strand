@@ -3,9 +3,9 @@ package import NIOCore
 package import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    package import FoundationEssentials
+package import FoundationEssentials
 #else
-    package import Foundation
+package import Foundation
 #endif
 
 // MARK: - Cursor page
@@ -494,7 +494,8 @@ package enum ManagementQueries {
                 "strand.namespace": .string(namespaceID),
                 "strand.queue": .string(queue ?? "*"),
                 "strand.count": .stringConvertible(count),
-            ])
+            ]
+        )
         return count
     }
 }
@@ -800,7 +801,8 @@ extension ManagementQueries {
                     finishedAt: try col.next()!.decode(Date?.self, context: .default),
                     workerID: try col.next()!.decode(String?.self, context: .default),
                     failureBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default)
-                ))
+                )
+            )
         }
         return rows
     }

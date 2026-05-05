@@ -2,9 +2,9 @@ import NIOCore
 public import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - TaskPriority

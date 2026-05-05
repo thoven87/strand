@@ -1,7 +1,7 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 // MARK: - ScheduleAccuracy
@@ -112,7 +112,7 @@ public struct ScheduleSummary: Sendable, Codable {
     public let lastRunAt: Date?
     public let runCount: Int
     public let accuracy: ScheduleAccuracy
-    public let kind: TaskKind          // 'WORKFLOW' or 'ACTIVITY'
+    public let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
     public let createdAt: Date
 }
 

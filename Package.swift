@@ -13,12 +13,15 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.99.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.12.0"),
         .package(
-            url: "https://github.com/swift-server/swift-service-lifecycle.git", from: "2.11.0"),
+            url: "https://github.com/swift-server/swift-service-lifecycle.git",
+            from: "2.11.0"
+        ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.22.0"),
         .package(url: "https://github.com/apple/swift-metrics.git", from: "2.10.1"),
         .package(url: "https://github.com/apple/swift-distributed-tracing.git", from: "1.4.1"),
         .package(
-            url: "https://github.com/swift-otel/swift-otel-semantic-conventions.git", from: "1.34.2"
+            url: "https://github.com/swift-otel/swift-otel-semantic-conventions.git",
+            from: "1.34.2"
         ),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
@@ -35,7 +38,9 @@ let package = Package(
                 .product(name: "Metrics", package: "swift-metrics"),
                 .product(name: "Tracing", package: "swift-distributed-tracing"),
                 .product(
-                    name: "OTelSemanticConventions", package: "swift-otel-semantic-conventions"),
+                    name: "OTelSemanticConventions",
+                    package: "swift-otel-semantic-conventions"
+                ),
                 .product(name: "DequeModule", package: "swift-collections"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
             ],

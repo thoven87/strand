@@ -1,14 +1,17 @@
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 /// Core schedule enumeration supporting various scheduling patterns
 public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     case cron(String, offset: String = "PT0M", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case interval(
-        Duration, offset: String = "PT0M", timezone: TimeZone = TimeZone(identifier: "UTC")!)
+        Duration,
+        offset: String = "PT0M",
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    )
     case daily(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case weekly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case monthly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
@@ -34,7 +37,10 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     ///   - date: Reference date (preferably in UTC)
     ///   - timezone: User's timezone for schedule interpretation (defaults to UTC)
     /// - Returns: Next run time in UTC, or nil if no future runs
-    public func nextRunTime(after date: Date, timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    public func nextRunTime(
+        after date: Date,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    )
         throws -> Date?
     {
         switch self {
@@ -89,7 +95,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
                     // Add a small epsilon to ensure we go to NEXT boundary if exactly on current one
                     let epsilon = 0.001  // 1ms to handle floating point precision
                     let nextBoundary =
-                        ceil((adjustedTime + epsilon) / intervalSeconds) * intervalSeconds
+                        ((adjustedTime + epsilon) / intervalSeconds).rounded(.up) * intervalSeconds
                     let boundaryTime = Date(timeIntervalSince1970: nextBoundary - timezoneOffset)
                     return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
                 }
@@ -97,15 +103,24 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
         case .daily(let offset, let scheduleTimezone):
             return try calculateDailyNextRunTime(
-                offset: offset, after: date, timezone: scheduleTimezone)
+                offset: offset,
+                after: date,
+                timezone: scheduleTimezone
+            )
 
         case .weekly(let offset, let scheduleTimezone):
             return try calculateWeeklyNextRunTime(
-                offset: offset, after: date, timezone: scheduleTimezone)
+                offset: offset,
+                after: date,
+                timezone: scheduleTimezone
+            )
 
         case .monthly(let offset, let scheduleTimezone):
             return try calculateMonthlyNextRunTime(
-                offset: offset, after: date, timezone: scheduleTimezone)
+                offset: offset,
+                after: date,
+                timezone: scheduleTimezone
+            )
 
         case .once(let scheduledDate, _, _):
             return scheduledDate > date ? scheduledDate : nil
@@ -113,7 +128,11 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     }
 
     /// Helper methods for offset-based schedule calculations
-    private func calculateDailyNextRunTime(offset: String, after date: Date, timezone: TimeZone)
+    private func calculateDailyNextRunTime(
+        offset: String,
+        after date: Date,
+        timezone: TimeZone
+    )
         throws -> Date?
     {
         var cal = Calendar(identifier: .gregorian)
@@ -127,7 +146,11 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
         return cal.nextDate(after: date, matching: comps, matchingPolicy: .nextTime)
     }
 
-    private func calculateWeeklyNextRunTime(offset: String, after date: Date, timezone: TimeZone)
+    private func calculateWeeklyNextRunTime(
+        offset: String,
+        after date: Date,
+        timezone: TimeZone
+    )
         throws -> Date?
     {
         var cal = Calendar(identifier: .gregorian)
@@ -145,7 +168,11 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
         return cal.nextDate(after: date, matching: comps, matchingPolicy: .nextTime)
     }
 
-    private func calculateMonthlyNextRunTime(offset: String, after date: Date, timezone: TimeZone)
+    private func calculateMonthlyNextRunTime(
+        offset: String,
+        after date: Date,
+        timezone: TimeZone
+    )
         throws -> Date?
     {
         var cal = Calendar(identifier: .gregorian)
@@ -229,7 +256,13 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             let dy = cal.component(.day, from: date)
             return String(
                 format: "Once on %04d-%02d-%02d at %02d:%02d%@",
-                y, mo, dy, h, m, tzSuffix(timezone))
+                y,
+                mo,
+                dy,
+                h,
+                m,
+                tzSuffix(timezone)
+            )
         }
     }
 
@@ -326,7 +359,8 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
             case .once(let date, let offset, let timezone):
                 DeterministicHasher.hash(
-                    "once:\(date.timeIntervalSince1970):\(offset):\(timezone.identifier)")
+                    "once:\(date.timeIntervalSince1970):\(offset):\(timezone.identifier)"
+                )
             }
 
         hasher.combine(deterministicHash)

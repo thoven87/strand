@@ -1,9 +1,9 @@
 import DequeModule
 
 #if canImport(FoundationEssentials)
-    public import FoundationEssentials
+public import FoundationEssentials
 #else
-    public import Foundation
+public import Foundation
 #endif
 
 /// High-performance Cron expression parser and evaluator
@@ -51,7 +51,10 @@ public struct CronExpression: Sendable, CustomStringConvertible, Codable {
     }
 
     /// Calculate the next run time after the given date
-    public func nextRunTime(after date: Date, in timeZone: TimeZone = TimeZone(identifier: "UTC")!)
+    public func nextRunTime(
+        after date: Date,
+        in timeZone: TimeZone = TimeZone(identifier: "UTC")!
+    )
         throws -> Date?
     {
         var cal = Calendar(identifier: .gregorian)
@@ -143,12 +146,13 @@ public struct CronExpression: Sendable, CustomStringConvertible, Codable {
     }
 
     /// Check if the current date matches the cron expression
-    public func matches(_ date: Date, in timeZone: TimeZone = TimeZone(identifier: "UTC")!) -> Bool
-    {
+    public func matches(_ date: Date, in timeZone: TimeZone = TimeZone(identifier: "UTC")!) -> Bool {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
         let components = calendar.dateComponents(
-            [.year, .month, .day, .hour, .minute, .weekday], from: date)
+            [.year, .month, .day, .hour, .minute, .weekday],
+            from: date
+        )
 
         guard let year = components.year,
             let month = components.month,
@@ -249,7 +253,11 @@ internal struct CronField: Sendable {
         values.count
     }
 
-    internal static func parse(_ field: String, range: ClosedRange<Int>, fieldName: String) throws
+    internal static func parse(
+        _ field: String,
+        range: ClosedRange<Int>,
+        fieldName: String
+    ) throws
         -> CronField
     {
         let trimmed = field.trimmingCharacters(in: .whitespaces)
@@ -272,7 +280,11 @@ internal struct CronField: Sendable {
         return CronField(values: values)
     }
 
-    private static func parseFieldPart(_ part: String, range: ClosedRange<Int>, fieldName: String)
+    private static func parseFieldPart(
+        _ part: String,
+        range: ClosedRange<Int>,
+        fieldName: String
+    )
         throws -> Set<Int>
     {
         // Handle step values (e.g., */5, 10-20/2)
@@ -300,7 +312,11 @@ internal struct CronField: Sendable {
         return Set([normalizedValue])
     }
 
-    private static func parseRange(_ part: String, range: ClosedRange<Int>, fieldName: String)
+    private static func parseRange(
+        _ part: String,
+        range: ClosedRange<Int>,
+        fieldName: String
+    )
         throws -> Set<Int>
     {
         let components = part.components(separatedBy: "-")
@@ -329,7 +345,11 @@ internal struct CronField: Sendable {
         return Set(start...end)
     }
 
-    private static func parseStepValue(_ part: String, range: ClosedRange<Int>, fieldName: String)
+    private static func parseStepValue(
+        _ part: String,
+        range: ClosedRange<Int>,
+        fieldName: String
+    )
         throws -> Set<Int>
     {
         let components = part.components(separatedBy: "/")
@@ -451,8 +471,7 @@ extension CronExpression {
     }
 
     /// Create a cron expression for specific time on specific weekdays
-    public static func weekdays(_ days: [Int], hour: Int, minute: Int = 0) throws -> CronExpression
-    {
+    public static func weekdays(_ days: [Int], hour: Int, minute: Int = 0) throws -> CronExpression {
         let validDays = days.filter { (0...7).contains($0) }
         guard validDays.count == days.count else {
             throw CronParseError.valueOutOfRange(-1, 0...7, "weekday")

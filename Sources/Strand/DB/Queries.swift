@@ -3,9 +3,9 @@ import NIOCore
 import PostgresNIO
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 /// All SQL operations against Strand's own tables.
@@ -41,7 +41,9 @@ enum Queries {
     /// Idempotent — safe to call on every worker start.
     /// The `display_name` defaults to the namespace ID itself when auto-created.
     static func registerNamespace(
-        on client: PostgresClient, namespaceID: String, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        logger: Logger
     ) async throws {
         try await client.query(
             """
@@ -49,50 +51,72 @@ enum Queries {
             VALUES (\(namespaceID), \(namespaceID))
             ON CONFLICT (id) DO NOTHING
             """,
-            logger: logger)
+            logger: logger
+        )
     }
 
     // MARK: - Queues
 
     static func createQueue(
-        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        name: String,
+        logger: Logger
     ) async throws {
         try await client.query(
             "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(name)) ON CONFLICT (namespace_id, name) DO NOTHING",
-            logger: logger)
+            logger: logger
+        )
     }
 
     static func dropQueue(
-        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        name: String,
+        logger: Logger
     ) async throws {
         try await client.query(
             "DELETE FROM strand.queues WHERE namespace_id = \(namespaceID) AND name = \(name)",
-            logger: logger)
+            logger: logger
+        )
     }
 
     // NOTE: requires the is_paused / updated_at columns added to strand.queues
     static func pauseQueue(
-        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        name: String,
+        logger: Logger
     ) async throws {
         try await client.query(
             "UPDATE strand.queues SET is_paused = TRUE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND name = \(name)",
-            logger: logger)
+            logger: logger
+        )
     }
 
     static func resumeQueue(
-        on client: PostgresClient, namespaceID: String, name: String, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        name: String,
+        logger: Logger
     ) async throws {
         try await client.query(
             "UPDATE strand.queues SET is_paused = FALSE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND name = \(name)",
-            logger: logger)
+            logger: logger
+        )
     }
 
-    static func listQueues(on client: PostgresClient, namespaceID: String, logger: Logger)
+    static func listQueues(
+        on client: PostgresClient,
+        namespaceID: String,
+        logger: Logger
+    )
         async throws -> [String]
     {
         let stream = try await client.query(
             "SELECT name FROM strand.queues WHERE namespace_id = \(namespaceID) ORDER BY name",
-            logger: logger)
+            logger: logger
+        )
         var names: [String] = []
         for try await row in stream {
             var col = row.makeIterator()
@@ -108,10 +132,14 @@ enum Queries {
     static func enqueueTask(
         on client: PostgresClient,
         namespaceID: String,
-        queue: String, taskName: String,
-        paramsBuffer: ByteBuffer, headersBuffer: ByteBuffer?,
-        retryStrategyBuffer: ByteBuffer?, maxAttempts: Int?,
-        cancellationBuffer: ByteBuffer?, idempotencyKey: String?,
+        queue: String,
+        taskName: String,
+        paramsBuffer: ByteBuffer,
+        headersBuffer: ByteBuffer?,
+        retryStrategyBuffer: ByteBuffer?,
+        maxAttempts: Int?,
+        cancellationBuffer: ByteBuffer?,
+        idempotencyKey: String?,
         priority: Int = 3,
         scheduledAt: Date? = nil,
         timeoutSeconds: Int? = nil,
@@ -122,7 +150,7 @@ enum Queries {
         parentTaskID: UUID? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
-        return try await client.withTransaction(logger: logger) { conn in
+        try await client.withTransaction(logger: logger) { conn in
             let taskID = UUID.v7()
             let runID = UUID.v7()
             // Auto-register the queue so strand.queues always reflects active queues.
@@ -144,10 +172,12 @@ enum Queries {
                         \(kind), \(parentTaskID), \(deadlineAt))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
                 """,
-                logger: logger)
+                logger: logger
+            )
             let checkStream = try await conn.query(
                 "SELECT id FROM strand.tasks WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND id = \(taskID)",
-                logger: logger)
+                logger: logger
+            )
             if try await checkStream.first(where: { _ in true }) != nil {
                 try await conn.query(
                     """
@@ -157,7 +187,8 @@ enum Queries {
                             COALESCE(\(scheduledAt), NOW()), \(priority),
                             \(fairnessKey), \(fairnessWeight), \(kind))
                     """,
-                    logger: logger)
+                    logger: logger
+                )
                 logger.debug(
                     "task enqueued",
                     metadata: [
@@ -166,7 +197,8 @@ enum Queries {
                         "strand.queue": .string(queue),
                         "strand.namespace": .string(namespaceID),
                         "strand.kind": .string(kind.rawValue),
-                    ])
+                    ]
+                )
                 return EnqueueRow(taskID: taskID, runID: runID, attempt: 1, created: true)
             } else {
                 let existStream = try await conn.query(
@@ -177,10 +209,12 @@ enum Queries {
                     WHERE t.namespace_id = \(namespaceID) AND t.queue = \(queue) AND t.idempotency_key = \(idempotencyKey)
                     ORDER BY r.attempt DESC LIMIT 1
                     """,
-                    logger: logger)
+                    logger: logger
+                )
                 guard let row = try await existStream.first(where: { _ in true }) else {
                     throw StrandError.database(
-                        underlying: QueryError("idempotency lookup returned no rows"))
+                        underlying: QueryError("idempotency lookup returned no rows")
+                    )
                 }
                 var col = row.makeIterator()
                 let eTaskID = try col.next()!.decode(UUID.self, context: .default)
@@ -197,8 +231,10 @@ enum Queries {
     static func claimTasks(
         on client: PostgresClient,
         namespaceID: String,
-        queue: String, workerID: String,
-        claimTimeoutSeconds: Int, qty: Int,
+        queue: String,
+        workerID: String,
+        claimTimeoutSeconds: Int,
+        qty: Int,
         logger: Logger
     ) async throws -> [ClaimedTask] {
         let stream = try await client.query(
@@ -268,7 +304,8 @@ enum Queries {
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
-            logger: logger)
+            logger: logger
+        )
         var tasks: [ClaimedTask] = []
         for try await row in stream { tasks.append(try ClaimedTask(row: row)) }
         return tasks
@@ -291,7 +328,8 @@ enum Queries {
             // Fetch task state and ID — FOR UPDATE prevents concurrent completions.
             let stateStream = try await conn.query(
                 "SELECT t.state, t.id FROM strand.runs r JOIN strand.tasks t ON t.id = r.task_id WHERE r.id = \(runID) AND r.namespace_id = \(namespaceID) FOR UPDATE",
-                logger: logger)
+                logger: logger
+            )
             guard let row = try await stateStream.first(where: { _ in true }) else { return }
             var col = row.makeIterator()
             let taskState = try col.next()!.decode(TaskState.self, context: .default)
@@ -307,23 +345,35 @@ enum Queries {
                   AND namespace_id = \(namespaceID)
                 RETURNING id
                 """,
-                logger: logger)
+                logger: logger
+            )
             guard try await casStream.first(where: { _ in true }) != nil else { return }
 
             try await conn.query(
                 "UPDATE strand.tasks SET state = 'COMPLETED', completed_at = NOW(), result = \(resultBuffer) WHERE id = \(taskID)",
-                logger: logger)
+                logger: logger
+            )
             try await conn.query(
-                "DELETE FROM strand.event_waits WHERE run_id = \(runID)", logger: logger)
+                "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
+                logger: logger
+            )
             try await emitTaskCompletionSignal(
-                conn: conn, namespaceID: namespaceID, taskID: taskID, state: .completed,
-                resultBuffer: resultBuffer, logger: logger)
+                conn: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                state: .completed,
+                resultBuffer: resultBuffer,
+                logger: logger
+            )
         }
     }
 
     /// Marks a run as failed and schedules a retry if attempts remain.
     static func failRun(
-        on client: PostgresClient, namespaceID: String, runID: UUID, reasonBuffer: ByteBuffer,
+        on client: PostgresClient,
+        namespaceID: String,
+        runID: UUID,
+        reasonBuffer: ByteBuffer,
         logger: Logger
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
@@ -333,7 +383,8 @@ enum Queries {
                 FROM strand.runs r JOIN strand.tasks t ON t.id = r.task_id
                 WHERE r.id = \(runID) FOR UPDATE OF t
                 """,
-                logger: logger)
+                logger: logger
+            )
             guard let row = try await infoStream.first(where: { _ in true }) else { return }
             var col = row.makeIterator()
             let taskID = try col.next()!.decode(UUID.self, context: .default)
@@ -346,16 +397,20 @@ enum Queries {
             // If another worker already processed it, bail out silently.
             let failStream = try await conn.query(
                 "UPDATE strand.runs SET state = 'FAILED', failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = 'RUNNING' RETURNING id",
-                logger: logger)
+                logger: logger
+            )
             guard try await failStream.first(where: { _ in true }) != nil else { return }
             try await conn.query(
-                "DELETE FROM strand.event_waits WHERE run_id = \(runID)", logger: logger)
+                "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
+                logger: logger
+            )
 
             // ── Check 1: nonRetryableErrorTypes ──────────────────────────────────────
             // Decode just the error type name from the failure payload.
             struct _ErrorType: Decodable { let name: String? }
             let errorTypeName = (try? JSON.decode(_ErrorType.self, from: reasonBuffer)).flatMap(
-                \.name)
+                \.name
+            )
 
             if let strategy = retryStrategyBuf.flatMap({
                 try? JSON.decode(RetryStrategy.self, from: $0)
@@ -367,10 +422,16 @@ enum Queries {
                     // Non-retryable error type — fail permanently, no retry
                     try await conn.query(
                         "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
-                        logger: logger)
+                        logger: logger
+                    )
                     try await emitTaskCompletionSignal(
-                        conn: conn, namespaceID: namespaceID, taskID: taskID,
-                        state: .failed, resultBuffer: nil, logger: logger)
+                        conn: conn,
+                        namespaceID: namespaceID,
+                        taskID: taskID,
+                        state: .failed,
+                        resultBuffer: nil,
+                        logger: logger
+                    )
                     return
                 }
             }
@@ -380,10 +441,16 @@ enum Queries {
                 // Total wall-clock budget exhausted — fail permanently
                 try await conn.query(
                     "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
-                    logger: logger)
+                    logger: logger
+                )
                 try await emitTaskCompletionSignal(
-                    conn: conn, namespaceID: namespaceID, taskID: taskID,
-                    state: .failed, resultBuffer: nil, logger: logger)
+                    conn: conn,
+                    namespaceID: namespaceID,
+                    taskID: taskID,
+                    state: .failed,
+                    resultBuffer: nil,
+                    logger: logger
+                )
                 return
             }
 
@@ -391,11 +458,17 @@ enum Queries {
             guard maxAttempts == nil || nextAttempt <= maxAttempts! else {
                 try await conn.query(
                     "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID)",
-                    logger: logger)
+                    logger: logger
+                )
                 // Wake any awaitTaskResult callers.
                 try await emitTaskCompletionSignal(
-                    conn: conn, namespaceID: namespaceID, taskID: taskID, state: .failed,
-                    resultBuffer: nil, logger: logger)
+                    conn: conn,
+                    namespaceID: namespaceID,
+                    taskID: taskID,
+                    state: .failed,
+                    resultBuffer: nil,
+                    logger: logger
+                )
                 return
             }
             let delay = retryDelay(strategy: retryStrategyBuf, attempt: attempt)
@@ -410,35 +483,47 @@ enum Queries {
                        priority, fairness_key, fairness_weight
                 FROM strand.runs WHERE id = \(runID)
                 """,
-                logger: logger)
+                logger: logger
+            )
             try await conn.query(
                 "UPDATE strand.tasks SET state = \(newState), attempt = \(nextAttempt) WHERE id = \(taskID)",
-                logger: logger)
+                logger: logger
+            )
         }
     }
 
     /// Suspends a run until `wakeAt` (used by `sleepFor` / `sleepUntil`).
     static func scheduleRun(
-        on client: PostgresClient, namespaceID: String, runID: UUID, taskID: UUID, wakeAt: Date,
+        on client: PostgresClient,
+        namespaceID: String,
+        runID: UUID,
+        taskID: UUID,
+        wakeAt: Date,
         logger: Logger
     ) async throws {
         try await client.query(
             "UPDATE strand.runs SET state = 'SLEEPING', available_at = \(wakeAt), worker_id = NULL, lease_expires_at = NULL WHERE id = \(runID) AND namespace_id = \(namespaceID)",
-            logger: logger)
+            logger: logger
+        )
         try await client.query(
             "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
-            logger: logger)
+            logger: logger
+        )
     }
 
     /// Extends the claim lease. Throws ``InternalError/cancelled`` if the run
     /// is no longer in 'running' state (task was cancelled or failed externally).
     static func extendClaim(
-        on client: PostgresClient, namespaceID: String, runID: UUID, extendBySeconds: Int,
+        on client: PostgresClient,
+        namespaceID: String,
+        runID: UUID,
+        extendBySeconds: Int,
         logger: Logger
     ) async throws {
         let stream = try await client.query(
             "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = 'RUNNING' AND namespace_id = \(namespaceID) RETURNING id",
-            logger: logger)
+            logger: logger
+        )
         if try await stream.first(where: { _ in true }) == nil {
             throw InternalError.cancelled
         }
@@ -447,12 +532,16 @@ enum Queries {
     /// `PostgresConnection` overload — used inside an open transaction (e.g. ``batchSetCheckpoints``).
     /// Semantics are identical to the `PostgresClient` variant.
     static func extendClaim(
-        on conn: PostgresConnection, namespaceID: String, runID: UUID, extendBySeconds: Int,
+        on conn: PostgresConnection,
+        namespaceID: String,
+        runID: UUID,
+        extendBySeconds: Int,
         logger: Logger
     ) async throws {
         let stream = try await conn.query(
             "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = 'RUNNING' AND namespace_id = \(namespaceID) RETURNING id",
-            logger: logger)
+            logger: logger
+        )
         if try await stream.first(where: { _ in true }) == nil {
             throw InternalError.cancelled
         }
@@ -460,7 +549,10 @@ enum Queries {
 
     /// Cancels a task and all its pending/sleeping runs.
     static func cancelTask(
-        on client: PostgresClient, namespaceID: String, taskID: UUID, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
 
@@ -473,7 +565,8 @@ enum Queries {
                   AND namespace_id = \(namespaceID)
                   AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
                 """,
-                logger: logger)
+                logger: logger
+            )
 
             // ── Step 2: Cancel/interrupt this task's runs ─────────────────────────
             // PENDING/SLEEPING/WAITING → CANCELLED immediately.
@@ -488,7 +581,8 @@ enum Queries {
                   AND namespace_id = \(namespaceID)
                   AND state IN ('PENDING', 'SLEEPING', 'WAITING', 'RUNNING')
                 """,
-                logger: logger)
+                logger: logger
+            )
 
             // ── Step 3: Cascade to all descendant tasks (recursive) ───────────────
             // Child activities and child workflows spawned by this workflow are also
@@ -511,7 +605,8 @@ enum Queries {
                 WHERE id IN (SELECT id FROM descendants)
                   AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
                 """,
-                logger: logger)
+                logger: logger
+            )
 
             // ── Step 4: Cancel/interrupt all descendant runs ───────────────────────
             try await conn.query(
@@ -532,22 +627,32 @@ enum Queries {
                   AND namespace_id = \(namespaceID)
                   AND state IN ('PENDING', 'SLEEPING', 'WAITING', 'RUNNING')
                 """,
-                logger: logger)
+                logger: logger
+            )
 
             // ── Step 5: Wake any awaitTaskResult callers ───────────────────────────
             try await emitTaskCompletionSignal(
-                conn: conn, namespaceID: namespaceID, taskID: taskID,
-                state: .cancelled, resultBuffer: nil, logger: logger)
+                conn: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                state: .cancelled,
+                resultBuffer: nil,
+                logger: logger
+            )
         }
 
         logger.debug(
             "task cancelled",
-            metadata: ["strand.task_id": .string(taskID.uuidString)])
+            metadata: ["strand.task_id": .string(taskID.uuidString)]
+        )
     }
 
     /// Returns the current state and result of a task.
     static func fetchTaskResult(
-        on client: PostgresClient, namespaceID: String, taskID: UUID, logger: Logger
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
     ) async throws -> TaskResultRow? {
         let stream = try await client.query(
             """
@@ -558,7 +663,8 @@ enum Queries {
             )
             WHERE t.id = \(taskID) AND t.namespace_id = \(namespaceID)
             """,
-            logger: logger)
+            logger: logger
+        )
         guard let row = try await stream.first(where: { _ in true }) else { return nil }
         return try TaskResultRow(row: row)
     }
@@ -570,7 +676,10 @@ enum Queries {
     /// Keyed by `seq_num` (integer primary key) rather than name. Callers use the
     /// returned `seqNum` to reconstruct the deterministic step counter cache.
     static func getCheckpointStates(
-        on client: PostgresClient, taskID: UUID, runID: UUID, logger: Logger
+        on client: PostgresClient,
+        taskID: UUID,
+        runID: UUID,
+        logger: Logger
     ) async throws -> [CheckpointRow] {
         let stream = try await client.query(
             """
@@ -580,7 +689,8 @@ enum Queries {
               AND run_id  = \(runID)
             ORDER BY created_at
             """,
-            logger: logger)
+            logger: logger
+        )
         var rows: [CheckpointRow] = []
         for try await row in stream { rows.append(try CheckpointRow(row: row)) }
         return rows
@@ -613,11 +723,16 @@ enum Queries {
                 WHERE (SELECT attempt FROM strand.runs WHERE id = strand.checkpoints.run_id)
                    <= (SELECT attempt FROM strand.runs WHERE id = EXCLUDED.run_id)
             """,
-            logger: logger)
+            logger: logger
+        )
         if let secs = extendClaimBySeconds {
             try await extendClaim(
-                on: client, namespaceID: namespaceID, runID: runID, extendBySeconds: secs,
-                logger: logger)
+                on: client,
+                namespaceID: namespaceID,
+                runID: runID,
+                extendBySeconds: secs,
+                logger: logger
+            )
         }
     }
 
@@ -640,9 +755,16 @@ enum Queries {
         if checkpoints.count == 1 {
             let c = checkpoints[0]
             try await setCheckpointState(
-                on: client, namespaceID: namespaceID, taskID: taskID, seqNum: c.seqNum,
-                name: c.name, stateBuffer: c.state, runID: runID,
-                extendClaimBySeconds: extendClaimBySeconds, logger: logger)
+                on: client,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seqNum: c.seqNum,
+                name: c.name,
+                stateBuffer: c.state,
+                runID: runID,
+                extendClaimBySeconds: extendClaimBySeconds,
+                logger: logger
+            )
             return
         }
         try await client.withTransaction(logger: logger) { conn in
@@ -658,12 +780,17 @@ enum Queries {
                         WHERE (SELECT attempt FROM strand.runs WHERE id = strand.checkpoints.run_id)
                            <= (SELECT attempt FROM strand.runs WHERE id = EXCLUDED.run_id)
                     """,
-                    logger: logger)
+                    logger: logger
+                )
             }
             if let secs = extendClaimBySeconds {
                 try await extendClaim(
-                    on: conn, namespaceID: namespaceID, runID: runID, extendBySeconds: secs,
-                    logger: logger)
+                    on: conn,
+                    namespaceID: namespaceID,
+                    runID: runID,
+                    extendBySeconds: secs,
+                    logger: logger
+                )
             }
         }
     }
@@ -673,10 +800,14 @@ enum Queries {
     /// Checks for an existing event; if absent, registers a wait and suspends the run.
     static func awaitEvent(
         on client: PostgresClient,
-        queue: String, taskID: UUID, runID: UUID,
-        stepName: String, eventName: String,
+        queue: String,
+        taskID: UUID,
+        runID: UUID,
+        stepName: String,
+        eventName: String,
         timeoutSeconds: Int?,
-        currentWakeEvent: String?, currentEventPayload: ByteBuffer?,
+        currentWakeEvent: String?,
+        currentEventPayload: ByteBuffer?,
         logger: Logger
     ) async throws -> AwaitEventResult {
         if currentWakeEvent == eventName {
@@ -685,7 +816,8 @@ enum Queries {
         return try await client.withTransaction(logger: logger) { conn in
             let evtStream = try await conn.query(
                 "SELECT payload FROM strand.events WHERE queue = \(queue) AND name = \(eventName)",
-                logger: logger)
+                logger: logger
+            )
             if let row = try await evtStream.first(where: { _ in true }) {
                 var col = row.makeIterator()
                 if let payload = try col.next()!.decode(ByteBuffer?.self, context: .default) {
@@ -700,7 +832,8 @@ enum Queries {
                 ON CONFLICT (run_id, step_name)
                 DO UPDATE SET event_name = EXCLUDED.event_name, timeout_at = EXCLUDED.timeout_at
                 """,
-                logger: logger)
+                logger: logger
+            )
             // Timed waits use SLEEPING so the claim poll loop auto-wakes the run when
             // available_at (= timeoutAt) is reached. Untimed waits use WAITING — the
             // run is only woken by an explicit event emission or signal delivery.
@@ -713,7 +846,8 @@ enum Queries {
                         worker_id = NULL, lease_expires_at = NULL
                     WHERE id = \(runID)
                     """,
-                    logger: logger)
+                    logger: logger
+                )
                 try await conn.query(
                     "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(taskID)",
                     logger: logger
@@ -727,9 +861,11 @@ enum Queries {
                         worker_id = NULL, lease_expires_at = NULL
                     WHERE id = \(runID)
                     """,
-                    logger: logger)
+                    logger: logger
+                )
                 try await conn.query(
-                    "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(taskID)", logger: logger
+                    "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(taskID)",
+                    logger: logger
                 )
             }
             return .suspended
@@ -740,7 +876,10 @@ enum Queries {
     static func emitEvent(
         on client: PostgresClient,
         namespaceID: String,
-        queue: String, eventName: String, payloadBuffer: ByteBuffer, logger: Logger
+        queue: String,
+        eventName: String,
+        payloadBuffer: ByteBuffer,
+        logger: Logger
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
             let insertStream = try await conn.query(
@@ -752,11 +891,13 @@ enum Queries {
                 WHERE strand.events.payload IS NULL
                 RETURNING 1
                 """,
-                logger: logger)
+                logger: logger
+            )
             guard try await insertStream.first(where: { _ in true }) != nil else { return }
             let waitsStream = try await conn.query(
                 "SELECT task_id, run_id FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
-                logger: logger)
+                logger: logger
+            )
             var waits: [(taskID: UUID, runID: UUID)] = []
             for try await row in waitsStream {
                 var col = row.makeIterator()
@@ -764,26 +905,30 @@ enum Queries {
                     (
                         try col.next()!.decode(UUID.self, context: .default),
                         try col.next()!.decode(UUID.self, context: .default)
-                    ))
+                    )
+                )
             }
             for wait in waits {
                 try await conn.query(
                     "UPDATE strand.runs SET state = 'PENDING', available_at = NOW(), event_payload = \(payloadBuffer), wake_event = \(eventName), lease_expires_at = NULL WHERE id = \(wait.runID) AND state IN ('SLEEPING', 'WAITING') AND namespace_id = \(namespaceID)",
-                    logger: logger)
+                    logger: logger
+                )
                 try await conn.query(
                     "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(wait.taskID) AND namespace_id = \(namespaceID)",
-                    logger: logger)
+                    logger: logger
+                )
             }
             try await conn.query(
                 "DELETE FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
-                logger: logger)
+                logger: logger
+            )
         }
     }
 
     // MARK: - Lease expiry sweep
 
     /// Finds runs whose claim lease has expired and fails them so they are
-    /// retried. 
+    /// retried.
     /// `FOR UPDATE SKIP LOCKED` ensures each expired run is processed by
     /// exactly one worker even when multiple workers share a queue.
     ///
@@ -823,8 +968,12 @@ enum Queries {
         for runID in expiredIDs {
             do {
                 try await failRun(
-                    on: client, namespaceID: namespaceID, runID: runID, reasonBuffer: reason,
-                    logger: logger)
+                    on: client,
+                    namespaceID: namespaceID,
+                    runID: runID,
+                    reasonBuffer: reason,
+                    logger: logger
+                )
             } catch {
                 logger.error("error expiring run \(runID): \(String(reflecting: error))")
             }
@@ -843,7 +992,7 @@ enum Queries {
         resetHistory: Bool = false,
         logger: Logger
     ) async throws -> (runID: UUID, attempt: Int) {
-        return try await client.withTransaction(logger: logger) { conn in
+        try await client.withTransaction(logger: logger) { conn in
             let stream = try await conn.query(
                 """
                 SELECT attempt, max_attempts FROM strand.tasks
@@ -855,7 +1004,8 @@ enum Queries {
             )
             guard let row = try await stream.first(where: { _ in true }) else {
                 throw StrandError.database(
-                    underlying: QueryError("task not found or not in failed state"))
+                    underlying: QueryError("task not found or not in failed state")
+                )
             }
             var col = row.makeIterator()
             let attempt = try col.next()!.decode(Int.self, context: .default)
@@ -920,7 +1070,7 @@ enum Queries {
         taskID: UUID,
         logger: Logger
     ) async throws -> EnqueueRow {
-        return try await client.withTransaction(logger: logger) { conn in
+        try await client.withTransaction(logger: logger) { conn in
             // Read the original task's metadata.
             let src = try await conn.query(
                 """
@@ -934,7 +1084,8 @@ enum Queries {
             )
             guard let row = try await src.first(where: { _ in true }) else {
                 throw StrandError.database(
-                    underlying: QueryError("task not found or not in completed state"))
+                    underlying: QueryError("task not found or not in completed state")
+                )
             }
             var col = row.makeIterator()
             let name = try col.next()!.decode(String.self, context: .default)
@@ -955,7 +1106,8 @@ enum Queries {
             // Create the queue row if not present (idempotent).
             try await conn.query(
                 "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(queue)) ON CONFLICT DO NOTHING",
-                logger: logger)
+                logger: logger
+            )
 
             try await conn.query(
                 """
@@ -967,7 +1119,8 @@ enum Queries {
                         \(headers), \(retryStrategy), \(maxAttempts), \(cancellation),
                         \(priority), \(fairnessKey), \(fairnessWeight), \(kind), 'PENDING')
                 """,
-                logger: logger)
+                logger: logger
+            )
 
             try await conn.query(
                 """
@@ -976,7 +1129,8 @@ enum Queries {
                 VALUES (\(namespaceID), \(newRunID), \(newTaskID), \(queue), 1, 'PENDING', NOW(),
                         \(priority), \(fairnessKey), \(fairnessWeight), \(kind))
                 """,
-                logger: logger)
+                logger: logger
+            )
 
             return EnqueueRow(taskID: newTaskID, runID: newRunID, attempt: 1, created: true)
         }
@@ -1032,7 +1186,8 @@ enum Queries {
                     try col.next()!.decode(String.self, context: .default),
                     try col.next()!.decode(UUID.self, context: .default),
                     try col.next()!.decode(UUID.self, context: .default)
-                ))
+                )
+            )
         }
         guard !waits.isEmpty else { return }
 

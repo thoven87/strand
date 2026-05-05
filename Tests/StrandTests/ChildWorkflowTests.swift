@@ -6,9 +6,9 @@ import Testing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Workflow fixtures
@@ -27,7 +27,7 @@ private struct AddTenWorkflow: Workflow {
     typealias Output = Int
 
     mutating func run(context: WorkflowContext<Self>, input: Int) async throws -> Int {
-        return input + 10
+        input + 10
     }
 }
 
@@ -125,7 +125,8 @@ struct ChildWorkflowTests {
     //   1. Cancel both worker tasks
     //   2. Drop the child queue
     @Test(
-        "child workflow on a different queue dispatches cross-queue and returns the correct result")
+        "child workflow on a different queue dispatches cross-queue and returns the correct result"
+    )
     func childWorkflowOnDifferentQueue() async throws {
         try await withTestEnvironment { client in
             let childQueue =

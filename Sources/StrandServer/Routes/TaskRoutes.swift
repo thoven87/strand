@@ -3,9 +3,9 @@ import PostgresNIO
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 struct TaskRoutes {
@@ -54,7 +54,8 @@ struct TaskRoutes {
         }
 
         router.get("queues/:queue/tasks") {
-            req, ctx -> CursorPageResponse<TaskSummaryResponse> in
+            req,
+            ctx -> CursorPageResponse<TaskSummaryResponse> in
             let queue = try ctx.parameters.require("queue")
             let qp = req.uri.queryParameters
             let state = qp.get("state")
@@ -62,21 +63,33 @@ struct TaskRoutes {
             let limit = qp.get("limit").flatMap(Int.init) ?? 50
             let cursor = qp.get("cursor").flatMap { UUID(uuidString: $0) }
             let page = try await ManagementQueries.listTasks(
-                on: self.postgres, namespaceID: ctx.namespaceID, queue: queue, state: state,
-                name: name, cursor: cursor, limit: min(limit, 200), logger: self.client.logger)
+                on: self.postgres,
+                namespaceID: ctx.namespaceID,
+                queue: queue,
+                state: state,
+                name: name,
+                cursor: cursor,
+                limit: min(limit, 200),
+                logger: self.client.logger
+            )
             return CursorPageResponse(
                 items: page.items.map(TaskSummaryResponse.init),
-                nextCursor: page.nextCursor)
+                nextCursor: page.nextCursor
+            )
         }
 
         router.post("queues/:queue/tasks") { req, ctx -> EnqueueResultResponse in
             let queue = try ctx.parameters.require("queue")
             let body = try await req.decode(as: EnqueueTaskBody.self, context: ctx)
             let result = try await self.client.enqueue(
-                taskName: body.name, params: body.params,
+                taskName: body.name,
+                params: body.params,
                 options: EnqueueOptions(
-                    queue: queue, maxAttempts: body.maxAttempts,
-                    idempotencyKey: body.idempotencyKey))
+                    queue: queue,
+                    maxAttempts: body.maxAttempts,
+                    idempotencyKey: body.idempotencyKey
+                )
+            )
             return EnqueueResultResponse(from: result)
         }
 
@@ -84,8 +97,11 @@ struct TaskRoutes {
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
             guard
                 let row = try await ManagementQueries.getTask(
-                    on: self.postgres, namespaceID: ctx.namespaceID, taskID: taskID,
-                    logger: self.client.logger)
+                    on: self.postgres,
+                    namespaceID: ctx.namespaceID,
+                    taskID: taskID,
+                    logger: self.client.logger
+                )
             else {
                 throw HTTPError(.notFound, message: "Task not found")
             }
@@ -96,7 +112,8 @@ struct TaskRoutes {
         // Returns tasks spawned by this task (parent_task_id = taskID).
         // Used by the task detail page to show activities a workflow launched.
         router.get("queues/:queue/tasks/:taskID/children") {
-            req, ctx -> CursorPageResponse<TaskSummaryResponse> in
+            req,
+            ctx -> CursorPageResponse<TaskSummaryResponse> in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
             let qp = req.uri.queryParameters
             let limit = qp.get("limit").flatMap(Int.init) ?? 50
@@ -146,7 +163,10 @@ struct TaskRoutes {
         router.get("queues/:queue/tasks/:taskID/history") { _, ctx -> [HistoryEventResponse] in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
             let rows = try await WorkflowStateQueries.listHistory(
-                on: self.postgres, taskID: taskID, logger: self.client.logger)
+                on: self.postgres,
+                taskID: taskID,
+                logger: self.client.logger
+            )
             return rows.map(HistoryEventResponse.init)
         }
 
@@ -156,7 +176,10 @@ struct TaskRoutes {
             let body = try await req.decode(as: SignalBody.self, context: ctx)
             let payloadBuf: ByteBuffer? = body.payload.map { ByteBuffer(string: $0) }
             try await self.client._sendSignal(
-                name: body.name, payload: payloadBuf, toWorkflowTaskID: taskID)
+                name: body.name,
+                payload: payloadBuf,
+                toWorkflowTaskID: taskID
+            )
             return SimpleResponse(message: "signal sent", id: taskID.uuidString)
         }
 
@@ -169,9 +192,11 @@ struct TaskRoutes {
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
             guard
                 let buf = try await WorkflowStateQueries.loadState(
-                    on: self.postgres, taskID: taskID,
+                    on: self.postgres,
+                    taskID: taskID,
                     namespaceID: ctx.namespaceID,
-                    logger: self.client.logger)
+                    logger: self.client.logger
+                )
             else {
                 return nil
             }
@@ -196,8 +221,7 @@ struct TaskRoutes {
 
     // MARK: - Trace helpers
 
-    private static func buildTrace(rows: [TraceSpanRow], rootCreatedAt: Date) -> [TraceSpanResponse]
-    {
+    private static func buildTrace(rows: [TraceSpanRow], rootCreatedAt: Date) -> [TraceSpanResponse] {
         let now = Date()
         var childrenByParent: [UUID: [TraceSpanRow]] = [:]
         for row in rows {
@@ -208,7 +232,11 @@ struct TaskRoutes {
         let roots = rows.filter { $0.depth == 0 }
         return roots.map {
             buildSpan(
-                $0, childrenByParent: childrenByParent, rootCreatedAt: rootCreatedAt, now: now)
+                $0,
+                childrenByParent: childrenByParent,
+                rootCreatedAt: rootCreatedAt,
+                now: now
+            )
         }
     }
 
@@ -226,7 +254,11 @@ struct TaskRoutes {
         let childRows = (childrenByParent[row.id] ?? []).sorted { $0.createdAt < $1.createdAt }
         let children = childRows.map {
             buildSpan(
-                $0, childrenByParent: childrenByParent, rootCreatedAt: rootCreatedAt, now: now)
+                $0,
+                childrenByParent: childrenByParent,
+                rootCreatedAt: rootCreatedAt,
+                now: now
+            )
         }
 
         return TraceSpanResponse(

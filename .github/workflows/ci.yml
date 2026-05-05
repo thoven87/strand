@@ -1,0 +1,59 @@
+name: CI
+
+on:
+    push:
+        branches:
+            - main
+        paths:
+            - "**.swift"
+            - "**.yml"
+    pull_request:
+    workflow_dispatch:
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}-ci
+    cancel-in-progress: true
+
+jobs:
+    linux:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        strategy:
+            matrix:
+                image:
+                    - "swift:6.3"
+                postgres-image:
+                    - "postgres:18"
+                include:
+                    - postgres-image: postgres:18
+                      postgres-auth: scram-sha-256
+        container:
+            image: ${{ matrix.image }}
+            volumes: ["pgrunshare:/var/run/postgresql"]
+        env:
+            POSTGRES_HOST: "psql"
+            POSTGRES_PORT: "5432"
+            POSTGRES_DB: "strand_dev"
+            POSTGRES_USER: "strand"
+            POSTGRES_PASSWORD: "strand"
+            POSTGRES_HOST_AUTH_METHOD: ${{ matrix.postgres-auth }}
+        services:
+            psql:
+                image: ${{ matrix.postgres-image }}
+                volumes: ["pgrunshare:/var/run/postgresql"]
+                env:
+                    POSTGRES_DB: "strand_dev"
+                    POSTGRES_USER: "strand"
+                    POSTGRES_PASSWORD: "strand"
+                    POSTGRES_HOST_AUTH_METHOD: ${{ matrix.postgres-auth }}
+                    POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.postgres-auth }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+            - name: Install PostgreSQL client
+              run: apt-get update -q && apt-get install -yq postgresql-client
+            - name: Apply schema
+              env:
+                  PGPASSWORD: strand
+              run: psql -h psql -U strand -d strand_dev -f strand.sql
+            - name: Test
+              run: swift test

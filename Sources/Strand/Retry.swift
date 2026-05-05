@@ -115,8 +115,11 @@ public struct RetryStrategy: Sendable, Codable {
         let maxD = (try? c.decode(Double.self, forKey: .maxDelay)) ?? 300
         let nret = try c.decodeIfPresent([String].self, forKey: .nonRetryableErrorTypes) ?? []
         self = RetryStrategy(
-            initialDelay: .seconds(initial), multiplier: mult,
-            maxDelay: .seconds(maxD), nonRetryableErrorTypes: nret)
+            initialDelay: .seconds(initial),
+            multiplier: mult,
+            maxDelay: .seconds(maxD),
+            nonRetryableErrorTypes: nret
+        )
     }
 
     public func encode(to encoder: any Encoder) throws {

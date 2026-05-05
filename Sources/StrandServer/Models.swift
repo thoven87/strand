@@ -4,9 +4,9 @@ import NIOFoundationCompat
 import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Shared response types
@@ -41,8 +41,12 @@ struct QueueResponse: Codable, Sendable {
         createdAt = row.createdAt
         isPaused = row.isPaused
         stats = StatsBody(
-            pending: row.pending, running: row.running, sleeping: row.sleeping,
-            completed: row.completed, failed: row.failed, cancelled: row.cancelled
+            pending: row.pending,
+            running: row.running,
+            sleeping: row.sleeping,
+            completed: row.completed,
+            failed: row.failed,
+            cancelled: row.cancelled
         )
     }
 }
@@ -123,7 +127,8 @@ struct TaskDetailResponse: Codable, Sendable {
                 scheduleId: $0.scheduleId,
                 executionTime: $0.executionTime,
                 partitionTime: $0.partitionTime,
-                scheduleOffset: $0.scheduleOffset)
+                scheduleOffset: $0.scheduleOffset
+            )
         }
     }
 }

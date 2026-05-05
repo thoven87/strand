@@ -6,9 +6,9 @@ import Testing
 @testable import Strand
 
 #if canImport(FoundationEssentials)
-    import FoundationEssentials
+import FoundationEssentials
 #else
-    import Foundation
+import Foundation
 #endif
 
 // MARK: - Workflow & Activity fixtures
@@ -103,7 +103,7 @@ private struct WltCancellableWorkflow: Workflow {
 // Used by: signalWakesWorkflowAndDeliversPayload.
 
 private struct WltSignalWorkflow: Workflow {
-    typealias Input  = StrandVoid
+    typealias Input = StrandVoid
     typealias Output = String
 
     var received: String = ""
@@ -491,7 +491,10 @@ struct WorkerLifecycleTests {
 
             // 4. Workflow should now complete with the payload value
             let terminal = try await awaitTerminal(
-                client: client, taskID: taskID, timeout: .seconds(10))
+                client: client,
+                taskID: taskID,
+                timeout: .seconds(10)
+            )
             #expect(terminal.state == .completed)
 
             // 5. Verify the payload was delivered and returned as the workflow result
