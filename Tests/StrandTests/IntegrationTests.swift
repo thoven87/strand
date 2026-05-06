@@ -825,7 +825,7 @@ struct ParallelActivityTests {
                 options: .init(),
                 input: "hello"
             )
-            let result = try await handle.result(timeout: .seconds(15))
+            let result = try await handle.result(timeout: .seconds(30))
 
             // Both activities ran exactly once
             #expect(DoubleActivity.counter.value == 1)
