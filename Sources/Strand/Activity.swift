@@ -352,8 +352,11 @@ extension ActivityDefinition {
         )
         // OTel span: one span per activity execution attempt.
         // Zero-cost no-op when no tracing backend is bootstrapped.
-        let output = try await withSpan("RunActivity:\(Self.name)", ofKind: .internal) { span in
+        let output = try await withSpan(Self.name, ofKind: .internal) { span in
             span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(Self.name)
+            span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
+                TaskKind.activity.rawValue
+            )
             span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
                 claimed.taskID.uuidString.lowercased()
             )

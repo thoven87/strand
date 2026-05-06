@@ -15,7 +15,7 @@
 --     is the first column in every composite index.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE SCHEMA strand;
+CREATE SCHEMA IF NOT EXISTS strand;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Namespaces — top-level isolation boundary.
@@ -25,7 +25,7 @@ CREATE SCHEMA strand;
 -- resource limits enforced per namespace.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.namespaces (
+CREATE TABLE IF NOT EXISTS strand.namespaces (
     id             TEXT        NOT NULL,   -- slug: "default", "acme-corp", "team-payments"
     display_name   TEXT,
     retention_days INTEGER     NOT NULL DEFAULT 30,
@@ -34,14 +34,14 @@ CREATE TABLE strand.namespaces (
 );
 
 -- Every fresh install gets a default namespace.
-INSERT INTO strand.namespaces (id, display_name) VALUES ('default', 'Default');
+INSERT INTO strand.namespaces (id, display_name) VALUES ('default', 'Default') ON CONFLICT DO NOTHING;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Queue registry
 -- One row per (namespace, queue) pair. Created by workers at startup.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.queues (
+CREATE TABLE IF NOT EXISTS strand.queues (
     namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
     name         TEXT        NOT NULL,
     is_paused    BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -55,7 +55,7 @@ CREATE TABLE strand.queues (
 -- Append-mostly; rows are created at enqueue time and updated as state changes.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.tasks (
+CREATE TABLE IF NOT EXISTS strand.tasks (
     id           UUID        NOT NULL,
     namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
     queue        TEXT        NOT NULL,
@@ -110,25 +110,25 @@ CREATE TABLE strand.tasks (
 );
 
 -- Hot management path: namespace_id first
-CREATE INDEX strand_tasks_ns_queue_state_idx
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_queue_state_idx
     ON strand.tasks (namespace_id, queue, state);
 
 -- Kind-filtered queries (Workflows page, Activities page)
-CREATE INDEX strand_tasks_ns_kind_idx
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_kind_idx
     ON strand.tasks (namespace_id, queue, kind, state);
 
 -- Most-recent-first task list (new API sort order)
-CREATE INDEX strand_tasks_ns_id_desc_idx
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_id_desc_idx
     ON strand.tasks (namespace_id, queue, id DESC)
     WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
 
 -- Parent-child lineage: "show all activities spawned by this workflow"
-CREATE INDEX strand_tasks_parent_idx
+CREATE INDEX IF NOT EXISTS strand_tasks_parent_idx
     ON strand.tasks (parent_task_id)
     WHERE parent_task_id IS NOT NULL;
 
 -- Skips tasks past their maxDuration deadline in claimTasks.
-CREATE INDEX strand_tasks_deadline_idx
+CREATE INDEX IF NOT EXISTS strand_tasks_deadline_idx
     ON strand.tasks (namespace_id, queue, deadline_at)
     WHERE deadline_at IS NOT NULL AND state = 'PENDING';
 
@@ -137,7 +137,7 @@ CREATE INDEX strand_tasks_deadline_idx
 -- High churn: rows transition through states frequently.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.runs (
+CREATE TABLE IF NOT EXISTS strand.runs (
     id           UUID    NOT NULL,
     namespace_id TEXT    NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
     task_id      UUID    NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
@@ -188,21 +188,21 @@ ALTER TABLE strand.runs SET (
 );
 
 -- Hot claim path: namespace_id first, then priority ASC so critical tasks are never starved.
-CREATE INDEX strand_runs_claim_idx
+CREATE INDEX IF NOT EXISTS strand_runs_claim_idx
     ON strand.runs (namespace_id, queue, priority ASC, available_at, id)
     WHERE state IN ('PENDING', 'SLEEPING');
 
 -- Supports the correlated NOT EXISTS subquery in claimTasks that enforces FIFO
 -- within a fairness key. Without this index the subquery degrades to a range scan
 -- over all PENDING/SLEEPING rows in the queue at high queue depth.
-CREATE INDEX strand_runs_fairness_idx
+CREATE INDEX IF NOT EXISTS strand_runs_fairness_idx
     ON strand.runs (namespace_id, queue, fairness_key, available_at, priority, id)
     WHERE state = ANY (ARRAY['PENDING'::text, 'SLEEPING'::text])
       AND fairness_key IS NOT NULL;
 
 -- Added `queue` so leaseExpiryLoop seeks directly to the right queue instead of
 -- scanning all expired leases in the namespace and filtering as a recheck.
-CREATE INDEX strand_runs_lease_idx
+CREATE INDEX IF NOT EXISTS strand_runs_lease_idx
     ON strand.runs (namespace_id, queue, lease_expires_at)
     WHERE state = 'RUNNING'::text AND lease_expires_at IS NOT NULL;
 
@@ -214,7 +214,7 @@ CREATE INDEX strand_runs_lease_idx
 -- unique integer identity regardless of operation type.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.checkpoints (
+CREATE TABLE IF NOT EXISTS strand.checkpoints (
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     seq_num      INTEGER     NOT NULL,                  -- global activation counter;
@@ -225,7 +225,7 @@ CREATE TABLE strand.checkpoints (
     CONSTRAINT strand_checkpoints_pkey PRIMARY KEY (task_id, seq_num)
 );
 
-CREATE INDEX strand_checkpoints_ns_idx
+CREATE INDEX IF NOT EXISTS strand_checkpoints_ns_idx
     ON strand.checkpoints (namespace_id, task_id, seq_num);
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -233,7 +233,7 @@ CREATE INDEX strand_checkpoints_ns_idx
 -- Used by ctx.waitForEvent / ctx.emitEvent. Payload is NULL until emitted.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.events (
+CREATE TABLE IF NOT EXISTS strand.events (
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     queue        TEXT        NOT NULL,
     name         TEXT        NOT NULL,
@@ -246,7 +246,7 @@ CREATE TABLE strand.events (
 -- Event waits — runs suspended waiting for a named event.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.event_waits (
+CREATE TABLE IF NOT EXISTS strand.event_waits (
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     run_id       UUID        NOT NULL REFERENCES strand.runs(id) ON DELETE CASCADE,
@@ -259,7 +259,7 @@ CREATE TABLE strand.event_waits (
 );
 
 -- Wake-up lookup: namespace_id first
-CREATE INDEX strand_event_waits_event_idx
+CREATE INDEX IF NOT EXISTS strand_event_waits_event_idx
     ON strand.event_waits (namespace_id, queue, event_name);
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -270,7 +270,7 @@ CREATE INDEX strand_event_waits_event_idx
 -- completes before the parent registers its event wait.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.task_completions (
+CREATE TABLE IF NOT EXISTS strand.task_completions (
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     state        TEXT        NOT NULL,   -- 'COMPLETED' | 'FAILED' | 'CANCELLED'
@@ -280,7 +280,7 @@ CREATE TABLE strand.task_completions (
 );
 
 -- Namespace-scoped completion lookups (used by management queries and UI)
-CREATE INDEX strand_task_completions_ns_idx
+CREATE INDEX IF NOT EXISTS strand_task_completions_ns_idx
     ON strand.task_completions (namespace_id, completed_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +290,7 @@ CREATE INDEX strand_task_completions_ns_idx
 -- Updated atomically with each run completion.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.workflow_state (
+CREATE TABLE IF NOT EXISTS strand.workflow_state (
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     state        BYTEA       NOT NULL,  -- JSON-encoded @Workflow struct
@@ -307,7 +307,7 @@ CREATE TABLE strand.workflow_state (
 -- Deleted after application.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.workflow_signals (
+CREATE TABLE IF NOT EXISTS strand.workflow_signals (
     id           UUID        NOT NULL DEFAULT gen_random_uuid(),
     seq          BIGSERIAL   NOT NULL,   -- monotonic total order, unaffected by transaction commit ordering
     namespace_id TEXT        NOT NULL DEFAULT 'default',
@@ -321,7 +321,7 @@ CREATE TABLE strand.workflow_signals (
 -- Ordered drain: namespace_id first, then arrival order via monotonic sequence.
 -- BIGSERIAL seq is allocated at INSERT time (not commit time), giving a causal
 -- total order even when two concurrent transactions commit in the wrong wall-clock order.
-CREATE INDEX strand_workflow_signals_inbox_idx
+CREATE INDEX IF NOT EXISTS strand_workflow_signals_inbox_idx
     ON strand.workflow_signals (namespace_id, task_id, seq ASC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -332,7 +332,7 @@ CREATE INDEX strand_workflow_signals_inbox_idx
 -- Used by the UI timeline and future workflow-reset functionality.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.workflow_history (
+CREATE TABLE IF NOT EXISTS strand.workflow_history (
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     seq          BIGINT      NOT NULL,  -- 1-based monotonic per workflow
@@ -346,7 +346,7 @@ CREATE TABLE strand.workflow_history (
 );
 
 -- Namespace-scoped history scan (UI timeline, reset, audit)
-CREATE INDEX strand_workflow_history_ns_idx
+CREATE INDEX IF NOT EXISTS strand_workflow_history_ns_idx
     ON strand.workflow_history (namespace_id, task_id, seq ASC);
 
 -- ────────────────────────────────────────────────────────────────────────────────
@@ -354,7 +354,7 @@ CREATE INDEX strand_workflow_history_ns_idx
 -- Polled by StrandScheduler. Fires WORKFLOW or ACTIVITY tasks into strand.tasks when due.
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE TABLE strand.schedules (
+CREATE TABLE IF NOT EXISTS strand.schedules (
     id           UUID        NOT NULL,
     namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
     queue        TEXT        NOT NULL,
@@ -389,6 +389,6 @@ CREATE TABLE strand.schedules (
 );
 
 -- Scheduler poll: namespace_id first, only active schedules with upcoming fire time
-CREATE INDEX strand_schedules_due_idx
+CREATE INDEX IF NOT EXISTS strand_schedules_due_idx
     ON strand.schedules (namespace_id, next_run_at)
     WHERE is_active = TRUE AND next_run_at IS NOT NULL;

@@ -95,10 +95,18 @@ struct VersionTests {
                 input: "start"
             )
 
-            // The workflow sleeps for 200 ms. At 100 ms it is still SLEEPING —
-            // a safe window to write the version checkpoint before the next
-            // activation loads its checkpoint cache.
-            try await Task.sleep(for: .milliseconds(100))
+            // Wait until the workflow is confirmed SLEEPING before overwriting
+            // the checkpoint. A fixed Task.sleep(100ms) is a timing race on slow
+            // CI machines: if the first activation hasn't run yet, markVersion
+            // writes false but the activation later overwrites it with true.
+            // Polling the actual state is safe regardless of machine speed.
+            let sleepDeadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < sleepDeadline {
+                if let snap = try await handle.snapshot(), snap.state == .sleeping {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
             try await client.markVersion(
                 changeID: "v2-feature",
                 value: false,

@@ -447,8 +447,13 @@ struct WorkerLifecycleTests {
             let result = try await handle.result(timeout: .seconds(10))
             #expect(result == "HELLO")
 
-            // Cleanup: drop namespace B's queue (withTestEnvironment handles namespace A).
+            // Cleanup: drop namespace B's queue and namespace row.
+            // withTestEnvironment handles all of namespace A's artefacts.
             try? await clientB.dropQueue(clientA.queueName)
+            _ = try? await clientA.postgres.query(
+                "DELETE FROM strand.namespaces WHERE id = \(nsB)",
+                logger: clientA.logger
+            )
         }
     }
 

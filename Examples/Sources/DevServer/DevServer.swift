@@ -1,5 +1,6 @@
 import Hummingbird
 import Logging
+import OTel
 import PostgresNIO
 import ServiceLifecycle
 import Strand
@@ -228,7 +229,52 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
 
 @main struct DevServer {
     static func main() async throws {
-        LoggingSystem.bootstrap(StreamLogHandler.standardOutput(label:))
+        let env = ProcessInfo.processInfo.environment
+
+        // Bootstrap OTel — replaces LoggingSystem, MetricsSystem, and
+        // InstrumentationSystem. Exports traces, metrics, and logs to Jaeger
+        // via OTLP/gRPC on the default port (4317) — no auth required.
+        //
+        // Override the endpoint for other collectors:
+        //   OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io:443 \
+        //   OTEL_EXPORTER_OTLP_AUTH=<base64-api-key> \
+        //   swift run DevServer
+        let otlpEndpoint = env["OTEL_EXPORTER_OTLP_ENDPOINT"] ?? "http://localhost:4317"
+        let otlpHeaders: [(String, String)] =
+            env["OTEL_EXPORTER_OTLP_AUTH"].map {
+                [("Authorization", "Basic \($0)")]
+            } ?? []
+
+        var otelConfig = OTel.Configuration.default
+        otelConfig.serviceName = env["OTEL_SERVICE_NAME"] ?? "strand-devserver"
+        otelConfig.diagnosticLogLevel = .warning
+        // Flush frequently so spans appear quickly during local dev.
+        // Jaeger only implements the traces gRPC service — disable logs and
+        // metrics to avoid "unknown service" errors on every flush cycle.
+        // Set OTEL_ENABLE_LOGS=true or OTEL_ENABLE_METRICS=true to re-enable
+        // when pointing at a collector that supports all three signals (e.g. SigNoz).
+        let enableLogs = env["OTEL_ENABLE_LOGS"] == "true"
+        let enableMetrics = env["OTEL_ENABLE_METRICS"] == "true"
+        otelConfig.logs.enabled = enableLogs
+        otelConfig.metrics.enabled = enableMetrics
+        otelConfig.traces.batchSpanProcessor.scheduleDelay = .seconds(3)
+        otelConfig.traces.otlpExporter.protocol = .grpc
+        otelConfig.traces.otlpExporter.endpoint = otlpEndpoint
+        otelConfig.traces.otlpExporter.headers = otlpHeaders
+        if enableLogs {
+            otelConfig.logs.batchLogRecordProcessor.scheduleDelay = .seconds(3)
+            otelConfig.logs.otlpExporter.protocol = .grpc
+            otelConfig.logs.otlpExporter.endpoint = otlpEndpoint
+            otelConfig.logs.otlpExporter.headers = otlpHeaders
+        }
+        if enableMetrics {
+            otelConfig.metrics.exportInterval = .seconds(10)
+            otelConfig.metrics.otlpExporter.protocol = .grpc
+            otelConfig.metrics.otlpExporter.endpoint = otlpEndpoint
+            otelConfig.metrics.otlpExporter.headers = otlpHeaders
+        }
+        let observability = try OTel.bootstrap(configuration: otelConfig)
+
         let logger = Logger(label: "strand.devserver")
 
         let postgres = makePostgres(logger: logger)
@@ -288,6 +334,7 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
         //   addServices → postgres, then workers (all managed by the Application)
         //   beforeServerStarts → schema check + seed (postgres is live by here)
         //   runService() → starts everything, handles SIGTERM/SIGINT
+        app.addServices(observability)  // must be first so OTel is live before any spans are emitted
         app.addServices(postgres)
         app.addServices(ordersWorker)
         app.addServices(reportsWorker)
@@ -299,8 +346,9 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
             Task { await runSeeder(orders: ordersClient, reports: reportsClient, logger: logger) }
             logger.info("────────────────────────────────────────────────")
             logger.info("  Strand DevServer ready")
-            logger.info("  API  →  http://localhost:8080/api/queues")
-            logger.info("  UI   →  cd loom && npm run dev")
+            logger.info("  API     →  http://localhost:8080/api/queues")
+            logger.info("  UI      →  cd loom && npm run dev")
+            logger.info("  Traces  →  http://localhost:16686  (Jaeger)")
             logger.info("  queues: orders, reports")
             logger.info("────────────────────────────────────────────────")
         }
