@@ -9,6 +9,7 @@ let package = Package(
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.32.2"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.12.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.22.0"),
+        .package(url: "https://github.com/swift-otel/swift-otel.git", from: "1.1.0", traits: ["OTLPGRPC"]),
         .package(
             url: "https://github.com/swift-server/swift-service-lifecycle.git",
             from: "2.11.0"
@@ -22,6 +23,7 @@ let package = Package(
                 .product(name: "StrandServer", package: "strand"),
                 .product(name: "PostgresNIO", package: "postgres-nio"),
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "OTel", package: "swift-otel"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ],
