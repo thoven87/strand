@@ -85,9 +85,13 @@ func withTestEnvironment<T: Sendable>(
 
     // Shared teardown: remove all test artefacts so they don't appear in the
     // dev dashboard when the DB is shared between tests and DevServer.
-    // Deleting tasks cascades to runs, checkpoints, workflow_history,
-    // workflow_state, workflow_signals, and task_completions via ON DELETE CASCADE.
-    // Events and event_waits are not FK-linked so we delete them explicitly.
+    //
+    // Cascade coverage via ON DELETE CASCADE:
+    //   tasks → runs, checkpoints, workflow_history, workflow_state,
+    //           workflow_signals, task_completions
+    //
+    // Explicit deletes (not FK-linked to tasks):
+    //   events, event_waits, schedules
     func cleanup() async {
         _ = try? await postgres.query(
             "DELETE FROM strand.tasks       WHERE queue = \(queueName)",
@@ -99,6 +103,10 @@ func withTestEnvironment<T: Sendable>(
         )
         _ = try? await postgres.query(
             "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
+            logger: logger
+        )
+        _ = try? await postgres.query(
+            "DELETE FROM strand.schedules   WHERE queue = \(queueName)",
             logger: logger
         )
         try? await client.dropQueue(queueName)
