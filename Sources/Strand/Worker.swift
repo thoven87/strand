@@ -89,7 +89,7 @@ public struct WorkerOptions: Sendable {
     public var fatalOnLeaseTimeout: Bool
 
     /// How long the worker waits for in-flight tasks to finish after receiving a
-    /// graceful-shutdown signal. Default: `.seconds(30)`.
+    /// graceful-shutdown signal. Default: `.seconds(10)`.
     public var gracefulShutdownTimeout: Duration
 
     /// Interval between expired-lease sweep passes. Default: `.seconds(5)`.
@@ -108,7 +108,7 @@ public struct WorkerOptions: Sendable {
         claimTimeout: Duration = .seconds(120),
         batchSize: Int? = nil,
         fatalOnLeaseTimeout: Bool = true,
-        gracefulShutdownTimeout: Duration = .seconds(30),
+        gracefulShutdownTimeout: Duration = .seconds(10),
         leaseExpiryInterval: Duration = .seconds(5),
         onError: (@Sendable (any Error) async -> Void)? = nil
     ) {
@@ -541,20 +541,21 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
                 case .startTimer(let wakeAt, _):
                     // Sleep: transition run to SLEEPING with available_at = wakeAt.
-                    try await exec.postgres.withTransaction(logger: exec.logger) { conn in
-                        try await conn.query(
-                            """
-                            UPDATE strand.runs SET state = 'SLEEPING', available_at = \(wakeAt),
+                    // Single CTE statement is atomic — no explicit transaction needed.
+                    try await exec.postgres.query(
+                        """
+                        WITH r AS (
+                            UPDATE strand.runs
+                            SET state = \(TaskState.sleeping), available_at = \(wakeAt),
                                 worker_id = NULL, lease_expires_at = NULL
                             WHERE id = \(claimed.runID)
-                            """,
-                            logger: exec.logger
+                            RETURNING id
                         )
-                        try await conn.query(
-                            "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(claimed.taskID)",
-                            logger: exec.logger
-                        )
-                    }
+                        UPDATE strand.tasks SET state = \(TaskState.sleeping)
+                        WHERE id = \(claimed.taskID)
+                        """,
+                        logger: exec.logger
+                    )
                     let timerData = try? JSON.encode([
                         "duration_ms": Int(wakeAt.timeIntervalSinceNow * 1000)
                     ])
@@ -570,18 +571,17 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     historySeq += 1
 
                 case .awaitEvent(let eventName, let seqNum, let timeoutAt):
-                    // Atomic check-or-wait: prevents a race where the event fires
-                    // between drain() returning and this transaction registering
-                    // the event_wait row.
+                    // Atomic check-or-wait: prevents the lost-wakeup race where the
+                    // event fires between drain() returning and this transaction committing.
                     //
-                    // Race being prevented:
-                    //   1. drain() finishes — handler suspended, emitted .awaitEvent command
-                    //   2. client.emitEvent(eventName) fires — finds NO event_wait yet — no run woken
-                    //   3. worker registers event_wait — run goes WAITING and stays there forever
+                    // Without this check:
+                    //   1. drain() returns — handler suspended, .awaitEvent command emitted
+                    //   2. client.emitEvent fires — finds no event_wait yet — run not woken
+                    //   3. worker inserts event_wait — run goes WAITING and stalls forever
                     //
-                    // Fix: inside ONE transaction, check strand.events first. If the event is
-                    // already there, set the run to PENDING immediately (not WAITING) with
-                    // wake_event=eventName. The next activation fast-paths through waitForEvent.
+                    // Both operations live in the same transaction: insert the event_wait
+                    // and check strand.events. If the event is already there, go PENDING
+                    // immediately so the next activation fast-paths through waitForEvent.
                     let taskID = claimed.taskID
                     let runID = claimed.runID
                     let queueName = exec.queue
@@ -621,11 +621,11 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                             )
 
                             // Transition to PENDING with the event payload so the next
-                            // activation’s waitForEvent fast-path (wakeEvent == name) fires.
+                            // activation's waitForEvent fast-path (wakeEvent == name) fires.
                             try await conn.query(
                                 """
                                 UPDATE strand.runs
-                                SET state        = 'PENDING',
+                                SET state        = \(TaskState.pending),
                                     available_at  = NOW(),
                                     wake_event    = \(eventName),
                                     event_payload = \(existingPayload),
@@ -636,14 +636,14 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                                 logger: exec.logger
                             )
                             try await conn.query(
-                                "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(taskID)",
+                                "UPDATE strand.tasks SET state = \(TaskState.pending) WHERE id = \(taskID)",
                                 logger: exec.logger
                             )
                         } else {
                             // Event not yet emitted — set run to WAITING (or SLEEPING for timed waits).
                             let availableAt =
                                 timeoutAt ?? Date(timeIntervalSince1970: 32_503_680_000)
-                            let runState = timeoutAt != nil ? "SLEEPING" : "WAITING"
+                            let runState: TaskState = timeoutAt != nil ? .sleeping : .waiting
                             try await conn.query(
                                 """
                                 UPDATE strand.runs
@@ -727,6 +727,20 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
             // Register event_waits for all enqueued activities / child workflows,
             // then transition the run to WAITING (event-driven, no timer).
+            //
+            // Atomic check-or-wait: prevents the lost-wakeup race where a child
+            // task completes between enqueueTask() committing and this transaction
+            // committing.
+            //
+            // Without this check:
+            //   1. enqueueTask() commits — child task visible to activity workers
+            //   2. Activity worker claims, runs, and completes it immediately
+            //   3. emitTaskCompletionSignal finds no event_wait — parent not woken
+            //   4. This transaction commits — run goes WAITING and stalls forever
+            //
+            // Both the event_wait inserts and a task_completions count live in the
+            // same transaction. If all children are already done, go PENDING immediately;
+            // the next poll re-activates the workflow. Remaining event_waits fire normally.
             if !enqueued.isEmpty {
                 try await exec.postgres.withTransaction(logger: exec.logger) { conn in
                     for item in enqueued {
@@ -741,18 +755,56 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                             logger: exec.logger
                         )
                     }
-                    try await conn.query(
+
+                    // Atomically check whether any child tasks already completed
+                    // (i.e. are present in task_completions) before we park the run.
+                    let childTaskIDs = enqueued.map { $0.taskID }
+                    let completedStream = try await conn.query(
                         """
-                        UPDATE strand.runs
-                        SET state = 'WAITING', worker_id = NULL, lease_expires_at = NULL
-                        WHERE id = \(claimed.runID)
+                        SELECT COUNT(*) FROM strand.task_completions
+                        WHERE task_id = ANY(\(childTaskIDs))
                         """,
                         logger: exec.logger
                     )
-                    try await conn.query(
-                        "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(claimed.taskID)",
-                        logger: exec.logger
-                    )
+                    var completedCount = 0
+                    for try await row in completedStream {
+                        var col = row.makeIterator()
+                        completedCount = try col.next()!.decode(Int.self, context: .default)
+                    }
+
+                    if completedCount == enqueued.count {
+                        // All children already finished — go PENDING so the next poll
+                        // re-activates immediately rather than waiting for events that
+                        // already fired and were missed.
+                        try await conn.query(
+                            """
+                            WITH r AS (
+                                UPDATE strand.runs
+                                SET state = \(TaskState.pending), available_at = NOW(),
+                                    worker_id = NULL, lease_expires_at = NULL
+                                WHERE id = \(claimed.runID)
+                                RETURNING id
+                            )
+                            UPDATE strand.tasks SET state = \(TaskState.pending)
+                            WHERE id = \(claimed.taskID)
+                            """,
+                            logger: exec.logger
+                        )
+                    } else {
+                        try await conn.query(
+                            """
+                            WITH r AS (
+                                UPDATE strand.runs
+                                SET state = \(TaskState.waiting), worker_id = NULL, lease_expires_at = NULL
+                                WHERE id = \(claimed.runID)
+                                RETURNING id
+                            )
+                            UPDATE strand.tasks SET state = \(TaskState.waiting)
+                            WHERE id = \(claimed.taskID)
+                            """,
+                            logger: exec.logger
+                        )
+                    }
                 }
             }
         }
@@ -773,14 +825,14 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     try await conn.query(
                         """
                         UPDATE strand.runs
-                        SET state = 'SLEEPING', available_at = \(wakeAt),
+                        SET state = \(TaskState.sleeping), available_at = \(wakeAt),
                             worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
                         """,
                         logger: exec.logger
                     )
                     try await conn.query(
-                        "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(condTaskID)",
+                        "UPDATE strand.tasks SET state = \(TaskState.sleeping) WHERE id = \(condTaskID)",
                         logger: exec.logger
                     )
                 }
@@ -790,13 +842,13 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     try await conn.query(
                         """
                         UPDATE strand.runs
-                        SET state = 'WAITING', worker_id = NULL, lease_expires_at = NULL
+                        SET state = \(TaskState.waiting), worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
                         """,
                         logger: exec.logger
                     )
                     try await conn.query(
-                        "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(condTaskID)",
+                        "UPDATE strand.tasks SET state = \(TaskState.waiting) WHERE id = \(condTaskID)",
                         logger: exec.logger
                     )
                 }
@@ -815,10 +867,13 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // No else branch: if scheduleCommands is empty and no conditions remain,
         // suspension came from sleep/waitForEvent which already wrote their own DB updates.
 
-        // ── 8. Cancel continuations + flush ─────────────────────────────────────────────
-        // Resume all parked continuations with StrandError.cancelled. This unblocks the
-        // handler task (which catches the error and sets handlerResult). Drain once more
-        // to run those cleanup jobs, then discard the task.
+        // ── 8. Signal handler exit ───────────────────────────────────────────────────────
+        // cancelPending() resumes every parked continuation with StrandError.cancelled.
+        // Each suspended runActivity / sleep / waitForEvent call receives that error,
+        // allowing the handler Task to finish and record its result in handlerResult.
+        // drain() flushes any final jobs the handler emits during that teardown.
+        // handlerTask.cancel() is a safety net for the (unreachable in practice) path
+        // where the handler didn't park any continuation and exited before this point.
         executor.cancelPending()
         executor.drain()
         handlerTask.cancel()
@@ -1032,7 +1087,7 @@ public struct StrandWorker: Service {
                             SET lease_expires_at = NOW()
                             WHERE worker_id     = \(workerID)
                               AND namespace_id  = \(self.namespace)
-                              AND state         = 'RUNNING'
+                              AND state         = \(TaskState.running)
                             """,
                             logger: self.logger
                         )
@@ -1053,20 +1108,14 @@ public struct StrandWorker: Service {
 
     /// Continuously claims and executes tasks using a slot-aware dispatch loop.
     ///
-    /// ## Architecture: continuous-fill vs batch-and-wait
+    /// The loop runs as the body of a `withThrowingDiscardingTaskGroup`. On each
+    /// iteration it claims up to `free = maxConcurrency - running` tasks and starts
+    /// each as an independent group child. When a child finishes it decrements the
+    /// counter and signals `_SlotSignal`, waking the loop to claim the next batch
+    /// without waiting for other in-flight tasks to complete.
     ///
-    /// The previous implementation used `await withTaskGroup { … }` which blocked
-    /// until ALL claimed tasks finished before claiming more. If 149 tasks completed
-    /// in 1 second but one workflow was sleeping for an hour, 149 slots sat idle.
-    ///
-    /// The new design uses `withThrowingDiscardingTaskGroup` — the dispatch loop runs as the group body
-    /// and claims up to `freeSlots` tasks on each iteration. Each execution task
-    /// decrements the running counter and signals `SlotSignal` when it finishes,
-    /// waking the dispatcher to claim more work immediately.
-    ///
-    /// `SlotSignal` is a `Mutex`-backed async wakeup. It uses
-    /// `withTaskCancellationHandler` + explicit `onCancel` resume,
-    /// so it never leaks a `_runTimer` continuation.
+    /// When all slots are occupied the loop parks on `_SlotSignal` — a
+    /// `Mutex`-backed async wakeup that resumes as soon as any slot is freed.
     private func pollLoop(workerID: String) async throws {
         let queueName = options.queue
         let maxConcurrency =
@@ -1152,7 +1201,10 @@ public struct StrandWorker: Service {
                         await self.runTask(claimedTask)
                     }
                 }
-                // Immediately re-check: there may be slots left if claimed < free.
+                // No explicit sleep: fall through to re-poll immediately.
+                // If claimed.count < free there is still open capacity for another
+                // batch. If claimed.count == free the next iteration finds free == 0
+                // and blocks on slotFreeSignal until a running task finishes.
             }
         }
     }
@@ -1224,9 +1276,9 @@ public struct StrandWorker: Service {
             ("queue", options.queue),
         ]
 
-        // ── Race execution against 2× timeout ─────────────────
-        // Both run as structured children — cancellation propagates cleanly when
-        // the first finishes, with no exit(1) and no leaked continuations.
+        // ── Race execution against 2× timeout ─────────────────────────
+        // Execution and deadline enforcement run as structured children of the
+        // same group — whichever finishes first cancels the other cleanly.
         do {
             let resultBuf: ByteBuffer? = try await withThrowingTaskGroup(of: ByteBuffer?.self) {
                 group in
@@ -1262,10 +1314,7 @@ public struct StrandWorker: Service {
                     }
                 }
 
-                // Task 2: deadline poller — two thresholds, both pure Swift concurrency.
-                // No GCD, no LeaseWatchdog, no Task.sleep-based continuations outside
-                // structured concurrency.
-                //
+                // Task 2: deadline poller — two escalating thresholds:
                 //   1× claimTimeout → log a warning (task is running long)
                 //   2× claimTimeout → cancel execution (fatalDeadline expired)
                 group.addTask {
@@ -1331,9 +1380,9 @@ public struct StrandWorker: Service {
                 label: StrandMetrics.tasksContinuedAsNew,
                 dimensions: taskDims
             ).increment(by: 1)
-            // Workflow called context.continueAsNew(input:). Enqueue a fresh task with the
-            // new input, then complete the current run cleanly. The old task's checkpoints
-            // and history are retained until client.cleanup() prunes them.
+            // context.continueAsNew(input:): enqueue a fresh task with the new input
+            // and complete the current run. The old task's checkpoints and history
+            // are retained until client.cleanup() prunes them.
             do {
                 _ = try await Queries.enqueueTask(
                     on: postgres,

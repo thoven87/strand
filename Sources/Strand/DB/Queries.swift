@@ -168,7 +168,7 @@ enum Queries {
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
                         \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
                         \(timeoutSeconds), \(cancellationBuffer), \(idempotencyKey), \(priority),
-                        \(fairnessKey), \(fairnessWeight), 'PENDING',
+                        \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
                         \(kind), \(parentTaskID), \(deadlineAt))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
                 """,
@@ -183,7 +183,7 @@ enum Queries {
                     """
                     INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at, priority,
                                            fairness_key, fairness_weight, kind)
-                    VALUES (\(namespaceID), \(runID), \(taskID), \(queue), 1, 'PENDING',
+                    VALUES (\(namespaceID), \(runID), \(taskID), \(queue), 1, \(TaskState.pending),
                             COALESCE(\(scheduledAt), NOW()), \(priority),
                             \(fairnessKey), \(fairnessWeight), \(kind))
                     """,
@@ -254,7 +254,7 @@ enum Queries {
                 JOIN strand.tasks t ON t.id = r.task_id
                 WHERE r.queue = \(queue)
                   AND r.namespace_id = \(namespaceID)
-                  AND r.state IN ('PENDING', 'SLEEPING')
+                  AND r.state IN (\(TaskState.pending), \(TaskState.sleeping))
                   AND r.available_at <= NOW()
                   AND (t.deadline_at IS NULL OR t.deadline_at > NOW())
                   AND (
@@ -264,7 +264,7 @@ enum Queries {
                           WHERE r2.queue        = r.queue
                             AND r2.namespace_id = r.namespace_id
                             AND r2.fairness_key = r.fairness_key
-                            AND r2.state IN ('PENDING', 'SLEEPING')
+                            AND r2.state IN (\(TaskState.pending), \(TaskState.sleeping))
                             AND r2.available_at <= NOW()
                             AND (
                                 r2.priority < r.priority
@@ -283,7 +283,7 @@ enum Queries {
             ),
             claimed AS (
                 UPDATE strand.runs r
-                SET state            = 'RUNNING',
+                SET state            = \(TaskState.running),
                     worker_id        = \(workerID),
                     lease_expires_at = NOW() + COALESCE(NULLIF(c.timeout_seconds, 0), \(claimTimeoutSeconds)) * INTERVAL '1 second',
                     started_at       = COALESCE(r.started_at, NOW())
@@ -292,7 +292,7 @@ enum Queries {
             ),
             task_upd AS (
                 UPDATE strand.tasks t
-                SET state        = 'RUNNING',
+                SET state        = \(TaskState.running),
                     attempt      = GREATEST(t.attempt, c.attempt),
                     first_run_at = COALESCE(t.first_run_at, NOW())
                 FROM claimed c WHERE t.id = c.task_id
@@ -337,22 +337,25 @@ enum Queries {
             if taskState == .cancelled { throw InternalError.cancelled }
 
             // CAS on version — if another worker already wrote a completion, bail out.
+            // The tasks update is gated on the runs CAS via the CTE: if r is empty
+            // (CAS failed), the WHERE subquery returns NULL and no task row is touched.
             let casStream = try await conn.query(
                 """
-                UPDATE strand.runs
-                SET state = 'COMPLETED', finished_at = NOW(), version = version + 1
-                WHERE id = \(runID) AND state = 'RUNNING' AND version = \(version)
-                  AND namespace_id = \(namespaceID)
+                WITH r AS (
+                    UPDATE strand.runs
+                    SET state = \(TaskState.completed), finished_at = NOW(), version = version + 1
+                    WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version)
+                      AND namespace_id = \(namespaceID)
+                    RETURNING task_id
+                )
+                UPDATE strand.tasks
+                SET state = \(TaskState.completed), completed_at = NOW(), result = \(resultBuffer)
+                WHERE id = (SELECT task_id FROM r)
                 RETURNING id
                 """,
                 logger: logger
             )
             guard try await casStream.first(where: { _ in true }) != nil else { return }
-
-            try await conn.query(
-                "UPDATE strand.tasks SET state = 'COMPLETED', completed_at = NOW(), result = \(resultBuffer) WHERE id = \(taskID)",
-                logger: logger
-            )
             try await conn.query(
                 "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
                 logger: logger
@@ -396,7 +399,7 @@ enum Queries {
             // Guard: only fail if this run is still running.
             // If another worker already processed it, bail out silently.
             let failStream = try await conn.query(
-                "UPDATE strand.runs SET state = 'FAILED', failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = 'RUNNING' RETURNING id",
+                "UPDATE strand.runs SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = \(TaskState.running) RETURNING id",
                 logger: logger
             )
             guard try await failStream.first(where: { _ in true }) != nil else { return }
@@ -421,7 +424,7 @@ enum Queries {
                 if !nret.isEmpty && nret.contains(errorType) {
                     // Non-retryable error type — fail permanently, no retry
                     try await conn.query(
-                        "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+                        "UPDATE strand.tasks SET state = \(TaskState.failed), attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
                         logger: logger
                     )
                     try await emitTaskCompletionSignal(
@@ -440,7 +443,7 @@ enum Queries {
             if let deadline = deadlineAt, Date.now >= deadline {
                 // Total wall-clock budget exhausted — fail permanently
                 try await conn.query(
-                    "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+                    "UPDATE strand.tasks SET state = \(TaskState.failed), attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
                     logger: logger
                 )
                 try await emitTaskCompletionSignal(
@@ -457,7 +460,7 @@ enum Queries {
             let nextAttempt = attempt + 1
             guard maxAttempts == nil || nextAttempt <= maxAttempts! else {
                 try await conn.query(
-                    "UPDATE strand.tasks SET state = 'FAILED', attempt = \(attempt) WHERE id = \(taskID)",
+                    "UPDATE strand.tasks SET state = \(TaskState.failed), attempt = \(attempt) WHERE id = \(taskID)",
                     logger: logger
                 )
                 // Wake any awaitTaskResult callers.
@@ -502,11 +505,17 @@ enum Queries {
         logger: Logger
     ) async throws {
         try await client.query(
-            "UPDATE strand.runs SET state = 'SLEEPING', available_at = \(wakeAt), worker_id = NULL, lease_expires_at = NULL WHERE id = \(runID) AND namespace_id = \(namespaceID)",
-            logger: logger
-        )
-        try await client.query(
-            "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+            """
+            WITH r AS (
+                UPDATE strand.runs
+                SET state = \(TaskState.sleeping), available_at = \(wakeAt),
+                    worker_id = NULL, lease_expires_at = NULL
+                WHERE id = \(runID) AND namespace_id = \(namespaceID)
+                RETURNING id
+            )
+            UPDATE strand.tasks SET state = \(TaskState.sleeping)
+            WHERE id = \(taskID) AND namespace_id = \(namespaceID)
+            """,
             logger: logger
         )
     }
@@ -521,7 +530,7 @@ enum Queries {
         logger: Logger
     ) async throws {
         let stream = try await client.query(
-            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = 'RUNNING' AND namespace_id = \(namespaceID) RETURNING id",
+            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = \(TaskState.running) AND namespace_id = \(namespaceID) RETURNING id",
             logger: logger
         )
         if try await stream.first(where: { _ in true }) == nil {
@@ -539,7 +548,7 @@ enum Queries {
         logger: Logger
     ) async throws {
         let stream = try await conn.query(
-            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = 'RUNNING' AND namespace_id = \(namespaceID) RETURNING id",
+            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = \(TaskState.running) AND namespace_id = \(namespaceID) RETURNING id",
             logger: logger
         )
         if try await stream.first(where: { _ in true }) == nil {
@@ -560,10 +569,10 @@ enum Queries {
             try await conn.query(
                 """
                 UPDATE strand.tasks
-                SET state = 'CANCELLED', cancelled_at = NOW()
+                SET state = \(TaskState.cancelled), cancelled_at = NOW()
                 WHERE id = \(taskID)
                   AND namespace_id = \(namespaceID)
-                  AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
                 """,
                 logger: logger
             )
@@ -576,10 +585,10 @@ enum Queries {
             try await conn.query(
                 """
                 UPDATE strand.runs
-                SET state = 'CANCELLED'
+                SET state = \(TaskState.cancelled)
                 WHERE task_id = \(taskID)
                   AND namespace_id = \(namespaceID)
-                  AND state IN ('PENDING', 'SLEEPING', 'WAITING', 'RUNNING')
+                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting), \(TaskState.running))
                 """,
                 logger: logger
             )
@@ -601,9 +610,9 @@ enum Queries {
                     WHERE t.namespace_id = \(namespaceID)
                 )
                 UPDATE strand.tasks
-                SET state = 'CANCELLED', cancelled_at = NOW()
+                SET state = \(TaskState.cancelled), cancelled_at = NOW()
                 WHERE id IN (SELECT id FROM descendants)
-                  AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
                 """,
                 logger: logger
             )
@@ -622,10 +631,10 @@ enum Queries {
                     WHERE t.namespace_id = \(namespaceID)
                 )
                 UPDATE strand.runs
-                SET state = 'CANCELLED'
+                SET state = \(TaskState.cancelled)
                 WHERE task_id IN (SELECT id FROM descendants)
                   AND namespace_id = \(namespaceID)
-                  AND state IN ('PENDING', 'SLEEPING', 'WAITING', 'RUNNING')
+                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting), \(TaskState.running))
                 """,
                 logger: logger
             )
@@ -840,31 +849,31 @@ enum Queries {
             if let timeoutAt {
                 try await conn.query(
                     """
-                    UPDATE strand.runs
-                    SET state = 'SLEEPING', available_at = \(timeoutAt),
-                        wake_event = \(eventName), event_payload = NULL,
-                        worker_id = NULL, lease_expires_at = NULL
-                    WHERE id = \(runID)
+                    WITH r AS (
+                        UPDATE strand.runs
+                        SET state = \(TaskState.sleeping), available_at = \(timeoutAt),
+                            wake_event = \(eventName), event_payload = NULL,
+                            worker_id = NULL, lease_expires_at = NULL
+                        WHERE id = \(runID)
+                        RETURNING id
+                    )
+                    UPDATE strand.tasks SET state = \(TaskState.sleeping) WHERE id = \(taskID)
                     """,
-                    logger: logger
-                )
-                try await conn.query(
-                    "UPDATE strand.tasks SET state = 'SLEEPING' WHERE id = \(taskID)",
                     logger: logger
                 )
             } else {
                 try await conn.query(
                     """
-                    UPDATE strand.runs
-                    SET state = 'WAITING',
-                        wake_event = \(eventName), event_payload = NULL,
-                        worker_id = NULL, lease_expires_at = NULL
-                    WHERE id = \(runID)
+                    WITH r AS (
+                        UPDATE strand.runs
+                        SET state = \(TaskState.waiting),
+                            wake_event = \(eventName), event_payload = NULL,
+                            worker_id = NULL, lease_expires_at = NULL
+                        WHERE id = \(runID)
+                        RETURNING id
+                    )
+                    UPDATE strand.tasks SET state = \(TaskState.waiting) WHERE id = \(taskID)
                     """,
-                    logger: logger
-                )
-                try await conn.query(
-                    "UPDATE strand.tasks SET state = 'WAITING' WHERE id = \(taskID)",
                     logger: logger
                 )
             }
@@ -910,11 +919,11 @@ enum Queries {
             }
             for wait in waits {
                 try await conn.query(
-                    "UPDATE strand.runs SET state = 'PENDING', available_at = NOW(), event_payload = \(payloadBuffer), wake_event = \(eventName), lease_expires_at = NULL WHERE id = \(wait.runID) AND state IN ('SLEEPING', 'WAITING') AND namespace_id = \(namespaceID)",
+                    "UPDATE strand.runs SET state = \(TaskState.pending), available_at = NOW(), event_payload = \(payloadBuffer), wake_event = \(eventName), lease_expires_at = NULL WHERE id = \(wait.runID) AND state IN (\(TaskState.sleeping), \(TaskState.waiting)) AND namespace_id = \(namespaceID)",
                     logger: logger
                 )
                 try await conn.query(
-                    "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(wait.taskID) AND namespace_id = \(namespaceID)",
+                    "UPDATE strand.tasks SET state = \(TaskState.pending) WHERE id = \(wait.taskID) AND namespace_id = \(namespaceID)",
                     logger: logger
                 )
             }
@@ -945,7 +954,7 @@ enum Queries {
             SELECT id FROM strand.runs
             WHERE namespace_id = \(namespaceID)
               AND queue        = \(queue)
-              AND state        = 'RUNNING'
+              AND state        = \(TaskState.running)
               AND lease_expires_at <= NOW()
             ORDER BY lease_expires_at, id
             LIMIT 50
@@ -996,7 +1005,7 @@ enum Queries {
             let stream = try await conn.query(
                 """
                 SELECT attempt, max_attempts FROM strand.tasks
-                WHERE id = \(taskID) AND state IN ('FAILED', 'CANCELLED')
+                WHERE id = \(taskID) AND state IN (\(TaskState.failed), \(TaskState.cancelled))
                   AND namespace_id = \(namespaceID)
                 FOR UPDATE
                 """,
@@ -1029,7 +1038,7 @@ enum Queries {
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
                                        priority, fairness_key, fairness_weight,
                                        kind, parent_task_id)
-                SELECT namespace_id, \(newRunID), id, queue, \(nextAttempt), 'PENDING', NOW(),
+                SELECT namespace_id, \(newRunID), id, queue, \(nextAttempt), \(TaskState.pending), NOW(),
                        priority, fairness_key, fairness_weight,
                        kind, parent_task_id
                 FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
@@ -1039,7 +1048,7 @@ enum Queries {
             try await conn.query(
                 """
                 UPDATE strand.tasks
-                SET state = 'PENDING', attempt = \(nextAttempt), max_attempts = \(newMaxAttempts)
+                SET state = \(TaskState.pending), attempt = \(nextAttempt), max_attempts = \(newMaxAttempts)
                 WHERE id = \(taskID)
                 """,
                 logger: logger
@@ -1050,7 +1059,7 @@ enum Queries {
                     """
                     UPDATE strand.runs
                     SET failure_reason = NULL
-                    WHERE task_id = \(taskID) AND state IN ('FAILED', 'CANCELLED')
+                    WHERE task_id = \(taskID) AND state IN (\(TaskState.failed), \(TaskState.cancelled))
                     """,
                     logger: logger
                 )
@@ -1076,7 +1085,7 @@ enum Queries {
                 """
                 SELECT name, queue, params, headers, retry_strategy, max_attempts,
                        cancellation, priority, fairness_key, fairness_weight, kind
-                FROM strand.tasks WHERE id = \(taskID) AND state = 'COMPLETED'
+                FROM strand.tasks WHERE id = \(taskID) AND state = \(TaskState.completed)
                   AND namespace_id = \(namespaceID)
                 FOR UPDATE
                 """,
@@ -1117,7 +1126,7 @@ enum Queries {
                      kind, state)
                 VALUES (\(newTaskID), \(namespaceID), \(queue), \(name), \(params),
                         \(headers), \(retryStrategy), \(maxAttempts), \(cancellation),
-                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind), 'PENDING')
+                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind), \(TaskState.pending))
                 """,
                 logger: logger
             )
@@ -1126,7 +1135,7 @@ enum Queries {
                 """
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
                                         priority, fairness_key, fairness_weight, kind)
-                VALUES (\(namespaceID), \(newRunID), \(newTaskID), \(queue), 1, 'PENDING', NOW(),
+                VALUES (\(namespaceID), \(newRunID), \(newTaskID), \(queue), 1, \(TaskState.pending), NOW(),
                         \(priority), \(fairnessKey), \(fairnessWeight), \(kind))
                 """,
                 logger: logger
@@ -1203,20 +1212,22 @@ enum Queries {
                 """,
                 logger: logger
             )
-            // Wake the suspended run.
+            // Wake the suspended run and its parent task in one round trip.
             try await conn.query(
                 """
-                UPDATE strand.runs
-                SET state = 'PENDING', available_at = NOW(),
-                    event_payload = \(payloadBuf), wake_event = NULL,
-                    lease_expires_at = NULL
-                WHERE id = \(wait.runID) AND state IN ('SLEEPING', 'WAITING')
+                WITH r AS (
+                    UPDATE strand.runs
+                    SET state = \(TaskState.pending), available_at = NOW(),
+                        event_payload = \(payloadBuf), wake_event = NULL,
+                        lease_expires_at = NULL
+                    WHERE id = \(wait.runID) AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
+                      AND namespace_id = \(namespaceID)
+                    RETURNING id
+                )
+                UPDATE strand.tasks SET state = \(TaskState.pending)
+                WHERE id = \(wait.taskID) AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
                   AND namespace_id = \(namespaceID)
                 """,
-                logger: logger
-            )
-            try await conn.query(
-                "UPDATE strand.tasks SET state = 'PENDING' WHERE id = \(wait.taskID) AND state IN ('SLEEPING', 'WAITING') AND namespace_id = \(namespaceID)",
                 logger: logger
             )
         }
