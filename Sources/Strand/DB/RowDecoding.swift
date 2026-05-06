@@ -38,7 +38,7 @@ struct ClaimedTask: Sendable {
     let parentWorkflowID: UUID?
 
     /// Task kind: `.workflow` or `.activity`.
-    /// Used for span naming: `RunWorkflow:<name>` vs `RunActivity:<name>`.
+    /// Stored as `strand.task.kind` on OTel spans.
     let kind: TaskKind
 
     /// Per-attempt execution cap in seconds. `nil` falls back to the worker's `claimTimeout`.
