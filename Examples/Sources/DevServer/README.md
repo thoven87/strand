@@ -2,7 +2,9 @@
 
 A local development backend that runs the Strand HTTP API server alongside
 two worker pools and a live seeder. Used as the backend for the Loom dashboard
-during local development.
+during local development. Exports traces, metrics, and logs to
+[Jaeger](https://www.jaegertracing.io/) via OTLP/gRPC using
+[swift-otel](https://github.com/swift-otel/swift-otel).
 
 ---
 
@@ -10,19 +12,23 @@ during local development.
 
 | Component | Detail |
 |---|---|
-| HTTP API | Hummingbird server on `http://localhost:8080` |
+| HTTP API | Hummingbird on `http://localhost:8080` |
 | `orders` worker | `workflowConcurrency: 4`, `activityConcurrency: 8` |
 | `reports` worker | `workflowConcurrency: 2`, `activityConcurrency: 4` |
-| Seeder | Creates new workflow tasks every 30 s so the dashboard always has live data |
+| Seeder | New workflow tasks every 30 s — keeps the dashboard live |
+| OTel exporter | OTLP/gRPC → Jaeger on `localhost:4317` (no auth needed) |
 
 ---
 
 ## Prerequisites
 
-- PostgreSQL 15+ on `localhost:5499`
-
 ```bash
-psql "postgresql://strand:strand@localhost:5499/strand_dev" -f ../../../strand.sql
+# Start Postgres + Jaeger
+podman compose up -d
+
+# Apply schema (first time only)
+PGPASSWORD=strand psql -h 127.0.0.1 -p 5499 -U strand -d strand_dev \
+    -f ../../../strand.sql
 ```
 
 ---
@@ -31,28 +37,47 @@ psql "postgresql://strand:strand@localhost:5499/strand_dev" -f ../../../strand.s
 
 ```bash
 # Terminal 1 — API server + workers
-cd Examples
-swift run DevServer
+cd Examples && swift run DevServer
 
 # Terminal 2 — Loom dashboard
-cd loom
-npm install   # first time only
-npm run dev   # → http://localhost:5173
+cd loom && npm run dev   # → http://localhost:5173
+
+# Terminal 3 — Jaeger UI
+open http://localhost:16686
+# Select service: strand-devserver
 ```
 
-The dashboard proxies `/api` to `http://localhost:8080` automatically.
+No environment variables needed — DevServer connects to Jaeger on the
+default OTLP gRPC port (`4317`) with no authentication.
 
 ---
 
-## What you'll see
+## What you'll see in Jaeger
 
-- The **Tasks** page fills up with `OrderWorkflow` and `DailyReportWorkflow`
-  tasks as the seeder fires every 30 s.
-- Workflows run through PENDING → RUNNING → COMPLETED with activities visible
-  in the trace view.
-- The **Workers** page shows the two active worker processes with live
-  `runningTasks` and `completedRecently` counts.
-- The **Queues** page shows per-state breakdowns for `orders` and `reports`.
+Open `http://localhost:16686`, select **strand-devserver** from the service
+dropdown, and click **Find Traces**.
+
+Each workflow execution appears as a trace. Expand any trace to see the full
+span tree — from `StrandWorker.claimRun` down through checkpoint replay and
+every activity execution, with durations at each level.
+
+---
+
+## Using a different collector
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` and optionally `OTEL_EXPORTER_OTLP_AUTH`
+to point at any OTLP/gRPC-compatible backend:
+
+```bash
+# Honeycomb
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io:443 \
+OTEL_EXPORTER_OTLP_AUTH=<your-api-key> \
+swift run DevServer
+
+# SigNoz (self-hosted)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+swift run DevServer
+```
 
 ---
 
@@ -65,3 +90,8 @@ The dashboard proxies `/api` to `http://localhost:8080` automatically.
 | `POSTGRES_USER` | `strand` | Username |
 | `POSTGRES_PASSWORD` | `strand` | Password |
 | `POSTGRES_DB` | `strand_dev` | Database |
+| `OTEL_SERVICE_NAME` | `strand-devserver` | Service name in traces |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint |
+| `OTEL_EXPORTER_OTLP_AUTH` | *(none)* | Base64 `user:pass` for auth-required collectors |
+| `OTEL_ENABLE_LOGS` | `false` | Set `true` for collectors that support log ingestion |
+| `OTEL_ENABLE_METRICS` | `false` | Set `true` for collectors that support metrics ingestion |

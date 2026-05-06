@@ -30,6 +30,7 @@ enum StrandLogKeys {
     static let taskID = "strand.task.id"
     static let runID = "strand.run.id"
     static let taskName = "strand.task.name"
+    static let taskKind = "strand.task.kind"
     static let attempt = "strand.attempt"
 }
 

@@ -74,11 +74,16 @@ private struct MixedWorkflow: Workflow {
 }
 
 // Simple regular activity used by MixedWorkflow.
+// Accepts an optional TestExpectation so the mixed-activity test can
+// receive push notification instead of polling the DB.
 private struct ReverseLocalActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
+    var done: TestExpectation?
     func run(input: String, context: ActivityContext) async throws -> String {
-        String(input.reversed())
+        let result = String(input.reversed())
+        done?.trigger()
+        return result
     }
 }
 
@@ -154,12 +159,15 @@ struct LocalActivityTests {
     @Test("local and regular activities can be mixed in the same workflow")
     func mixedLocalAndRegularActivity() async throws {
         try await withTestEnvironment { client in
+            // Push-based: ReverseLocalActivity triggers the expectation the
+            // instant it runs. No polling, no 2-second backoff window.
+            let done = TestExpectation()
             let workerTask = startWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [MixedWorkflow.self],
-                activities: [UppercaseActivity(), ReverseLocalActivity()]
+                activities: [UppercaseActivity(), ReverseLocalActivity(done: done)]
             )
             defer { workerTask.cancel() }
 
@@ -169,7 +177,14 @@ struct LocalActivityTests {
                 input: "abc"
             )
             // "abc" → local uppercase → "ABC" → regular reverse → "CBA"
-            let result = try await handle.result(timeout: .seconds(15))
+            try await done.wait(for: "ReverseLocalActivity", timeout: .seconds(30))
+            let snap = try await awaitTerminal(
+                client: client,
+                taskID: handle.taskID,
+                timeout: .seconds(10)
+            )
+            #expect(snap.state == .completed)
+            let result = try snap.decodeResult(as: String.self)
             #expect(result == "CBA")
         }
     }

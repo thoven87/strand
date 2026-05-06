@@ -38,7 +38,7 @@ struct ClaimedTask: Sendable {
     let parentWorkflowID: UUID?
 
     /// Task kind: `.workflow` or `.activity`.
-    /// Used for span naming: `RunWorkflow:<name>` vs `RunActivity:<name>`.
+    /// Stored as `strand.task.kind` on OTel spans.
     let kind: TaskKind
 
     /// Per-attempt execution cap in seconds. `nil` falls back to the worker's `claimTimeout`.
@@ -47,6 +47,16 @@ struct ClaimedTask: Sendable {
 
     /// Scheduling metadata injected by `StrandScheduler`. `nil` for directly-enqueued tasks.
     let schedulingMetadata: SchedulingMetadata?
+
+    /// `true` when this attempt is the last one allowed.
+    ///
+    /// Used to decide whether a thrown error should mark the OTel span `ERROR`.
+    /// Retryable attempts keep `UNSET` status so Jaeger doesn't count them as
+    /// failures; only the terminal attempt is marked `ERROR`.
+    var isTerminalAttempt: Bool {
+        guard let max = maxAttempts else { return true }  // no cap → always terminal
+        return attempt >= max
+    }
 }
 
 extension ClaimedTask {

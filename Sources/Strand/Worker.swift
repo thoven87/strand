@@ -1241,13 +1241,12 @@ public struct StrandWorker: Service {
                     }
                     // OTel span: one span per task execution attempt.
                     // If no tracing backend is bootstrapped this is a zero-cost no-op.
-                    let spanName =
-                        claimed.kind == .activity
-                        ? "RunActivity:\(claimed.taskName)"
-                        : "RunWorkflow:\(claimed.taskName)"
-                    return try await withSpan(spanName, ofKind: .internal) { span in
+                    return try await withSpan(claimed.taskName, ofKind: .internal) { span in
                         span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(
                             claimed.taskName
+                        )
+                        span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
+                            claimed.kind.rawValue
                         )
                         span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
                             claimed.taskID.uuidString.lowercased()

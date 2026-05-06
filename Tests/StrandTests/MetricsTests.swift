@@ -299,7 +299,7 @@ struct MetricsTests {
 @Suite("Integration — Tracing", .tags(.integration), .serialized)
 struct TracingTests {
 
-    @Test("RunWorkflow and RunActivity spans are emitted with strand.* attributes")
+    @Test("workflow and activity spans are emitted with strand.* attributes")
     func allSpans() async throws {
         let tracer = TestTracer()
         InstrumentationSystem.bootstrap(tracer)
@@ -321,13 +321,18 @@ struct TracingTests {
             _ = try await handle.result(timeout: .seconds(10))
         }
 
-        let wfSpan = tracer.span(named: "RunWorkflow:SimpleWorkflow")
-        #expect(wfSpan != nil, "expected RunWorkflow:SimpleWorkflow span")
+        let wfSpan = tracer.span(named: "SimpleWorkflow")
+        #expect(wfSpan != nil, "expected SimpleWorkflow span")
         if let span = wfSpan {
             if case .string(let v)? = span.attributes[StrandLogKeys.taskName]?.toSpanAttribute() {
                 #expect(v == "SimpleWorkflow")
             } else {
                 Issue.record("strand.task.name attribute missing")
+            }
+            if case .string(let k)? = span.attributes[StrandLogKeys.taskKind]?.toSpanAttribute() {
+                #expect(k == "WORKFLOW")
+            } else {
+                Issue.record("strand.task.kind attribute missing")
             }
             #expect(span.attributes[StrandLogKeys.queue] != nil)
             #expect(span.attributes[StrandLogKeys.taskID] != nil)
@@ -351,13 +356,18 @@ struct TracingTests {
             _ = try await handle.result(timeout: .seconds(10))
         }
 
-        let actSpan = tracer.span(named: "RunActivity:SimpleActivity")
-        #expect(actSpan != nil, "expected RunActivity:SimpleActivity span")
+        let actSpan = tracer.span(named: "SimpleActivity")
+        #expect(actSpan != nil, "expected SimpleActivity span")
         if let span = actSpan {
             if case .string(let v)? = span.attributes[StrandLogKeys.taskName]?.toSpanAttribute() {
                 #expect(v == "SimpleActivity")
             } else {
                 Issue.record("strand.task.name attribute missing")
+            }
+            if case .string(let k)? = span.attributes[StrandLogKeys.taskKind]?.toSpanAttribute() {
+                #expect(k == "ACTIVITY")
+            } else {
+                Issue.record("strand.task.kind attribute missing")
             }
         }
     }

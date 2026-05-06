@@ -35,6 +35,66 @@ final class AtomicInt: @unchecked Sendable {
     func store(_ v: Int) { _value.withLock { $0 = v } }
 }
 
+// MARK: - TestExpectation
+
+/// Push-based test synchronisation using `AsyncStream`.
+///
+/// Pass an instance to an activity or workflow, call `trigger()` from inside
+/// the running code, and `wait()` in the test. Unlike polling with
+/// `Task.sleep`, completion is signalled the instant `trigger()` is called —
+/// no fixed delay and no 2-second backoff window.
+///
+/// ```swift
+/// private struct MyActivity: ActivityDefinition {
+///     let done: TestExpectation
+///     func run(input: String, context: ActivityContext) async throws -> String {
+///         defer { done.trigger() }
+///         return input.uppercased()
+///     }
+/// }
+///
+/// // In the test:
+/// let done = TestExpectation()
+/// startWorker(..., activities: [MyActivity(done: done)])
+/// try await done.wait(for: "MyActivity", timeout: .seconds(10))
+/// ```
+struct TestExpectation: Sendable {
+    private let stream: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+
+    init() {
+        (self.stream, self.continuation) = AsyncStream<Void>.makeStream()
+    }
+
+    /// Signal that one unit of work completed.
+    func trigger() {
+        continuation.yield()
+    }
+
+    /// Await `count` triggers or throw after `timeout` elapses.
+    func wait(
+        for label: String? = nil,
+        count: Int = 1,
+        timeout: Duration = .seconds(10)
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                var iterator = self.stream.makeAsyncIterator()
+                for _ in 0..<count {
+                    await iterator.next()
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                let msg = label.map { "timed out waiting on \($0)" } ?? "timed out"
+                throw IntegrationError(msg)
+            }
+            try await group.next()!
+            group.cancelAll()
+        }
+    }
+}
+
 // MARK: - Test error types
 
 struct IntegrationError: Error, CustomStringConvertible {
@@ -85,9 +145,13 @@ func withTestEnvironment<T: Sendable>(
 
     // Shared teardown: remove all test artefacts so they don't appear in the
     // dev dashboard when the DB is shared between tests and DevServer.
-    // Deleting tasks cascades to runs, checkpoints, workflow_history,
-    // workflow_state, workflow_signals, and task_completions via ON DELETE CASCADE.
-    // Events and event_waits are not FK-linked so we delete them explicitly.
+    //
+    // Cascade coverage via ON DELETE CASCADE:
+    //   tasks → runs, checkpoints, workflow_history, workflow_state,
+    //           workflow_signals, task_completions
+    //
+    // Explicit deletes (not FK-linked to tasks):
+    //   events, event_waits, schedules
     func cleanup() async {
         _ = try? await postgres.query(
             "DELETE FROM strand.tasks       WHERE queue = \(queueName)",
@@ -99,6 +163,10 @@ func withTestEnvironment<T: Sendable>(
         )
         _ = try? await postgres.query(
             "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
+            logger: logger
+        )
+        _ = try? await postgres.query(
+            "DELETE FROM strand.schedules   WHERE queue = \(queueName)",
             logger: logger
         )
         try? await client.dropQueue(queueName)
