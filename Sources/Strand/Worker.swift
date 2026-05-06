@@ -1241,17 +1241,7 @@ public struct StrandWorker: Service {
                     }
                     // OTel span: one span per task execution attempt.
                     // If no tracing backend is bootstrapped this is a zero-cost no-op.
-                    //
-                    // Error handling: catch inside the closure so we control whether
-                    // the span is marked ERROR. Retryable failures (attempt < maxAttempts)
-                    // record an exception event but keep OK status — only the terminal
-                    // attempt (or an uncapped task) is marked ERROR. This prevents false
-                    // positives in Jaeger's error summary for expected retry storms.
-                    var spanError: (any Error)? = nil
-                    let spanResult: ByteBuffer? = await withSpan(
-                        claimed.taskName,
-                        ofKind: .internal
-                    ) { (span: any Span) -> ByteBuffer? in
+                    return try await withSpan(claimed.taskName, ofKind: .internal) { span in
                         span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(
                             claimed.taskName
                         )
@@ -1268,30 +1258,8 @@ public struct StrandWorker: Service {
                         span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(
                             Int64(claimed.attempt)
                         )
-                        do {
-                            return try await reg.run(claimed, fatalDeadline)
-                        } catch {
-                            // Always attach the exception event so it's visible in traces.
-                            var excAttrs = SpanAttributes()
-                            excAttrs["exception.type"] = SpanAttribute.string(
-                                String(describing: type(of: error))
-                            )
-                            excAttrs["exception.message"] = SpanAttribute.string(
-                                String(describing: error)
-                            )
-                            span.addEvent(SpanEvent(name: "exception", attributes: excAttrs))
-                            if claimed.isTerminalAttempt {
-                                span.setStatus(
-                                    SpanStatus(code: .error, message: String(describing: error))
-                                )
-                            }
-                            // Capture and return nil so withSpan doesn't also record the error.
-                            spanError = error
-                            return nil
-                        }
+                        return try await reg.run(claimed, fatalDeadline)
                     }
-                    if let err = spanError { throw err }
-                    return spanResult
                 }
 
                 // Task 2: deadline poller — two thresholds, both pure Swift concurrency.
