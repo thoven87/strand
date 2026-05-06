@@ -1248,7 +1248,7 @@ public struct StrandWorker: Service {
                     // attempt (or an uncapped task) is marked ERROR. This prevents false
                     // positives in Jaeger's error summary for expected retry storms.
                     var spanError: (any Error)? = nil
-                    let spanResult: ByteBuffer? = try await withSpan(
+                    let spanResult: ByteBuffer? = await withSpan(
                         claimed.taskName,
                         ofKind: .internal
                     ) { (span: any Span) -> ByteBuffer? in

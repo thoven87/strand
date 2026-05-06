@@ -825,7 +825,17 @@ struct ParallelActivityTests {
                 options: .init(),
                 input: "hello"
             )
-            let result = try await handle.result(timeout: .seconds(30))
+            // Use awaitTerminal (fixed 80 ms poll, no exponential backoff) so that
+            // a slow CI runner doesn't hit a 2-second polling gap after the workflow
+            // completes. handle.result backs off to 2 s which makes the test fragile
+            // under load. 60 s is an ample ceiling for the actual work (~200 ms).
+            let snap = try await awaitTerminal(
+                client: client,
+                taskID: handle.taskID,
+                timeout: .seconds(60)
+            )
+            #expect(snap.state == .completed)
+            let result = try snap.decodeResult(as: [String].self)
 
             // Both activities ran exactly once
             #expect(DoubleActivity.counter.value == 1)
