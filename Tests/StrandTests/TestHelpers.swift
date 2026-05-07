@@ -143,33 +143,38 @@ func withTestEnvironment<T: Sendable>(
     try await client.verifySchema()
     try await client.createQueue(queueName)
 
-    // Shared teardown: remove all test artefacts so they don't appear in the
-    // dev dashboard when the DB is shared between tests and DevServer.
+    // Shared teardown: remove all test artefacts so they don't accumulate in
+    // the dev DB and confuse the dashboard or DevServer.
     //
-    // Cascade coverage via ON DELETE CASCADE:
-    //   tasks → runs, checkpoints, workflow_history, workflow_state,
-    //           workflow_signals, task_completions
-    //
-    // Explicit deletes (not FK-linked to tasks):
-    //   events, event_waits, schedules
+    // Schedules are deleted first — a live schedule can fire new tasks while
+    // older tasks are still being deleted. Errors are thrown, not swallowed:
+    // a silently-failed cleanup leaves active schedules that StrandScheduler
+    // will keep firing long after the test has finished.
     func cleanup() async {
-        _ = try? await postgres.query(
-            "DELETE FROM strand.tasks       WHERE queue = \(queueName)",
-            logger: logger
-        )
-        _ = try? await postgres.query(
-            "DELETE FROM strand.events      WHERE queue = \(queueName)",
-            logger: logger
-        )
-        _ = try? await postgres.query(
-            "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
-            logger: logger
-        )
-        _ = try? await postgres.query(
-            "DELETE FROM strand.schedules   WHERE queue = \(queueName)",
-            logger: logger
-        )
-        try? await client.dropQueue(queueName)
+        do {
+            try await postgres.query(
+                "DELETE FROM strand.schedules   WHERE queue = \(queueName)",
+                logger: logger
+            )
+            try await postgres.query(
+                "DELETE FROM strand.events      WHERE queue = \(queueName)",
+                logger: logger
+            )
+            try await postgres.query(
+                "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
+                logger: logger
+            )
+            try await postgres.query(
+                "DELETE FROM strand.tasks       WHERE queue = \(queueName)",
+                logger: logger
+            )
+            try await client.dropQueue(queueName)
+        } catch {
+            logger.error(
+                "[TestHelpers] cleanup failed — manually run: DELETE FROM strand.schedules WHERE queue = '\(queueName)'",
+                metadata: .forError(error)
+            )
+        }
     }
 
     do {
@@ -202,7 +207,10 @@ func startWorker(
             workflowConcurrency: concurrency,
             activityConcurrency: concurrency * 2,
             pollInterval: .milliseconds(20),
-            fatalOnLeaseTimeout: false
+            fatalOnLeaseTimeout: false,
+            // No jitter in tests: single worker per queue, no thundering herd,
+            // and jitter would add up to 50 ms latency per task step.
+            notifyJitter: .zero
         ),
         workflows: workflows,
         activityContainers: activityContainers,

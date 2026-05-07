@@ -131,17 +131,26 @@ struct GreetUserWorkflow: Workflow {
 
 private func makePostgres(logger: Logger) -> PostgresClient {
     let env = ProcessInfo.processInfo.environment
-    return PostgresClient(
-        configuration: .init(
-            host: env["POSTGRES_HOST"] ?? "localhost",
-            port: Int(env["POSTGRES_PORT"] ?? "5499") ?? 5499,
-            username: env["POSTGRES_USER"] ?? "strand",
-            password: env["POSTGRES_PASSWORD"] ?? "strand",
-            database: env["POSTGRES_DB"] ?? "strand_dev",
-            tls: .disable
-        ),
-        backgroundLogger: logger
+    let host = env["POSTGRES_HOST"] ?? "localhost"
+    let port = Int(env["POSTGRES_PORT"] ?? "5499") ?? 5499
+    let user = env["POSTGRES_USER"] ?? "strand"
+    let pass = env["POSTGRES_PASSWORD"] ?? "strand"
+    let db = env["POSTGRES_DB"] ?? "strand_dev"
+
+    var config = PostgresClient.Configuration(
+        host: host,
+        port: port,
+        username: user,
+        password: pass,
+        database: db,
+        tls: .disable
     )
+    // Pool sizing: Σ(activityConcurrency) + Σ(workflowConcurrency)
+    //            + N workers × 3 (listenLoop + poll + lease)
+    //            + headroom for HTTP handlers
+    // ordersWorker (16+8) + reportsWorker (8+4) + 2×3 + 8 HTTP = 50
+    config.options.maximumConnections = 50
+    return PostgresClient(configuration: config, backgroundLogger: logger)
 }
 
 // MARK: - Seeder
@@ -303,9 +312,13 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
                 queue: "orders",
                 workflowConcurrency: 8,
                 activityConcurrency: 16,
-                pollInterval: .milliseconds(100),
+                // pollInterval is a fallback for LISTEN/NOTIFY misses (timer fires,
+                // brief reconnect window). 5 s is plenty — NOTIFY handles the fast path.
+                pollInterval: .seconds(5),
                 claimTimeout: .seconds(60),
-                leaseExpiryInterval: .seconds(5)
+                leaseExpiryInterval: .seconds(5),
+                // Only 2 workers on this server — no thundering herd, no jitter needed.
+                notifyJitter: .zero
             ),
             workflows: [
                 ProcessOrderWorkflow.self,
@@ -321,9 +334,10 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
                 queue: "reports",
                 workflowConcurrency: 4,
                 activityConcurrency: 8,
-                pollInterval: .milliseconds(250),
+                pollInterval: .seconds(5),
                 claimTimeout: .seconds(120),
-                leaseExpiryInterval: .seconds(5)
+                leaseExpiryInterval: .seconds(5),
+                notifyJitter: .zero
             ),
             workflows: [GenerateReportWorkflow.self],
             logger: logger

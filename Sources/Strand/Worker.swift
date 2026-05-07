@@ -65,8 +65,16 @@ public struct WorkerOptions: Sendable {
     /// Default: `8`.
     public var activityConcurrency: Int
 
-    /// How long the worker sleeps between poll cycles when the queue is empty.
-    /// Default: `.milliseconds(250)`.
+    /// Fallback poll interval used when the LISTEN/NOTIFY connection is briefly down
+    /// (e.g. during the 1-second reconnect back-off in `listenLoop`), and for tasks
+    /// that become PENDING via paths that do not send NOTIFY — SLEEPING timer fires
+    /// and lease-expiry re-queues.
+    ///
+    /// With LISTEN/NOTIFY active this is a safety net, not the primary wakeup mechanism.
+    /// Keeping it at a few seconds (rather than sub-100 ms) avoids unnecessary polling
+    /// when the queue is genuinely idle.
+    ///
+    /// Default: `.seconds(5)` (matches `leaseExpiryInterval`).
     public var pollInterval: Duration
 
     /// Maximum time a claimed task may run per attempt before the in-process
@@ -95,6 +103,34 @@ public struct WorkerOptions: Sendable {
     /// Interval between expired-lease sweep passes. Default: `.seconds(5)`.
     public var leaseExpiryInterval: Duration
 
+    /// Maximum random delay applied **only** to NOTIFY wakeups before the worker
+    /// issues a `claimTasks` query.
+    ///
+    /// When many workers share a queue, a single `pg_notify` wakes all of them
+    /// simultaneously. Without jitter they all hit Postgres at once; `FOR UPDATE
+    /// SKIP LOCKED` keeps correctness but the concurrent empty claims waste DB
+    /// resources. Jitter spreads the herd across a window so only the first few
+    /// workers to fire actually find tasks, and the rest skip the round-trip.
+    ///
+    /// With a jitter window of W ms and N workers, the average number of
+    /// concurrent claims after one notification is:
+    ///
+    ///     concurrent_claims ≈ N / W_ms
+    ///
+    /// Keep this around 2–5 to avoid unnecessary DB load:
+    ///
+    /// - 1 worker: `.zero` (no overhead)
+    /// - ~10 workers: `.milliseconds(20)` — ~2–3 concurrent claims
+    /// - ~100 workers: `.milliseconds(100)` — ~2–3 concurrent claims
+    /// - 300+ workers: `.milliseconds(300)` — ~2–3 concurrent claims
+    ///
+    /// Jitter is **not** applied to the fallback `pollInterval` wakeup — those
+    /// are already staggered naturally because workers start at different times.
+    ///
+    /// Default: `.milliseconds(50)` — a safe default for most SaaS deployments;
+    /// set to `.zero` for development or single-worker setups.
+    public var notifyJitter: Duration
+
     /// Called on every poll error. When `nil`, errors are logged at `.error` level.
     public var onError: (@Sendable (any Error) async -> Void)?
 
@@ -104,12 +140,13 @@ public struct WorkerOptions: Sendable {
         workerID: String? = nil,
         workflowConcurrency: Int = 4,
         activityConcurrency: Int = 8,
-        pollInterval: Duration = .milliseconds(250),
+        pollInterval: Duration = .seconds(5),
         claimTimeout: Duration = .seconds(120),
         batchSize: Int? = nil,
         fatalOnLeaseTimeout: Bool = true,
         gracefulShutdownTimeout: Duration = .seconds(10),
         leaseExpiryInterval: Duration = .seconds(5),
+        notifyJitter: Duration = .milliseconds(50),
         onError: (@Sendable (any Error) async -> Void)? = nil
     ) {
         self.queue = queue
@@ -123,6 +160,7 @@ public struct WorkerOptions: Sendable {
         self.fatalOnLeaseTimeout = fatalOnLeaseTimeout
         self.gracefulShutdownTimeout = gracefulShutdownTimeout
         self.leaseExpiryInterval = leaseExpiryInterval
+        self.notifyJitter = notifyJitter
         self.onError = onError
     }
 }
@@ -311,11 +349,17 @@ public struct StrandWorker: Service {
         )
 
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
+        // Signal shared between listenLoop (producer) and pollLoop (consumer).
+        // _SlotSignal (Mutex + CheckedContinuation) has buffer-of-1 semantics:
+        // a notification that arrives while the worker is busy is stored and
+        // consumed on the next idle check with no allocation or task creation.
+        let notifySignal = _SlotSignal()
 
         try await withTaskCancellationOrGracefulShutdownHandler {
             do {
                 try await withThrowingTaskGroup(of: Void.self) { group in
-                    group.addTask { try await self.pollLoop(workerID: workerID) }
+                    group.addTask { try await self.pollLoop(workerID: workerID, notifySignal: notifySignal) }
+                    group.addTask { try await self.listenLoop(notifySignal: notifySignal) }
                     group.addTask { try await self.leaseExpiryLoop() }
                     group.addTask {
                         // Wait for shutdown signal.
@@ -361,7 +405,7 @@ public struct StrandWorker: Service {
     ///
     /// When all slots are occupied the loop parks on `_SlotSignal` — a
     /// `Mutex`-backed async wakeup that resumes as soon as any slot is freed.
-    private func pollLoop(workerID: String) async throws {
+    private func pollLoop(workerID: String, notifySignal: _SlotSignal) async throws {
         let queueName = options.queue
         let maxConcurrency =
             options.batchSize ?? (options.workflowConcurrency + options.activityConcurrency)
@@ -415,10 +459,34 @@ public struct StrandWorker: Service {
                 }
 
                 if claimed.isEmpty {
-                    // No runnable tasks — sleep until next poll tick.
-                    // LISTEN/NOTIFY wakeup would eliminate this sleep on the busy path.
+                    // No runnable tasks — park until listenLoop signals a new
+                    // PENDING task or the fallback interval fires.
                     try Task.checkCancellation()
-                    try await Task.sleep(for: options.pollInterval)
+                    let wasNotified = await withTaskGroup(of: Bool.self) { sleepGroup in
+                        sleepGroup.addTask {
+                            try? await notifySignal.wait()  // returns on signal or cancellation
+                            return true
+                        }
+                        sleepGroup.addTask {
+                            try? await Task.sleep(for: self.options.pollInterval)
+                            return false
+                        }
+                        let first = await sleepGroup.next()!
+                        sleepGroup.cancelAll()
+                        return first
+                    }
+                    // Apply jitter only to NOTIFY wakeups.
+                    // Fallback polls are already staggered because workers start at
+                    // different times; adding jitter there would only hurt latency.
+                    if wasNotified {
+                        let jitter = options.notifyJitter
+                        if jitter > .zero {
+                            let maxMs =
+                                jitter.components.seconds * 1_000
+                                + jitter.components.attoseconds / 1_000_000_000_000_000
+                            try await Task.sleep(for: .milliseconds(Int64.random(in: 0...maxMs)))
+                        }
+                    }
                     continue
                 }
 
@@ -474,6 +542,44 @@ public struct StrandWorker: Service {
                     "lease sweep error",
                     metadata: .forError(error) + ["strand.queue": .string(queueName)]
                 )
+            }
+        }
+    }
+
+    // MARK: - LISTEN/NOTIFY loop
+
+    /// Holds one dedicated Postgres connection and listens on `strand_tasks`.
+    /// Whenever a notification arrives with our namespace/queue as payload,
+    /// it signals `wakeSignal` so the poll loop claims immediately instead of
+    /// sleeping the full poll interval.
+    ///
+    /// Reconnects automatically on connection loss (network hiccup, Postgres
+    /// restart). Cancellation tears down the connection cleanly via the
+    /// structured-concurrency cancel path.
+    private func listenLoop(notifySignal: _SlotSignal) async throws {
+        let channel = StrandChannels.tasks
+        let myNotification = StrandChannels.Notification(namespace: namespace, queue: options.queue)
+
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await postgres.withConnection { conn in
+                    try await conn.listen(on: channel) { notifications in
+                        for try await note in notifications {
+                            if note.payload == myNotification.payload {
+                                notifySignal.signal()
+                            }
+                        }
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                logger.warning(
+                    "LISTEN connection lost — reconnecting",
+                    metadata: .forError(error)
+                )
+                try await Task.sleep(for: .seconds(1))
             }
         }
     }
