@@ -988,20 +988,30 @@ private final class _SlotSignal: Sendable {
         // Slow path: park the continuation until signal() or cancellation.
         await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                // Race between signal() arriving after fast-path check and now.
-                let raced = _mutex.withLock { s -> Bool in
+                // Three-way check inside the lock:
+                //  1. A signal arrived after the fast-path check above       → resume now
+                //  2. Cancellation arrived before onCancel could see the     → resume now
+                //     continuation (the narrow window between registering the
+                //     onCancel handler and this closure running): onCancel
+                //     fired, read continuation = nil, did nothing. Without
+                //     this check the continuation would be stored and leaked.
+                //  3. Neither → store the continuation for signal()/onCancel.
+                var shouldResume = false
+                _mutex.withLock { s in
                     if s.pending {
                         s.pending = false
-                        return true  // signal already here — resume immediately
+                        shouldResume = true
+                    } else if Task.isCancelled {
+                        shouldResume = true  // onCancel already missed us
+                    } else {
+                        s.continuation = cont
                     }
-                    s.continuation = cont
-                    return false
                 }
-                if raced { cont.resume() }
+                if shouldResume { cont.resume() }
             }
         } onCancel: {
-            // Resume synchronously from the canceller’s thread so the
-            // dispatcher unblocks and can call Task.checkCancellation().
+            // Resume synchronously from the canceller's thread so the
+            // dispatcher unblocks and can propagate CancellationError.
             let cont = _mutex.withLock { s -> CheckedContinuation<Void, Never>? in
                 let c = s.continuation
                 s.continuation = nil
