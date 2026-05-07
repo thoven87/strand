@@ -87,7 +87,7 @@ extension ClaimedTask {
         parentWorkflowID = try col.next()!.decode(UUID?.self, context: .default)
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         timeoutSeconds = try col.next()!.decode(Int?.self, context: .default)
-        schedulingMetadata = SchedulingMetadata.from(headers: h)
+        schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
     }
 }
 

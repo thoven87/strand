@@ -385,9 +385,11 @@ extension ActivityDefinition {
             }
         )
         // OTel span: one span per activity execution attempt.
+        // SpanKind.consumer: child of the outer task consumer span; ServiceContext
+        // propagates automatically via task-local storage so no addLink is needed.
         // Zero-cost no-op when no tracing backend is bootstrapped.
         do {
-            let output = try await withSpan(Self.name, ofKind: .internal) { span in
+            let output = try await withSpan(Self.name, ofKind: .consumer) { span in
                 span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(Self.name)
                 span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
                     TaskKind.activity.rawValue

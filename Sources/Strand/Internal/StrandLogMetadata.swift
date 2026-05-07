@@ -1,4 +1,5 @@
 import Logging
+import Tracing
 
 // MARK: - Strand structured-logging conventions
 //
@@ -64,6 +65,27 @@ extension Logger {
             l[metadataKey: key] = value
         }
         return l
+    }
+}
+
+// MARK: - W3C trace-context propagation helpers
+//
+// Used by StrandClient._enqueue (inject) and StrandWorker.runTask (extract)
+// so that distributed traces span from the enqueue call-site into task execution.
+// Both types are private to the Strand module; the [String: String] carrier
+// maps directly to the `headers` column in strand.tasks.
+
+/// Writes trace-context key-value pairs into a `[String: String]` header dict.
+struct DictionaryInjector: Injector {
+    func inject(_ value: String, forKey key: String, into carrier: inout [String: String]) {
+        carrier[key] = value
+    }
+}
+
+/// Reads trace-context key-value pairs from a `[String: String]` header dict.
+struct DictionaryExtractor: Extractor {
+    func extract(key: String, from carrier: [String: String]) -> String? {
+        carrier[key]
     }
 }
 

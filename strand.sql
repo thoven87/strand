@@ -62,10 +62,11 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     name         TEXT        NOT NULL,   -- registered workflow/activity name
 
     -- Payloads: BYTEA blobs, never parsed by Postgres.
-    params          BYTEA       NOT NULL,
-    headers         BYTEA,
-    retry_strategy  BYTEA,
-    cancellation    BYTEA,
+    params               BYTEA       NOT NULL,
+    headers              BYTEA,
+    scheduling_metadata  BYTEA,      -- NULL for directly-enqueued tasks; set by StrandScheduler
+    retry_strategy       BYTEA,
+    cancellation         BYTEA,
 
     max_attempts    INTEGER,
     timeout_seconds INTEGER,                  -- per-attempt execution cap in seconds; NULL = worker's claimTimeout

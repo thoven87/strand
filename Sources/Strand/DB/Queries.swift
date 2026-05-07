@@ -136,6 +136,7 @@ enum Queries {
         taskName: String,
         paramsBuffer: ByteBuffer,
         headersBuffer: ByteBuffer?,
+        schedulingMetadata: SchedulingMetadata? = nil,
         retryStrategyBuffer: ByteBuffer?,
         maxAttempts: Int?,
         cancellationBuffer: ByteBuffer?,
@@ -162,11 +163,13 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.tasks
-                    (namespace_id, id, queue, name, params, headers, retry_strategy, max_attempts,
-                     timeout_seconds, cancellation, idempotency_key, priority, fairness_key,
-                     fairness_weight, state, kind, parent_task_id, deadline_at)
+                    (namespace_id, id, queue, name, params, headers, scheduling_metadata,
+                     retry_strategy, max_attempts, timeout_seconds, cancellation,
+                     idempotency_key, priority, fairness_key, fairness_weight,
+                     state, kind, parent_task_id, deadline_at)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
-                        \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
+                        \(headersBuffer), \(schedulingMetadata),
+                        \(retryStrategyBuffer), \(maxAttempts),
                         \(timeoutSeconds), \(cancellationBuffer), \(idempotencyKey), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
                         \(kind), \(parentTaskID), \(deadlineAt))
@@ -300,7 +303,7 @@ enum Queries {
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
                    c.wake_event, c.event_payload,
-                   t.parent_task_id, t.kind, t.timeout_seconds
+                   t.parent_task_id, t.kind, t.timeout_seconds, t.scheduling_metadata
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
@@ -1205,7 +1208,7 @@ enum Queries {
             // Read the original task's metadata.
             let src = try await conn.query(
                 """
-                SELECT name, queue, params, headers, retry_strategy, max_attempts,
+                SELECT name, queue, params, headers, scheduling_metadata, retry_strategy, max_attempts,
                        cancellation, priority, fairness_key, fairness_weight, kind
                 FROM strand.tasks WHERE id = \(taskID) AND state = \(TaskState.completed)
                   AND namespace_id = \(namespaceID)
@@ -1223,6 +1226,7 @@ enum Queries {
             let queue = try col.next()!.decode(String.self, context: .default)
             let params = try col.next()!.decode(ByteBuffer.self, context: .default)
             let headers = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let schedulingMetadata = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let retryStrategy = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
             let cancellation = try col.next()!.decode(ByteBuffer?.self, context: .default)
@@ -1243,12 +1247,13 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.tasks
-                    (id, namespace_id, queue, name, params, headers, retry_strategy,
-                     max_attempts, cancellation, priority, fairness_key, fairness_weight,
-                     kind, state)
+                    (id, namespace_id, queue, name, params, headers, scheduling_metadata,
+                     retry_strategy, max_attempts, cancellation, priority, fairness_key,
+                     fairness_weight, kind, state)
                 VALUES (\(newTaskID), \(namespaceID), \(queue), \(name), \(params),
-                        \(headers), \(retryStrategy), \(maxAttempts), \(cancellation),
-                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind), \(TaskState.pending))
+                        \(headers), \(schedulingMetadata), \(retryStrategy), \(maxAttempts),
+                        \(cancellation), \(priority), \(fairnessKey), \(fairnessWeight),
+                        \(kind), \(TaskState.pending))
                 """,
                 logger: logger
             )

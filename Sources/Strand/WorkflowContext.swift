@@ -99,6 +99,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         wakeEvent: String?,
         eventPayload: ByteBuffer?,
         headers: [String: String],
+        schedulingMetadata: SchedulingMetadata?,
         postgres: PostgresClient,
         logger: Logger,
         executor: StrandWorkflowExecutor,
@@ -116,7 +117,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         self.wakeEvent = wakeEvent
         self.eventPayload = eventPayload
         self.headers = headers
-        self.schedulingMetadata = SchedulingMetadata.from(headers: headers)
+        self.schedulingMetadata = schedulingMetadata
         self.postgres = postgres
         self.logger = logger
         self.executor = executor
