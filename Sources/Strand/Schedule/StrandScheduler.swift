@@ -183,12 +183,8 @@ public struct StrandScheduler: Service {
             partitionTime = nil
         }
 
-        // Inject scheduling metadata as a single JSON header.
-        // SchedulingMetadata is Codable — encode the struct directly rather than
-        // scattering individual string keys (which are error-prone and brittle).
-        var headers =
-            row.headersBuffer
-            .flatMap { try? JSON.decode([String: String].self, from: $0) } ?? [:]
+        // Build scheduling metadata. Passed directly to enqueueTask as SchedulingMetadata?
+        // (PostgresCodable conformance handles the BYTEA encoding inside the query binding).
         let schedulingMeta = SchedulingMetadata(
             executionTime: now,
             partitionTime: partitionTime,
@@ -196,10 +192,7 @@ public struct StrandScheduler: Service {
             scheduleId: row.id.uuidString,
             scheduledBy: row.name
         )
-        headers[SchedulingMetadata.headerKey] = try String(
-            buffer: JSON.encode(schedulingMeta)
-        )
-        let headersBuf = try JSON.encode(headers)
+        let headersBuf = row.headersBuffer  // user-provided headers only; no mutation needed
 
         // Idempotency key: schedule_id + scheduled fire time.
         // Safe across multiple scheduler instances and restarts.
@@ -213,6 +206,7 @@ public struct StrandScheduler: Service {
             taskName: row.taskName,
             paramsBuffer: row.paramsBuffer,
             headersBuffer: headersBuf,
+            schedulingMetadata: schedulingMeta,
             retryStrategyBuffer: row.retryStrategyBuffer,
             maxAttempts: row.maxAttempts,
             cancellationBuffer: row.cancellationBuffer,

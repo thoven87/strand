@@ -136,6 +136,7 @@ enum Queries {
         taskName: String,
         paramsBuffer: ByteBuffer,
         headersBuffer: ByteBuffer?,
+        schedulingMetadata: SchedulingMetadata? = nil,
         retryStrategyBuffer: ByteBuffer?,
         maxAttempts: Int?,
         cancellationBuffer: ByteBuffer?,
@@ -162,11 +163,13 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.tasks
-                    (namespace_id, id, queue, name, params, headers, retry_strategy, max_attempts,
-                     timeout_seconds, cancellation, idempotency_key, priority, fairness_key,
-                     fairness_weight, state, kind, parent_task_id, deadline_at)
+                    (namespace_id, id, queue, name, params, headers, scheduling_metadata,
+                     retry_strategy, max_attempts, timeout_seconds, cancellation,
+                     idempotency_key, priority, fairness_key, fairness_weight,
+                     state, kind, parent_task_id, deadline_at)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
-                        \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
+                        \(headersBuffer), \(schedulingMetadata),
+                        \(retryStrategyBuffer), \(maxAttempts),
                         \(timeoutSeconds), \(cancellationBuffer), \(idempotencyKey), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
                         \(kind), \(parentTaskID), \(deadlineAt))
@@ -300,7 +303,7 @@ enum Queries {
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
                    c.wake_event, c.event_payload,
-                   t.parent_task_id, t.kind, t.timeout_seconds
+                   t.parent_task_id, t.kind, t.timeout_seconds, t.scheduling_metadata
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
@@ -371,6 +374,9 @@ enum Queries {
         }
     }
 
+    private struct _NRFlag: Decodable { let non_retryable: Bool? }
+    private struct _ErrorType: Decodable { let name: String? }
+
     /// Marks a run as failed and schedules a retry if attempts remain.
     static func failRun(
         on client: PostgresClient,
@@ -408,9 +414,27 @@ enum Queries {
                 logger: logger
             )
 
+            // ── Check 0: non_retryable flag (from NonRetryableError protocol) ──────────
+            // Activities whose Failure type conforms to NonRetryableError encode
+            // `non_retryable: true` in the failure payload. Skip retry immediately.
+            if (try? JSON.decode(_NRFlag.self, from: reasonBuffer))?.non_retryable == true {
+                try await conn.query(
+                    "UPDATE strand.tasks SET state = \(TaskState.failed), attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+                    logger: logger
+                )
+                try await emitTaskCompletionSignal(
+                    conn: conn,
+                    namespaceID: namespaceID,
+                    taskID: taskID,
+                    state: .failed,
+                    resultBuffer: nil,
+                    logger: logger
+                )
+                return
+            }
+
             // ── Check 1: nonRetryableErrorTypes ──────────────────────────────────────
             // Decode just the error type name from the failure payload.
-            struct _ErrorType: Decodable { let name: String? }
             let errorTypeName = (try? JSON.decode(_ErrorType.self, from: reasonBuffer)).flatMap(
                 \.name
             )
@@ -722,8 +746,8 @@ enum Queries {
     ) async throws {
         try await client.query(
             """
-            INSERT INTO strand.checkpoints (task_id, seq_num, name, state, run_id)
-            VALUES (\(taskID), \(seqNum), \(name), \(stateBuffer), \(runID))
+            INSERT INTO strand.checkpoints (namespace_id, task_id, seq_num, name, state, run_id)
+            VALUES (\(namespaceID), \(taskID), \(seqNum), \(name), \(stateBuffer), \(runID))
             ON CONFLICT (task_id, seq_num) DO UPDATE
                 SET state      = EXCLUDED.state,
                     run_id     = EXCLUDED.run_id,
@@ -780,8 +804,8 @@ enum Queries {
             for c in checkpoints {
                 try await conn.query(
                     """
-                    INSERT INTO strand.checkpoints (task_id, seq_num, name, state, run_id)
-                    VALUES (\(taskID), \(c.seqNum), \(c.name), \(c.state), \(runID))
+                    INSERT INTO strand.checkpoints (namespace_id, task_id, seq_num, name, state, run_id)
+                    VALUES (\(namespaceID), \(taskID), \(c.seqNum), \(c.name), \(c.state), \(runID))
                     ON CONFLICT (task_id, seq_num) DO UPDATE
                         SET state      = EXCLUDED.state,
                             run_id     = EXCLUDED.run_id,
@@ -812,7 +836,7 @@ enum Queries {
         queue: String,
         taskID: UUID,
         runID: UUID,
-        stepName: String,
+        seqNum: Int,
         eventName: String,
         timeoutSeconds: Int?,
         currentWakeEvent: String?,
@@ -836,9 +860,9 @@ enum Queries {
             let timeoutAt: Date? = timeoutSeconds.map { Date.now.addingTimeInterval(Double($0)) }
             try await conn.query(
                 """
-                INSERT INTO strand.event_waits (task_id, run_id, queue, step_name, event_name, timeout_at)
-                VALUES (\(taskID), \(runID), \(queue), \(stepName), \(eventName), \(timeoutAt))
-                ON CONFLICT (run_id, step_name)
+                INSERT INTO strand.event_waits (task_id, run_id, queue, seq_num, event_name, timeout_at)
+                VALUES (\(taskID), \(runID), \(queue), \(seqNum), \(eventName), \(timeoutAt))
+                ON CONFLICT (run_id, seq_num)
                 DO UPDATE SET event_name = EXCLUDED.event_name, timeout_at = EXCLUDED.timeout_at
                 """,
                 logger: logger
@@ -941,52 +965,153 @@ enum Queries {
     /// `FOR UPDATE SKIP LOCKED` ensures each expired run is processed by
     /// exactly one worker even when multiple workers share a queue.
     ///
-    /// `failRun` guards on `state = 'running'` internally, so concurrent
-    /// calls on the same run are safely idempotent.
+    /// Re-queues every run that has been in RUNNING state past its
+    /// `lease_expires_at` deadline. Transitions `RUNNING → PENDING` for
+    /// the **same attempt** so the next worker picks it up transparently.
+    ///
+    /// A ClaimTimeout is a pure infrastructure event (worker crash, restart,
+    /// or OOM). It must **not** count against a task’s retry budget and must
+    /// **not** surface as an error in the dashboard. The task’s `attempt`
+    /// counter stays unchanged; the next worker replays from checkpoints.
+    ///
+    /// Contrast with the 2×-claimTimeout in-process deadline (``ClaimTimeoutError``
+    /// thrown from ``StrandWorker/runTask(_:)``): that fires when the
+    /// *same worker* is still running the task and is genuinely stuck —
+    /// it goes through ``failRun`` and does increment the attempt counter.
     static func sweepExpiredLeases(
         on client: PostgresClient,
         namespaceID: String,
         queue: String,
         logger: Logger
     ) async throws {
+        // Select expired runs and re-queue them atomically.
+        // `FOR UPDATE SKIP LOCKED` ensures two concurrent sweepers on the
+        // same queue never double-process the same run.
         let stream = try await client.query(
             """
-            SELECT id FROM strand.runs
-            WHERE namespace_id = \(namespaceID)
-              AND queue        = \(queue)
-              AND state        = \(TaskState.running)
-              AND lease_expires_at <= NOW()
-            ORDER BY lease_expires_at, id
-            LIMIT 50
-            FOR UPDATE SKIP LOCKED
+            WITH expired AS (
+                SELECT r.id AS run_id, r.task_id
+                FROM strand.runs r
+                WHERE r.namespace_id    = \(namespaceID)
+                  AND r.queue           = \(queue)
+                  AND r.state           = \(TaskState.running)
+                  AND r.lease_expires_at <= NOW()
+                ORDER BY r.lease_expires_at, r.id
+                LIMIT 50
+                FOR UPDATE SKIP LOCKED
+            ),
+            requeued_runs AS (
+                UPDATE strand.runs
+                SET state            = \(TaskState.pending),
+                    available_at     = NOW(),
+                    worker_id        = NULL,
+                    lease_expires_at = NULL
+                FROM expired
+                WHERE strand.runs.id = expired.run_id
+                RETURNING expired.run_id, expired.task_id
+            )
+            UPDATE strand.tasks
+            SET state = \(TaskState.pending)
+            FROM requeued_runs
+            WHERE strand.tasks.id             = requeued_runs.task_id
+              AND strand.tasks.namespace_id   = \(namespaceID)
+            RETURNING requeued_runs.run_id
             """,
             logger: logger
         )
-        var expiredIDs: [UUID] = []
-        for try await row in stream {
-            var col = row.makeIterator()
-            expiredIDs.append(try col.next()!.decode(UUID.self, context: .default))
+        var count = 0
+        for try await _ in stream { count += 1 }
+        if count > 0 {
+            logger.warning(
+                "re-queued \(count) run(s) with expired lease—worker was likely restarted",
+                metadata: ["queue": "\(queue)"]
+            )
         }
-        guard !expiredIDs.isEmpty else { return }
+    }
 
-        logger.warning(
-            "sweeping \(expiredIDs.count) expired lease(s)",
-            metadata: ["queue": "\(queue)"]
+    // MARK: - continueAsNew for child workflows
+
+    /// Resets a **child** workflow for continuation-as-new without signalling its parent.
+    ///
+    /// When `context.continueAsNew(input:)` is called inside a child workflow
+    /// (one that has a `parent_task_id`), creating a brand-new task would break the
+    /// parent’s `event_wait`, which is keyed on the **original** `task_id`. This
+    /// function keeps the same `task_id` and instead:
+    ///
+    ///   1. Marks the current run `COMPLETED` — no `task_completions` row, no signal.
+    ///   2. Resets `strand.tasks` to `PENDING` with the new input.
+    ///   3. Deletes checkpoints, `workflow_state`, stale signals, and the child’s
+    ///      own `event_waits` (the parent’s wait for this task is on the *parent*’s
+    ///      `run_id` and is untouched).
+    ///   4. Inserts a fresh `PENDING` run for the same task.
+    ///
+    /// The parent remains `WAITING` (its `event_waits.child_task_id` still points to
+    /// `taskID`). When the chain finally calls `completeRun` with a real result,
+    /// `emitTaskCompletionSignal` fires and the parent receives the correct value.
+    ///
+    /// The entire operation is one atomic CTE. If the CAS check
+    /// (`state = RUNNING AND version = currentVersion`) fails (race / duplicate),
+    /// all CTEs are no-ops — safe under concurrent execution.
+    static func continueChildWorkflowAsNew(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        currentRunID: UUID,
+        currentVersion: Int,
+        newInput: ByteBuffer,
+        newRunID: UUID,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            WITH
+            complete_run AS (
+                UPDATE strand.runs
+                SET state = 'COMPLETED', finished_at = NOW()
+                WHERE id            = \(currentRunID)
+                  AND state         = 'RUNNING'
+                  AND version       = \(currentVersion)
+                RETURNING task_id
+            ),
+            reset_task AS (
+                UPDATE strand.tasks
+                SET state  = 'PENDING',
+                    params = \(newInput)
+                WHERE id           = (SELECT task_id FROM complete_run)
+                  AND namespace_id = \(namespaceID)
+                RETURNING id, queue, priority, fairness_key, fairness_weight, kind
+            ),
+            del_checkpoints AS (
+                DELETE FROM strand.checkpoints
+                WHERE task_id      = (SELECT task_id FROM complete_run)
+                  AND namespace_id = \(namespaceID)
+            ),
+            del_workflow_state AS (
+                DELETE FROM strand.workflow_state
+                WHERE task_id      = (SELECT task_id FROM complete_run)
+                  AND namespace_id = \(namespaceID)
+            ),
+            del_signals AS (
+                DELETE FROM strand.workflow_signals
+                WHERE task_id      = (SELECT task_id FROM complete_run)
+                  AND namespace_id = \(namespaceID)
+            ),
+            del_event_waits AS (
+                -- Remove the child’s OWN event_waits (activities / timers it was
+                -- waiting for). The parent’s event_wait is on the parent’s run_id
+                -- and is not touched.
+                DELETE FROM strand.event_waits
+                WHERE task_id = (SELECT task_id FROM complete_run)
+            )
+            INSERT INTO strand.runs
+                (id, namespace_id, task_id, queue, attempt, state,
+                 available_at, created_at, priority, fairness_key, fairness_weight, kind)
+            SELECT \(newRunID), \(namespaceID), id, queue, 1, 'PENDING',
+                   NOW(), NOW(), priority, fairness_key, fairness_weight, kind
+            FROM reset_task
+            """,
+            logger: logger
         )
-        let reason = try JSON.encode(ClaimTimeoutReason())
-        for runID in expiredIDs {
-            do {
-                try await failRun(
-                    on: client,
-                    namespaceID: namespaceID,
-                    runID: runID,
-                    reasonBuffer: reason,
-                    logger: logger
-                )
-            } catch {
-                logger.error("error expiring run \(runID): \(String(reflecting: error))")
-            }
-        }
     }
 
     // MARK: - Retry
@@ -1083,7 +1208,7 @@ enum Queries {
             // Read the original task's metadata.
             let src = try await conn.query(
                 """
-                SELECT name, queue, params, headers, retry_strategy, max_attempts,
+                SELECT name, queue, params, headers, scheduling_metadata, retry_strategy, max_attempts,
                        cancellation, priority, fairness_key, fairness_weight, kind
                 FROM strand.tasks WHERE id = \(taskID) AND state = \(TaskState.completed)
                   AND namespace_id = \(namespaceID)
@@ -1101,6 +1226,7 @@ enum Queries {
             let queue = try col.next()!.decode(String.self, context: .default)
             let params = try col.next()!.decode(ByteBuffer.self, context: .default)
             let headers = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let schedulingMetadata = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let retryStrategy = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
             let cancellation = try col.next()!.decode(ByteBuffer?.self, context: .default)
@@ -1121,12 +1247,13 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.tasks
-                    (id, namespace_id, queue, name, params, headers, retry_strategy,
-                     max_attempts, cancellation, priority, fairness_key, fairness_weight,
-                     kind, state)
+                    (id, namespace_id, queue, name, params, headers, scheduling_metadata,
+                     retry_strategy, max_attempts, cancellation, priority, fairness_key,
+                     fairness_weight, kind, state)
                 VALUES (\(newTaskID), \(namespaceID), \(queue), \(name), \(params),
-                        \(headers), \(retryStrategy), \(maxAttempts), \(cancellation),
-                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind), \(TaskState.pending))
+                        \(headers), \(schedulingMetadata), \(retryStrategy), \(maxAttempts),
+                        \(cancellation), \(priority), \(fairnessKey), \(fairnessWeight),
+                        \(kind), \(TaskState.pending))
                 """,
                 logger: logger
             )
@@ -1145,14 +1272,16 @@ enum Queries {
         }
     }
 
-    // MARK: - Task completion signals (for awaitTaskResult suspension)
+    // MARK: - Task completion signals
 
-    /// Emits a synthetic `$strand:task:{taskID}` event and wakes every task
-    /// that was suspended in `awaitTaskResult` waiting for this task.
+    /// Persists the completion and wakes every parent run waiting on this task.
     ///
-    /// Cross-queue safe: looks up waiters across ALL queues in
-    /// `strand.event_waits`, so a task on queue "default" can await a task
-    /// on queue "gpu" without any extra configuration.
+    /// Single round trip: one CTE atomically inserts the completion record,
+    /// finds event_waits by child_task_id (FOR UPDATE SKIP LOCKED), wakes
+    /// WAITING/SLEEPING parent runs, conditionally removes event_waits (only
+    /// when the wake succeeded — RUNNING parents keep their event_wait so the
+    /// partial-completion re-wait CTE can detect the missed signal), and
+    /// transitions parent tasks to PENDING.
     ///
     /// Must be called inside an existing transaction (`conn`).
     static func emitTaskCompletionSignal(
@@ -1163,77 +1292,51 @@ enum Queries {
         resultBuffer: ByteBuffer?,
         logger: Logger
     ) async throws {
-        let eventName = "$strand:task:\(taskID.uuidString)"
         let payloadBuf = try JSON.encode(["state": state.rawValue])
-
-        // Always persist to the permanent completion store so that
-        // awaitTaskResult finds the result even when called AFTER the
-        // task finishes (late subscriber — the original event is gone).
         try await conn.query(
             """
-            INSERT INTO strand.task_completions (task_id, state, result)
-            VALUES (\(taskID), \(state.rawValue), \(resultBuffer))
-            ON CONFLICT (task_id) DO NOTHING
+            WITH
+            ins_completion AS (
+                INSERT INTO strand.task_completions (namespace_id, task_id, state, result)
+                VALUES (\(namespaceID), \(taskID), \(state.rawValue), \(resultBuffer))
+                ON CONFLICT (task_id) DO NOTHING
+            ),
+            waits AS (
+                SELECT task_id AS parent_task_id, run_id
+                FROM   strand.event_waits
+                WHERE  child_task_id = \(taskID)
+                FOR UPDATE SKIP LOCKED
+            ),
+            woken AS (
+                UPDATE strand.runs r
+                SET state            = \(TaskState.pending),
+                    available_at     = NOW(),
+                    event_payload    = \(payloadBuf),
+                    wake_event       = NULL,
+                    lease_expires_at = NULL
+                FROM   waits w
+                WHERE  r.id           = w.run_id
+                  AND  r.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
+                  AND  r.namespace_id = \(namespaceID)
+                RETURNING r.id AS run_id
+            ),
+            del_waits AS (
+                -- Only delete the event_wait when the wake succeeded.
+                -- If the parent was RUNNING, woken is empty for that run
+                -- and the event_wait survives so the partial-completion
+                -- re-wait CTE can detect it on the next WAITING transition.
+                DELETE FROM strand.event_waits ew
+                USING  woken k
+                WHERE  ew.child_task_id = \(taskID)
+                  AND  ew.run_id        = k.run_id
+            )
+            UPDATE strand.tasks t SET state = \(TaskState.pending)
+            FROM   woken k
+            JOIN   waits w ON w.run_id = k.run_id
+            WHERE  t.id           = w.parent_task_id
+              AND  t.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
+              AND  t.namespace_id = \(namespaceID)
             """,
-            logger: logger
-        )
-
-        // Find every task waiting for this completion, across all queues.
-        let waitsStream = try await conn.query(
-            """
-            SELECT queue, task_id, run_id FROM strand.event_waits
-            WHERE event_name = \(eventName)
-            FOR UPDATE SKIP LOCKED
-            """,
-            logger: logger
-        )
-        var waits: [(queue: String, taskID: UUID, runID: UUID)] = []
-        for try await row in waitsStream {
-            var col = row.makeIterator()
-            waits.append(
-                (
-                    try col.next()!.decode(String.self, context: .default),
-                    try col.next()!.decode(UUID.self, context: .default),
-                    try col.next()!.decode(UUID.self, context: .default)
-                )
-            )
-        }
-        guard !waits.isEmpty else { return }
-
-        for wait in waits {
-            // Insert event on the WAITER's queue (not the completing task's queue).
-            try await conn.query(
-                """
-                INSERT INTO strand.events (namespace_id, queue, name, payload)
-                VALUES (\(namespaceID), \(wait.queue), \(eventName), \(payloadBuf))
-                ON CONFLICT (namespace_id, queue, name) DO UPDATE
-                SET payload = EXCLUDED.payload, created_at = NOW()
-                WHERE strand.events.payload IS NULL
-                """,
-                logger: logger
-            )
-            // Wake the suspended run and its parent task in one round trip.
-            try await conn.query(
-                """
-                WITH r AS (
-                    UPDATE strand.runs
-                    SET state = \(TaskState.pending), available_at = NOW(),
-                        event_payload = \(payloadBuf), wake_event = NULL,
-                        lease_expires_at = NULL
-                    WHERE id = \(wait.runID) AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
-                      AND namespace_id = \(namespaceID)
-                    RETURNING id
-                )
-                UPDATE strand.tasks SET state = \(TaskState.pending)
-                WHERE id = \(wait.taskID) AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
-                  AND namespace_id = \(namespaceID)
-                """,
-                logger: logger
-            )
-        }
-        // Remove processed waits.
-        try await conn.query(
-            "DELETE FROM strand.event_waits WHERE event_name = \(eventName)",
             logger: logger
         )
     }
@@ -1253,9 +1356,4 @@ private func retryDelay(strategy buf: ByteBuffer?, attempt: Int) -> TimeInterval
 private struct QueryError: Error, CustomStringConvertible {
     let description: String
     init(_ msg: String) { self.description = msg }
-}
-
-private struct ClaimTimeoutReason: Encodable, Sendable {
-    let name = "ClaimTimeout"
-    let message = "Worker did not complete the task within the claim timeout"
 }

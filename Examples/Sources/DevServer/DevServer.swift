@@ -96,8 +96,15 @@ struct FlakyTaskWorkflow: Workflow {
         context: WorkflowContext<Self>,
         input: String
     ) async throws -> String {
-        struct TransientFailure: Error, CustomStringConvertible {
+        struct TransientFailure: LocatableError, CustomStringConvertible {
             let attempt: Int
+            let sourceFileID: String
+            let sourceLine: Int
+            init(attempt: Int, fileID: String = #fileID, line: Int = #line) {
+                self.attempt = attempt
+                self.sourceFileID = fileID
+                self.sourceLine = line
+            }
             var description: String { "Transient failure on attempt \(attempt) — will retry" }
         }
         guard context.attempt >= 3 else {

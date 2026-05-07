@@ -286,8 +286,8 @@ extension StrandClient {
         // Wrapping both in a transaction means either the run wakes and the
         // signal is deliverable, or neither write survives.
         //
-        // `wakeWorkflowRun` is a no-op when the run is already PENDING or
-        // RUNNING, so it is safe to call unconditionally after every signal.
+        // The UPDATE on strand.runs is a no-op when the run is already PENDING
+        // or RUNNING, so it is safe to call unconditionally after every signal.
         let ns = namespaceID
         try await postgres.withTransaction(logger: logger) { conn in
             try await conn.query(

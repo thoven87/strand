@@ -38,7 +38,7 @@ package struct TaskSummaryRow: Sendable {
 }
 
 extension TaskSummaryRow {
-    /// Column order: id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, headers
+    /// Column order: id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, scheduling_metadata
     package init(row: PostgresRow) throws {
         var col = row.makeIterator()
         id = try col.next()!.decode(UUID.self, context: .default)
@@ -50,9 +50,7 @@ extension TaskSummaryRow {
         completedAt = try col.next()!.decode(Date?.self, context: .default)
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         parentTaskId = try col.next()!.decode(UUID?.self, context: .default)
-        let headersBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
-        let h = headersBuffer.flatMap { try? JSON.decode([String: String].self, from: $0) } ?? [:]
-        scheduleName = SchedulingMetadata.from(headers: h)?.scheduledBy
+        scheduleName = try col.next()!.decode(SchedulingMetadata?.self, context: .default)?.scheduledBy
     }
 }
 
@@ -93,9 +91,7 @@ extension TaskDetailRow {
         cancelledAt = try col.next()!.decode(Date?.self, context: .default)
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         parentTaskId = try col.next()!.decode(UUID?.self, context: .default)
-        let headersBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
-        let h = headersBuffer.flatMap { try? JSON.decode([String: String].self, from: $0) } ?? [:]
-        schedulingMetadata = SchedulingMetadata.from(headers: h)
+        schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
     }
 }
 
@@ -264,7 +260,7 @@ package enum ManagementQueries {
         let fetchLimit = limit + 1  // fetch one extra to detect a next page
         let stream = try await client.query(
             """
-            SELECT id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, headers
+            SELECT id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, scheduling_metadata
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
               AND (\(queue)::text IS NULL OR queue = \(queue))
@@ -296,7 +292,7 @@ package enum ManagementQueries {
             """
             SELECT id, name, queue, params, state, attempt, max_attempts,
                    created_at, first_run_at, completed_at, result, cancelled_at,
-                   kind, parent_task_id, headers
+                   kind, parent_task_id, scheduling_metadata
             FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
             """,
             logger: logger
@@ -368,7 +364,6 @@ package enum ManagementQueries {
             SELECT name, payload, created_at, queue
             FROM strand.events
             WHERE queue = \(queue)
-              AND name NOT LIKE '$strand:%'
               AND (\(cursor)::timestamptz IS NULL OR created_at < \(cursor))
             ORDER BY created_at DESC
             LIMIT \(fetchLimit)
@@ -400,7 +395,6 @@ package enum ManagementQueries {
             SELECT name, payload, created_at, queue
             FROM strand.events
             WHERE (\(queue)::text IS NULL OR queue = \(queue))
-              AND name NOT LIKE '$strand:%'
               AND (\(cursor)::timestamptz IS NULL OR created_at < \(cursor))
             ORDER BY created_at DESC
             LIMIT \(fetchLimit)
@@ -565,7 +559,7 @@ extension ManagementQueries {
         let fetchLimit = limit + 1
         let stream = try await client.query(
             """
-            SELECT id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, headers
+            SELECT id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, scheduling_metadata
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
               AND parent_task_id = \(parentTaskID)

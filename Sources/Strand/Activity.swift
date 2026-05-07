@@ -129,6 +129,12 @@ public struct ActivityContext: Sendable {
     public let attempt: Int
     /// Logger scoped to this activity execution.
     public let logger: Logger
+    /// When this activity task was originally enqueued.
+    ///
+    /// Decoded from the UUIDv7 timestamp embedded in `activityID` — the same
+    /// information that is stored in `strand.tasks.created_at`, available here
+    /// at zero cost without an extra DB column or init parameter.
+    public var queuedAt: Date { activityID.v7CreatedAt ?? Date() }
 
     // Package-internal: the parent workflow's task UUID (for parent_task_id FK).
     package let parentWorkflowID: UUID?
@@ -238,6 +244,22 @@ public struct Activity<P: Codable & Sendable, R: Codable & Sendable>: Sendable {
 public protocol ActivityDefinition: ActivityBox {
     associatedtype Input: Codable & Sendable
     associatedtype Output: Codable & Sendable
+    /// The typed error this activity can throw.
+    ///
+    /// Declare a concrete `Codable` error type to get direct typed propagation in
+    /// `WorkflowContext.runActivity` — no `ActivityError` wrapper, no `.cause` cast.
+    ///
+    /// ```swift
+    /// struct AddBankAccountActivity: ActivityDefinition {
+    ///     typealias Failure = BankAccountError   // BankAccountError: Codable
+    ///     func run(input: Input, context: ActivityContext) async throws(BankAccountError) -> Output {
+    ///         throw .invalidDetails
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Use `Failure = Never` for activities that never fail with a typed error.
+    associatedtype Failure: Error & Codable & Sendable = Never
 
     /// Unique registered name. Defaults to the Swift type name.
     static var name: String { get }
@@ -251,6 +273,18 @@ public protocol ActivityDefinition: ActivityBox {
     static var defaultTimeout: Duration? { get }
 
     /// Run the activity. May perform I/O. Called on each attempt.
+    ///
+    /// The function is declared `async throws` (untyped) so that activities that
+    /// use Swift's cancellation mechanism (`try await Task.sleep(...)`) compile
+    /// correctly regardless of their `Failure` type. Typed-throw enforcement is
+    /// voluntary: conformers that want compile-time guarantees write
+    /// `async throws(Failure) -> Output` on their own `run` declaration — Swift
+    /// accepts this as a subtype of the protocol requirement.
+    ///
+    /// `Failure` drives serialisation: Strand encodes the full `Codable` value
+    /// into `strand.runs.failure_reason` when a thrown error matches `Failure`,
+    /// and decodes it back in `WorkflowContext.runActivity` so the workflow sees
+    /// `Failure` directly — no `ActivityError` wrapper.
     func run(input: Input, context: ActivityContext) async throws -> Output
 }
 
@@ -265,7 +299,7 @@ extension ActivityDefinition {
     public var activityName: String { Self.name }
 }
 
-// Default ActivityBox._makeToken() and internal _run() entry point.
+// Internal _makeToken() and _run() entry point.
 // Every ActivityDefinition gets these for free — no manual implementation needed.
 extension ActivityDefinition {
 
@@ -351,22 +385,50 @@ extension ActivityDefinition {
             }
         )
         // OTel span: one span per activity execution attempt.
+        // SpanKind.consumer: child of the outer task consumer span; ServiceContext
+        // propagates automatically via task-local storage so no addLink is needed.
         // Zero-cost no-op when no tracing backend is bootstrapped.
-        let output = try await withSpan(Self.name, ofKind: .internal) { span in
-            span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(Self.name)
-            span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
-                TaskKind.activity.rawValue
+        do {
+            let output = try await withSpan(Self.name, ofKind: .consumer) { span in
+                span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(Self.name)
+                span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
+                    TaskKind.activity.rawValue
+                )
+                span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
+                    claimed.taskID.uuidString.lowercased()
+                )
+                span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
+                    claimed.runID.uuidString.lowercased()
+                )
+                span.attributes[StrandLogKeys.queue] = SpanAttribute.string(exec.queue)
+                span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(Int64(claimed.attempt))
+                return try await self.run(input: input, context: ctx)
+            }
+            return try JSON.encode(output)
+        } catch let typedFailure as Failure {
+            // Typed failure declared by the activity — encode the full Codable value.
+            let payloadData = (try? JSON.encode(typedFailure)).map { Data($0.readableBytesView) }
+            let src = (typedFailure as? any LocatableError).map { ($0.sourceFileID, $0.sourceLine) }
+            throw _TypedActivityFailure(
+                name: String(describing: type(of: typedFailure)),
+                message: strandErrorMessage(typedFailure),
+                payload: payloadData,
+                nonRetryable: typedFailure is any NonRetryableError,
+                source: src
             )
-            span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
-                claimed.taskID.uuidString.lowercased()
+        } catch is CancellationError {
+            // Worker shutdown — propagate for proper runTask handling.
+            throw CancellationError()
+        } catch {
+            // Non-typed or unexpected error (Failure = Never, or unhandled throw).
+            let src = (error as? any LocatableError).map { ($0.sourceFileID, $0.sourceLine) }
+            throw _TypedActivityFailure(
+                name: String(describing: type(of: error)),
+                message: strandErrorMessage(error),
+                payload: nil,
+                nonRetryable: error is any NonRetryableError,
+                source: src
             )
-            span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
-                claimed.runID.uuidString.lowercased()
-            )
-            span.attributes[StrandLogKeys.queue] = SpanAttribute.string(exec.queue)
-            span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(Int64(claimed.attempt))
-            return try await self.run(input: input, context: ctx)
         }
-        return try JSON.encode(output)
     }
 }

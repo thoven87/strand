@@ -172,8 +172,10 @@ private struct SimpleWorkflow: Workflow {
 private struct SimpleActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
+    var done: TestExpectation?
     func run(input: String, context: ActivityContext) async throws -> String {
-        input.uppercased()
+        done?.trigger()
+        return input.uppercased()
     }
 }
 
@@ -266,12 +268,13 @@ struct MetricsTests {
         let metrics = TestMetricsFactory()
 
         try await withTestEnvironment { client in
+            let done = TestExpectation()
             let workerTask = startWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ActivityWorkflowM.self],
-                activities: [SimpleActivity()],
+                activities: [SimpleActivity(done: done)],
                 metricsFactory: metrics
             )
             defer { workerTask.cancel() }
@@ -281,6 +284,7 @@ struct MetricsTests {
                 options: .init(),
                 input: "hello"
             )
+            try await done.wait(for: "SimpleActivity", timeout: .seconds(30))
             let result = try await handle.result(timeout: .seconds(10))
             #expect(result == "HELLO")
         }
@@ -340,12 +344,13 @@ struct TracingTests {
 
         // ── Activity span ─────────────────────────────────────────────────────
         try await withTestEnvironment { client in
+            let done = TestExpectation()
             let workerTask = startWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ActivityWorkflowM.self],
-                activities: [SimpleActivity()]
+                activities: [SimpleActivity(done: done)]
             )
             defer { workerTask.cancel() }
             let handle = try await client.startWorkflow(
@@ -353,7 +358,8 @@ struct TracingTests {
                 options: .init(),
                 input: "span-test"
             )
-            _ = try await handle.result(timeout: .seconds(10))
+            try await done.wait(for: "SimpleActivity", timeout: .seconds(30))
+            _ = try await awaitTerminal(client: client, taskID: handle.taskID, timeout: .seconds(10))
         }
 
         let actSpan = tracer.span(named: "SimpleActivity")

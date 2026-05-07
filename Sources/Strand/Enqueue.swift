@@ -256,10 +256,10 @@ public struct TaskResultSnapshot: Sendable, Codable {
 
     /// Decodes the result JSON into `T`. Internal — use `awaitTaskResult(id:as:)` instead.
     func decodeResult<T: Decodable>(as type: T.Type = T.self) throws -> T {
-        guard let json = resultJSON, let data = json.data(using: .utf8) else {
+        guard let json = resultJSON else {
             throw StrandError.serialization(underlying: MissingResultError())
         }
-        return try JSONDecoder().decode(type, from: data)
+        return try JSON.decode(type, from: json)
     }
 }
 

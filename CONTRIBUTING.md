@@ -80,16 +80,18 @@ retried. Can be enqueued standalone or called from a workflow.
 ### Execution Model
 
 1. Worker claims a run (`FOR UPDATE SKIP LOCKED`).
-2. Worker loads checkpoints into `WorkflowContext` / `TaskContext`.
-3. Handler calls `ctx.runActivity(...)` → enqueues activity, suspends via
-   `InternalError.suspend`, releases the worker slot.
-4. Activity runs on another worker slot.
-5. Activity completes → `emitTaskCompletionSignal` fires → orchestrator
-   transitions to `PENDING` → worker re-claims and re-runs from the top.
-6. On re-run, `ctx.runActivity(...)` hits the `task_completions` fast path and
-   returns immediately without suspension.
+2. If a cached handler `Task` exists for this workflow instance, `resumeActivation`
+   resumes the parked `CheckedContinuation` with the activity result and calls
+   `drain()` to continue the handler from exactly where it paused.
+3. If no cached `Task` exists (first activation or crash recovery), `_activate`
+   creates a fresh handler `Task`, loads checkpoints, and calls `drain()`.
+4. After `drain()` the worker writes schedule commands to Postgres and caches
+   the handler `Task`. The handler stays alive between activations, parked on
+   its continuations — no worker slot is held while waiting.
+5. When a child activity/workflow completes, `emitTaskCompletionSignal` wakes the
+   parent run (WAITING → PENDING). The worker re-claims it and repeats from step 2.
 
-No worker slot is held while an activity runs. The orchestrator is `SLEEPING`.
+No worker slot is held while an activity runs. The handler `Task` is parked in memory.
 
 ### State Transitions
 

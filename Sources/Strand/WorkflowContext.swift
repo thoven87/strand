@@ -12,7 +12,7 @@ public import Foundation
 
 /// Checkpoint sentinel persisted when a `waitForEvent` call times out.
 /// Detected on the next activation to immediately re-throw the timeout error.
-private struct TimeoutSentinel: Codable {
+struct TimeoutSentinel: Codable {
     let timeout: Bool
     init() { self.timeout = true }
     private enum CodingKeys: String, CodingKey { case timeout = "$timeout" }
@@ -39,8 +39,7 @@ private struct TimeoutSentinel: Codable {
 /// ## Why `@unchecked Sendable`
 /// `WorkflowContext<W>: Sendable` stores a reference to this object. The `@unchecked`
 /// is safe because the invariant above (single-task exclusive access) is enforced by
-/// the worker's claim mechanism and the `InternalError.suspend` protocol — never by
-/// Swift's type system.
+/// the worker's claim mechanism — never by Swift's type system.
 final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
 
     // MARK: - Identity (set once in init, never mutated)
@@ -100,6 +99,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         wakeEvent: String?,
         eventPayload: ByteBuffer?,
         headers: [String: String],
+        schedulingMetadata: SchedulingMetadata?,
         postgres: PostgresClient,
         logger: Logger,
         executor: StrandWorkflowExecutor,
@@ -117,7 +117,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         self.wakeEvent = wakeEvent
         self.eventPayload = eventPayload
         self.headers = headers
-        self.schedulingMetadata = SchedulingMetadata.from(headers: headers)
+        self.schedulingMetadata = schedulingMetadata
         self.postgres = postgres
         self.logger = logger
         self.executor = executor
@@ -301,7 +301,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///   - type: The `ActivityDefinition` conforming type to schedule.
     ///   - input: Encoded and forwarded to the activity handler.
     ///   - options: Routing, retry, and timeout overrides. Inherits from workflow defaults if omitted.
-    /// - Throws: `InternalError.suspend` when the activity is not yet complete (clean suspension).
+    /// - Throws: `A.Failure` directly when the activity failed with a typed failure (if declared).
     ///           `ActivityError` when the activity reached a terminal error state (all retries exhausted or cancelled).
     public func runActivity<A: ActivityDefinition>(
         _ type: A.Type,
@@ -319,11 +319,16 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Fast path 2a: activity terminated with FAILED or CANCELLED in a prior activation ───
-        // task_completions carries the terminal state; the executor pre-populates this map
-        // so we can throw immediately. Without this check the slow path would register an
-        // event_wait AFTER the completion signal already fired — a permanent deadlock.
         if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
             _impl.lastCallSite = (fileID, line)
+            // Attempt to decode the original typed Failure value from the stored payload.
+            // Falls back to ActivityError when Failure = Never or payload is absent.
+            if let buf = nonSuccess.failureReason,
+                let af = ActivityFailure.decode(from: buf),
+                let typedErr = af.decode(A.Failure.self)
+            {
+                throw typedErr
+            }
             let cause = nonSuccess.failureReason.flatMap { ActivityFailure.decode(from: $0) }
             let retryState: ActivityRetryState =
                 nonSuccess.state == .cancelled ? .cancelled : .maximumAttemptsReached
@@ -355,23 +360,26 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             )
         )
 
-        // Suspend via continuation. The executor stores this continuation; after
-        // drain() the worker applies the command to Postgres, then calls cancelPending()
-        // which resumes this continuation with StrandError.cancelled. That error
-        // propagates out of runActivity — signalling a clean end-of-activation.
-        //
-        // On the NEXT activation the activity may be complete; its result will be found
-        // in fast path 2 (pre-loaded) or fast path 1 (checkpoint already written).
-        //
-        // Note: `StrandError.cancelled` (not Swift's `CancellationError`) is used here
-        // because it is a domain-owned lifecycle signal, not a task primitive.
-        let _ = try await withCheckedThrowingContinuation {
-            (cont: CheckedContinuation<ByteBuffer, Error>) in
-            _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
+        // Suspend via continuation until the activity completes on the next activation.
+        // The worker resumes with the real result (resumeActivity) or an
+        // _ActivityFailureSignal (resumeActivityFailure) on re-activation.
+        do {
+            let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<ByteBuffer, Error>) in
+                _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
+            }
+            return try JSON.decode(A.Output.self, from: resultBuffer)
+        } catch let signal as _ActivityFailureSignal {
+            // Re-activation delivered a typed failure signal — try to decode A.Failure.
+            if let buf = signal.failureReason,
+                let af = ActivityFailure.decode(from: buf),
+                let typedErr = af.decode(A.Failure.self)
+            {
+                throw typedErr
+            }
+            let cause = signal.failureReason.flatMap { ActivityFailure.decode(from: $0) }
+            throw ActivityError(activityName: A.name, retryState: signal.retryState, cause: cause)
         }
-
-        // Unreachable — StrandError.cancelled always propagates before we get here.
-        throw StrandError.cancelled
     }
 
     /// Convenience overload for activities whose `Input` is `StrandVoid` (the codable unit type).
@@ -587,11 +595,9 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         let resultBuffer = try await withCheckedThrowingContinuation {
             (cont: CheckedContinuation<ByteBuffer, Error>) in
-            _impl.executor.suspendEvent(seqNum: seqNum, continuation: cont)
+            _impl.executor.suspendEvent(seqNum: seqNum, eventName: name, continuation: cont)
         }
 
-        // Unreachable: cancelPending() always resumes the continuation with
-        // StrandError.cancelled before the handler can reach this return.
         return try JSON.decode(T.self, from: resultBuffer)
     }
 
@@ -745,7 +751,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         let stateBox = _impl.stateBox
         let id = _impl.executor.registerCondition(
             predicate: { stateBox.withValue { predicate($0) } },
-            wakeAt: wakeAt
+            wakeAt: wakeAt,
+            timeout: timeout
         )
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             _impl.executor.linkConditionContinuation(cont, forID: id)
@@ -888,8 +895,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///   - type: The `Workflow` conforming type to enqueue as a child.
     ///   - options: Queue, priority, and concurrency overrides.
     ///   - input: Forwarded verbatim to the child workflow handler.
-    /// - Throws: `InternalError.suspend` on first scheduling.
-    ///           `StrandError.childWorkflowFailed` when the child reached a terminal error state.
+    /// - Throws: `StrandError.childWorkflowFailed` when the child reached a terminal error state.
     public func runChildWorkflow<CW: Workflow>(
         _ type: CW.Type,
         options: ChildWorkflowOptions = .init(),
@@ -936,12 +942,17 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             )
         )
 
-        let _ = try await withCheckedThrowingContinuation {
-            (cont: CheckedContinuation<ByteBuffer, Error>) in
-            _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
+        do {
+            let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<ByteBuffer, Error>) in
+                _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
+            }
+            return try JSON.decode(CW.Output.self, from: resultBuffer)
+        } catch let signal as _ActivityFailureSignal {
+            throw StrandError.childWorkflowFailed(
+                name: CW.workflowName,
+                state: signal.state.rawValue
+            )
         }
-
-        // Unreachable — StrandError.cancelled always propagates before we get here.
-        throw StrandError.cancelled
     }
 }

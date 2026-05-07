@@ -3,6 +3,7 @@ public import Logging
 import NIOCore
 // Re-export PostgresNIO so callers can use PostgresClient without an explicit import.
 public import PostgresNIO
+import Tracing
 
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
@@ -282,7 +283,8 @@ public struct StrandClient: Sendable {
         WorkflowHandle(
             workflowID: taskID.uuidString,
             taskID: taskID,
-            initialRunID: taskID,  // placeholder — initial run not needed for signal-only usage
+            initialRunID: taskID,  // attach() doesn't know the run ID; taskID is a safe fallback
+            // since signal/snapshot never dereference it
             client: self
         )
     }
@@ -386,32 +388,49 @@ public struct StrandClient: Sendable {
                     + Double($0.components.attoseconds) / 1_000_000_000_000_000_000
             )
         }
-        let row = try await Queries.enqueueTask(
-            on: postgres,
-            namespaceID: namespaceID,
-            queue: queue,
-            taskName: taskName,
-            paramsBuffer: try JSON.encode(params),
-            headersBuffer: headers.isEmpty ? nil : try JSON.encode(headers),
-            retryStrategyBuffer: try JSON.encode(retryStrategy),
-            maxAttempts: maxAttempts,
-            cancellationBuffer: try cancellation.map { try JSON.encode($0) },
-            idempotencyKey: idempotencyKey,
-            priority: priority.rawValue,
-            scheduledAt: delayUntil,
-            deadlineAt: deadlineAt,
-            fairnessKey: fairnessKey,
-            fairnessWeight: fairnessWeight,
-            kind: kind,
-            parentTaskID: parentTaskID,
-            logger: logger
-        )
-        return EnqueueResult(
-            taskID: row.taskID,
-            runID: row.runID,
-            attempt: row.attempt,
-            createdAt: Date.now
-        )
+        // Producer span: wraps the DB insert so that the context injected into
+        // task headers IS this span's context. The worker's consumer span then
+        // addLink-s back here, completing the producer → consumer trace link.
+        // Zero-cost no-op when no tracing backend is bootstrapped.
+        return try await withSpan(taskName, ofKind: .producer) { span in
+            span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(taskName)
+            span.attributes[StrandLogKeys.queue] = SpanAttribute.string(queue)
+            span.attributes[StrandLogKeys.namespace] = SpanAttribute.string(namespaceID)
+
+            // Inject inside the producer span — ServiceContext.current is now the
+            // producer span itself, which is what the consumer will link back to.
+            var h = headers
+            if let ctx = ServiceContext.current {
+                InstrumentationSystem.tracer.inject(ctx, into: &h, using: DictionaryInjector())
+            }
+
+            let row = try await Queries.enqueueTask(
+                on: postgres,
+                namespaceID: namespaceID,
+                queue: queue,
+                taskName: taskName,
+                paramsBuffer: try JSON.encode(params),
+                headersBuffer: h.isEmpty ? nil : try JSON.encode(h),
+                retryStrategyBuffer: try JSON.encode(retryStrategy),
+                maxAttempts: maxAttempts,
+                cancellationBuffer: try cancellation.map { try JSON.encode($0) },
+                idempotencyKey: idempotencyKey,
+                priority: priority.rawValue,
+                scheduledAt: delayUntil,
+                deadlineAt: deadlineAt,
+                fairnessKey: fairnessKey,
+                fairnessWeight: fairnessWeight,
+                kind: kind,
+                parentTaskID: parentTaskID,
+                logger: logger
+            )
+            return EnqueueResult(
+                taskID: row.taskID,
+                runID: row.runID,
+                attempt: row.attempt,
+                createdAt: Date.now
+            )
+        }
     }
 
     // MARK: - Events

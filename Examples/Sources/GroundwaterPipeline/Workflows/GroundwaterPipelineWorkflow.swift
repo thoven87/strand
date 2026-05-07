@@ -123,7 +123,11 @@ struct GroundwaterPipelineWorkflow: Workflow {
         }
 
         // ── Finalise pipeline_runs record ──────────────────────────────────────
-        let durationSecs = context.activationTime.timeIntervalSince(startTime)
+        // Use Date() here — not context.activationTime. In the cached-Task model
+        // activationTime is captured once at the FIRST activation and is identical
+        // on every subsequent activation, so it cannot measure total elapsed time.
+        // This is the final statement; the value is never replayed.
+        let durationSecs = Date().timeIntervalSince(startTime)
 
         return PipelineResult(
             jobID: input.jobID,

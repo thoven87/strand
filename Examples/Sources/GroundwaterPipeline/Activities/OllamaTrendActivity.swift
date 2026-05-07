@@ -25,7 +25,7 @@ struct OllamaTrendActivity: ActivityDefinition {
         )
 
         let prompt = buildPrompt(input)
-        let result = try await callOllama(prompt: prompt, logger: context.logger)
+        let result = try await callOllama(prompt: prompt, countyName: input.countyName, logger: context.logger)
 
         // Persist the AI result to county_stats
         try await postgres.query(
@@ -93,6 +93,7 @@ struct OllamaTrendActivity: ActivityDefinition {
 
 private func callOllama(
     prompt: String,
+    countyName: String,
     logger: Logger
 ) async throws -> OllamaTrendOutput {
     struct OllamaRequest: Encodable {
@@ -146,7 +147,7 @@ private func callOllama(
             trend = "UNKNOWN"
         }
         return OllamaTrendOutput(
-            countyName: "",
+            countyName: countyName,
             trend: trend,
             narrative: ollamaResp.response.trimmingCharacters(in: .whitespacesAndNewlines)
         )
@@ -155,7 +156,7 @@ private func callOllama(
     // Sanitise trend value
     let validTrends = Set(["DECLINING", "STABLE", "RECOVERING", "UNKNOWN"])
     let trend = validTrends.contains(tj.trend.uppercased()) ? tj.trend.uppercased() : "UNKNOWN"
-    return OllamaTrendOutput(countyName: "", trend: trend, narrative: tj.narrative)
+    return OllamaTrendOutput(countyName: countyName, trend: trend, narrative: tj.narrative)
 }
 
 enum OllamaError: Error, CustomStringConvertible, LocalizedError {

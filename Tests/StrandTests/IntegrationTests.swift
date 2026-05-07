@@ -14,7 +14,7 @@ import Foundation
 
 // MARK: - Test-local error types
 
-private struct DeliberateFailure: Error {
+private struct DeliberateFailure: Error, Codable, Sendable {
     let reason: String
 }
 
@@ -209,6 +209,7 @@ private struct ActivityWorkflow: Workflow {
 private struct FlakyActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
+    typealias Failure = DeliberateFailure
 
     static let name = "flaky-activity"
     static let executionCount = AtomicCounter()

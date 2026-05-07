@@ -1,3 +1,6 @@
+import NIOCore
+import PostgresNIO
+
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
 #else
@@ -58,21 +61,38 @@ public struct SchedulingMetadata: Codable, Sendable {
     }
 }
 
-extension SchedulingMetadata {
-    /// The single header key under which the full ``SchedulingMetadata`` JSON is stored.
-    ///
-    /// ``StrandScheduler`` encodes the struct here; ``SchedulingMetadata/from(headers:)``
-    /// decodes it. Having one key with a typed payload is safer than multiple
-    /// individual string keys that can drift out of sync.
-    package static let headerKey = "$strand:scheduling"
+// MARK: - PostgresCodable
 
-    /// Decodes the scheduling metadata written by ``StrandScheduler`` from the task
-    /// headers. Returns `nil` when the task was enqueued directly (not via a schedule).
-    ///
-    /// Called once per activation in `_WorkflowActivation.init` and stored as a typed
-    /// field — not re-parsed on every ``WorkflowContext/schedulingMetadata`` access.
-    package static func from(headers: [String: String]) -> SchedulingMetadata? {
-        guard let json = headers[headerKey] else { return nil }
-        return try? JSONDecoder().decode(SchedulingMetadata.self, from: Data(json.utf8))
+/// Stores and retrieves `SchedulingMetadata` as a BYTEA JSON blob.
+///
+/// Strand's convention is plain BYTEA (no JSONB version-byte prefix), so we
+/// provide a custom conformance rather than relying on PostgresNIO's default
+/// `Codable` extension which targets `.jsonb`.
+///
+/// On the decode side PostgresNIO calls `context.jsonDecoder.decode(_:from:)`,
+/// which dispatches to `JSONDecoder.decode(_:from:ByteBuffer)` (from
+/// NIOFoundationCompat) and uses `byteTransferStrategy: .noCopy` internally —
+/// zero extra Data allocation.
+extension SchedulingMetadata: PostgresCodable {
+    static var psqlType: PostgresDataType { .bytea }
+    static var psqlFormat: PostgresFormat { .binary }
+
+    func encode<JSONEncoder: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) throws {
+        try context.jsonEncoder.encode(self, into: &byteBuffer)
+    }
+
+    init<JSONDecoder: PostgresJSONDecoder>(
+        from buffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<JSONDecoder>
+    ) throws {
+        guard case (.binary, .bytea) = (format, type) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = try context.jsonDecoder.decode(SchedulingMetadata.self, from: buffer)
     }
 }

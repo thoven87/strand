@@ -87,7 +87,7 @@ extension ClaimedTask {
         parentWorkflowID = try col.next()!.decode(UUID?.self, context: .default)
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         timeoutSeconds = try col.next()!.decode(Int?.self, context: .default)
-        schedulingMetadata = SchedulingMetadata.from(headers: h)
+        schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
     }
 }
 
@@ -151,7 +151,7 @@ enum AwaitEventResult: Sendable {
     case payload(ByteBuffer)
     /// The run was woken after a timeout (wake_event matches, event_payload nil).
     case timedOut
-    /// Wait registered; task should throw `InternalError.suspend`.
+    /// Wait registered; run transitioned to WAITING/SLEEPING.
     case suspended
 }
 

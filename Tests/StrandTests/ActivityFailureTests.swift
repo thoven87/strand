@@ -30,6 +30,7 @@ import Foundation
 private struct AlwaysFailingActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
+    typealias Failure = AlwaysFailingError
 
     static let name = "always-failing-activity-regression"
 
@@ -38,7 +39,7 @@ private struct AlwaysFailingActivity: ActivityDefinition {
     }
 }
 
-private struct AlwaysFailingError: Error, CustomStringConvertible {
+private struct AlwaysFailingError: Error, Codable, Sendable, CustomStringConvertible {
     let attempt: Int
     var description: String { "unconditional failure on attempt \(attempt)" }
 }
@@ -59,7 +60,7 @@ private struct CatchingActivityFailureWorkflow: Workflow {
                 input: input,
                 options: .init(maxAttempts: 1, retryStrategy: .constant(.zero))
             )
-        } catch is ActivityError {
+        } catch is AlwaysFailingError {
             // Compensating path: activity exhausted all retries; acknowledge
             // and return a stable sentinel so the test can verify we got here.
             return "compensated"
