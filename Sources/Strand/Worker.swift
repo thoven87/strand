@@ -112,11 +112,17 @@ public struct WorkerOptions: Sendable {
     /// resources. Jitter spreads the herd across a window so only the first few
     /// workers to fire actually find tasks, and the rest skip the round-trip.
     ///
-    /// Tuning guidance:
-    /// - 0 workers / single worker: `.zero` (no overhead)
-    /// - ~10 workers: `.milliseconds(20)` — 2‐3 concurrent claims on average
-    /// - ~100 workers: `.milliseconds(100)` — a few concurrent claims
-    /// - 300+ workers: `.milliseconds(300)`
+    /// With a jitter window of W ms and N workers, the average number of
+    /// concurrent claims after one notification is:
+    ///
+    ///     concurrent_claims ≈ N / W_ms
+    ///
+    /// Keep this around 2–5 to avoid unnecessary DB load:
+    ///
+    /// - 1 worker: `.zero` (no overhead)
+    /// - ~10 workers: `.milliseconds(20)` — ~2–3 concurrent claims
+    /// - ~100 workers: `.milliseconds(100)` — ~2–3 concurrent claims
+    /// - 300+ workers: `.milliseconds(300)` — ~2–3 concurrent claims
     ///
     /// Jitter is **not** applied to the fallback `pollInterval` wakeup — those
     /// are already staggered naturally because workers start at different times.
@@ -343,20 +349,17 @@ public struct StrandWorker: Service {
         )
 
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
-        // Buffer capacity 1: all notifications mean the same thing ("there might be
-        // work"). A second signal while the worker is busy processing tasks is
-        // redundant — drop it. Without this bound the buffer grows without limit
-        // while the worker is at capacity, then drains in a tight loop (100 % CPU).
-        let (wakeStream, wakeCont) = AsyncStream.makeStream(
-            of: Void.self,
-            bufferingPolicy: .bufferingNewest(1)
-        )
+        // Signal shared between listenLoop (producer) and pollLoop (consumer).
+        // _SlotSignal (Mutex + CheckedContinuation) has buffer-of-1 semantics:
+        // a notification that arrives while the worker is busy is stored and
+        // consumed on the next idle check with no allocation or task creation.
+        let notifySignal = _SlotSignal()
 
         try await withTaskCancellationOrGracefulShutdownHandler {
             do {
                 try await withThrowingTaskGroup(of: Void.self) { group in
-                    group.addTask { try await self.pollLoop(workerID: workerID, wakeStream: wakeStream) }
-                    group.addTask { try await self.listenLoop(wakeSignal: wakeCont) }
+                    group.addTask { try await self.pollLoop(workerID: workerID, notifySignal: notifySignal) }
+                    group.addTask { try await self.listenLoop(notifySignal: notifySignal) }
                     group.addTask { try await self.leaseExpiryLoop() }
                     group.addTask {
                         // Wait for shutdown signal.
@@ -402,7 +405,7 @@ public struct StrandWorker: Service {
     ///
     /// When all slots are occupied the loop parks on `_SlotSignal` — a
     /// `Mutex`-backed async wakeup that resumes as soon as any slot is freed.
-    private func pollLoop(workerID: String, wakeStream: AsyncStream<Void>) async throws {
+    private func pollLoop(workerID: String, notifySignal: _SlotSignal) async throws {
         let queueName = options.queue
         let maxConcurrency =
             options.batchSize ?? (options.workflowConcurrency + options.activityConcurrency)
@@ -456,19 +459,17 @@ public struct StrandWorker: Service {
                 }
 
                 if claimed.isEmpty {
-                    // No runnable tasks — park until a LISTEN/NOTIFY wakeup or the
-                    // fallback poll interval fires (whichever comes first).
+                    // No runnable tasks — park until listenLoop signals a new
+                    // PENDING task or the fallback interval fires.
                     try Task.checkCancellation()
-                    enum _WakeSource { case notification, fallback }
-                    let source = await withTaskGroup(of: _WakeSource.self) { sleepGroup in
+                    let wasNotified = await withTaskGroup(of: Bool.self) { sleepGroup in
                         sleepGroup.addTask {
-                            var iter = wakeStream.makeAsyncIterator()
-                            _ = await iter.next()
-                            return .notification
+                            try? await notifySignal.wait()  // returns on signal or cancellation
+                            return true
                         }
                         sleepGroup.addTask {
                             try? await Task.sleep(for: self.options.pollInterval)
-                            return .fallback
+                            return false
                         }
                         let first = await sleepGroup.next()!
                         sleepGroup.cancelAll()
@@ -477,10 +478,7 @@ public struct StrandWorker: Service {
                     // Apply jitter only to NOTIFY wakeups.
                     // Fallback polls are already staggered because workers start at
                     // different times; adding jitter there would only hurt latency.
-                    // Jitter spreads the thundering herd: with N workers and a
-                    // jitter window W, only ~1/(W_ms) workers claim per millisecond
-                    // rather than all N hitting Postgres simultaneously.
-                    if source == .notification {
+                    if wasNotified {
                         let jitter = options.notifyJitter
                         if jitter > .zero {
                             let maxMs =
@@ -558,7 +556,7 @@ public struct StrandWorker: Service {
     /// Reconnects automatically on connection loss (network hiccup, Postgres
     /// restart). Cancellation tears down the connection cleanly via the
     /// structured-concurrency cancel path.
-    private func listenLoop(wakeSignal: AsyncStream<Void>.Continuation) async throws {
+    private func listenLoop(notifySignal: _SlotSignal) async throws {
         let channel = StrandChannels.tasks
         let myNotification = StrandChannels.Notification(namespace: namespace, queue: options.queue)
 
@@ -569,7 +567,7 @@ public struct StrandWorker: Service {
                     try await conn.listen(on: channel) { notifications in
                         for try await note in notifications {
                             if note.payload == myNotification.payload {
-                                wakeSignal.yield(())
+                                notifySignal.signal()
                             }
                         }
                     }
@@ -578,7 +576,7 @@ public struct StrandWorker: Service {
                 return
             } catch {
                 logger.warning(
-                    "LISTEN connection lost \u{2014} reconnecting",
+                    "LISTEN connection lost — reconnecting",
                     metadata: .forError(error)
                 )
                 try await Task.sleep(for: .seconds(1))
