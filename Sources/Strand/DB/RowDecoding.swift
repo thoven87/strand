@@ -151,7 +151,7 @@ enum AwaitEventResult: Sendable {
     case payload(ByteBuffer)
     /// The run was woken after a timeout (wake_event matches, event_payload nil).
     case timedOut
-    /// Wait registered; task should throw `InternalError.suspend`.
+    /// Wait registered; run transitioned to WAITING/SLEEPING.
     case suspended
 }
 

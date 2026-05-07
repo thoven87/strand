@@ -149,7 +149,7 @@ struct WorkerLifecycleTests {
     //  9. Assert state == .completed and attempt == 2.
     //
     @Test(
-        "expired lease is swept by leaseExpiryLoop and the task retries on attempt 2",
+        "expired lease is swept by leaseExpiryLoop and re-queued transparently at the same attempt",
         .tags(.integration)
     )
     func expiredLeaseRetriedByNewWorker() async throws {
@@ -226,14 +226,16 @@ struct WorkerLifecycleTests {
             )
             #expect(snap.state == .completed)
 
-            // 9. Verify the retry incremented the attempt counter to 2.
+            // 9. Verify the sweep re-queued the same attempt (no attempt increment).
+            // A lease expiry is an infrastructure event, not a business failure —
+            // the task's retry budget must not be consumed.
             if let detail = try await ManagementQueries.getTask(
                 on: client.postgres,
                 namespaceID: "default",
                 taskID: enq.taskID,
                 logger: client.logger
             ) {
-                #expect(detail.attempt == 2)
+                #expect(detail.attempt == 1)
             } else {
                 Issue.record("task detail row not found after completion")
             }

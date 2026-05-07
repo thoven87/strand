@@ -32,7 +32,8 @@ private struct AddOneActivity: ActivityDefinition {
 private struct FailingLocalActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
-    struct LocalError: Error {}
+    typealias Failure = LocalError
+    struct LocalError: Error, Codable, Sendable {}
     func run(input: String, context: ActivityContext) async throws -> String {
         throw LocalError()
     }

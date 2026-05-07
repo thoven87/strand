@@ -247,20 +247,28 @@ CREATE TABLE IF NOT EXISTS strand.events (
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS strand.event_waits (
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
-    task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
-    run_id       UUID        NOT NULL REFERENCES strand.runs(id) ON DELETE CASCADE,
-    queue        TEXT        NOT NULL,
-    step_name    TEXT        NOT NULL,
-    event_name   TEXT        NOT NULL,
-    timeout_at   TIMESTAMPTZ,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT strand_event_waits_pkey PRIMARY KEY (run_id, step_name)
+    namespace_id  TEXT        NOT NULL DEFAULT 'default',
+    task_id       UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    run_id        UUID        NOT NULL REFERENCES strand.runs(id) ON DELETE CASCADE,
+    queue         TEXT        NOT NULL,
+    seq_num       INTEGER     NOT NULL,
+    -- Named-event waits (context.waitForEvent): event_name is non-null, child_task_id is null.
+    -- Task-completion waits (runActivity / runChildWorkflow): child_task_id is non-null, event_name is null.
+    -- The two are mutually exclusive; exactly one is non-null per row.
+    event_name    TEXT,
+    child_task_id UUID        REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    timeout_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_event_waits_pkey PRIMARY KEY (run_id, seq_num)
 );
 
--- Wake-up lookup: namespace_id first
+-- Wake-up lookup by named event (waitForEvent path).
 CREATE INDEX IF NOT EXISTS strand_event_waits_event_idx
     ON strand.event_waits (namespace_id, queue, event_name);
+
+-- Wake-up lookup by child task ID (runActivity / runChildWorkflow completion path).
+CREATE INDEX IF NOT EXISTS strand_event_waits_child_task_idx
+    ON strand.event_waits (child_task_id) WHERE child_task_id IS NOT NULL;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Task completions — permanent terminal record for every finished task.

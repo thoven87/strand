@@ -8,20 +8,34 @@ public import Foundation
 
 // MARK: - ActivityError
 
-/// Thrown by `WorkflowContext.runActivity(_:input:options:)` when the activity
-/// reaches a terminal non-success state after exhausting all retry attempts.
+/// Fallback error thrown by `WorkflowContext.runActivity(_:input:options:)` when
+/// an activity with `Failure = Never` (or an unrecognised payload) reaches a
+/// terminal non-success state.
 ///
-/// The underlying error from the activity lives in ``cause`` so workflows can
-/// inspect it without matching on raw string activity names.
+/// ## Typed failures (preferred)
+///
+/// When an activity declares `typealias Failure = MyError` (where `MyError: Codable`),
+/// `runActivity` decodes and throws `MyError` **directly** — no `ActivityError` wrapper:
 ///
 /// ```swift
+/// // Activity declares: typealias Failure = PaymentError
 /// do {
 ///     let result = try await context.runActivity(ChargeCardActivity.self, input: req)
+/// } catch let err as PaymentError {
+///     // err is the original typed value — no unwrapping needed
+/// }
+/// ```
+///
+/// ## Untyped fallback
+///
+/// For activities with `Failure = Never` (the default), `ActivityError` is thrown.
+/// ``cause`` carries an ``ActivityFailure`` with the stored name and message:
+///
+/// ```swift
 /// } catch let err as ActivityError {
 ///     if err.retryState == .maximumAttemptsReached {
 ///         // compensate — roll back earlier steps
 ///     }
-///     logger.error("activity failed", metadata: ["cause": "\(err.cause?.localizedDescription ?? "")"])
 /// }
 /// ```
 public struct ActivityError: Error, LocalizedError, Sendable {
@@ -66,18 +80,16 @@ public enum ActivityRetryState: String, Sendable, CustomStringConvertible {
 
 /// Deserialized representation of an activity's stored failure reason.
 ///
-/// When `runActivity()` throws `ActivityError`, the ``ActivityError/cause`` is an
-/// `ActivityFailure` decoded from `strand.runs.failure_reason`. This lets workflows
-/// inspect the original error type name and message without a direct type dependency
-/// on the activity's error type.
+/// When `runActivity()` cannot decode the original typed `A.Failure` value
+/// (e.g. when the activity declared `Failure = Never`), it falls back to
+/// throwing ``ActivityError`` whose ``ActivityError/cause`` is an
+/// `ActivityFailure`.
 ///
 /// ```swift
 /// } catch let err as ActivityError {
 ///     if let failure = err.cause as? ActivityFailure {
 ///         print(failure.name)     // "OllamaActivityError"
 ///         print(failure.message)  // "Ollama returned HTTP 500"
-///         print(failure.fileID)   // "AIAgent/OllamaCallActivity.swift"
-///         print(failure.line)     // 42
 ///     }
 /// }
 /// ```
@@ -86,33 +98,41 @@ public struct ActivityFailure: Error, LocalizedError, Sendable {
     public let name: String
     /// The `localizedDescription` of the original error.
     public let message: String
-    /// The source file captured by `#fileID` at the `context.runActivity(...)` call site.
-    public let fileID: String?
-    /// The source line captured by `#line` at the `context.runActivity(...)` call site.
-    public let line: Int?
+    /// Base64-encoded JSON of the original `Failure` value (if it was `Codable`).
+    /// Use `decode(_:)` to recover the original typed error.
+    let payload: Data?
 
     public var errorDescription: String? { "\(name): \(message)" }
+
+    /// Attempts to decode the original typed failure value from the stored payload.
+    ///
+    /// Returns `nil` when no payload is stored (activity declared `Failure = Never`)
+    /// or when the payload cannot be decoded as `F`.
+    ///
+    /// ```swift
+    /// } catch let err as ActivityError {
+    ///     if let bankErr = (err.cause as? ActivityFailure)?.decode(BankAccountError.self) {
+    ///         print(bankErr)  // BankAccountError.invalidDetails
+    ///     }
+    /// }
+    /// ```
+    public func decode<F: Error & Decodable>(_ type: F.Type) -> F? {
+        guard let data = payload else { return nil }
+        let buf = ByteBuffer(bytes: data)
+        return try? JSON.decode(type, from: buf)
+    }
 }
 
 extension ActivityFailure {
-    /// Attempt to deserialize an `ActivityFailure` from the raw JSON stored in
+    /// Deserialise an `ActivityFailure` from the raw JSON stored in
     /// `strand.runs.failure_reason`. Returns `nil` when the buffer is unreadable.
     package static func decode(from buffer: ByteBuffer) -> ActivityFailure? {
         struct Payload: Decodable {
             let name: String
             let message: String
-            let source: Source?
-            struct Source: Decodable {
-                let file_id: String?
-                let line: Int?
-            }
+            let payload: Data?
         }
-        guard let payload = try? JSON.decode(Payload.self, from: buffer) else { return nil }
-        return ActivityFailure(
-            name: payload.name,
-            message: payload.message,
-            fileID: payload.source?.file_id,
-            line: payload.source?.line
-        )
+        guard let p = try? JSON.decode(Payload.self, from: buffer) else { return nil }
+        return ActivityFailure(name: p.name, message: p.message, payload: p.payload)
     }
 }

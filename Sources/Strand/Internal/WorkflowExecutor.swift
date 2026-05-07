@@ -62,24 +62,16 @@ enum WorkflowCommand: Sendable {
 
 /// The deterministic serial executor for workflow activations.
 ///
-/// **How it works**
-///
-/// 1. The worker calls `resolveCompleted(_:)` with results of previously-completed
-///    child activities (keyed by checkpoint name).
-/// 2. The worker creates `Task(executorPreference: executor)` for the handler.
-/// 3. The worker calls `drain()` — runs all buffered jobs synchronously. The
-///    handler body is pure: it emits `WorkflowCommand` values and stores
-///    `CheckedContinuation` references; it never touches the DB.
-/// 4. After `drain()` the executor's `pendingCommands` array holds everything the
-///    worker needs to write to Postgres.
-/// 5. The worker calls `cancelPending()` → all suspended continuations throw
-///    `CancellationError` → the handler task completes.
-/// 6. The worker calls `drain()` once more to flush the cancellation jobs.
+/// One instance is created per workflow type at registration time and stored in
+/// `_WorkflowTaskCache<W>`. The handler `Task` stays alive between activations,
+/// parked on `CheckedContinuation`s here. On re-activation the worker calls the
+/// Resume API (`resumeActivity`, `resumeAllTimers`, etc.) to deliver real results,
+/// then calls `drain()` to continue the handler from where it paused.
 ///
 /// **Why `@unchecked Sendable`**
 ///
-/// All access occurs on a single thread — the drain loop caller. Never share
-/// this object across concurrent tasks or call `drain()` from two threads.
+/// All access occurs on the drain loop caller's thread. Never share this object
+/// across concurrent tasks or call `drain()` from two threads at once.
 /// A local activity scheduled for in-process execution post-drain.
 struct LocalActivityEntry {
     /// Registered activity name, used to look up the runner in `_WorkerExec`.
@@ -100,6 +92,9 @@ struct ConditionEntry {
     let predicate: @Sendable () -> Bool
     /// Deadline for `condition(_:timeout:)` waits; `nil` for indefinite conditions.
     let wakeAt: Date?
+    /// Original timeout duration — used only for the error message in
+    /// `resumeExpiredConditions()` to match the fresh-activation message exactly.
+    let timeout: Duration?
     /// Parked continuation. Linked immediately after the task suspends via
     /// `linkConditionContinuation(_:forID:)`.
     var continuation: CheckedContinuation<Void, Error>?
@@ -154,8 +149,12 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     private var activityContinuations: [Int: CheckedContinuation<ByteBuffer, Error>] = [:]
     /// Timer continuations parked by `suspendTimer(seqNum:continuation:)`.
     private var timerContinuations: [Int: CheckedContinuation<Void, Error>] = [:]
-    /// Event-wait continuations parked by `suspendEvent(seqNum:continuation:)`.
+    /// Event-wait continuations parked by `suspendEvent(seqNum:eventName:continuation:)`.
     private var eventContinuations: [Int: CheckedContinuation<ByteBuffer, Error>] = [:]
+    /// Maps event name → seqNum for parked event continuations.
+    /// Populated by `suspendEvent`; lets the worker look up the right continuation
+    /// when a named event fires on a cached re-activation.
+    private var eventNameToSeqNum: [String: Int] = [:]
     /// Condition entries keyed by auto-incrementing ID. Each entry stores the
     /// predicate closure and (after the task suspends) its continuation.
     /// Predicates are evaluated POST-drain so `stateBox.value` is never read
@@ -354,10 +353,8 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
 
     /// Store an activity continuation. The task suspends after this returns.
     ///
-    /// The worker cancels this continuation via `cancelPending()` after applying
-    /// `pendingCommands` to Postgres. On the next activation the activity result
-    /// will appear in `preloadedResults` and the handler will replay past this point
-    /// without suspension.
+    /// The continuation stays parked until `resumeActivity(seqNum:result:)` or
+    /// `resumeActivityFailure(seqNum:error:)` is called on re-activation.
     func suspendActivity(
         seqNum: Int,
         continuation: CheckedContinuation<ByteBuffer, Error>
@@ -374,11 +371,82 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     }
 
     /// Store an event-wait continuation. The task suspends after this returns.
+    /// `eventName` is recorded so the worker can resume this continuation by name
+    /// on a cached re-activation (see `seqNum(forEventName:)` and `resumeEvent`).
     func suspendEvent(
         seqNum: Int,
+        eventName: String,
         continuation: CheckedContinuation<ByteBuffer, Error>
     ) {
         eventContinuations[seqNum] = continuation
+        eventNameToSeqNum[eventName] = seqNum
+    }
+
+    // MARK: - Resume API
+    //
+    // Called by the worker on re-activation to deliver real results to the parked
+    // continuations. After calling the appropriate resume method(s), the worker
+    // calls drain() to continue the handler from where it paused.
+    // All access is from a single drain() caller — no locking needed.
+
+    /// Resume an activity or child-workflow continuation with a successful result.
+    func resumeActivity(seqNum: Int, result: ByteBuffer) {
+        activityContinuations.removeValue(forKey: seqNum)?.resume(returning: result)
+    }
+
+    /// Resume an activity or child-workflow continuation with a failure error.
+    func resumeActivityFailure(seqNum: Int, error: Error) {
+        activityContinuations.removeValue(forKey: seqNum)?.resume(throwing: error)
+    }
+
+    /// Resume all parked timer continuations (timer elapsed; run woken from SLEEPING).
+    /// In normal operation at most one timer is active at a time.
+    func resumeAllTimers() {
+        let keys = Array(timerContinuations.keys)
+        for seqNum in keys {
+            timerContinuations.removeValue(forKey: seqNum)?.resume()
+        }
+    }
+
+    /// Resume the event continuation identified by `seqNum` with the delivered payload.
+    func resumeEvent(seqNum: Int, payload: ByteBuffer) {
+        eventContinuations.removeValue(forKey: seqNum)?.resume(returning: payload)
+        eventNameToSeqNum = eventNameToSeqNum.filter { $1 != seqNum }
+    }
+
+    /// Resume the event continuation for `eventName` with a timeout error (no payload arrived).
+    func resumeEventWithTimeout(seqNum: Int, eventName: String) {
+        eventContinuations.removeValue(forKey: seqNum)?
+            .resume(throwing: StrandError.timeout(message: "Timed out waiting for event \"\(eventName)\""))
+        eventNameToSeqNum.removeValue(forKey: eventName)
+    }
+
+    /// Returns the seqNum for the parked event continuation registered under `name`, or `nil`.
+    func seqNum(forEventName name: String) -> Int? {
+        eventNameToSeqNum[name]
+    }
+
+    /// Resume any condition continuations whose deadlines have elapsed.
+    /// Returns `true` when at least one was resumed (caller should `drain()` and loop).
+    func resumeExpiredConditions() -> Bool {
+        let now = Date()
+        for (id, entry) in conditionEntries {
+            if let wakeAt = entry.wakeAt, now >= wakeAt {
+                conditionEntries.removeValue(forKey: id)
+                let msg =
+                    entry.timeout.map { "condition timed out after \($0)" }
+                    ?? "condition timed out"
+                entry.continuation?.resume(throwing: StrandError.timeout(message: msg))
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Discard all accumulated commands from a previous activation before resuming
+    /// cached continuations and re-draining. Only call on the cached activation path.
+    func clearPendingCommands() {
+        pendingCommands.removeAll()
     }
 
     // MARK: - Condition API
@@ -398,11 +466,12 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     ///   - wakeAt: Deadline for `condition(_:timeout:)`, `nil` for indefinite waits.
     func registerCondition(
         predicate: @escaping @Sendable () -> Bool,
-        wakeAt: Date? = nil
+        wakeAt: Date? = nil,
+        timeout: Duration? = nil
     ) -> Int {
         let id = nextConditionID
         nextConditionID += 1
-        conditionEntries[id] = ConditionEntry(predicate: predicate, wakeAt: wakeAt)
+        conditionEntries[id] = ConditionEntry(predicate: predicate, wakeAt: wakeAt, timeout: timeout)
         return id
     }
 
@@ -436,18 +505,14 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
         conditionEntries.values.compactMap(\.wakeAt).min()
     }
 
-    // MARK: - Teardown (called by worker after applying commands)
+    // MARK: - Teardown
 
     /// Resume all pending continuations with `StrandError.cancelled`.
     ///
-    /// Called after the worker has written all `pendingCommands` to Postgres. The
-    /// suspended handler tasks see `StrandError.cancelled` from their `await`s and
-    /// complete cleanly; the worker then calls `drain()` one more time to flush
-    /// those cleanup jobs.
-    ///
-    /// - Note: `StrandError.cancelled` is used instead of Swift’s `CancellationError`
-    ///   because it is a domain-owned, serialisable lifecycle signal rather than a
-    ///   Swift task primitive.
+    /// **Only call during true teardown** (workflow completion, real failure, worker
+    /// shutdown). The normal suspension path does NOT call this — the handler Task
+    /// stays alive between activations, parked on its continuations, and the Resume
+    /// API delivers real results on re-activation.
     func cancelPending() {
         for (_, cont) in activityContinuations { cont.resume(throwing: StrandError.cancelled) }
         for (_, cont) in timerContinuations { cont.resume(throwing: StrandError.cancelled) }
@@ -463,6 +528,7 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
         eventContinuations.removeAll()
         conditionEntries.removeAll()
         localActivityEntries.removeAll()
+        eventNameToSeqNum.removeAll()
     }
 
     // MARK: - Inspection
@@ -480,23 +546,4 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
             || !localActivityEntries.isEmpty
     }
 
-    /// `true` when any schedule-type commands were emitted this activation.
-    ///
-    /// Schedule-type commands (`scheduleActivity`, `startTimer`, `awaitEvent`,
-    /// `scheduleChildWorkflow`) require DB writes. `writeCheckpoint` commands are
-    /// also written to Postgres but do not cause suspension, so they are excluded
-    /// from this predicate.
-    var hasOutboundWork: Bool {
-        // Unsatisfied conditions and pending local activities are outbound work.
-        hasUnsatisfiedConditions
-            || !localActivityEntries.isEmpty
-            || pendingCommands.contains { command in
-                switch command {
-                case .scheduleActivity, .startTimer, .awaitEvent, .scheduleChildWorkflow:
-                    return true
-                case .writeCheckpoint, .timerFired, .eventReceived:
-                    return false
-                }
-            }
-    }
 }

@@ -160,9 +160,6 @@ package enum WorkflowStateQueries {
     /// Insert a signal into the inbox for a workflow task.
     ///
     /// Called by `StrandClient.signal(...)` / `WorkflowHandle.signal(...)`.
-    /// After inserting, callers should call ``wakeWorkflowRun(on:taskID:logger:)``
-    /// so the workflow is re-activated promptly rather than waiting for the
-    /// next polling cycle.
     package static func insertSignal(
         on postgres: PostgresClient,
         taskID: UUID,
@@ -398,52 +395,4 @@ package enum WorkflowStateQueries {
         }
     }
 
-    // MARK: - wakeWorkflowRun
-
-    /// Wake a sleeping or waiting workflow run so it can process a newly-inserted signal.
-    ///
-    /// Transitions the run (and its parent task) from `SLEEPING` or `WAITING` → `PENDING`,
-    /// clearing the lease and wake-event metadata so the worker can re-claim
-    /// the run on the next poll cycle.
-    ///
-    /// - `SLEEPING`: timer-based suspension (`available_at` is meaningful).
-    /// - `WAITING`: event/signal-based suspension (poll loop ignores it; must be explicitly woken).
-    ///
-    /// This is a **best-effort** nudge: if the run is not currently `SLEEPING` or `WAITING`
-    /// (e.g. it's already `PENDING`, `RUNNING`, or `COMPLETED`) the UPDATE
-    /// matches zero rows and the call is a no-op. This makes it safe to call
-    /// unconditionally after ``insertSignal``.
-    package static func wakeWorkflowRun(
-        on postgres: PostgresClient,
-        taskID: UUID,
-        logger: Logger
-    ) async throws {
-        // Transition the run row first so that a polling worker can claim it
-        // as soon as available_at is reached.
-        try await postgres.query(
-            """
-            UPDATE strand.runs
-               SET state            = 'PENDING',
-                   available_at     = NOW(),
-                   wake_event       = NULL,
-                   event_payload    = NULL,
-                   worker_id        = NULL,
-                   lease_expires_at = NULL
-             WHERE task_id = \(taskID)
-               AND state   IN ('SLEEPING', 'WAITING')
-            """,
-            logger: logger
-        )
-        // Keep strand.tasks.state consistent with the run state so that
-        // management queries and the dashboard reflect the correct status.
-        try await postgres.query(
-            """
-            UPDATE strand.tasks
-               SET state = 'PENDING'
-             WHERE id    = \(taskID)
-               AND state IN ('SLEEPING', 'WAITING')
-            """,
-            logger: logger
-        )
-    }
 }

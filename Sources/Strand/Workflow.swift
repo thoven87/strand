@@ -8,43 +8,21 @@ public import Foundation
 
 // MARK: - Registration tokens
 //
-// These are the type-erased closures StrandWorker stores per registered handler.
-// They must be `public` because they appear in the return type of the public
-// SPI architecture note:
-//
-// Two groups are available for future use:
-//   @_spi(Internal) — cross-target package internals (StrandServer etc.)
-//   @_spi(Testing)  — test-only helpers
-//
-// Why `_WorkflowToken` / `_ActivityToken` are NOT @_spi:
-//   The default `_makeToken()` implementation (in `extension Workflow`) must
-//   reference the return type. Swift requires that any non-SPI declaration only
-//   references non-SPI types — so if the token types were SPI-gated, the
-//   public default could not compile. Marking both the default AND the types
-//   as SPI would force all external conformers to add an SPI import, which is
-//   exactly the problem we want to avoid. The underscore prefix + doc comment
-//   is the right signal here; SPI is reserved for truly cross-target internals.
+// Type-erased closures the worker stores per registered handler.
+// Underscore-prefixed: infrastructure details; never call these directly.
 
-/// Opaque workflow activation token. Created exclusively by ``StrandWorker``.
-/// Do not construct or call this type — the underscore prefix signals it is
-/// an implementation detail of the registration machinery.
+/// Opaque workflow activation token. Do not construct or call directly.
 public struct _WorkflowToken: Sendable {
     let name: String
     let preferredQueue: String?
     let activate: @Sendable (ClaimedTask, _WorkerExec) async throws -> ByteBuffer?
 }
 
-/// Opaque activity execution token. Created exclusively by ``StrandWorker``.
-/// Do not construct or call this type — the underscore prefix signals it is
-/// an implementation detail of the registration machinery.
+/// Opaque activity execution token. Do not construct or call directly.
 public struct _ActivityToken: Sendable {
     let name: String
     let preferredQueue: String?
-    /// Executes the activity via a `ClaimedTask` (normal queue-based dispatch).
-    /// `fatalDeadline` is forwarded from `runTask` so heartbeats can renew it.
     let run: @Sendable (ClaimedTask, _WorkerExec, TaskDeadline) async throws -> ByteBuffer
-    /// Executes the activity in-process without a DB task row (local activity path).
-    /// Parameters: (encodedInput, workerExec, parentWorkflowTaskID)
     let runLocal: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer
 }
 
@@ -58,9 +36,8 @@ public protocol WorkflowRegistrable: Sendable {
     /// The task name used for DB dispatch. Defaults to the Swift type name.
     static var workflowName: String { get }
 
-    /// **Do not call.** Infrastructure used exclusively by ``StrandWorker``
-    /// to produce a type-erased activation token at registration time.
-    /// A default is provided via `extension Workflow`.
+    /// Infrastructure used by ``StrandWorker``. Do not call or implement manually;
+    /// a default is provided via `extension Workflow`.
     static func _makeToken() -> _WorkflowToken
 }
 
@@ -169,22 +146,6 @@ extension Workflow {
         return try JSON.decode(type, from: buf)
     }
 
-    /// Default `WorkflowRegistrable._makeToken()` implementation.
-    /// Captures `Self` generically so the worker can activate `W` without
-    /// knowing the concrete type at the call site.
-
-    public static func _makeToken() -> _WorkflowToken {
-        _WorkflowToken(name: workflowName, preferredQueue: nil) { claimed, exec in
-            do {
-                return try await WorkflowRegistration<Self>().activate(
-                    claimed: claimed,
-                    exec: exec
-                )
-            } catch InternalError.suspend {
-                return nil
-            }
-        }
-    }
 }
 
 // MARK: - WorkflowEvent
@@ -287,11 +248,8 @@ public protocol ActivityBox: Sendable {
     /// The registered activity name — shown in logs and the dashboard.
     var activityName: String { get }
 
-    /// Infrastructure method used exclusively by ``StrandWorker`` at registration time.
-    ///
-    /// **Do not call.** Infrastructure used exclusively by ``StrandWorker``
-    /// to produce a type-erased execution token at registration time.
-    /// A default is provided via `extension ActivityDefinition`.
+    /// Infrastructure used by ``StrandWorker``. Do not call or implement manually;
+    /// a default is provided via `extension ActivityDefinition`.
     func _makeToken() -> _ActivityToken
 }
 

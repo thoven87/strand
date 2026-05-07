@@ -368,7 +368,6 @@ package enum ManagementQueries {
             SELECT name, payload, created_at, queue
             FROM strand.events
             WHERE queue = \(queue)
-              AND name NOT LIKE '$strand:%'
               AND (\(cursor)::timestamptz IS NULL OR created_at < \(cursor))
             ORDER BY created_at DESC
             LIMIT \(fetchLimit)
@@ -400,7 +399,6 @@ package enum ManagementQueries {
             SELECT name, payload, created_at, queue
             FROM strand.events
             WHERE (\(queue)::text IS NULL OR queue = \(queue))
-              AND name NOT LIKE '$strand:%'
               AND (\(cursor)::timestamptz IS NULL OR created_at < \(cursor))
             ORDER BY created_at DESC
             LIMIT \(fetchLimit)

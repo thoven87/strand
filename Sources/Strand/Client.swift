@@ -282,7 +282,8 @@ public struct StrandClient: Sendable {
         WorkflowHandle(
             workflowID: taskID.uuidString,
             taskID: taskID,
-            initialRunID: taskID,  // placeholder — initial run not needed for signal-only usage
+            initialRunID: taskID,  // attach() doesn't know the run ID; taskID is a safe fallback
+            // since signal/snapshot never dereference it
             client: self
         )
     }
