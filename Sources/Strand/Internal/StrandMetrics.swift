@@ -48,6 +48,45 @@ public enum StrandMetrics {
     public static let tasksContinuedAsNew = "strand.tasks.continued_as_new"
 }
 
+// MARK: - LISTEN/NOTIFY channel names
+
+/// Internal PostgreSQL channel names and payload type for LISTEN/NOTIFY wakeups.
+enum StrandChannels {
+    /// Channel on which workers LISTEN and `enqueueTask` sends NOTIFY.
+    static let tasks = "strand_tasks"
+
+    // MARK: - Payload type
+
+    /// A typed NOTIFY payload carrying a `(namespace, queue)` pair.
+    ///
+    /// Wire format: `"<namespace>/<queue>"`. Splitting on the first `/` allows
+    /// a queue name that contains `/` as long as the namespace does not
+    /// (namespace IDs are plain identifiers validated by a Postgres FK).
+    struct Notification: Sendable {
+        let namespace: String
+        let queue: String
+
+        /// Creates a notification for the given namespace and queue.
+        init(namespace: String, queue: String) {
+            self.namespace = namespace
+            self.queue = queue
+        }
+
+        /// Parses a raw NOTIFY payload. Returns `nil` if the format is unrecognised.
+        init?(payload: String) {
+            guard let slash = payload.firstIndex(of: "/") else { return nil }
+            let ns = String(payload[..<slash])
+            let q = String(payload[payload.index(after: slash)...])
+            guard !ns.isEmpty, !q.isEmpty else { return nil }
+            self.namespace = ns
+            self.queue = q
+        }
+
+        /// The encoded string passed as the `pg_notify` payload.
+        var payload: String { "\(namespace)/\(queue)" }
+    }
+}
+
 // MARK: - Helpers
 
 extension Duration {

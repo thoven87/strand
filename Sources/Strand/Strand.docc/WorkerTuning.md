@@ -173,31 +173,48 @@ try await context.runActivity(
 
 ---
 
-## Poll interval
+## LISTEN/NOTIFY and the poll interval
 
-`pollInterval` controls how long the worker sleeps between claim attempts when
-the queue is empty.
+Workers hold a dedicated PostgreSQL `LISTEN` connection and wake up the
+moment a task becomes `PENDING`. Every path that creates a pending run —
+`enqueueTask`, `emitTaskCompletionSignal`, `emitEvent`, `retryTask`, and
+others — sends `pg_notify('strand_tasks', '<namespace>/<queue>')` inside its
+transaction. The notification is only delivered after the transaction commits,
+so the worker always sees a claimable row.
 
-```swift
-WorkerOptions(pollInterval: .milliseconds(100))  // default
-```
+### `pollInterval` — safety-net fallback only
 
-**Tradeoffs:**
+With LISTEN/NOTIFY active, `pollInterval` (default: `5 s`) fires only for
+two edge cases:
+- The LISTEN connection was briefly down during the 1-second reconnect
+  back-off.
+- A `SLEEPING` task's `available_at` fired (timer expiry). Timer wakeups
+  are driven by `available_at <= NOW()` in `claimTasks` — no `NOTIFY` is
+  sent for this transition, so the fallback poll catches them.
 
-| Value | Latency | Postgres load |
-|---|---|---|
-| 50 ms | Very low | Higher (~20 req/s per worker) |
-| 100 ms | Low (default) | Moderate (~10 req/s) |
-| 500 ms | Acceptable for batch | Low |
-| 1 s | Background jobs only | Minimal |
+Keep `pollInterval` at a few seconds. Sub-100 ms values add unnecessary DB
+load without reducing task-pickup latency — NOTIFY handles the fast path.
 
-With the **continuous-fill** dispatch loop, `pollInterval` only fires when the
-queue returns empty. When work is available, polling is continuous — a freed
-slot triggers an immediate re-claim without sleeping. The interval therefore
-only affects **latency for newly-arrived tasks on an otherwise idle worker**.
+### `notifyJitter` — thundering-herd mitigation
 
-Future: LISTEN/NOTIFY will make this sleep unnecessary for the common case
-(new task arrives while worker is idle) — see ``BootOrder``.
+`NOTIFY` is broadcast: every worker on the queue wakes simultaneously. With
+hundreds of workers, a single enqueue can trigger hundreds of concurrent
+`claimTasks` queries. `notifyJitter` (default: `50 ms`) applies a random
+delay drawn from `[0, notifyJitter]` **only on NOTIFY wakeups** so claims
+spread across the window instead of hitting Postgres all at once.
+
+Tuning formula: keep `N / W_ms ≈ 2–5` concurrent claims.
+
+| Workers | `notifyJitter` |
+|---------|----------------|
+| 1 | `.zero` |
+| ≤ 10 | `.milliseconds(20)` |
+| ≤ 100 | `.milliseconds(100)` |
+| 300+ | `.milliseconds(300)` |
+
+`FOR UPDATE SKIP LOCKED` guarantees correctness regardless of jitter — each
+row is claimed by exactly one worker. Jitter is a load knob, not a
+correctness requirement.
 
 ---
 
@@ -304,8 +321,9 @@ WorkerOptions(
     queue:                "api",
     workflowConcurrency:  16,
     activityConcurrency:  64,
-    claimTimeout:         .seconds(15),
-    pollInterval:         .milliseconds(50)
+    claimTimeout:         .seconds(15)
+    // pollInterval left at default (5 s) — LISTEN/NOTIFY handles fast wakeup;
+    // tune notifyJitter based on how many workers share this queue.
 )
 ```
 

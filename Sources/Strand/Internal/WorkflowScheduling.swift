@@ -324,6 +324,12 @@ extension WorkflowRegistration {
                                 """,
                                 logger: exec.logger
                             )
+                            // Run is PENDING — notify workers to claim immediately.
+                            let notification = StrandChannels.Notification(namespace: exec.namespace, queue: queueName)
+                            try await conn.query(
+                                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                                logger: exec.logger
+                            )
                         } else {
                             // Event not yet emitted — set run to WAITING (or SLEEPING for timed waits).
                             let availableAt =
@@ -473,6 +479,12 @@ extension WorkflowRegistration {
                             """,
                             logger: exec.logger
                         )
+                        // Run is PENDING — notify workers immediately.
+                        let notification = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
+                        try await conn.query(
+                            "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                            logger: exec.logger
+                        )
                     } else {
                         try await conn.query(
                             """
@@ -591,6 +603,14 @@ extension WorkflowRegistration {
                 WHERE id = \(claimed.taskID)
                   AND namespace_id = \(exec.namespace)
                 """,
+                logger: exec.logger
+            )
+            // Notify speculatively: if the run went PENDING (missed > 0) workers should
+            // claim it immediately. If it went WAITING the notification is a spurious
+            // wakeup that costs at most one empty poll — acceptable.
+            let notification = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
+            try await exec.postgres.query(
+                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
                 logger: exec.logger
             )
         }

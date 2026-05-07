@@ -202,6 +202,14 @@ enum Queries {
                         "strand.kind": .string(kind.rawValue),
                     ]
                 )
+                // Notify any listening workers that a new task is available for this queue.
+                // pg_notify is transactional — the notification is only delivered after this
+                // transaction commits, so listeners always see a task that can be claimed.
+                let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
+                try await conn.query(
+                    "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                    logger: logger
+                )
                 return EnqueueRow(taskID: taskID, runID: runID, attempt: 1, created: true)
             } else {
                 let existStream = try await conn.query(
@@ -516,6 +524,22 @@ enum Queries {
                 "UPDATE strand.tasks SET state = \(newState), attempt = \(nextAttempt) WHERE id = \(taskID)",
                 logger: logger
             )
+            // Only notify when the retry is immediately runnable (no sleep delay).
+            if newState == .pending {
+                let qStream = try await conn.query(
+                    "SELECT queue FROM strand.runs WHERE id = \(runID)",
+                    logger: logger
+                )
+                if let qRow = try await qStream.first(where: { _ in true }) {
+                    var qCol = qRow.makeIterator()
+                    let q = try qCol.next()!.decode(String.self, context: .default)
+                    let notification = StrandChannels.Notification(namespace: namespaceID, queue: q)
+                    try await conn.query(
+                        "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                        logger: logger
+                    )
+                }
+            }
         }
     }
 
@@ -955,6 +979,14 @@ enum Queries {
                 "DELETE FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
                 logger: logger
             )
+            if !waits.isEmpty {
+                // Wake workers: runs transitioned to PENDING above.
+                let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
+                try await conn.query(
+                    "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                    logger: logger
+                )
+            }
         }
     }
 
@@ -1025,6 +1057,11 @@ enum Queries {
             logger.warning(
                 "re-queued \(count) run(s) with expired lease—worker was likely restarted",
                 metadata: ["queue": "\(queue)"]
+            )
+            let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
+            try await client.query(
+                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                logger: logger
             )
         }
     }
@@ -1097,18 +1134,23 @@ enum Queries {
                   AND namespace_id = \(namespaceID)
             ),
             del_event_waits AS (
-                -- Remove the child’s OWN event_waits (activities / timers it was
-                -- waiting for). The parent’s event_wait is on the parent’s run_id
+                -- Remove the child's OWN event_waits (activities / timers it was
+                -- waiting for). The parent's event_wait is on the parent's run_id
                 -- and is not touched.
                 DELETE FROM strand.event_waits
                 WHERE task_id = (SELECT task_id FROM complete_run)
+            ),
+            new_run AS (
+                INSERT INTO strand.runs
+                    (id, namespace_id, task_id, queue, attempt, state,
+                     available_at, created_at, priority, fairness_key, fairness_weight, kind)
+                SELECT \(newRunID), \(namespaceID), id, queue, 1, 'PENDING',
+                       NOW(), NOW(), priority, fairness_key, fairness_weight, kind
+                FROM reset_task
+                RETURNING namespace_id, queue
             )
-            INSERT INTO strand.runs
-                (id, namespace_id, task_id, queue, attempt, state,
-                 available_at, created_at, priority, fairness_key, fairness_weight, kind)
-            SELECT \(newRunID), \(namespaceID), id, queue, 1, 'PENDING',
-                   NOW(), NOW(), priority, fairness_key, fairness_weight, kind
-            FROM reset_task
+            SELECT pg_notify(\(StrandChannels.tasks), namespace_id || '/' || queue)
+            FROM new_run
             """,
             logger: logger
         )
@@ -1186,6 +1228,19 @@ enum Queries {
                     SET failure_reason = NULL
                     WHERE task_id = \(taskID) AND state IN (\(TaskState.failed), \(TaskState.cancelled))
                     """,
+                    logger: logger
+                )
+            }
+            let qStream = try await conn.query(
+                "SELECT queue FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
+                logger: logger
+            )
+            if let qRow = try await qStream.first(where: { _ in true }) {
+                var qCol = qRow.makeIterator()
+                let q = try qCol.next()!.decode(String.self, context: .default)
+                let notification = StrandChannels.Notification(namespace: namespaceID, queue: q)
+                try await conn.query(
+                    "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
                     logger: logger
                 )
             }
@@ -1267,7 +1322,11 @@ enum Queries {
                 """,
                 logger: logger
             )
-
+            let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
+            try await conn.query(
+                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+                logger: logger
+            )
             return EnqueueRow(taskID: newTaskID, runID: newRunID, attempt: 1, created: true)
         }
     }
@@ -1329,13 +1388,18 @@ enum Queries {
                 USING  woken k
                 WHERE  ew.child_task_id = \(taskID)
                   AND  ew.run_id        = k.run_id
+            ),
+            task_upd AS (
+                UPDATE strand.tasks t SET state = \(TaskState.pending)
+                FROM   woken k
+                JOIN   waits w ON w.run_id = k.run_id
+                WHERE  t.id           = w.parent_task_id
+                  AND  t.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
+                  AND  t.namespace_id = \(namespaceID)
+                RETURNING t.namespace_id, t.queue
             )
-            UPDATE strand.tasks t SET state = \(TaskState.pending)
-            FROM   woken k
-            JOIN   waits w ON w.run_id = k.run_id
-            WHERE  t.id           = w.parent_task_id
-              AND  t.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
-              AND  t.namespace_id = \(namespaceID)
+            SELECT pg_notify(\(StrandChannels.tasks), namespace_id || '/' || queue)
+            FROM task_upd
             """,
             logger: logger
         )
