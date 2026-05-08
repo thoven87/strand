@@ -193,4 +193,158 @@ struct SchedulerIntegrationTests {
             try? await client.deleteSchedule(id: scheduleID)
         }
     }
+
+    // ── 3 ───────────────────────────────────────────────────────────────────────────
+    //
+    // `last_run_at` stores the scheduled slot time, not the wall-clock fire time.
+    //
+    // `markScheduleFired` is called with `firedAt: row.scheduledAt` — the
+    // `next_run_at` value that triggered the fire.  When the scheduler catches
+    // up a missed slot the wall-clock time and the slot time diverge (e.g. a
+    // slot due at 13:00 UTC may be processed at 12:19 UTC the following day);
+    // `last_run_at` must always reflect the slot, not the poll time, so the
+    // UI displays a coherent cadence.
+    //
+    // We snapshot `nextRunAt` immediately after registration (that is the slot
+    // the scheduler will fire), start the scheduler, wait for one fire, then
+    // assert `lastRunAt == snapshotted nextRunAt` within floating-point tolerance.
+    //
+    @Test(
+        "markScheduleFired stores the scheduled slot time, not the wall-clock fire time",
+        .tags(.integration)
+    )
+    func firedAtIsScheduledSlotNotWallClock() async throws {
+        try await withTestEnvironment { client in
+            // Register with startsAt in the past so the schedule is
+            // immediately due on the first scheduler poll.
+            let scheduleID = try await client.schedule(
+                name: "sit-firedat-test",
+                pattern: .interval(.seconds(5)),
+                workflowType: SitSimpleWorkflow.self,
+                input: .done,
+                startsAt: Date.now.addingTimeInterval(-10)
+            )
+
+            // Capture the scheduled slot time before the scheduler fires.
+            let preFireList = try await client.listSchedules(queue: client.queueName)
+            guard
+                let scheduledSlot =
+                    preFireList
+                    .first(where: { $0.name == "sit-firedat-test" })?.nextRunAt
+            else {
+                Issue.record("schedule must have a nextRunAt after registration")
+                return
+            }
+
+            // Start the scheduler (no worker needed — markScheduleFired runs
+            // independently of whether a worker processes the enqueued task).
+            let scheduler = StrandScheduler(
+                client: client,
+                options: SchedulerOptions(sleepCap: .seconds(1))
+            )
+            let schedulerTask = Task { try? await scheduler.run() }
+            defer { schedulerTask.cancel() }
+
+            // Wait until the schedule has been fired at least once.
+            let deadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < deadline {
+                let list = try await client.listSchedules(queue: client.queueName)
+                if (list.first(where: { $0.name == "sit-firedat-test" })?.runCount ?? 0) >= 1 {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+
+            // lastRunAt must equal scheduledSlot (the slot the scheduler fired),
+            // not the wall-clock time the scheduler happened to poll.
+            let postFireList = try await client.listSchedules(queue: client.queueName)
+            let lastRunAt =
+                postFireList
+                .first(where: { $0.name == "sit-firedat-test" })?.lastRunAt
+
+            #expect(lastRunAt != nil, "lastRunAt must be set after the schedule fires")
+            if let lastRunAt {
+                // Both values come from the same Postgres TIMESTAMPTZ column
+                // decoded through the same path — they must be bit-identical.
+                let drift = abs(lastRunAt.timeIntervalSince(scheduledSlot))
+                #expect(
+                    drift < 0.001,
+                    "lastRunAt (\(lastRunAt)) must equal the scheduled slot (\(scheduledSlot)), not the wall-clock fire time; drift = \(drift)s"
+                )
+            }
+
+            try? await client.deleteSchedule(id: scheduleID)
+        }
+    }
+
+    // ── 4 ───────────────────────────────────────────────────────────────────────────
+    //
+    // `upsertSchedule` never moves `next_run_at` backwards.
+    //
+    // The ON CONFLICT clause uses `GREATEST(existing, incoming)` so that a
+    // scheduler restart — which recomputes `next_run_at` from scratch via
+    // catch-up recovery — cannot reset an already-advanced schedule to an
+    // earlier slot.  Without this guard, restarts cause spurious re-fires
+    // (idempotent at the task level but they inflate `run_count` and corrupt
+    // `last_run_at` with the catch-up wall-clock time).
+    //
+    // Test sequence:
+    //  1. Register with no startsAt → next_run_at ≈ now + 3600 s (future).
+    //  2. Re-register the same name with startsAt 2 h ago → catch-up recovery
+    //     computes next_run_at ≈ now, which is earlier than the existing value.
+    //  3. Assert the DB still holds the original future next_run_at.
+    //
+    @Test(
+        "upsertSchedule preserves next_run_at when re-registration computes an earlier value",
+        .tags(.integration)
+    )
+    func upsertPreservesNextRunAtOnReregistration() async throws {
+        try await withTestEnvironment { client in
+            // Step 1: fresh registration, no startsAt → next_run_at ≈ now + 3600s.
+            let scheduleID = try await client.schedule(
+                name: "sit-greatest-test",
+                pattern: .interval(.seconds(3600)),
+                workflowType: SitSimpleWorkflow.self,
+                input: .done
+            )
+
+            let initial = try await client.listSchedules(queue: client.queueName)
+            guard
+                let initialNextRunAt =
+                    initial
+                    .first(where: { $0.name == "sit-greatest-test" })?.nextRunAt
+            else {
+                Issue.record("schedule must have nextRunAt after fresh registration")
+                return
+            }
+
+            // Step 2: re-register the same name with startsAt 2 hours ago.
+            // .latest accuracy fast-forwards nextRunAt to the most recent
+            // elapsed 1-hour boundary, which is ≤ now — well behind the
+            // already-set initialNextRunAt (≈ now + 3600s).
+            _ = try await client.schedule(
+                name: "sit-greatest-test",  // same name → ON CONFLICT DO UPDATE
+                pattern: .interval(.seconds(3600)),
+                workflowType: SitSimpleWorkflow.self,
+                input: .done,
+                startsAt: Date.now.addingTimeInterval(-7200)  // 2 hours ago
+            )
+
+            // Step 3: next_run_at must not have moved backward.
+            let after = try await client.listSchedules(queue: client.queueName)
+            let afterNextRunAt =
+                after
+                .first(where: { $0.name == "sit-greatest-test" })?.nextRunAt
+
+            #expect(afterNextRunAt != nil, "nextRunAt must remain set after re-registration")
+            if let afterNextRunAt {
+                #expect(
+                    afterNextRunAt >= initialNextRunAt.addingTimeInterval(-1),
+                    "next_run_at must not regress on re-registration: was \(initialNextRunAt), got \(afterNextRunAt)"
+                )
+            }
+
+            try? await client.deleteSchedule(id: scheduleID)
+        }
+    }
 }

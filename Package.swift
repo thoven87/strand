@@ -9,7 +9,10 @@ let package = Package(
         .library(name: "StrandServer", targets: ["StrandServer"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.32.2"),
+        // Pinned to commit 820771e which includes the runTimer continuation leak fix
+        // (PR #641: pool idle-timer reschedule dropped CheckedContinuation).
+        // Revert to `from: "1.x.x"` once a release including that patch is cut.
+        .package(url: "https://github.com/vapor/postgres-nio.git", revision: "820771e"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.99.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.12.0"),
         .package(
