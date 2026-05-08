@@ -208,8 +208,15 @@ package enum ScheduleQueries {
                 kind            = EXCLUDED.kind,
                 starts_at       = EXCLUDED.starts_at,
                 ends_at         = EXCLUDED.ends_at,
-                next_run_at     = EXCLUDED.next_run_at,
-                is_active       = EXCLUDED.is_active,
+                -- GREATEST preserves whichever date is further ahead.
+                -- On a scheduler restart the freshly-computed next_run_at
+                -- (from catch-up recovery) can be earlier than what the DB
+                -- already has, which would reset the schedule backwards and
+                -- cause spurious re-fires (idempotent but inflates run_count
+                -- and corrupts last_run_at).  PostgreSQL GREATEST ignores
+                -- NULLs, so a fresh insert still gets EXCLUDED.next_run_at.
+                next_run_at     = GREATEST(strand.schedules.next_run_at, EXCLUDED.next_run_at),
+                is_active       = (GREATEST(strand.schedules.next_run_at, EXCLUDED.next_run_at) IS NOT NULL),
                 updated_at      = NOW()
             RETURNING id
             """,

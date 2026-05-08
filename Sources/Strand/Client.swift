@@ -697,6 +697,10 @@ public struct StrandClient: Sendable {
     /// The workflow type provides the registered task name — no strings needed.
     /// On name conflict within the queue the schedule is updated in place.
     ///
+    /// Use this for **runtime schedule creation** (e.g. from an HTTP API or
+    /// a workflow).  For schedules known at startup, declare them on
+    /// ``StrandScheduler`` instead so they are upserted before the first poll.
+    ///
     /// ```swift
     /// // 9 AM UTC every day
     /// try await client.schedule(
@@ -725,8 +729,8 @@ public struct StrandClient: Sendable {
     /// missed run. Subsequent fires resume on the normal cadence.
     ///
     /// Example: `.daily(offset: "PT15M")` + `startsAt` = yesterday, registered
-    /// at 23:20 UTC today. Without recovery, yesterday's 00:15 slot would fire
-    /// and today's would be lost. With recovery, `nextRunAt` advances to today
+    /// at 23:20 UTC today. Without recovery, yesterday’s 00:15 slot would fire
+    /// and today’s would be lost. With recovery, `nextRunAt` advances to today
     /// 00:15 — the scheduler fires it on the next poll, then schedules
     /// tomorrow 00:15.
     ///
@@ -736,8 +740,7 @@ public struct StrandClient: Sendable {
     /// - Parameters:
     ///   - name: Stable human-readable name, unique within the queue.
     ///   - pattern: When to fire — `.cron`, `.interval`, `.daily`, `.weekly`, `.monthly`, or `.once`.
-    ///   - workflowType: The ``Workflow`` type to enqueue. The registered name is derived
-    ///     from ``WorkflowRegistrable/workflowName``.
+    ///   - workflowType: The ``Workflow`` type to enqueue on each fire.
     ///   - input: Input forwarded to the workflow on each fire.
     ///   - queue: Target queue. `nil` inherits this client's default queue.
     ///   - startsAt: First eligible fire date. `nil` means active from creation.
@@ -769,12 +772,10 @@ public struct StrandClient: Sendable {
         )
     }
 
-    /// Schedules an `ActivityDefinition`-conforming activity on a recurring pattern.
+    /// Schedules an ``ActivityDefinition``-conforming activity on a recurring pattern.
     ///
     /// The activity fires directly — no wrapping workflow is created.
-    /// Use this for fire-and-forget work where durable orchestration is not needed.
-    /// For retries, error recovery, or multi-step logic, wrap the activity in a
-    /// ``WorkflowDefinition`` and use ``schedule(_:workflowType:input:queue:startsAt:endsAt:options:)`` instead.
+    /// Buffering / lifecycle semantics are identical to the workflow overload.
     @discardableResult
     public func schedule<A: ActivityDefinition>(
         name: String,
@@ -799,9 +800,10 @@ public struct StrandClient: Sendable {
         )
     }
 
-    /// Schedules an `Activity<P, R>` instance on a recurring pattern.
+    /// Schedules an ``Activity`` instance on a recurring pattern.
     ///
     /// The activity fires directly — no wrapping workflow is created.
+    /// Buffering / lifecycle semantics are identical to the workflow overload.
     @discardableResult
     public func schedule<P: Codable & Sendable, R: Codable & Sendable>(
         name scheduleName: String,
@@ -826,8 +828,8 @@ public struct StrandClient: Sendable {
         )
     }
 
-    // Private implementation — not public API.
-    // The typed `schedule(workflowType:input:)` overload is the only public entry point.
+    // MARK: - Schedule implementation
+
     @discardableResult
     private func _schedule<P: Codable & Sendable>(
         name: String,

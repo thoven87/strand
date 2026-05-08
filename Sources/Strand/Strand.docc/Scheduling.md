@@ -1,60 +1,91 @@
 # Scheduling recurring tasks
 
-``StrandScheduler`` fires workflow or activity tasks on a repeating pattern.
+``StrandScheduler`` fires workflow or activity tasks on a repeating pattern and
+runs as a `Service` in your `ServiceGroup`.
 
-## Start the scheduler
+## Two modes: static declarations vs. runtime calls
 
-Add ``StrandScheduler`` alongside your worker in the `ServiceGroup`:
+Strand distinguishes between two kinds of schedule registration:
+
+| Mode | When to use | API |
+|---|---|---|
+| **Static declaration** | Schedules known at compile time (boot-time setup) | `StrandScheduler(schedules:)` |
+| **Runtime call** | Schedules created dynamically (HTTP API, user action) | `client.schedule(...)` |
+
+## Static declarations (boot-time)
+
+Pass schedule definitions directly to ``StrandScheduler`` at construction time.
+The scheduler upserts them to the database as the very first step of `run()` —
+Postgres is guaranteed to be live at that point because the `ServiceGroup` starts
+``PostgresClient`` before any other service.
 
 ```swift
-let scheduler = StrandScheduler(client: client)
+let scheduler = StrandScheduler(
+    client: client,
+    schedules: [
+        // Workflow schedule — every hour on the hour
+        .workflow(
+            "hourly-sync",
+            pattern: .interval(.hours(1)),
+            workflowType: DataSyncWorkflow.self,
+            input: SyncInput()
+        ),
+
+        // Daily at 09:00 UTC
+        .workflow(
+            "daily-report",
+            pattern: .daily(offset: "PT9H"),
+            workflowType: DailyReportWorkflow.self,
+            input: ReportInput()
+        ),
+
+        // Weekdays at 08:30 US Eastern via cron
+        .workflow(
+            "market-open",
+            pattern: .cron("30 8 * * 1-5",
+                           timezone: TimeZone(identifier: "America/New_York")!),
+            workflowType: MarketOpenWorkflow.self,
+            input: StrandVoid()
+        ),
+
+        // Activity fired directly — no wrapping workflow
+        .activity(
+            "cleanup-old-files",
+            pattern: .daily(offset: "PT2H"),
+            activityType: CleanupActivity.self,
+            input: CleanupInput(olderThanDays: 30)
+        ),
+    ]
+)
 
 let group = ServiceGroup(configuration: .init(
     services: [
         .init(service: postgres),
         .init(service: worker),
-        .init(service: scheduler),
+        .init(service: scheduler),   // ← schedules are upserted here
     ],
     gracefulShutdownSignals: [.sigterm, .sigint]
 ))
+try await group.run()
 ```
 
-## Register schedules
+Registering the same name twice upserts the pattern — existing in-flight tasks
+are unaffected.
 
-Schedules are registered at startup (or any time). Registering the same name
-twice upserts the pattern — existing in-flight tasks are unaffected.
+## Runtime calls (dynamic)
+
+For schedules created in response to an external event (an HTTP request, a user
+action, a Strand workflow itself), call ``StrandClient/schedule(name:pattern:workflowType:input:queue:startsAt:endsAt:options:)``
+directly from wherever the event is handled.  Postgres is always live at that
+point, so the call is a straightforward database write:
 
 ```swift
-// Every hour on the hour
+// Inside a Hummingbird route handler, a workflow activity, etc.
 try await client.schedule(
-    name: "hourly-sync",
-    pattern: .interval(.hours(1)),
-    workflowType: DataSyncWorkflow.self,
-    input: SyncInput()
-)
-
-// Daily at 09:00 UTC
-try await client.schedule(
-    name: "daily-report",
-    pattern: .daily(offset: "PT9H"),
-    workflowType: DailyReportWorkflow.self,
-    input: ReportInput()
-)
-
-// Every weekday at 08:30 UTC via cron
-try await client.schedule(
-    name: "market-open",
-    pattern: .cron("30 8 * * 1-5"),
-    workflowType: MarketOpenWorkflow.self,
-    input: StrandVoid()
-)
-
-// One-time future execution
-try await client.schedule(
-    name: "launch-day",
-    pattern: .once(at: launchDate),
-    workflowType: LaunchWorkflow.self,
-    input: LaunchInput()
+    name: "send-invoice-\(orderID)",
+    pattern: .once(at: invoiceDate),
+    workflowType: InvoiceWorkflow.self,
+    input: InvoiceInput(orderID: orderID)
 )
 ```
 
@@ -69,40 +100,42 @@ try await client.schedule(
 | `.monthly(offset:)` | `.monthly(offset: "P14DT9H")` | Monthly on a day-of-month + time |
 | `.once(at:)` | `.once(at: someDate)` | Fire exactly once at the given `Date` |
 
-## Scheduling activities directly
-
-For fire-and-forget work that doesn't need durable orchestration history:
-
-```swift
-try await client.schedule(
-    name: "cleanup-old-files",
-    pattern: .daily(offset: "PT2H"),
-    activityType: CleanupActivity.self,
-    input: CleanupInput(olderThanDays: 30)
-)
-```
-
 ## Catch-up behaviour
 
-``ScheduleAccuracy`` controls what happens when the scheduler starts after being
-offline:
+``ScheduleAccuracy`` controls what happens when the scheduler restarts after an
+outage:
 
 ```swift
 // Default: fire only the most-recent missed slot (avoids flooding the queue)
 options: ScheduleOptions(accuracy: .latest)
 
-// Fire all missed slots in order (for financial reconciliation etc.)
+// Fire all missed slots in order (e.g. financial reconciliation)
 options: ScheduleOptions(accuracy: .all)
 
 // Fire only the last 3 missed slots
 options: ScheduleOptions(accuracy: .last(3))
 ```
 
-## Time zones
+A past `startsAt` date triggers catch-up recovery automatically:
 
 ```swift
-try await client.schedule(
-    name: "new-york-open",
+.workflow(
+    "iss-telemetry",
+    pattern: .interval(.seconds(90 * 60)),
+    workflowType: TelemetryWorkflow.self,
+    input: TelemetryInput(),
+    startsAt: Date(timeIntervalSince1970: 0),   // active since epoch
+    options: ScheduleOptions(accuracy: .last(3)) // recover last 3 slots
+)
+```
+
+## Time zones
+
+Pass a `timezone:` argument to `.cron` or any pattern that accepts one:
+
+```swift
+.workflow(
+    "new-york-open",
     pattern: .cron("30 9 * * 1-5",
                    timezone: TimeZone(identifier: "America/New_York")!),
     workflowType: MarketOpenWorkflow.self,
@@ -113,10 +146,10 @@ try await client.schedule(
 ## Manage schedules at runtime
 
 ```swift
-// List all schedules in the default queue
+// List all schedules
 let schedules = try await client.listSchedules()
 
-// Pause / resume / delete by ID
+// Pause / resume / delete by UUID
 try await client.pauseSchedule(id: scheduleID)
 try await client.resumeSchedule(id: scheduleID)
 try await client.deleteSchedule(id: scheduleID)
@@ -125,15 +158,30 @@ try await client.deleteSchedule(id: scheduleID)
 ## Reading schedule metadata inside a workflow
 
 When a workflow is triggered by a schedule, ``SchedulingMetadata`` is available
-in the context:
+via the context:
 
 ```swift
 mutating func run(context: WorkflowContext<Self>, input: ReportInput) async throws -> ReportResult {
     if let meta = context.schedulingMetadata {
-        // meta.scheduleName  — e.g. "daily-report"
+        // meta.scheduleName  — "daily-report"
         // meta.scheduledAt   — wall-clock time the slot was due
         // meta.executionTime — time the task was actually dispatched
     }
     // ...
 }
 ```
+
+## Scheduler options
+
+```swift
+let scheduler = StrandScheduler(
+    client: client,
+    options: SchedulerOptions(
+        sleepCap: .seconds(60)   // max sleep between polls; default 60 s
+    ),
+    schedules: [ ... ]
+)
+```
+
+The scheduler sleeps precisely until the next known fire time, but wakes at
+least every `sleepCap` seconds to detect newly-added schedules.

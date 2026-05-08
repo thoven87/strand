@@ -107,6 +107,49 @@ let handle = try await client.startWorkflow(
 try await group.run()
 ```
 
+## Scheduling
+
+Declare recurring schedules directly on ``StrandScheduler`` — they are upserted
+to the database when the service starts:
+
+```swift
+let scheduler = StrandScheduler(
+    client: client,
+    schedules: [
+        .workflow(
+            "daily-report",
+            pattern: .daily(offset: "PT9H"),          // 09:00 UTC every day
+            workflowType: DailyReportWorkflow.self,
+            input: ReportInput()
+        ),
+        .workflow(
+            "market-open",
+            pattern: .cron("30 8 * * 1-5",
+                           timezone: TimeZone(identifier: "America/New_York")!),
+            workflowType: MarketOpenWorkflow.self,
+            input: StrandVoid()
+        ),
+    ]
+)
+
+let group = ServiceGroup(configuration: .init(
+    services: [
+        .init(service: postgres),
+        .init(service: worker),
+        .init(service: scheduler),
+    ],
+    gracefulShutdownSignals: [.sigterm, .sigint]
+))
+try await group.run()
+```
+
+For schedules created at runtime (e.g. from an HTTP API), call
+`client.schedule(name:pattern:workflowType:input:)` directly — it is always a
+live database write.
+
+See **[Scheduling](Sources/Strand/Strand.docc/Scheduling.md)** for patterns,
+catch-up behaviour, time zones, and runtime management.
+
 ## Examples
 
 See [`Examples/`](Examples/) for complete runnable examples:

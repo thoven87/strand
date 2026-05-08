@@ -3,10 +3,117 @@ import NIOCore
 public import ServiceLifecycle
 
 #if canImport(FoundationEssentials)
-import FoundationEssentials
+public import FoundationEssentials
 #else
-import Foundation
+public import Foundation
 #endif
+
+// MARK: - StrandSchedule
+
+/// A static schedule definition passed to ``StrandScheduler`` at construction
+/// time and upserted to the database when the scheduler starts.
+///
+/// Use the static factory methods to build schedules fluently:
+///
+/// ```swift
+/// let scheduler = StrandScheduler(
+///     client: client,
+///     schedules: [
+///         .workflow(
+///             "daily-report",
+///             pattern: .daily(offset: "PT9H"),
+///             workflowType: DailyReportWorkflow.self,
+///             input: ReportInput()
+///         ),
+///         .activity(
+///             "hourly-cleanup",
+///             pattern: .interval(.seconds(3600)),
+///             activityType: CleanupActivity.self,
+///             input: CleanupInput()
+///         ),
+///     ]
+/// )
+/// ```
+///
+/// For schedules created at runtime (e.g. from an HTTP API), use
+/// ``StrandClient/schedule(name:pattern:workflowType:input:queue:startsAt:endsAt:options:)``
+/// directly — it is always a live database call.
+public struct StrandSchedule: Sendable {
+
+    // Type erasure: captures the generic W/A parameters so the schedule
+    // can be stored in a homogeneous [StrandSchedule] array.
+    // Private — callers only see the factory methods.
+    private let _body: @Sendable (StrandClient) async throws -> Void
+
+    private init(_ body: @escaping @Sendable (StrandClient) async throws -> Void) {
+        self._body = body
+    }
+
+    /// Applies this schedule to the database using `client`.
+    /// Called by ``StrandScheduler/run()`` at startup.
+    func _apply(to client: StrandClient) async throws {
+        try await _body(client)
+    }
+
+    // MARK: Workflow
+
+    /// Declares a recurring workflow schedule.
+    ///
+    /// The schedule is upserted to the database when ``StrandScheduler/run()``
+    /// is called.  On a name conflict the existing row is updated in place.
+    public static func workflow<W: Workflow>(
+        _ name: String,
+        pattern: SchedulePattern,
+        workflowType: W.Type = W.self,
+        input: W.Input,
+        queue: String? = nil,
+        startsAt: Date? = nil,
+        endsAt: Date? = nil,
+        options: ScheduleOptions = .init()
+    ) -> StrandSchedule {
+        StrandSchedule { client in
+            _ = try await client.schedule(
+                name: name,
+                pattern: pattern,
+                workflowType: workflowType,
+                input: input,
+                queue: queue,
+                startsAt: startsAt,
+                endsAt: endsAt,
+                options: options
+            )
+        }
+    }
+
+    // MARK: ActivityDefinition
+
+    /// Declares a recurring activity schedule.
+    ///
+    /// The activity fires directly — no wrapping workflow is created.
+    public static func activity<A: ActivityDefinition>(
+        _ name: String,
+        pattern: SchedulePattern,
+        activityType: A.Type,
+        input: A.Input,
+        queue: String? = nil,
+        startsAt: Date? = nil,
+        endsAt: Date? = nil,
+        options: ScheduleOptions = .init()
+    ) -> StrandSchedule {
+        StrandSchedule { client in
+            _ = try await client.schedule(
+                name: name,
+                pattern: pattern,
+                activityType: activityType,
+                input: input,
+                queue: queue,
+                startsAt: startsAt,
+                endsAt: endsAt,
+                options: options
+            )
+        }
+    }
+}
 
 /// A `Service`-conformant scheduler that fires durable workflow tasks on a
 /// configurable ``SchedulePattern`` (cron, interval, daily, weekly, monthly,
@@ -16,16 +123,17 @@ import Foundation
 /// and `StrandWorker` instances:
 ///
 /// ```swift
-/// // Define a schedule
-/// try await client.schedule(
-///     name: "nightly-report",
-///     pattern: .daily(offset: "PT9H"),   // 9 AM UTC every day
-///     taskName: "generate-report",
-///     params: ReportParams(kind: "daily")
+/// let scheduler = StrandScheduler(
+///     client: client,
+///     schedules: [
+///         .workflow(
+///             "nightly-report",
+///             pattern: .daily(offset: "PT9H"),
+///             workflowType: NightlyReportWorkflow.self,
+///             input: ReportInput()
+///         )
+///     ]
 /// )
-///
-/// // Run the scheduler as a Service
-/// let scheduler = StrandScheduler(client: client)
 /// ```
 ///
 /// When a schedule fires, Strand injects these headers into the task:
@@ -43,16 +151,32 @@ import Foundation
 public struct StrandScheduler: Service {
     private let client: StrandClient
     private let options: SchedulerOptions
+    /// Static schedules upserted to the database at startup.
+    private let schedules: [StrandSchedule]
 
-    public init(client: StrandClient, options: SchedulerOptions = .init()) {
+    public init(
+        client: StrandClient,
+        options: SchedulerOptions = .init(),
+        schedules: [StrandSchedule] = []
+    ) {
         self.client = client
         self.options = options
+        self.schedules = schedules
     }
 
     public func run() async throws {
         let logger = client.logger
         logger.info("scheduler starting")
         defer { logger.info("scheduler stopped") }
+
+        // Upsert all statically-declared schedules before the poll loop starts.
+        // Any failure is propagated immediately — a bad schedule definition is
+        // a programming error (wrong pattern, invalid input encoding, DB schema
+        // mismatch) that should surface loudly at startup rather than silently
+        // skipping a schedule and causing confusing production behaviour.
+        for declaration in schedules {
+            try await declaration._apply(to: client)
+        }
 
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
 
@@ -67,6 +191,7 @@ public struct StrandScheduler: Service {
                 }
             } catch is CancellationError {}
         } onCancelOrGracefulShutdown: {
+            logger.info("scheduler shutting down")
             cont.finish()
         }
     }
@@ -222,7 +347,13 @@ public struct StrandScheduler: Service {
             on: postgres,
             namespaceID: client.namespaceID,
             id: row.id,
-            firedAt: now,
+            // Use the scheduled slot time, not the wall-clock fire time.
+            // When the scheduler catches up a missed slot, `now` is the
+            // catch-up time (e.g. 12:19 UTC) while the slot was due at
+            // 13:00 UTC the previous day — using `now` makes last_run_at
+            // misleading and inconsistent with nextRunAt (which already
+            // anchors to row.scheduledAt to prevent drift).
+            firedAt: row.scheduledAt,
             nextRunAt: nextRunAt,
             logger: logger
         )

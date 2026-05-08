@@ -357,20 +357,36 @@ public struct StrandWorker: Service {
 
         try await withTaskCancellationOrGracefulShutdownHandler {
             do {
-                try await withThrowingTaskGroup(of: Void.self) { group in
+                // heartbeatLoop and leaseExpiryLoop exit *voluntarily* when
+                // Task.isShuttingDownGracefully becomes true (to avoid runTimer
+                // continuation leaks on their internal sleeps).  A regular
+                // withThrowingTaskGroup + group.next() would treat those normal
+                // returns as the first child completion and immediately call
+                // group.cancelAll(), killing the shutdown task's sleep before
+                // the grace period could run.
+                //
+                // A discarding group silently discards normal completions; only
+                // a *throw* exits the group.  The shutdown task throws after the
+                // full gracefulShutdownTimeout, which cancels any still-running
+                // children (pollLoop, listenLoop) and lets run() return cleanly.
+                try await withThrowingDiscardingTaskGroup { group in
                     group.addTask { try await self.pollLoop(workerID: workerID, notifySignal: notifySignal) }
                     group.addTask { try await self.listenLoop(notifySignal: notifySignal) }
                     group.addTask { try await self.heartbeatLoop(notifySignal: notifySignal) }
                     group.addTask { try await self.leaseExpiryLoop() }
                     group.addTask {
-                        // Wait for shutdown signal.
+                        // Wait for the graceful-shutdown signal from
+                        // onCancelOrGracefulShutdown below.
                         await stream.first { _ in true }
+
+                        // Wake pollLoop if it is parked in notifySignal.wait() so
+                        // it checks Task.isShuttingDownGracefully and exits its
+                        // while loop, letting in-flight runTask children finish.
+                        notifySignal.signal()
 
                         // Immediately expire all in-flight runs for this worker so
                         // the next worker's leaseExpiryLoop picks them up on its
                         // first sweep rather than waiting up to claimTimeout.
-                        // Runs in structured context — guaranteed to finish or be
-                        // cancelled with everything else. No fire-and-forget Task needed.
                         let _ = try? await self.postgres.query(
                             """
                             UPDATE strand.runs
@@ -382,11 +398,20 @@ public struct StrandWorker: Service {
                             logger: self.logger
                         )
 
-                        try Task.checkCancellation()
+                        // Grace period: give in-flight tasks time to finish.
+                        // Task.sleep responds to task *cancellation* (forced
+                        // shutdown / ServiceGroup timeout) by throwing
+                        // CancellationError, which exits the group immediately.
+                        // On graceful shutdown the sleep runs to completion;
+                        // the explicit throw below then drives the group exit.
                         try await Task.sleep(for: self.options.gracefulShutdownTimeout)
+
+                        // Reached only after the full graceful grace period.
+                        // Throwing from a discarding-group child cancels all
+                        // remaining siblings (pollLoop if still draining) and
+                        // propagates out — caught below.
+                        throw CancellationError()
                     }
-                    try await group.next()
-                    group.cancelAll()
                 }
             } catch is CancellationError {}
         } onCancelOrGracefulShutdown: {
@@ -422,7 +447,11 @@ public struct StrandWorker: Service {
         // Execution tasks are added as independent children of the same group
         // so cancellation propagates cleanly on graceful shutdown.
         try await withThrowingDiscardingTaskGroup { group in
-            while true {
+            // When graceful shutdown fires the shutdown task signals notifySignal
+            // to unblock this loop, then we detect isShuttingDownGracefully here
+            // and exit the while loop.  withThrowingDiscardingTaskGroup then waits
+            // for all in-flight runTask children to complete before pollLoop returns.
+            while !Task.isShuttingDownGracefully && !Task.isCancelled {
                 try Task.checkCancellation()
 
                 let free = maxConcurrency - running.value
@@ -454,8 +483,9 @@ public struct StrandWorker: Service {
                             metadata: .forError(error) + ["strand.queue": .string(queueName)]
                         )
                     }
-                    try Task.checkCancellation()
-                    try await Task.sleep(for: options.pollInterval)
+                    try? await cancelWhenGracefulShutdown {
+                        try await Task.sleep(for: options.pollInterval)
+                    }
                     continue
                 }
 
@@ -474,7 +504,12 @@ public struct StrandWorker: Service {
                         let maxMs =
                             jitter.components.seconds * 1_000
                             + jitter.components.attoseconds / 1_000_000_000_000_000
-                        try await Task.sleep(for: .milliseconds(Int64.random(in: 0...maxMs)))
+                        // try? so a graceful-shutdown CancellationError from
+                        // cancelWhenGracefulShutdown doesn't propagate into the
+                        // inner discarding group and kill in-flight runTasks.
+                        try? await cancelWhenGracefulShutdown {
+                            try await Task.sleep(for: .milliseconds(Int64.random(in: 0...maxMs)))
+                        }
                     }
                     continue
                 }
@@ -516,9 +551,15 @@ public struct StrandWorker: Service {
     private func leaseExpiryLoop() async throws {
         let queueName = options.queue
 
-        while true {
-            try Task.checkCancellation()
-            try await Task.sleep(for: options.leaseExpiryInterval)
+        while !Task.isShuttingDownGracefully && !Task.isCancelled {
+            // try? for the same reason as heartbeatLoop: cancelWhenGracefulShutdown
+            // throws on graceful shutdown, and we must not let that propagate out
+            // of this function into the discarding group.
+            try? await cancelWhenGracefulShutdown {
+                try await Task.sleep(for: self.options.leaseExpiryInterval)
+            }
+            // Re-check after the sleep — shutdown may have fired mid-interval.
+            guard !Task.isShuttingDownGracefully && !Task.isCancelled else { break }
             do {
                 try await Queries.sweepExpiredLeases(
                     on: postgres,
@@ -545,9 +586,15 @@ public struct StrandWorker: Service {
     /// `Task.sleep` is cancelled once by the parent group on shutdown, not
     /// repeatedly by sibling-cancel (which leaks the `runTimer` continuation).
     private func heartbeatLoop(notifySignal: _SlotSignal) async throws {
-        while true {
-            try Task.checkCancellation()
-            try await Task.sleep(for: options.pollInterval)
+        while !Task.isShuttingDownGracefully && !Task.isCancelled {
+            // try? is essential: cancelWhenGracefulShutdown throws CancellationError
+            // on graceful shutdown.  Without try? that error propagates out of this
+            // function and into withThrowingDiscardingTaskGroup, which then cancels
+            // all siblings (including the shutdown task's grace-period sleep)
+            // before the timeout can run.
+            try? await cancelWhenGracefulShutdown {
+                try await Task.sleep(for: self.options.pollInterval)
+            }
             notifySignal.signal()
         }
     }
@@ -566,14 +613,35 @@ public struct StrandWorker: Service {
         let channel = StrandChannels.tasks
         let myNotification = StrandChannels.Notification(namespace: namespace, queue: options.queue)
 
-        while true {
-            try Task.checkCancellation()
+        // cancelWhenGracefulShutdown is used for two reasons:
+        //
+        // 1. Fast voluntary exit on graceful shutdown.
+        //    cancelWhenGracefulShutdown detects Task.isShuttingDownGracefully
+        //    and cancels the postgres.withConnection body via an inner task
+        //    group.  Without it the loop would keep the connection open until
+        //    the while-condition check on the next iteration (up to the full
+        //    reconnect / poll cycle).
+        //
+        // 2. NIO runTimer continuation safety.
+        //    When cancelWhenGracefulShutdown cancels the inner scope, the
+        //    *outer* listenLoop task is still alive (it will execute the
+        //    catch block and return).  NIO's event-loop cleanup callbacks —
+        //    including any runTimer continuations scheduled during connection
+        //    teardown — have time to fire within this window.  If the outer
+        //    task were torn down at the same moment (e.g. by the grace-period
+        //    throw after gracefulShutdownTimeout), those continuations would
+        //    be leaked.
+        //
+        // The reconnect sleep uses the same wrapper for reason 2.
+        while !Task.isShuttingDownGracefully && !Task.isCancelled {
             do {
-                try await postgres.withConnection { conn in
-                    try await conn.listen(on: channel) { notifications in
-                        for try await note in notifications {
-                            if note.payload == myNotification.payload {
-                                notifySignal.signal()
+                try await cancelWhenGracefulShutdown {
+                    try await self.postgres.withConnection { conn in
+                        try await conn.listen(on: channel) { notifications in
+                            for try await note in notifications {
+                                if note.payload == myNotification.payload {
+                                    notifySignal.signal()
+                                }
                             }
                         }
                     }
@@ -585,7 +653,11 @@ public struct StrandWorker: Service {
                     "LISTEN connection lost — reconnecting",
                     metadata: .forError(error)
                 )
-                try await Task.sleep(for: .seconds(1))
+                // Wrap the reconnect sleep for the same reason: a raw
+                // group.cancelAll() mid-sleep leaks the runTimer continuation.
+                try await cancelWhenGracefulShutdown {
+                    try await Task.sleep(for: .seconds(1))
+                }
             }
         }
     }
