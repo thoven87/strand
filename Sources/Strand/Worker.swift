@@ -360,6 +360,7 @@ public struct StrandWorker: Service {
                 try await withThrowingTaskGroup(of: Void.self) { group in
                     group.addTask { try await self.pollLoop(workerID: workerID, notifySignal: notifySignal) }
                     group.addTask { try await self.listenLoop(notifySignal: notifySignal) }
+                    group.addTask { try await self.heartbeatLoop(notifySignal: notifySignal) }
                     group.addTask { try await self.leaseExpiryLoop() }
                     group.addTask {
                         // Wait for shutdown signal.
@@ -459,33 +460,21 @@ public struct StrandWorker: Service {
                 }
 
                 if claimed.isEmpty {
-                    // No runnable tasks — park until listenLoop signals a new
-                    // PENDING task or the fallback interval fires.
-                    try Task.checkCancellation()
-                    let wasNotified = await withTaskGroup(of: Bool.self) { sleepGroup in
-                        sleepGroup.addTask {
-                            try? await notifySignal.wait()  // returns on signal or cancellation
-                            return true
-                        }
-                        sleepGroup.addTask {
-                            try? await Task.sleep(for: self.options.pollInterval)
-                            return false
-                        }
-                        let first = await sleepGroup.next()!
-                        sleepGroup.cancelAll()
-                        return first
-                    }
-                    // Apply jitter only to NOTIFY wakeups.
-                    // Fallback polls are already staggered because workers start at
-                    // different times; adding jitter there would only hurt latency.
-                    if wasNotified {
-                        let jitter = options.notifyJitter
-                        if jitter > .zero {
-                            let maxMs =
-                                jitter.components.seconds * 1_000
-                                + jitter.components.attoseconds / 1_000_000_000_000_000
-                            try await Task.sleep(for: .milliseconds(Int64.random(in: 0...maxMs)))
-                        }
+                    // Park until either listenLoop (NOTIFY) or heartbeatLoop
+                    // (periodic fallback) signals. Both are structured siblings
+                    // in the same task group — no sibling-cancel of Task.sleep,
+                    // no unstructured tasks, no runTimer leak.
+                    try await notifySignal.wait()
+                    // Apply jitter on every wakeup to spread thundering herd.
+                    // Heartbeat wakeups are naturally staggered (each worker's
+                    // timer starts when it first goes idle, so different workers
+                    // fire at different offsets) — jitter is harmless there too.
+                    let jitter = options.notifyJitter
+                    if jitter > .zero {
+                        let maxMs =
+                            jitter.components.seconds * 1_000
+                            + jitter.components.attoseconds / 1_000_000_000_000_000
+                        try await Task.sleep(for: .milliseconds(Int64.random(in: 0...maxMs)))
                     }
                     continue
                 }
@@ -543,6 +532,23 @@ public struct StrandWorker: Service {
                     metadata: .forError(error) + ["strand.queue": .string(queueName)]
                 )
             }
+        }
+    }
+
+    // MARK: - Heartbeat loop
+
+    /// Fires `notifySignal` every `pollInterval` so the poll loop wakes to claim
+    /// tasks that became PENDING via paths that don’t send NOTIFY — SLEEPING
+    /// timer expiry and brief LISTEN reconnect windows.
+    ///
+    /// Running as a structured sibling in the same task group means its
+    /// `Task.sleep` is cancelled once by the parent group on shutdown, not
+    /// repeatedly by sibling-cancel (which leaks the `runTimer` continuation).
+    private func heartbeatLoop(notifySignal: _SlotSignal) async throws {
+        while true {
+            try Task.checkCancellation()
+            try await Task.sleep(for: options.pollInterval)
+            notifySignal.signal()
         }
     }
 
@@ -1023,4 +1029,5 @@ private final class _SlotSignal: Sendable {
         // After waking from cancellation, throw so the dispatch loop exits.
         try Task.checkCancellation()
     }
+
 }

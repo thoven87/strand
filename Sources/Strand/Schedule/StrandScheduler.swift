@@ -109,8 +109,11 @@ public struct StrandScheduler: Service {
                 sleepFor = options.sleepCap
             }
 
-            try Task.checkCancellation()
-            try await Task.sleep(for: sleepFor)
+            // cancelWhenGracefulShutdown exits early on both task cancellation
+            // and graceful shutdown.
+            try await cancelWhenGracefulShutdown {
+                try await Task.sleep(for: sleepFor)
+            }
         }
     }
 
