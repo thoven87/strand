@@ -75,15 +75,13 @@ private struct MixedWorkflow: Workflow {
 }
 
 // Simple regular activity used by MixedWorkflow.
-// Accepts an optional TestExpectation so the mixed-activity test can
-// receive push notification instead of polling the DB.
 private struct ReverseLocalActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
-    var done: TestExpectation?
+    var onRan: (@Sendable () -> Void)?
     func run(input: String, context: ActivityContext) async throws -> String {
         let result = String(input.reversed())
-        done?.trigger()
+        onRan?()
         return result
     }
 }
@@ -160,33 +158,33 @@ struct LocalActivityTests {
     @Test("local and regular activities can be mixed in the same workflow")
     func mixedLocalAndRegularActivity() async throws {
         try await withTestEnvironment { client in
-            // Push-based: ReverseLocalActivity triggers the expectation the
-            // instant it runs. No polling, no 2-second backoff window.
-            let done = TestExpectation()
-            let workerTask = startWorker(
-                postgres: client.postgres,
-                queueName: client.queueName,
-                logger: client.logger,
-                workflows: [MixedWorkflow.self],
-                activities: [UppercaseActivity(), ReverseLocalActivity(done: done)]
-            )
-            defer { workerTask.cancel() }
+            try await confirmation("ReverseLocalActivity ran") { confirm in
+                let workerTask = startWorker(
+                    postgres: client.postgres,
+                    queueName: client.queueName,
+                    logger: client.logger,
+                    workflows: [MixedWorkflow.self],
+                    activities: [UppercaseActivity(), ReverseLocalActivity(onRan: { confirm() })]
+                )
+                defer { workerTask.cancel() }
 
-            let handle = try await client.startWorkflow(
-                MixedWorkflow.self,
-                options: .init(),
-                input: "abc"
-            )
-            // "abc" → local uppercase → "ABC" → regular reverse → "CBA"
-            try await done.wait(for: "ReverseLocalActivity", timeout: .seconds(30))
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(10)
-            )
-            #expect(snap.state == .completed)
-            let result = try snap.decodeResult(as: String.self)
-            #expect(result == "CBA")
+                let handle = try await client.startWorkflow(
+                    MixedWorkflow.self,
+                    options: .init(),
+                    input: "abc"
+                )
+                // "abc" → local uppercase → "ABC" → regular reverse → "CBA".
+                // awaitTerminal guarantees the activity completed before we return,
+                // so confirmation will see exactly 1 call to confirm().
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(30)
+                )
+                #expect(snap.state == .completed)
+                let result = try snap.decodeResult(as: String.self)
+                #expect(result == "CBA")
+            }
         }
     }
 

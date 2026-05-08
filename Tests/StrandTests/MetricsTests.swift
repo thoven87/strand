@@ -172,9 +172,9 @@ private struct SimpleWorkflow: Workflow {
 private struct SimpleActivity: ActivityDefinition {
     typealias Input = String
     typealias Output = String
-    var done: TestExpectation?
+    var onRan: (@Sendable () -> Void)?
     func run(input: String, context: ActivityContext) async throws -> String {
-        done?.trigger()
+        onRan?()
         return input.uppercased()
     }
 }
@@ -268,25 +268,27 @@ struct MetricsTests {
         let metrics = TestMetricsFactory()
 
         try await withTestEnvironment { client in
-            let done = TestExpectation()
-            let workerTask = startWorker(
-                postgres: client.postgres,
-                queueName: client.queueName,
-                logger: client.logger,
-                workflows: [ActivityWorkflowM.self],
-                activities: [SimpleActivity(done: done)],
-                metricsFactory: metrics
-            )
-            defer { workerTask.cancel() }
+            try await confirmation("SimpleActivity ran") { confirm in
+                let workerTask = startWorker(
+                    postgres: client.postgres,
+                    queueName: client.queueName,
+                    logger: client.logger,
+                    workflows: [ActivityWorkflowM.self],
+                    activities: [SimpleActivity(onRan: { confirm() })],
+                    metricsFactory: metrics
+                )
+                defer { workerTask.cancel() }
 
-            let handle = try await client.startWorkflow(
-                ActivityWorkflowM.self,
-                options: .init(),
-                input: "hello"
-            )
-            try await done.wait(for: "SimpleActivity", timeout: .seconds(30))
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "HELLO")
+                let handle = try await client.startWorkflow(
+                    ActivityWorkflowM.self,
+                    options: .init(),
+                    input: "hello"
+                )
+                // handle.result() only returns after the activity completed,
+                // so confirmation sees exactly 1 confirm() call.
+                let result = try await handle.result(timeout: .seconds(30))
+                #expect(result == "HELLO")
+            }
         }
 
         // Workflow + activity are each claimed tasks → at least 2 duration samples.
@@ -344,22 +346,22 @@ struct TracingTests {
 
         // ── Activity span ─────────────────────────────────────────────────────
         try await withTestEnvironment { client in
-            let done = TestExpectation()
-            let workerTask = startWorker(
-                postgres: client.postgres,
-                queueName: client.queueName,
-                logger: client.logger,
-                workflows: [ActivityWorkflowM.self],
-                activities: [SimpleActivity(done: done)]
-            )
-            defer { workerTask.cancel() }
-            let handle = try await client.startWorkflow(
-                ActivityWorkflowM.self,
-                options: .init(),
-                input: "span-test"
-            )
-            try await done.wait(for: "SimpleActivity", timeout: .seconds(30))
-            _ = try await awaitTerminal(client: client, taskID: handle.taskID, timeout: .seconds(10))
+            try await confirmation("SimpleActivity ran") { confirm in
+                let workerTask = startWorker(
+                    postgres: client.postgres,
+                    queueName: client.queueName,
+                    logger: client.logger,
+                    workflows: [ActivityWorkflowM.self],
+                    activities: [SimpleActivity(onRan: { confirm() })]
+                )
+                defer { workerTask.cancel() }
+                let handle = try await client.startWorkflow(
+                    ActivityWorkflowM.self,
+                    options: .init(),
+                    input: "span-test"
+                )
+                _ = try await awaitTerminal(client: client, taskID: handle.taskID, timeout: .seconds(30))
+            }
         }
 
         let actSpan = tracer.span(named: "SimpleActivity")
