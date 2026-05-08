@@ -440,8 +440,15 @@ struct EventTests {
                 input: EventWaitInput(eventName: eventName)
             )
 
-            // Give the workflow time to start and register the event wait.
-            try await Task.sleep(for: .milliseconds(400))
+            // Wait until the workflow has registered its event_waits row (state = WAITING).
+            // A fixed sleep is fragile on slow CI runners — if the first activation
+            // hasn't finished by the time we emit, the event fires before the wait
+            // is registered and the workflow never resumes.
+            let waitDeadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < waitDeadline {
+                if let snap = try await handle.snapshot(), snap.state == .waiting { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
             try await client.emitEvent(eventName, payload: EventPayload(msg: "from-test"))
 
             let result = try await handle.result(timeout: .seconds(10))
