@@ -386,20 +386,16 @@ struct SchedulerIntegrationTests {
 
 // MARK: - Catch-up unit tests (injected `now`, no scheduler process)
 
-/// Parses an ISO 8601 UTC date string. File-level so it is never captured
-/// as `self` inside `#expect` closures (Swift 6 Sendable requirement).
+/// Parses an ISO 8601 UTC date string (`"YYYY-MM-DDThh:mm:ssZ"`).
+/// File-level so it is never captured as `self` inside `#expect` closures.
 private func catchupDate(_ s: String) -> Date {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime]
-    return f.date(from: s)!
+    try! Date(s, strategy: .iso8601)
 }
 
-/// Formats a date as ISO 8601 UTC for assertion messages.
+/// Formats a date as `"YYYY-MM-DDThh:mm:ssZ"` for assertion messages.
 private func catchupFmt(_ d: Date?) -> String {
     guard let d else { return "nil" }
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime]
-    return f.string(from: d)
+    return d.formatted(.iso8601)
 }
 
 /// Seeds a schedule row with an explicit `next_run_at` + `last_slot_at` (the state
