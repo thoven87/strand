@@ -134,12 +134,15 @@ public final class StrandNotifier: Service, Sendable {
         defer {
             // Finish every active stream so consumer for-await loops exit cleanly
             // rather than blocking indefinitely.
-            _state.withLock { s in
-                for conts in s.subscriptions.values {
-                    for (_, cont) in conts { cont.finish() }
-                }
+            //
+            // collect continuations and clear subscriptions under the
+            // lock, then call finish() OUTSIDE the lock.
+            let pending = _state.withLock { s -> [AsyncStream<String>.Continuation] in
+                let all = s.subscriptions.values.flatMap(\.values)
                 s.subscriptions.removeAll()
+                return all
             }
+            for cont in pending { cont.finish() }
             logger.info("notifier stopped")
         }
 
