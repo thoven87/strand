@@ -233,6 +233,15 @@ public struct StrandWorker: Service {
     /// `Sendable` handler registry — a class reference whose `let` store is
     /// data-race free by construction (written once in `init`, never mutated).
     private let _registry: Registry
+    /// Shared LISTEN/NOTIFY hub.  The worker subscribes to `strand_tasks`
+    /// via the notifier's `AsyncStream` — no separate Postgres connection
+    /// is opened.  The notifier must declare ``StrandChannels/tasks`` in its
+    /// `channels` set.
+    let notifier: StrandNotifier
+    /// Optional shared timing buffer.  When set, the worker records each
+    /// task's execution duration (in milliseconds) after every completion so
+    /// ``StrandMetricsLoop`` can include DDSketch percentiles in its broadcast.
+    private let metricsBuffer: AggregatedMetricsBuffer?
 
     /// Creates a worker with typed registration arrays.
     ///
@@ -248,6 +257,8 @@ public struct StrandWorker: Service {
     public init(
         postgres: PostgresClient,
         options: WorkerOptions = .init(),
+        notifier: StrandNotifier,
+        metricsBuffer: AggregatedMetricsBuffer? = nil,
         workflows: [any WorkflowRegistrable.Type] = [],
         activityContainers: [any ActivityContainerProtocol] = [],
         activities: [any ActivityBox] = [],
@@ -257,6 +268,8 @@ public struct StrandWorker: Service {
         self.postgres = postgres
         self.options = options
         self.namespace = options.namespace
+        self.notifier = notifier
+        self.metricsBuffer = metricsBuffer
         self.logger = logger
         self._metrics = _MetricsFactoryBox(value: metricsFactory ?? MetricsSystem.factory)
 
@@ -348,6 +361,21 @@ public struct StrandWorker: Service {
             logger: logger
         )
 
+        // Shared running counter — lifted here so heartbeatLoop can read it.
+        let running = _RunningCounter()
+
+        // Register this worker in strand.workers so the dashboard can see it.
+        // try? so a transient DB error on startup doesn't prevent the worker from running.
+        try? await Queries.upsertWorker(
+            on: postgres,
+            workerID: workerID,
+            namespaceID: namespace,
+            queue: options.queue,
+            concurrency: options.workflowConcurrency + options.activityConcurrency,
+            running: 0,
+            logger: logger
+        )
+
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
         // Signal shared between listenLoop (producer) and pollLoop (consumer).
         // _SlotSignal (Mutex + CheckedContinuation) has buffer-of-1 semantics:
@@ -370,9 +398,24 @@ public struct StrandWorker: Service {
                 // full gracefulShutdownTimeout, which cancels any still-running
                 // children (pollLoop, listenLoop) and lets run() return cleanly.
                 try await withThrowingDiscardingTaskGroup { group in
-                    group.addTask { try await self.pollLoop(workerID: workerID, notifySignal: notifySignal) }
-                    group.addTask { try await self.listenLoop(notifySignal: notifySignal) }
-                    group.addTask { try await self.heartbeatLoop(notifySignal: notifySignal) }
+                    group.addTask { try await self.pollLoop(workerID: workerID, notifySignal: notifySignal, running: running) }
+                    let myPayload = StrandChannels.Notification(
+                        namespace: self.namespace,
+                        queue: self.options.queue
+                    ).payload
+                    group.addTask {
+                        // cancelWhenGracefulShutdown: exit the stream loop immediately
+                        // on graceful shutdown rather than waiting for the notifier
+                        // to shut down and finish the stream.  Mirrors the pattern
+                        // used by heartbeatLoop and leaseExpiryLoop.
+                        await cancelWhenGracefulShutdown {
+                            for await payload in self.notifier.stream(for: StrandChannels.tasks) {
+                                if payload == myPayload { notifySignal.signal() }
+                            }
+                        }
+                        // Returns normally — discarded by withThrowingDiscardingTaskGroup.
+                    }
+                    group.addTask { try await self.heartbeatLoop(workerID: workerID, notifySignal: notifySignal, running: running) }
                     group.addTask { try await self.leaseExpiryLoop() }
                     group.addTask {
                         // Wait for the graceful-shutdown signal from
@@ -387,14 +430,15 @@ public struct StrandWorker: Service {
                         // Immediately expire all in-flight runs for this worker so
                         // the next worker's leaseExpiryLoop picks them up on its
                         // first sweep rather than waiting up to claimTimeout.
-                        let _ = try? await self.postgres.query(
-                            """
-                            UPDATE strand.runs
-                            SET lease_expires_at = NOW()
-                            WHERE worker_id     = \(workerID)
-                              AND namespace_id  = \(self.namespace)
-                              AND state         = \(TaskState.running)
-                            """,
+                        // Expire in-flight run leases + remove worker heartbeat row
+                        // in one round-trip so the next worker's leaseExpiryLoop
+                        // picks up the runs immediately and the dashboard stops
+                        // showing this worker at the same instant.
+                        try? await Queries.shutdownWorker(
+                            on: self.postgres,
+                            workerID: workerID,
+                            namespaceID: self.namespace,
+                            queue: self.options.queue,
                             logger: self.logger
                         )
 
@@ -431,16 +475,15 @@ public struct StrandWorker: Service {
     ///
     /// When all slots are occupied the loop parks on `_SlotSignal` — a
     /// `Mutex`-backed async wakeup that resumes as soon as any slot is freed.
-    private func pollLoop(workerID: String, notifySignal: _SlotSignal) async throws {
+    private func pollLoop(workerID: String, notifySignal: _SlotSignal, running: _RunningCounter) async throws {
         let queueName = options.queue
         let maxConcurrency =
             options.batchSize ?? (options.workflowConcurrency + options.activityConcurrency)
         let claimSecs = Int(options.claimTimeout.components.seconds)
 
-        // Slot counter shared between the dispatch body and execution tasks.
-        // `_RunningCounter` is `Sendable`; concurrent increment/decrement are
-        // data-race free via its internal `Mutex`.
-        let running = _RunningCounter()
+        // slotFreeSignal is local to pollLoop — used to wake the dispatch body
+        // when a running task finishes and frees a slot.  `running` is shared
+        // with heartbeatLoop (injected via parameter) so it can report live counts.
         let slotFreeSignal = _SlotSignal()
 
         // Dispatch body: claims work when slots are available, parks when full.
@@ -585,7 +628,7 @@ public struct StrandWorker: Service {
     /// Running as a structured sibling in the same task group means its
     /// `Task.sleep` is cancelled once by the parent group on shutdown, not
     /// repeatedly by sibling-cancel (which leaks the `runTimer` continuation).
-    private func heartbeatLoop(notifySignal: _SlotSignal) async throws {
+    private func heartbeatLoop(workerID: String, notifySignal: _SlotSignal, running: _RunningCounter) async throws {
         while !Task.isShuttingDownGracefully && !Task.isCancelled {
             // try? is essential: cancelWhenGracefulShutdown throws CancellationError
             // on graceful shutdown.  Without try? that error propagates out of this
@@ -596,6 +639,25 @@ public struct StrandWorker: Service {
                 try await Task.sleep(for: self.options.pollInterval)
             }
             notifySignal.signal()
+            // Upsert heartbeat row with current running count.
+            // try? so a transient DB blip doesn't abort the worker.
+            try? await Queries.upsertWorker(
+                on: postgres,
+                workerID: workerID,
+                namespaceID: namespace,
+                queue: options.queue,
+                concurrency: options.workflowConcurrency + options.activityConcurrency,
+                running: running.value,
+                logger: logger
+            )
+            // Sweep stale worker rows left by crashed peers
+            // (threshold: 3× pollInterval, floor 30 s).
+            let stalenessSeconds = Int(max(30, options.pollInterval.components.seconds * 3))
+            try? await Queries.sweepStaleWorkers(
+                on: postgres,
+                olderThanSeconds: stalenessSeconds,
+                logger: logger
+            )
         }
     }
 
@@ -700,6 +762,7 @@ public struct StrandWorker: Service {
         let fatalDeadline = TaskDeadline(timeout: fatalDeadlineTimeout)
 
         let taskStart = ContinuousClock.now
+        let taskStartWall = Date.now  // wall clock for wait_time
         let taskDims: [(String, String)] = [
             ("task_name", claimed.taskName),
             ("queue", options.queue),
@@ -719,21 +782,69 @@ public struct StrandWorker: Service {
                         self._metrics.value
                             .makeTimer(label: StrandMetrics.taskDuration, dimensions: taskDims)
                             .recordNanoseconds(elapsed.nanoseconds)
+                        // execMs is read after the task group exits via
+                        // (ContinuousClock.now - taskStart).  The ~1-2 ms overhead
+                        // from group teardown is negligible for p50/p95/p99.
                     }
                     // OTel span: one span per task execution attempt.
-                    // SpanKind.consumer: the worker is processing an async message
-                    // from the task queue. The producer span (enqueue call-site) ended
-                    // before this span starts, so we use addLink rather than
-                    // parent-child — the async gap breaks the parent-child model.
+                    //
+                    // Extract the W3C trace context from the task headers and use it
+                    // as the *parent* span.  This creates a proper parent-child
+                    // relationship in Jaeger / OTLP collectors:
+                    //
+                    //   • Activities / child-workflows enqueued by a workflow carry the
+                    //     workflow activation’s span (injected in applyScheduleCommands)
+                    //     → they appear nested under the workflow span.
+                    //
+                    //   • Root tasks enqueued directly (e.g. from an HTTP handler) carry
+                    //     the producer span (injected by StrandClient._enqueue)
+                    //     → they appear nested under the HTTP request span.
+                    //
+                    // OTel parent-child is causal, not temporal: the child span may start
+                    // after the parent ends.  This is standard async-messaging propagation
+                    // (Kafka, SQS, AMQP) and is handled correctly by all major collectors.
+                    //
                     // Zero-cost no-op when no tracing backend is bootstrapped.
-                    var linkCtx = ServiceContext.topLevel
+                    var parentCtx = ServiceContext.topLevel
                     InstrumentationSystem.tracer.extract(
                         claimed.headers,
-                        into: &linkCtx,
+                        into: &parentCtx,
                         using: DictionaryExtractor()
                     )
-                    return try await withSpan(claimed.taskName, ofKind: .consumer) { span in
-                        span.addLink(SpanLink(context: linkCtx, attributes: [:]))
+
+                    // ── Trace continuity (zero DB cost) ──────────────────────────
+                    // Workflows enqueued outside an HTTP context (seeders, cron)
+                    // have NULL headers — no traceparent at enqueue time — so
+                    // each activation creates a fresh root span in a different
+                    // Jaeger trace. The user sees one span per trace instead of
+                    // the full workflow history.
+                    //
+                    // Fix: derive a synthetic traceparent directly from the task
+                    // UUID (128 bits ≡ OTel trace ID). Because the UUID is stable
+                    // across every activation, all activations and their spawned
+                    // activities share the same trace ID → one complete trace in
+                    // Jaeger. No DB write, no extra round-trip.
+                    //
+                    // Workflows enqueued from an HTTP handler already have a real
+                    // traceparent extracted above; this block is skipped for them.
+                    if claimed.kind == .workflow && claimed.headers.isEmpty {
+                        // UUIDv7 hex (32 chars) = OTel trace ID (16 bytes).
+                        // Span ID (8 bytes) = first 16 hex chars of the UUID.
+                        // The synthetic “parent” span does not physically exist in
+                        // Jaeger; collectors treat these spans as trace roots while
+                        // still grouping them under the shared trace ID.
+                        let hex = claimed.taskID.uuidString
+                            .lowercased()
+                            .replacing("-", with: "")
+                        let syntheticParent = "00-\(hex)-\(hex.prefix(16))-01"
+                        InstrumentationSystem.tracer.extract(
+                            ["traceparent": syntheticParent],
+                            into: &parentCtx,
+                            using: DictionaryExtractor()
+                        )
+                    }
+
+                    return try await withSpan(claimed.taskName, context: parentCtx, ofKind: .consumer) { span in
                         span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(
                             claimed.taskName
                         )
@@ -804,7 +915,16 @@ public struct StrandWorker: Service {
             }
             _metrics.value.makeCounter(label: StrandMetrics.tasksCompleted, dimensions: taskDims)
                 .increment(by: 1)
-            // nil → workflow suspended cleanly; DB already transitioned to SLEEPING.
+            // Record to DDSketch buffer with known state.
+            // nil result means the workflow suspended cleanly — still a "completed" execution
+            // from the worker’s perspective (it ran and handed off cleanly).
+            metricsBuffer?.record(
+                queue: options.queue,
+                taskName: claimed.taskName,
+                state: .completed,
+                execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
+                waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
+            )
         } catch is CancellationError {
             // Worker is shutting down (graceful SIGTERM or forced cancellation).
             // Leave the run in RUNNING state — the leaseExpiryLoop sweep will
@@ -875,6 +995,13 @@ public struct StrandWorker: Service {
             // Pre-encoded failure reason from ActivityDefinition._run — use verbatim.
             _metrics.value.makeCounter(label: StrandMetrics.tasksFailed, dimensions: taskDims)
                 .increment(by: 1)
+            metricsBuffer?.record(
+                queue: options.queue,
+                taskName: claimed.taskName,
+                state: .failed,
+                execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
+                waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
+            )
             do {
                 try await Queries.failRun(
                     on: postgres,
@@ -892,6 +1019,13 @@ public struct StrandWorker: Service {
         } catch {
             _metrics.value.makeCounter(label: StrandMetrics.tasksFailed, dimensions: taskDims)
                 .increment(by: 1)
+            metricsBuffer?.record(
+                queue: options.queue,
+                taskName: claimed.taskName,
+                state: .failed,
+                execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
+                waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
+            )
             let reason = FailureReason(error: error)
             do {
                 let buf =

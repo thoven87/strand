@@ -362,7 +362,7 @@ public struct StrandScheduler: Service {
             "schedule fired",
             metadata: [
                 "strand.schedule_name": .string(row.name),
-                "strand.schedule_id": .string(row.id.uuidString),
+                "strand.schedule_id": .stringConvertible(row.id),
                 "strand.task_name": .string(row.taskName),
                 "strand.queue": .string(row.queue),
                 "strand.scheduled_at": .string(row.scheduledAt.ISO8601Format()),

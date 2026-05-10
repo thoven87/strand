@@ -1,4 +1,4 @@
-import NIOCore
+package import NIOCore
 import NIOFoundationCompat
 
 #if canImport(FoundationEssentials)
@@ -12,7 +12,7 @@ import Foundation
 ///
 /// `NIOFoundationCompat` provides the `encodeAsByteBuffer` and
 /// `decode(_:from:ByteBuffer)` overloads used here.
-enum JSON {
+package enum JSON {
 
     // MARK: - Shared instances
     //
@@ -20,7 +20,7 @@ enum JSON {
     // JSONEncoder / JSONDecoder are classes; construction allocates and initialises
     // strategy tables. Both are `Sendable` in Swift 6 and stateless after init
     // (we never mutate date/key strategies), so sharing across concurrent tasks is safe.
-    private static let allocator = ByteBufferAllocator()
+    package static let allocator = ByteBufferAllocator()
     private static let encoder = JSONEncoder()
     private static let decoder = JSONDecoder()
 
@@ -32,7 +32,7 @@ enum JSON {
     /// available option without a third-party JSON library.
     ///
     /// - Throws: `StrandError.serialization` if encoding fails.
-    static func encode<T: Encodable & Sendable>(_ value: T) throws(StrandError) -> ByteBuffer {
+    package static func encode<T: Encodable & Sendable>(_ value: T) throws(StrandError) -> ByteBuffer {
         do {
             return try encoder.encodeAsByteBuffer(value, allocator: allocator)
         } catch {
@@ -47,7 +47,7 @@ enum JSON {
     /// ByteBuffer's backing storage.
     ///
     /// - Throws: `StrandError.serialization` if decoding fails.
-    static func decode<T: Decodable>(
+    package static func decode<T: Decodable>(
         _ type: T.Type,
         from buffer: ByteBuffer
     ) throws(StrandError) -> T {
@@ -75,7 +75,7 @@ enum JSON {
     /// (unlike the failable `string.data(using: .utf8)` form), so no optional is needed.
     ///
     /// - Throws: `StrandError.serialization` if decoding fails.
-    static func decode<T: Decodable>(_ type: T.Type, from string: String) throws(StrandError) -> T {
+    package static func decode<T: Decodable>(_ type: T.Type, from string: String) throws(StrandError) -> T {
         do {
             return try decoder.decode(type, from: Data(string.utf8))
         } catch {
@@ -86,7 +86,7 @@ enum JSON {
     /// Decode `type` from an optional buffer. Returns `nil` for `nil` or
     /// empty buffers (representing SQL `NULL` / empty JSON columns).
     /// - Throws: `StrandError.serialization` if `JSONDecoder` fails.
-    static func decodeOptional<T: Decodable>(
+    package static func decodeOptional<T: Decodable>(
         _ type: T.Type,
         from buffer: ByteBuffer?
     ) throws(StrandError) -> T? {

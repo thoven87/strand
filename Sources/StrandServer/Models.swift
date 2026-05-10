@@ -30,7 +30,10 @@ struct QueueResponse: Codable, Sendable {
     struct StatsBody: Codable, Sendable {
         let pending: Int
         let running: Int
+        /// Workflows suspended on a `ctx.sleep(for:)` timer.
         let sleeping: Int
+        /// Workflows suspended waiting for an activity, child workflow, or named event.
+        let waiting: Int
         let completed: Int
         let failed: Int
         let cancelled: Int
@@ -44,6 +47,7 @@ struct QueueResponse: Codable, Sendable {
             pending: row.pending,
             running: row.running,
             sleeping: row.sleeping,
+            waiting: row.waiting,
             completed: row.completed,
             failed: row.failed,
             cancelled: row.cancelled
@@ -72,6 +76,10 @@ struct TaskSummaryResponse: Codable, Sendable {
     let parentTaskId: UUID?
     /// Schedule name that triggered this task, or `null` if not scheduled.
     let scheduleName: String?
+    /// Human-readable workflow ID — the value passed to ``WorkflowOptions/id`` at
+    /// enqueue time, or the auto-generated `"WorkflowName-<ms>"` string.
+    /// `nil` for activity tasks (spawned internally, not via `startWorkflow`).
+    let workflowId: String?
 
     init(from row: TaskSummaryRow) {
         id = row.id
@@ -84,6 +92,7 @@ struct TaskSummaryResponse: Codable, Sendable {
         kind = row.kind
         parentTaskId = row.parentTaskId
         scheduleName = row.scheduleName
+        workflowId = row.workflowId
     }
 }
 extension TaskSummaryResponse: ResponseCodable {}
@@ -103,6 +112,8 @@ struct TaskDetailResponse: Codable, Sendable {
     let cancelledAt: Date?
     let kind: TaskKind
     let parentTaskId: UUID?
+    /// Human-readable workflow ID. See ``TaskSummaryResponse/workflowId``.
+    let workflowId: String?
     /// Scheduling metadata for tasks triggered by a schedule, or `null` if not scheduled.
     let scheduling: SchedulingInfoResponse?
 
@@ -121,6 +132,7 @@ struct TaskDetailResponse: Codable, Sendable {
         cancelledAt = row.cancelledAt
         kind = row.kind
         parentTaskId = row.parentTaskId
+        workflowId = row.workflowId
         scheduling = row.schedulingMetadata.map {
             SchedulingInfoResponse(
                 scheduleName: $0.scheduledBy,
@@ -280,8 +292,11 @@ extension WorkerTaskResponse: ResponseCodable {}
 
 struct WorkerDetailResponse: Codable, Sendable {
     let workerID: String
+    let queue: String
+    let concurrency: Int
     let runningTasks: Int
     let completedRecently: Int
+    let startedAt: Date?
     let lastSeenAt: Date?
     let leaseExpiresAt: Date?
     let isHealthy: Bool

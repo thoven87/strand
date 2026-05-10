@@ -147,9 +147,10 @@ private func makePostgres(logger: Logger) -> PostgresClient {
     )
     // Pool sizing: Σ(activityConcurrency) + Σ(workflowConcurrency)
     //            + N workers × 3 (listenLoop + poll + lease)
-    //            + headroom for HTTP handlers
-    // ordersWorker (16+8) + reportsWorker (8+4) + 2×3 + 8 HTTP = 50
-    config.options.maximumConnections = 50
+    //            + headroom for HTTP handlers + notifier
+    // ordersWorker (16+8) + reportsWorker (8+4) + 2×3 + 8 HTTP + 1 notifier = 51
+    // Add headroom for podcast fan-outs (up to 8 parallel TranscribeSegment)
+    config.options.maximumConnections = 60
     return PostgresClient(configuration: config, backgroundLogger: logger)
 }
 
@@ -160,14 +161,44 @@ private func runSeeder(
     reports: StrandClient,
     logger: Logger
 ) async {
-    // postgres.run() is now managed by Application; give it a moment.
+    // Give the postgres pool a moment to be ready before the first seed.
     try? await Task.sleep(for: .milliseconds(500))
+    guard !Task.isShuttingDownGracefully else { return }
+
     await seedBatch(orders: orders, reports: reports, logger: logger)
 
-    while !Task.isCancelled {
-        try? await Task.sleep(for: .seconds(30))
-        guard !Task.isCancelled else { break }
+    var tick = 0
+    // Task.isShuttingDownGracefully is set via task-local storage by
+    // ServiceLifecycle when the ServiceGroup receives SIGTERM/SIGINT.
+    // It propagates into unstructured Tasks spawned from a managed context,
+    // so this check exits the loop without waiting for the next tick.
+    while !Task.isShuttingDownGracefully && !Task.isCancelled {
+        // cancelWhenGracefulShutdown wakes the sleep immediately on shutdown
+        // instead of waiting the full 30 s before the loop condition is checked.
+        try? await cancelWhenGracefulShutdown {
+            try await Task.sleep(for: .seconds(30))
+        }
+        guard !Task.isShuttingDownGracefully && !Task.isCancelled else { break }
+        tick += 1
         await seedOne(orders: orders, logger: logger)
+        // Billing: every 2 ticks (~60 s)
+        if tick % 2 == 0 {
+            let userID = Int.random(in: 4000...9999)
+            let email = "user\(userID)@example.com"
+            do {
+                _ = try await orders.startWorkflow(
+                    MonthlyBillingWorkflow.self,
+                    input: BillingInput(userID: userID, userEmail: email, adminEmail: "billing@example.com")
+                )
+                logger.info("[seeder] periodic billing userID=\(userID)")
+            } catch { logger.warning("[seeder] periodic billing: \(error)") }
+        }
+        // Voice training: every 4 ticks (~120 s)
+        if tick % 4 == 0 {
+            await seedVoiceTraining(client: orders, logger: logger)
+        }
+        // Podcast: every tick (~30 s) — short runs, good throughput driver
+        await seedOnePodcast(client: orders, logger: logger)
     }
 }
 
@@ -224,6 +255,10 @@ private func seedBatch(
     } catch {
         logger.warning("[seeder] misc tasks: \(error)")
     }
+
+    await seedBilling(client: orders, logger: logger)
+    await seedVoiceTraining(client: orders, logger: logger)
+    await seedPodcast(client: orders, logger: logger)
 }
 
 private func seedOne(orders: StrandClient, logger: Logger) async {
@@ -238,6 +273,90 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
         logger.info("[seeder] periodic order \(id)")
     } catch {
         logger.warning("[seeder] periodic order: \(error)")
+    }
+}
+
+private func seedBilling(client: StrandClient, logger: Logger) async {
+    let users: [(Int, String, String)] = [
+        (1001, "alice@example.com", "billing@example.com"),
+        (1042, "bob@example.com", "billing@example.com"),
+        (2087, "carol@example.com", "billing@example.com"),
+        (3314, "dave@example.com", "billing@example.com"),
+    ]
+    for (userID, email, admin) in users {
+        do {
+            _ = try await client.startWorkflow(
+                MonthlyBillingWorkflow.self,
+                input: BillingInput(userID: userID, userEmail: email, adminEmail: admin)
+            )
+            logger.info("[seeder] billing userID=\(userID) enqueued")
+        } catch {
+            logger.warning("[seeder] billing userID=\(userID): \(error)")
+        }
+    }
+}
+
+private func seedVoiceTraining(client: StrandClient, logger: Logger) async {
+    let jobName = "voice-\(Int(Date().timeIntervalSince1970) % 10_000)"
+    do {
+        _ = try await client.startWorkflow(
+            TrainVoiceAssistantWorkflow.self,
+            input: TrainingJobInput(
+                jobName: jobName,
+                partitions: [
+                    CountryPartitionInput(country: "ID", partition: 0, variants: 2),
+                    CountryPartitionInput(country: "JP", partition: 1, variants: 4),
+                    CountryPartitionInput(country: "PN", partition: 2, variants: 2),
+                ]
+            )
+        )
+        logger.info("[seeder] voice training job '\(jobName)' enqueued")
+    } catch {
+        logger.warning("[seeder] voice training: \(error)")
+    }
+}
+
+private func seedPodcast(client: StrandClient, logger: Logger) async {
+    // Seed a variety of episode lengths on startup to populate the metrics dashboard.
+    // Longer episodes fan out to more parallel TranscribeSegment activities.
+    let episodes: [(String, String, Int)] = [
+        ("Corecursive", "The Mess We're In with Joe Armstrong", 120),  // 8 segments
+        ("The Changelog", "Swift on the Server", 45),  // 3 segments
+        ("How I Built This", "Figma: Dylan Field", 35),  // 2 segments
+        ("Darknet Diaries", "The Twitter Hack", 60),  // 4 segments
+    ]
+    for (show, title, duration) in episodes {
+        do {
+            _ = try await client.startWorkflow(
+                PodcastTranscriptionWorkflow.self,
+                input: PodcastEpisodeInput(showName: show, episodeTitle: title, durationMinutes: duration)
+            )
+            logger.info("[seeder] podcast '\(show)' enqueued (\(duration) min)")
+        } catch {
+            logger.warning("[seeder] podcast '\(show)': \(error)")
+        }
+    }
+}
+
+private func seedOnePodcast(client: StrandClient, logger: Logger) async {
+    let episodes: [(String, String, Int)] = [
+        ("Corecursive", "Forget Passwords with Randall Degges", 90),  // 6 segments
+        ("Corecursive", "The Mess We're In with Joe Armstrong", 120),  // 8 segments
+        ("Hardcore History", "Blueprint for Armageddon", 180),  // 8 segments (capped)
+        ("The Changelog", "Open Source AI", 45),  // 3 segments
+        ("Darknet Diaries", "SolarWinds", 55),  // 3 segments
+        ("How I Built This", "Stripe: Patrick Collison", 40),  // 2 segments
+        ("Software Unscripted", "Type Systems", 60),  // 4 segments
+    ]
+    let (show, title, duration) = episodes.randomElement()!
+    do {
+        _ = try await client.startWorkflow(
+            PodcastTranscriptionWorkflow.self,
+            input: PodcastEpisodeInput(showName: show, episodeTitle: title, durationMinutes: duration)
+        )
+        logger.info("[seeder] periodic podcast '\(show)' (\(duration) min)")
+    } catch {
+        logger.warning("[seeder] periodic podcast: \(error)")
     }
 }
 
@@ -306,6 +425,33 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
             options: StrandOptions(logger: logger)
         )
 
+        // ── Shared LISTEN/NOTIFY hub ───────────────────────────────────────────────────────
+        // One StrandNotifier holds the single Postgres LISTEN connection for
+        // the entire process.  Both workers subscribe to strand_tasks; the
+        // MetricsBroadcastListener subscribes to strand_metrics.
+        // Before this: 2 workers × 1 listenLoop = 2 dedicated connections.
+        // After: 1 notifier, 2 subscribers — all share the same connection.
+        let notifier = StrandNotifier(
+            postgres: postgres,
+            channels: [StrandNotifier.tasksChannel, StrandNotifier.metricsChannel],
+            logger: logger
+        )
+
+        // ── Metrics ─────────────────────────────────────────────────────────────────────
+        // AggregatedMetricsBuffer: workers write exec times here after each
+        // task; StrandMetricsLoop flushes it every 5 s, compresses into
+        // DDSketches, and includes them in the broadcast so the dashboard
+        // can show p50/p95/p99 without any additional DB queries.
+        let metricsBuffer = AggregatedMetricsBuffer()
+        let metricsCache = MetricsCache()
+        let metricsListener = MetricsBroadcastListener(
+            notifier: notifier,
+            cache: metricsCache,
+            logger: logger
+        )
+        let metricsLoop = StrandMetricsLoop(client: ordersClient, metricsBuffer: metricsBuffer)
+
+        // ── Workers ─────────────────────────────────────────────────────────────────────────
         let ordersWorker = StrandWorker(
             postgres: postgres,
             options: WorkerOptions(
@@ -320,10 +466,30 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
                 // Only 2 workers on this server — no thundering herd, no jitter needed.
                 notifyJitter: .zero
             ),
+            notifier: notifier,
+            metricsBuffer: metricsBuffer,
             workflows: [
                 ProcessOrderWorkflow.self,
                 GreetUserWorkflow.self,
                 FlakyTaskWorkflow.self,
+                MonthlyBillingWorkflow.self,
+                TrainVoiceAssistantWorkflow.self,
+                TrainCountryModelWorkflow.self,
+                PodcastTranscriptionWorkflow.self,
+            ],
+            activities: [
+                CalculateInvoiceActivity(),
+                ChargeCreditCardActivity(),
+                GeneratePDFActivity(),
+                SendEmailActivity(),
+                IngestTextCorpusActivity(),
+                AnalyzeTextCorpusActivity(),
+                GenerateVoiceModelActivity(),
+                PublishModelsActivity(),
+                DownloadEpisodeActivity(),
+                TranscribeSegmentActivity(),
+                MergeTranscriptActivity(),
+                GenerateChaptersActivity(),
             ],
             logger: logger
         )
@@ -339,11 +505,17 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
                 leaseExpiryInterval: .seconds(5),
                 notifyJitter: .zero
             ),
+            notifier: notifier,
+            metricsBuffer: metricsBuffer,
             workflows: [GenerateReportWorkflow.self],
             logger: logger
         )
 
-        let router = StrandServer.buildRouter(client: ordersClient, postgres: postgres)
+        let router = StrandServer.buildRouter(
+            client: ordersClient,
+            postgres: postgres,
+            metricsCache: metricsCache
+        )
 
         var app = Application(
             router: router,
@@ -351,14 +523,13 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
             logger: logger
         )
 
-        // Mirror the Hummingbird todos-postgres pattern exactly:
-        //   addServices → postgres, then workers (all managed by the Application)
-        //   beforeServerStarts → schema check + seed (postgres is live by here)
-        //   runService() → starts everything, handles SIGTERM/SIGINT
-        app.addServices(observability)  // must be first so OTel is live before any spans are emitted
+        app.addServices(observability)  // OTel must be first so spans are emitted correctly
         app.addServices(postgres)
+        app.addServices(notifier)  // one LISTEN connection, fans out to workers + listener
         app.addServices(ordersWorker)
         app.addServices(reportsWorker)
+        app.addServices(metricsListener)  // receives strand_metrics broadcasts→ updates cache
+        app.addServices(metricsLoop)  // broadcasts live counts every 5 s
 
         app.beforeServerStarts {
             try await ordersClient.verifySchema()

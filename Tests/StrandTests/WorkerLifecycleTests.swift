@@ -204,18 +204,31 @@ struct WorkerLifecycleTests {
 
             // 6. Start worker 2 with a short leaseExpiryInterval so the
             //    sweep fires within ~1 second instead of the 5-second default.
-            let worker2 = StrandWorker(
-                postgres: client.postgres,
-                options: WorkerOptions(
-                    queue: client.queueName,
-                    pollInterval: .milliseconds(20),
-                    fatalOnLeaseTimeout: false,
-                    leaseExpiryInterval: .seconds(1)
-                ),
-                activities: [WltHungActivity(executionCount: counter)],
-                logger: client.logger
-            )
-            let worker2Task = Task { try? await worker2.run() }
+            let worker2Task = Task {
+                let notifier2 = StrandNotifier(
+                    postgres: client.postgres,
+                    channels: [StrandNotifier.tasksChannel],
+                    logger: client.logger
+                )
+                let worker2 = StrandWorker(
+                    postgres: client.postgres,
+                    options: WorkerOptions(
+                        queue: client.queueName,
+                        pollInterval: .milliseconds(20),
+                        fatalOnLeaseTimeout: false,
+                        leaseExpiryInterval: .seconds(1)
+                    ),
+                    notifier: notifier2,
+                    activities: [WltHungActivity(executionCount: counter)],
+                    logger: client.logger
+                )
+                try? await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await notifier2.run() }
+                    group.addTask { try await worker2.run() }
+                    try await group.next()
+                    group.cancelAll()
+                }
+            }
             defer { worker2Task.cancel() }
 
             // 7-8. Wait for terminal state.
@@ -404,6 +417,11 @@ struct WorkerLifecycleTests {
             // Start worker B — auto-registers namespace B and its queue,
             // then polls exclusively for namespace B tasks.
             let workerBTask = Task {
+                let notifierB = StrandNotifier(
+                    postgres: clientA.postgres,
+                    channels: [StrandNotifier.tasksChannel],
+                    logger: clientA.logger
+                )
                 let w = StrandWorker(
                     postgres: clientA.postgres,
                     options: WorkerOptions(
@@ -412,10 +430,16 @@ struct WorkerLifecycleTests {
                         pollInterval: .milliseconds(20),
                         fatalOnLeaseTimeout: false
                     ),
+                    notifier: notifierB,
                     workflows: [WltEchoWorkflow.self],
                     logger: clientA.logger
                 )
-                try? await w.run()
+                try? await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await notifierB.run() }
+                    group.addTask { try await w.run() }
+                    try await group.next()
+                    group.cancelAll()
+                }
             }
             defer { workerBTask.cancel() }
 

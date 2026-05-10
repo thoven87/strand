@@ -7,8 +7,11 @@ import { EmptyState } from "@/components/EmptyState";
 
 interface Worker {
     workerID: string;
+    queue: string;
+    concurrency: number;
     runningTasks: number;
     completedRecently: number;
+    startedAt: string | null;
     lastSeenAt: string | null;
     leaseExpiresAt: string | null;
     isHealthy: boolean;
@@ -55,6 +58,8 @@ export function WorkersPage() {
                             <tr className="border-b border-border bg-secondary/20">
                                 {[
                                     "Worker ID",
+                                    "Queue",
+                                    "Concurrency",
                                     "Running",
                                     "Completed (5 min)",
                                     "Last Seen",
@@ -73,7 +78,7 @@ export function WorkersPage() {
                         <tbody>
                             {workers.map((w) => (
                                 <tr
-                                    key={w.workerID}
+                                    key={`${w.workerID}:${w.queue}`}
                                     className="border-b border-border/40 last:border-0 hover:bg-secondary/10 transition-colors"
                                 >
                                     <td className="px-4 py-2.5 font-mono text-xs max-w-xs truncate">
@@ -91,6 +96,12 @@ export function WorkersPage() {
                                             {w.workerID.split(":").pop() ??
                                                 w.workerID}
                                         </Link>
+                                    </td>
+                                    <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
+                                        {w.queue}
+                                    </td>
+                                    <td className="px-4 py-2.5">
+                                        {w.concurrency}
                                     </td>
                                     <td className="px-4 py-2.5">
                                         {w.runningTasks > 0 ? (

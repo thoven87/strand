@@ -33,6 +33,7 @@ const ZERO_STATS: QueueStats = {
     pending: 0,
     running: 0,
     sleeping: 0,
+    waiting: 0,
     completed: 0,
     failed: 0,
     cancelled: 0,
@@ -89,6 +90,11 @@ const STATE_CONFIG = [
         state: "SLEEPING",
         countKey: "sleeping" as const,
         accent: "bg-slate-500/20  text-slate-300",
+    },
+    {
+        state: "WAITING",
+        countKey: "waiting" as const,
+        accent: "bg-violet-500/20 text-violet-300",
     },
     {
         state: "COMPLETED",
@@ -280,6 +286,7 @@ export function TasksPage() {
                 pending: acc.pending + q.stats.pending,
                 running: acc.running + q.stats.running,
                 sleeping: acc.sleeping + q.stats.sleeping,
+                waiting: acc.waiting + q.stats.waiting,
                 completed: acc.completed + q.stats.completed,
                 failed: acc.failed + q.stats.failed,
                 cancelled: acc.cancelled + q.stats.cancelled,
@@ -485,9 +492,17 @@ export function TasksPage() {
                                                         search={{
                                                             queue: task.queue,
                                                         }}
-                                                        className="font-medium text-foreground hover:text-brand transition-colors"
+                                                        className="group block"
                                                     >
-                                                        {task.name}
+                                                        <span className="font-medium text-foreground group-hover:text-brand transition-colors">
+                                                            {task.name}
+                                                        </span>
+                                                        <span className="block font-mono text-[10px] text-muted-foreground/50 mt-0.5">
+                                                            {task.workflowId ??
+                                                                task.id.split(
+                                                                    "-",
+                                                                )[0]}
+                                                        </span>
                                                     </Link>
                                                 </td>
                                                 <td className="px-4 py-2.5">

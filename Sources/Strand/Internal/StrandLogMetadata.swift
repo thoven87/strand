@@ -51,8 +51,8 @@ extension Logger {
     /// Returns a copy of this logger enriched with task-activation metadata.
     func withTaskContext(_ task: ClaimedTask) -> Logger {
         self.with([
-            StrandLogKeys.taskID: .string(task.taskID.uuidString.lowercased()),
-            StrandLogKeys.runID: .string(task.runID.uuidString.lowercased()),
+            StrandLogKeys.taskID: .stringConvertible(task.taskID),
+            StrandLogKeys.runID: .stringConvertible(task.runID),
             StrandLogKeys.taskName: .string(task.taskName),
             StrandLogKeys.attempt: .stringConvertible(task.attempt),
         ])

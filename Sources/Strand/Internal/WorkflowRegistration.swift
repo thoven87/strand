@@ -68,8 +68,8 @@ final class _WorkflowTaskCache<W: Workflow>: @unchecked Sendable {
         _ = _mutex.withLock { $0.removeValue(forKey: taskID) }
     }
 
-    /// Cancel every cached Task — called from a cancellation handler so that
-    /// worker shutdown also cleans up Tasks that are parked mid-activation.
+    /// Cancel every cached Task — called on worker shutdown so that all
+    /// parked handler Tasks are torn down cleanly.
     func cancelAll() {
         _mutex.withLock { states in
             for (_, state) in states {
@@ -79,6 +79,27 @@ final class _WorkflowTaskCache<W: Workflow>: @unchecked Sendable {
             }
             states.removeAll()
         }
+    }
+
+    /// Cancel and evict ONE workflow’s handler Task.
+    ///
+    /// Called from `WorkflowRegistration.activate`’s cancellation handler so
+    /// that a `ClaimTimeoutError` or unexpected failure on workflow A does
+    /// **not** cancel the handler Tasks of unrelated workflows B, C, … that
+    /// are running concurrently on the same worker.
+    ///
+    /// For worker shutdown every active activation fires this independently
+    /// for its own `taskID` — the net result is identical to `cancelAll()`
+    /// but without cross-contamination between workflows.
+    func evictOne(_ taskID: UUID) {
+        let cached = _mutex.withLock { states -> CachedState? in
+            defer { states.removeValue(forKey: taskID) }
+            return states[taskID]
+        }
+        guard let cached else { return }
+        cached.executor.cancelPending()
+        cached.executor.drain()
+        cached.task.cancel()
     }
 }
 
@@ -96,12 +117,26 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         exec: _WorkerExec,
         cache: _WorkflowTaskCache<W>
     ) async throws -> ByteBuffer? {
-        // Wrap the whole activation so that worker shutdown (Task cancellation)
-        // also tears down any cached handler Task for this workflow instance.
+        // Cancellation handler: fires when THIS activation task is cancelled
+        // (ClaimTimeoutError, worker shutdown, or any other fatal error).
+        //
+        // Critically: use evictOne rather than cancelAll.
+        // cancelAll() would cancel the handler Tasks of EVERY workflow currently
+        // running on this worker, not just the one that timed out. That would
+        // orphan workflows B, C, … whenever workflow A hits its claim timeout.
+        //
+        // evictOne() cancels only this workflow’s handler Task and removes it
+        // from the cache. The next attempt (failRun creates attempt N+1) will
+        // then take the fresh path (_activate) and rebuild from checkpoints
+        // rather than trying to resumeActivation on a cancelled handler.
+        //
+        // Worker shutdown: each concurrent activation fires evictOne for its own
+        // taskID independently — net result is identical to cancelAll, just
+        // scoped correctly.
         try await withTaskCancellationHandler {
             try await _activate(claimed: claimed, exec: exec, cache: cache)
         } onCancel: {
-            cache.cancelAll()
+            cache.evictOne(claimed.taskID)
         }
     }
 

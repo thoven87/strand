@@ -195,7 +195,7 @@ enum Queries {
                 logger.debug(
                     "task enqueued",
                     metadata: [
-                        "strand.task_id": .string(taskID.uuidString),
+                        "strand.task_id": .stringConvertible(taskID),
                         "strand.task_name": .string(taskName),
                         "strand.queue": .string(queue),
                         "strand.namespace": .string(namespaceID),
@@ -299,7 +299,7 @@ enum Queries {
                     lease_expires_at = NOW() + COALESCE(NULLIF(c.timeout_seconds, 0), \(claimTimeoutSeconds)) * INTERVAL '1 second',
                     started_at       = COALESCE(r.started_at, NOW())
                 FROM candidate c WHERE r.id = c.id
-                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload
+                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload, r.available_at
             ),
             task_upd AS (
                 UPDATE strand.tasks t
@@ -311,7 +311,8 @@ enum Queries {
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
                    c.wake_event, c.event_payload,
-                   t.parent_task_id, t.kind, t.timeout_seconds, t.scheduling_metadata
+                   t.parent_task_id, t.kind, t.timeout_seconds, t.scheduling_metadata,
+                   c.available_at
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
@@ -700,7 +701,7 @@ enum Queries {
 
         logger.debug(
             "task cancelled",
-            metadata: ["strand.task_id": .string(taskID.uuidString)]
+            metadata: ["strand.task_id": .stringConvertible(taskID)]
         )
     }
 
@@ -1064,6 +1065,96 @@ enum Queries {
                 logger: logger
             )
         }
+    }
+
+    // MARK: - Worker heartbeat
+
+    /// Upserts a worker heartbeat row into `strand.workers`.
+    /// Called on startup (running=0) and on every heartbeat tick (with current running count).
+    static func upsertWorker(
+        on client: PostgresClient,
+        workerID: String,
+        namespaceID: String,
+        queue: String,
+        concurrency: Int,
+        running: Int,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            INSERT INTO strand.workers (id, namespace_id, queue, concurrency, running, started_at, updated_at)
+            VALUES (\(workerID), \(namespaceID), \(queue), \(concurrency), \(running), NOW(), NOW())
+            ON CONFLICT (id, namespace_id, queue)
+            DO UPDATE SET
+                concurrency  = EXCLUDED.concurrency,
+                running      = EXCLUDED.running,
+                updated_at   = NOW()
+            """,
+            logger: logger
+        )
+    }
+
+    /// Deletes a worker row — called on clean shutdown.
+    /// Workers killed without a graceful shutdown are swept by `sweepStaleWorkers`.
+    static func deleteWorker(
+        on client: PostgresClient,
+        workerID: String,
+        namespaceID: String,
+        queue: String,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            DELETE FROM strand.workers
+            WHERE id           = \(workerID)
+              AND namespace_id = \(namespaceID)
+              AND queue        = \(queue)
+            """,
+            logger: logger
+        )
+    }
+
+    /// Graceful-shutdown helper: expires in-flight run leases and removes the
+    /// worker heartbeat row in a single round-trip.
+    ///
+    /// Previously these were two separate queries (two pool checkouts, two
+    /// network round-trips). The CTE folds them into one atomic statement.
+    static func shutdownWorker(
+        on client: PostgresClient,
+        workerID: String,
+        namespaceID: String,
+        queue: String,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            WITH expire_runs AS (
+                UPDATE strand.runs
+                SET lease_expires_at = NOW()
+                WHERE worker_id    = \(workerID)
+                  AND namespace_id = \(namespaceID)
+                  AND state        = \(TaskState.running)
+            )
+            DELETE FROM strand.workers
+            WHERE id           = \(workerID)
+              AND namespace_id = \(namespaceID)
+              AND queue        = \(queue)
+            """,
+            logger: logger
+        )
+    }
+
+    /// Removes worker rows whose `updated_at` is older than `olderThanSeconds`.
+    /// Called on each heartbeat tick so stale entries from crashed workers are cleaned up.
+    static func sweepStaleWorkers(
+        on client: PostgresClient,
+        olderThanSeconds: Int,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            "DELETE FROM strand.workers WHERE updated_at < NOW() - \(olderThanSeconds) * INTERVAL '1 second'",
+            logger: logger
+        )
     }
 
     // MARK: - continueAsNew for child workflows
