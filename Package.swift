@@ -28,6 +28,8 @@ let package = Package(
         ),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
+        .package(url: "https://github.com/adam-fowler/compress-nio.git", from: "1.4.2"),
+        .package(url: "https://github.com/swift-extras/swift-extras-base64.git", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -46,6 +48,8 @@ let package = Package(
                 ),
                 .product(name: "DequeModule", package: "swift-collections"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+                .product(name: "CompressNIO", package: "compress-nio"),
+                .product(name: "ExtrasBase64", package: "swift-extras-base64"),
             ],
             swiftSettings: [
                 // Non-isolated async functions run on a generic executor, not the caller's actor.

@@ -1,7 +1,9 @@
-#if canImport(FoundationEssentials)
-import FoundationEssentials
-#else
-import Foundation
+#if canImport(Darwin)
+import Darwin  // For macOS, iOS, watchOS, tvOS
+#elseif canImport(Glibc)
+import Glibc  // For Linux
+#elseif os(Windows)
+import ucrt  // For Windows
 #endif
 
 // MARK: - DDSketch

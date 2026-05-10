@@ -20,7 +20,7 @@ package enum JSON {
     // JSONEncoder / JSONDecoder are classes; construction allocates and initialises
     // strategy tables. Both are `Sendable` in Swift 6 and stateless after init
     // (we never mutate date/key strategies), so sharing across concurrent tasks is safe.
-    private static let allocator = ByteBufferAllocator()
+    package static let allocator = ByteBufferAllocator()
     private static let encoder = JSONEncoder()
     private static let decoder = JSONDecoder()
 
