@@ -165,8 +165,13 @@ struct ConditionTests {
                 input: "start"
             )
 
-            // Wait for the workflow to reach and enter the condition suspension.
-            try await Task.sleep(for: .milliseconds(400))
+            // Poll until the workflow enters condition suspension (WAITING state).
+            // A fixed sleep is not reliable on CI where DB round-trips can be
+            // 50 ms+ each, making the first activation exceed any fixed bound.
+            for _ in 0..<50 {
+                if let snap = try await handle.snapshot(), snap.state == .waiting { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
 
             // Deliver the signal that sets `unpaused = true`.
             try await handle.signal(name: "unpause")
@@ -197,8 +202,15 @@ struct ConditionTests {
                 input: "start"
             )
 
-            // Give the workflow time to start and enter the condition suspension.
-            try await Task.sleep(for: .milliseconds(400))
+            // Poll until the workflow enters condition suspension (SLEEPING/WAITING state).
+            for _ in 0..<50 {
+                if let snap = try await handle.snapshot(),
+                    snap.state == .waiting || snap.state == .sleeping
+                {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
 
             // Send the signal — well within the 10 s deadline.
             try await handle.signal(name: "unpause")

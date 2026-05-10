@@ -1,4 +1,5 @@
 import NIOCore
+import PostgresNIO
 import Tracing
 
 #if canImport(FoundationEssentials)
@@ -430,44 +431,92 @@ extension WorkflowRegistration {
         if executor.hasUnsatisfiedConditions && scheduleCommands.isEmpty {
             let condTaskID = claimed.taskID
             let condRunID = claimed.runID
+
+            // Both branches use the same post-CTE logic: read the final state from
+            // RETURNING, then notify only if PENDING and write history only if
+            // the run actually parked (SLEEPING or WAITING).
+            //
+            // If a signal arrived while the run was RUNNING it couldn't flip the run
+            // directly (the signal UPDATE only matches SLEEPING/WAITING). The
+            // pending_sigs CTE catches that race: if workflow_signals already has rows
+            // for this task we go straight to PENDING rather than parking.
+            let condStateStream: PostgresRowSequence
             if let wakeAt = executor.conditionMinWakeAt {
-                // At least one condition has a deadline — sleep until the earliest one.
-                try await exec.postgres.query(
+                condStateStream = try await exec.postgres.query(
                     """
-                    WITH r AS (
+                    WITH
+                    pending_sigs AS (
+                        SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                        WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                    ),
+                    run_upd AS (
                         UPDATE strand.runs
-                        SET state = \(TaskState.sleeping), available_at = \(wakeAt),
+                        SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN \(TaskState.pending)
+                                               ELSE \(TaskState.sleeping) END,
+                            available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN NOW()
+                                               ELSE \(wakeAt) END,
                             worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
+                        RETURNING state
                     )
-                    UPDATE strand.tasks SET state = \(TaskState.sleeping) WHERE id = \(condTaskID)
+                    UPDATE strand.tasks
+                    SET state = (SELECT state FROM run_upd)
+                    WHERE id = \(condTaskID)
+                    RETURNING state
                     """,
                     logger: exec.logger
                 )
             } else {
-                // All conditions are indefinite — wait for a signal.
-                try await exec.postgres.query(
+                condStateStream = try await exec.postgres.query(
                     """
-                    WITH r AS (
+                    WITH
+                    pending_sigs AS (
+                        SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                        WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                    ),
+                    run_upd AS (
                         UPDATE strand.runs
-                        SET state = \(TaskState.waiting), worker_id = NULL, lease_expires_at = NULL
+                        SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN \(TaskState.pending)
+                                               ELSE \(TaskState.waiting) END,
+                            available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN NOW()
+                                               ELSE available_at END,
+                            worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
+                        RETURNING state
                     )
-                    UPDATE strand.tasks SET state = \(TaskState.waiting) WHERE id = \(condTaskID)
+                    UPDATE strand.tasks
+                    SET state = (SELECT state FROM run_upd)
+                    WHERE id = \(condTaskID)
+                    RETURNING state
                     """,
                     logger: exec.logger
                 )
             }
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .conditionWaiting,
-                eventData: nil,
-                logger: exec.logger
-            )
-            historySeq += 1
+
+            // Read the state the CTE actually wrote.
+            var conditionState: TaskState = .waiting
+            for try await row in condStateStream {
+                var col = row.makeIterator()
+                conditionState = try col.next()!.decode(TaskState.self, context: .default)
+            }
+
+            // Notify only when the run went PENDING (signals were waiting).
+            // SLEEPING/WAITING runs don't need a notify — they wake via timer or
+            // the next _sendSignal call.
+            if conditionState == .pending {
+                try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
+            }
+
+            // Only record CONDITION_WAITING when the run actually parked.
+            // If pending signals sent us straight to PENDING the workflow never
+            // entered a wait — recording the event would mislead the history view.
+            if conditionState != .pending {
+                try await record(.conditionWaiting, nil)
+            }
         }
         // No else branch: if scheduleCommands is empty and no conditions remain,
         // suspension came from sleep/waitForEvent which already wrote its own DB update.
