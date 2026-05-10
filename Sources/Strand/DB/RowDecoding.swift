@@ -48,6 +48,11 @@ struct ClaimedTask: Sendable {
     /// Scheduling metadata injected by `StrandScheduler`. `nil` for directly-enqueued tasks.
     let schedulingMetadata: SchedulingMetadata?
 
+    /// The wall-clock time at which this run last became PENDING/SLEEPING (i.e. available
+    /// for claiming).  Used to compute `wait_time` — how long the task spent in the queue
+    /// before a worker picked it up.
+    let availableAt: Date
+
     /// `true` when this attempt is the last one allowed.
     ///
     /// Used to decide whether a thrown error should mark the OTel span `ERROR`.
@@ -62,7 +67,8 @@ struct ClaimedTask: Sendable {
 extension ClaimedTask {
     /// Decode from the column order returned by the claim CTE:
     /// run_id, task_id, attempt, version, task_name, params,
-    /// retry_strategy, max_attempts, headers, wake_event, event_payload
+    /// retry_strategy, max_attempts, headers, wake_event, event_payload,
+    /// parent_task_id, kind, timeout_seconds, scheduling_metadata, available_at
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -88,6 +94,7 @@ extension ClaimedTask {
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         timeoutSeconds = try col.next()!.decode(Int?.self, context: .default)
         schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
+        availableAt = try col.next()!.decode(Date.self, context: .default)
     }
 }
 

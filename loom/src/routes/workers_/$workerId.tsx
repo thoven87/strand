@@ -24,8 +24,11 @@ interface WorkerTask {
 
 interface WorkerDetail {
     workerID: string;
+    queue: string;
+    concurrency: number;
     runningTasks: number;
     completedRecently: number;
+    startedAt: string | null;
     lastSeenAt: string | null;
     leaseExpiresAt: string | null;
     isHealthy: boolean;
@@ -152,7 +155,7 @@ export function WorkerDetailPage() {
             {data && (
                 <>
                     {/* ── Stats strip ────────────────────────────────────────────── */}
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
                         {[
                             {
                                 label: "Running",
@@ -161,6 +164,20 @@ export function WorkerDetailPage() {
                                     data.runningTasks > 0
                                         ? "text-yellow-300"
                                         : "text-foreground",
+                            },
+                            {
+                                label: "Queue",
+                                value: (
+                                    <span className="font-mono text-xs">
+                                        {data.queue}
+                                    </span>
+                                ),
+                                accent: "text-foreground",
+                            },
+                            {
+                                label: "Concurrency",
+                                value: data.concurrency,
+                                accent: "text-foreground",
                             },
                             {
                                 label: "Completed (5 min)",

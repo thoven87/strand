@@ -1,4 +1,5 @@
 import NIOCore
+import Tracing
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -177,6 +178,25 @@ extension WorkflowRegistration {
         }
 
         if !scheduleCommands.isEmpty {
+            // Build a headers buffer carrying the current workflow activation span so
+            // every activity and child workflow this activation spawns appears as a
+            // child span in Jaeger / OTLP collectors rather than a disconnected trace.
+            //
+            // `ServiceContext.current` is the span opened by Worker.runTask's
+            // `withSpan(claimed.taskName, ...)` — active for the entire duration of
+            // drain() and applyScheduleCommands.  Injecting it here is the standard
+            // W3C trace-context propagation pattern used by all async messaging systems
+            // (Kafka, SQS, AMQP, etc.).  OTel parent-child relationships are causal,
+            // not temporal — the child span may legitimately start after the parent ends.
+            var _spanHeaders: [String: String] = [:]
+            InstrumentationSystem.tracer.inject(
+                ServiceContext.current ?? .topLevel,
+                into: &_spanHeaders,
+                using: DictionaryInjector()
+            )
+            let childHeadersBuf: ByteBuffer? =
+                _spanHeaders.isEmpty ? nil : try? JSON.encode(_spanHeaders)
+
             // Enqueue activities / child workflows (idempotent — safe if row exists).
             var enqueued: [(seqNum: Int, taskID: UUID)] = []
             for cmd in scheduleCommands {
@@ -194,7 +214,7 @@ extension WorkflowRegistration {
                         queue: options.queue ?? exec.queue,
                         taskName: name,
                         paramsBuffer: actInput,
-                        headersBuffer: nil,
+                        headersBuffer: childHeadersBuf,
                         retryStrategyBuffer: options.retryStrategy.flatMap { try? JSON.encode($0) },
                         maxAttempts: options.maxAttempts,
                         cancellationBuffer: nil,
@@ -380,7 +400,7 @@ extension WorkflowRegistration {
                         queue: targetQueue,
                         taskName: name,
                         paramsBuffer: wfInput,
-                        headersBuffer: nil,
+                        headersBuffer: childHeadersBuf,
                         retryStrategyBuffer: nil,
                         maxAttempts: nil,
                         cancellationBuffer: nil,
@@ -461,16 +481,31 @@ extension WorkflowRegistration {
                         completedCount = try col.next()!.decode(Int.self, context: .default)
                     }
 
-                    if completedCount == enqueued.count {
-                        // All children already finished — go PENDING so the next poll
-                        // re-activates immediately rather than waiting for events that
-                        // already fired and were missed.
+                    // Go PENDING if ANY child has already completed, not just ALL.
+                    // The `for try await r in group` loop delivers results one at a time,
+                    // so even a single completion requires a re-activation to make progress.
+                    //
+                    // The del_orphans CTE deletes event_waits for the completed children
+                    // in the same atomic operation.  Without this, the partial-completion
+                    // re-wait in step 7 would find them on every subsequent activation and
+                    // repeatedly go PENDING for no-op deliveries (spin loop).
+                    if completedCount > 0 {
                         try await conn.query(
                             """
-                            WITH r AS (
+                            WITH
+                            del_orphans AS (
+                                DELETE FROM strand.event_waits ew
+                                USING strand.task_completions tc
+                                WHERE ew.run_id        = \(claimed.runID)
+                                  AND ew.child_task_id = tc.task_id
+                                  AND tc.task_id       = ANY(\(childTaskIDs))
+                            ),
+                            r AS (
                                 UPDATE strand.runs
-                                SET state = \(TaskState.pending), available_at = NOW(),
-                                    worker_id = NULL, lease_expires_at = NULL
+                                SET state        = \(TaskState.pending),
+                                    available_at = NOW(),
+                                    worker_id    = NULL,
+                                    lease_expires_at = NULL
                                 WHERE id = \(claimed.runID)
                                 RETURNING id
                             )
@@ -479,7 +514,6 @@ extension WorkflowRegistration {
                             """,
                             logger: exec.logger
                         )
-                        // Run is PENDING — notify workers immediately.
                         let notification = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
                         try await conn.query(
                             "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
@@ -579,18 +613,28 @@ extension WorkflowRegistration {
                     -- event_waits whose children have already completed but whose
                     -- wake signal was silently dropped (parent was RUNNING at the time).
                     -- child_task_id is a typed UUID FK — direct join, no string parsing.
-                    SELECT COUNT(*) AS cnt
+                    SELECT ew.child_task_id
                     FROM strand.event_waits ew
                     JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
                     WHERE ew.run_id        = \(claimed.runID)
                       AND ew.child_task_id IS NOT NULL
                 ),
+                del_orphans AS (
+                    -- Delete the orphaned event_waits immediately so they do not
+                    -- re-trigger a PENDING transition on the NEXT re-activation
+                    -- (which would cause a spin loop: re-activate → no progress →
+                    -- PENDING again, ad infinitum, until the remaining children finish).
+                    DELETE FROM strand.event_waits ew
+                    USING missed m
+                    WHERE ew.run_id        = \(claimed.runID)
+                      AND ew.child_task_id = m.child_task_id
+                ),
                 run_upd AS (
                     UPDATE strand.runs
-                    SET state            = CASE WHEN (SELECT cnt FROM missed) > 0
+                    SET state            = CASE WHEN (SELECT COUNT(*) FROM missed) > 0
                                                THEN \(TaskState.pending)
                                                ELSE \(TaskState.waiting) END,
-                        available_at     = CASE WHEN (SELECT cnt FROM missed) > 0
+                        available_at     = CASE WHEN (SELECT COUNT(*) FROM missed) > 0
                                                THEN NOW()
                                                ELSE available_at END,
                         worker_id        = NULL,
@@ -613,6 +657,70 @@ extension WorkflowRegistration {
                 "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
                 logger: exec.logger
             )
+
+            // ── 7B. Post-wait snapshot-isolation recovery ───────────────────────────────
+            // Step 7's CTE runs under Postgres snapshot isolation: it cannot see
+            // task_completions rows that committed AFTER step 7's snapshot started.
+            // In the exact race window where a sibling worker commits a child
+            // completion concurrently with step 7, the run goes WAITING with no
+            // further signal to ever wake it — stuck forever.
+            //
+            // This follow-up query executes as a NEW statement (READ COMMITTED —
+            // fresh snapshot) and therefore sees all concurrent commits that step 7
+            // missed.  If any remaining event_wait children have now completed,
+            // flip WAITING → PENDING and notify.
+            //
+            // del_orphans here serves the same spin-loop prevention role as in step 7.
+            let recoveryStream = try await exec.postgres.query(
+                """
+                WITH
+                missed AS (
+                    SELECT ew.child_task_id
+                    FROM strand.event_waits ew
+                    JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
+                    WHERE ew.run_id        = \(claimed.runID)
+                      AND ew.child_task_id IS NOT NULL
+                ),
+                del_orphans AS (
+                    DELETE FROM strand.event_waits ew
+                    USING missed m
+                    WHERE ew.run_id        = \(claimed.runID)
+                      AND ew.child_task_id = m.child_task_id
+                ),
+                run_upd AS (
+                    UPDATE strand.runs
+                    SET state        = \(TaskState.pending),
+                        available_at = NOW(),
+                        worker_id    = NULL,
+                        lease_expires_at = NULL
+                    WHERE id    = \(claimed.runID)
+                      AND state = \(TaskState.waiting)
+                      AND (SELECT COUNT(*) FROM missed) > 0
+                    RETURNING id
+                )
+                UPDATE strand.tasks
+                SET state = \(TaskState.pending)
+                FROM run_upd
+                WHERE strand.tasks.id           = \(claimed.taskID)
+                  AND strand.tasks.namespace_id = \(exec.namespace)
+                RETURNING strand.tasks.id
+                """,
+                logger: exec.logger
+            )
+            if try await recoveryStream.first(where: { _ in true }) != nil {
+                exec.logger.debug(
+                    "partial-completion recovery: snapshot-isolation race detected — run set to PENDING",
+                    metadata: [
+                        "strand.task_id": .stringConvertible(claimed.taskID),
+                        "strand.run_id": .stringConvertible(claimed.runID),
+                    ]
+                )
+                let recoveryNote = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
+                try await exec.postgres.query(
+                    "SELECT pg_notify(\(StrandChannels.tasks), \(recoveryNote.payload))",
+                    logger: exec.logger
+                )
+            }
         }
 
         // ── 8. Cache the live Task for the next activation ───────────────────────────

@@ -152,8 +152,23 @@ public protocol NonRetryableError: Error {}
 /// Pre-encoded activity failure reason thrown from `ActivityDefinition._run`.
 /// Carries the JSON BYTEA that should be stored verbatim in `strand.runs.failure_reason`.
 /// `StrandWorker.runTask` catches this to bypass re-encoding in `FailureReason`.
-struct _TypedActivityFailure: Error {
+struct _TypedActivityFailure: Error, CustomStringConvertible {
     let reasonBuffer: ByteBuffer
+
+    /// Human-readable description used by OTel’s `withSpan` when recording this
+    /// error as an exception attribute on the activity span.
+    /// Without this, swift-distributed-tracing falls back to `String(describing:)`
+    /// which emits the raw struct internals: `_TypedActivityFailure(reasonBuffer: [7b...])`.
+    var description: String {
+        struct Reason: Decodable {
+            let name: String
+            let message: String
+        }
+        if let r = try? JSON.decode(Reason.self, from: reasonBuffer) {
+            return "\(r.name): \(r.message)"
+        }
+        return "activity failed"
+    }
 
     /// Builds the failure reason payload and encodes it as JSON.
     /// Falls back to a minimal JSON string if encoding itself fails.

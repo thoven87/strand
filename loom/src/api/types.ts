@@ -15,7 +15,10 @@ export type TaskState =
 export interface QueueStats {
     pending: number;
     running: number;
+    /** Workflows suspended on ctx.sleep(for:) — waiting for a timer. */
     sleeping: number;
+    /** Workflows suspended waiting for an activity, child workflow, or named event. */
+    waiting: number;
     completed: number;
     failed: number;
     cancelled: number;
@@ -53,6 +56,12 @@ export interface TaskSummary {
     kind: TaskKind;
     /** UUID of the parent workflow that spawned this task, null for root tasks. */
     parentTaskId: string | null;
+    /**
+     * Human-readable workflow ID — the value passed to WorkflowOptions.id at enqueue
+     * time, or the auto-generated "WorkflowName-<ms>" string.
+     * null for activity tasks (spawned internally, not via startWorkflow).
+     */
+    workflowId: string | null;
     /** Schedule name when triggered by StrandScheduler, null for manual enqueues. */
     scheduleName: string | null;
 }
@@ -72,6 +81,7 @@ export interface TaskDetail {
     cancelledAt: string | null;
     kind: TaskKind;
     parentTaskId: string | null;
+    workflowId: string | null;
     scheduling: {
         scheduleName: string | null;
         scheduleId: string | null;

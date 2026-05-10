@@ -11,6 +11,7 @@ import {
     CartesianGrid,
 } from "recharts";
 import { getMetrics } from "@/api/metrics";
+import type { TaskTiming } from "@/api/metrics";
 import { qk } from "@/lib/queryKeys";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -28,8 +29,17 @@ function fmtHour(iso: string): string {
     }
 }
 
-function fmtDuration(ms: number): string {
-    if (!isFinite(ms) || ms < 0) return "—";
+function fmtRate(ratePerSec: number | null | undefined): string {
+    if (ratePerSec == null || !isFinite(ratePerSec) || ratePerSec < 0)
+        return "—";
+    const perMin = ratePerSec * 60;
+    if (perMin < 1) return "< 1/min";
+    if (ratePerSec < 1) return `${perMin.toFixed(perMin < 10 ? 1 : 0)}/min`;
+    return `${ratePerSec >= 10 ? ratePerSec.toFixed(0) : ratePerSec.toFixed(1)}/s`;
+}
+
+function fmtDuration(ms: number | null | undefined): string {
+    if (ms == null || !isFinite(ms) || ms < 0) return "—";
     if (ms < 1000) return `${Math.round(ms)}ms`;
     if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
     const m = Math.floor(ms / 60_000);
@@ -139,6 +149,105 @@ function ChartSection({ title, data, fill }: ChartSectionProps) {
     );
 }
 
+// ── Latency table ──────────────────────────────────────────────────────────
+
+function LatencyTable({ timings }: { timings: TaskTiming[] }) {
+    // Sort completed first, then by count descending
+    const sorted = [...timings].sort((a, b) => {
+        if (a.state !== b.state) return a.state === "COMPLETED" ? -1 : 1;
+        return b.count - a.count;
+    });
+
+    const headers = [
+        "Queue",
+        "Task",
+        "State",
+        "Count",
+        "Rate",
+        "exec p50",
+        "exec p95",
+        "exec p99",
+        "wait p50",
+        "wait p95",
+    ];
+
+    return (
+        <section className="rounded-lg border border-border bg-card/40 overflow-hidden">
+            <div className="px-4 py-3 border-b border-border/50 flex items-center justify-between">
+                <h2 className="text-sm font-medium text-foreground">
+                    Task latency
+                </h2>
+                <span className="text-xs text-muted-foreground">
+                    exec = run duration · wait = queue time · ±2% error
+                </span>
+            </div>
+            <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                    <thead>
+                        <tr className="border-b border-border bg-secondary/20">
+                            {headers.map((h) => (
+                                <th
+                                    key={h}
+                                    className="text-left px-4 py-2.5 text-[11px] font-medium text-muted-foreground uppercase tracking-wide whitespace-nowrap"
+                                >
+                                    {h}
+                                </th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {sorted.map((t) => (
+                            <tr
+                                key={`${t.queue}/${t.taskName}/${t.state}`}
+                                className="border-b border-border/40 last:border-0 hover:bg-secondary/10 transition-colors"
+                            >
+                                <td className="px-4 py-3 font-mono text-xs text-muted-foreground whitespace-nowrap">
+                                    {t.queue}
+                                </td>
+                                <td className="px-4 py-3 font-mono text-xs text-foreground whitespace-nowrap">
+                                    {t.taskName}
+                                </td>
+                                <td className="px-4 py-3">
+                                    <span
+                                        className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium ${
+                                            t.state === "COMPLETED"
+                                                ? "bg-green-500/15 text-green-300 border-green-500/25"
+                                                : "bg-red-500/15 text-red-300 border-red-500/25"
+                                        }`}
+                                    >
+                                        {t.state}
+                                    </span>
+                                </td>
+                                <td className="px-4 py-3 text-muted-foreground tabular-nums">
+                                    {t.count.toLocaleString()}
+                                </td>
+                                <td className="px-4 py-3 tabular-nums text-violet-400 whitespace-nowrap">
+                                    {fmtRate(t.ratePerSec)}
+                                </td>
+                                <td className="px-4 py-3 tabular-nums text-green-400">
+                                    {fmtDuration(t.p50Ms)}
+                                </td>
+                                <td className="px-4 py-3 tabular-nums text-yellow-400">
+                                    {fmtDuration(t.p95Ms)}
+                                </td>
+                                <td className="px-4 py-3 tabular-nums text-orange-400">
+                                    {fmtDuration(t.p99Ms)}
+                                </td>
+                                <td className="px-4 py-3 tabular-nums text-sky-400">
+                                    {fmtDuration(t.p50WaitMs)}
+                                </td>
+                                <td className="px-4 py-3 tabular-nums text-blue-400">
+                                    {fmtDuration(t.p95WaitMs)}
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    );
+}
+
 // ── Page ───────────────────────────────────────────────────────────────────
 
 export function MetricsPage() {
@@ -152,7 +261,15 @@ export function MetricsPage() {
 
     return (
         <div className="px-6 py-5 space-y-5">
-            <h1 className="text-base font-semibold text-foreground">Metrics</h1>
+            <div>
+                <h1 className="text-base font-semibold text-foreground mb-0.5">
+                    Metrics
+                </h1>
+                <p className="text-xs text-muted-foreground">
+                    All queues in this namespace · completed/failed/cancelled
+                    counts are last 24 h
+                </p>
+            </div>
 
             {isLoading && (
                 <p className="text-sm text-muted-foreground">Loading…</p>
@@ -162,19 +279,19 @@ export function MetricsPage() {
             {data && (
                 <>
                     {/* Summary stat cards */}
-                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
                         <StatCard
-                            label="Completed"
+                            label="Completed (24h)"
                             value={data.completed}
                             colorClass="text-green-400"
                         />
                         <StatCard
-                            label="Failed"
+                            label="Failed (24h)"
                             value={data.failed}
                             colorClass="text-red-400"
                         />
                         <StatCard
-                            label="Cancelled"
+                            label="Cancelled (24h)"
                             value={data.cancelled}
                             colorClass="text-muted-foreground"
                         />
@@ -188,6 +305,21 @@ export function MetricsPage() {
                             value={data.running}
                             colorClass="text-blue-400"
                         />
+                        {/* Throughput card — only rendered when the broadcast
+                             cache is warm (AggregatedMetricsBuffer wired in). */}
+                        <div className="rounded-lg border border-border bg-card/40 p-4 flex flex-col gap-1">
+                            <span className="text-2xl font-bold tabular-nums text-violet-400">
+                                {data.throughputPerSec != null
+                                    ? fmtRate(data.throughputPerSec)
+                                    : "—"}
+                            </span>
+                            <span className="text-xs text-muted-foreground font-medium uppercase tracking-wide">
+                                Throughput
+                            </span>
+                            <span className="text-[10px] text-muted-foreground/60">
+                                live · last 5 s window
+                            </span>
+                        </div>
                     </div>
 
                     {/* Avg duration */}
@@ -202,6 +334,11 @@ export function MetricsPage() {
                                 </span>
                             </div>
                         )}
+
+                    {/* Task latency percentiles (DDSketch) */}
+                    {data.taskTimings && data.taskTimings.length > 0 && (
+                        <LatencyTable timings={data.taskTimings} />
+                    )}
 
                     {/* Charts */}
                     <ChartSection

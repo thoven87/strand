@@ -133,6 +133,47 @@ CREATE INDEX IF NOT EXISTS strand_tasks_deadline_idx
     ON strand.tasks (namespace_id, queue, deadline_at)
     WHERE deadline_at IS NOT NULL AND state = 'PENDING';
 
+-- ── Historic / metrics queries on terminal states ────────────────────────────
+--
+-- Partial indexes scoped to each terminal state so historic queries (dashboard
+-- metrics, task list, cleanup) never touch live-task pages. Each index is
+-- ordered by its natural completion timestamp so range scans are efficient.
+--
+-- Without these, every MetricsRoutes or ManagementQueries call that filters on
+-- a terminal state must scan the full strand.tasks table.
+
+CREATE INDEX IF NOT EXISTS strand_tasks_completed_at_idx
+    ON strand.tasks (namespace_id, queue, completed_at DESC)
+    WHERE state = 'COMPLETED' AND completed_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS strand_tasks_cancelled_at_idx
+    ON strand.tasks (namespace_id, queue, cancelled_at DESC)
+    WHERE state = 'CANCELLED' AND cancelled_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS strand_tasks_failed_idx
+    ON strand.tasks (namespace_id, queue, created_at DESC)
+    WHERE state = 'FAILED';
+
+-- ── Storage / autovacuum tuning ───────────────────────────────────────────────
+--
+-- fillfactor = 85: reserves 15 % of each heap page for in-place rewrites.
+-- When `state` changes (PENDING → RUNNING → COMPLETED) Postgres performs a
+-- HOT (Heap-Only Tuple) update — the new row version stays on the same page,
+-- no index entries are rewritten, and index bloat is prevented.
+--
+-- Aggressive autovacuum: the state column changes on every task execution, so
+-- dead tuples accumulate quickly. A 2 % scale factor and 1 ms cost delay keep
+-- the table lean without holding back normal work.
+ALTER TABLE strand.tasks SET (
+    fillfactor                          = 85,
+    autovacuum_vacuum_scale_factor      = 0.02,
+    autovacuum_vacuum_threshold         = 50,
+    autovacuum_analyze_scale_factor     = 0.02,
+    autovacuum_analyze_threshold        = 100,
+    autovacuum_vacuum_cost_limit        = 2000,
+    autovacuum_vacuum_cost_delay        = 1
+);
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Runs — individual execution attempts.
 -- High churn: rows transition through states frequently.
@@ -179,13 +220,17 @@ CREATE TABLE IF NOT EXISTS strand.runs (
     ))
 );
 
--- Aggressive autovacuum: runs accumulate many dead tuples from frequent updates.
+-- strand.runs is the highest-churn table: attempt, state, lease_expires_at,
+-- started_at and finished_at all change on every execution. fillfactor = 80
+-- gives extra headroom for HOT updates. autovacuum is more aggressive than the
+-- Postgres default (5 % scale factor) to keep dead-tuple accumulation in check.
 ALTER TABLE strand.runs SET (
-    autovacuum_vacuum_scale_factor  = '0.05',
-    autovacuum_analyze_scale_factor = '0.02',
-    autovacuum_vacuum_threshold     = '50',
-    autovacuum_analyze_threshold    = '50',
-    autovacuum_vacuum_cost_delay    = '2'
+    fillfactor                      = 80,
+    autovacuum_vacuum_scale_factor  = 0.05,
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_threshold     = 50,
+    autovacuum_analyze_threshold    = 50,
+    autovacuum_vacuum_cost_delay    = 2
 );
 
 -- Hot claim path: namespace_id first, then priority ASC so critical tasks are never starved.
@@ -401,3 +446,68 @@ CREATE TABLE IF NOT EXISTS strand.schedules (
 CREATE INDEX IF NOT EXISTS strand_schedules_due_idx
     ON strand.schedules (namespace_id, next_run_at)
     WHERE is_active = TRUE AND next_run_at IS NOT NULL;
+
+-- ───────────────────────────────────────────────────────────────────────────────
+-- Workers — ephemeral runtime heartbeat table.
+--
+-- Each StrandWorker instance upserts one row per queue on startup and
+-- refreshes updated_at on every heartbeat cycle. A background sweeper deletes
+-- rows older than 2×heartbeat_interval so stale entries are self-cleaning.
+--
+-- UNLOGGED: no WAL writes at all — as fast as writing to a local file.
+-- On crash the table is truncated, which is fine: workers re-register on the
+-- next startup. This table is never replicated to standbys.
+--
+-- Dashboard and management queries read from here to show live queue health
+-- (running, concurrency, paused) without scanning strand.runs.
+-- ───────────────────────────────────────────────────────────────────────────────
+
+CREATE UNLOGGED TABLE IF NOT EXISTS strand.workers (
+    id           TEXT        NOT NULL,    -- "<hostname>:<pid>"
+    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    queue        TEXT        NOT NULL,
+    concurrency  INTEGER     NOT NULL,    -- configured workflowConcurrency + activityConcurrency
+    running      INTEGER     NOT NULL DEFAULT 0,   -- currently executing tasks
+    paused       BOOLEAN     NOT NULL DEFAULT FALSE,
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_workers_pkey PRIMARY KEY (id, namespace_id, queue)
+);
+
+-- Live queue health lookup from the Workers dashboard page.
+CREATE INDEX IF NOT EXISTS strand_workers_ns_queue_idx
+    ON strand.workers (namespace_id, queue);
+
+-- ───────────────────────────────────────────────────────────────────────────────
+-- Count estimate — fast approximate row counts for large tables.
+--
+-- Uses the query planner’s own statistics (updated by autovacuum ANALYZE) to
+-- return an estimate in sub-millisecond time without a sequential scan.
+-- The planner estimate is typically within 5–10 % of the real count once
+-- autovacuum has run; for dashboard displays this is more than accurate enough.
+--
+-- Usage:
+--   SELECT strand.count_estimate('default', 'reports', 'PENDING');
+--
+-- Complement with exact COUNT(*) when the estimate returns < 50,000
+-- (planner statistics are less reliable for small tables).
+-- ───────────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION strand.count_estimate(
+    ns   TEXT,
+    q    TEXT,
+    st   TEXT
+) RETURNS BIGINT AS $$
+DECLARE
+    plan JSONB;
+BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON)
+        SELECT id FROM strand.tasks
+        WHERE namespace_id = $1
+          AND queue        = $2
+          AND state        = $3'
+        INTO plan
+        USING ns, q, st;
+    RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT;
+END;
+$$ LANGUAGE plpgsql;

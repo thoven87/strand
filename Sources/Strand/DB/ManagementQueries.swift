@@ -35,10 +35,15 @@ package struct TaskSummaryRow: Sendable {
     package let parentTaskId: UUID?
     /// Schedule name that triggered this task, or `nil` if not scheduled.
     package let scheduleName: String?
+    /// Human-readable workflow ID set at enqueue time via ``WorkflowOptions/id``.
+    /// Auto-generated as `"WorkflowName-<ms>"` when not explicitly provided.
+    /// `nil` for activity tasks (spawned internally, not via `startWorkflow`).
+    package let workflowId: String?
 }
 
 extension TaskSummaryRow {
-    /// Column order: id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, scheduling_metadata
+    /// Column order: id, name, queue, state, attempt, created_at, completed_at,
+    ///               kind, parent_task_id, scheduling_metadata, idempotency_key
     package init(row: PostgresRow) throws {
         var col = row.makeIterator()
         id = try col.next()!.decode(UUID.self, context: .default)
@@ -51,6 +56,7 @@ extension TaskSummaryRow {
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         parentTaskId = try col.next()!.decode(UUID?.self, context: .default)
         scheduleName = try col.next()!.decode(SchedulingMetadata?.self, context: .default)?.scheduledBy
+        workflowId = try col.next()!.decode(String?.self, context: .default)
     }
 }
 
@@ -72,6 +78,8 @@ package struct TaskDetailRow: Sendable {
     package let parentTaskId: UUID?
     /// Scheduling metadata decoded from task headers, or `nil` if not scheduled.
     package let schedulingMetadata: SchedulingMetadata?
+    /// Human-readable workflow ID (stored as `idempotency_key`). See ``TaskSummaryRow/workflowId``.
+    package let workflowId: String?
 }
 
 extension TaskDetailRow {
@@ -92,6 +100,7 @@ extension TaskDetailRow {
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         parentTaskId = try col.next()!.decode(UUID?.self, context: .default)
         schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
+        workflowId = try col.next()!.decode(String?.self, context: .default)
     }
 }
 
@@ -129,11 +138,13 @@ package struct QueueStatsRow: Sendable {
     package let createdAt: Date
     package let pending: Int
     package let running: Int
+    /// Workflows suspended on a `ctx.sleep(for:)` timer.
     package let sleeping: Int
+    /// Workflows suspended waiting for an activity, child workflow, or named event.
+    package let waiting: Int
     package let completed: Int
     package let failed: Int
     package let cancelled: Int
-    /// Whether the queue is administratively paused (requires is_paused column migration).
     package let isPaused: Bool
 }
 
@@ -145,6 +156,7 @@ extension QueueStatsRow {
         pending = try col.next()!.decode(Int.self, context: .default)
         running = try col.next()!.decode(Int.self, context: .default)
         sleeping = try col.next()!.decode(Int.self, context: .default)
+        waiting = try col.next()!.decode(Int.self, context: .default)
         completed = try col.next()!.decode(Int.self, context: .default)
         failed = try col.next()!.decode(Int.self, context: .default)
         cancelled = try col.next()!.decode(Int.self, context: .default)
@@ -189,12 +201,13 @@ package enum ManagementQueries {
             SELECT
               q.name,
               q.created_at,
-              COUNT(t.id) FILTER (WHERE t.state = 'PENDING')                    AS pending,
-              COUNT(t.id) FILTER (WHERE t.state = 'RUNNING')                    AS running,
-              COUNT(t.id) FILTER (WHERE t.state IN ('SLEEPING', 'WAITING'))     AS sleeping,
-              COUNT(t.id) FILTER (WHERE t.state = 'COMPLETED')                  AS completed,
-              COUNT(t.id) FILTER (WHERE t.state = 'FAILED')                     AS failed,
-              COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')                  AS cancelled,
+              COUNT(t.id) FILTER (WHERE t.state = 'PENDING')    AS pending,
+              COUNT(t.id) FILTER (WHERE t.state = 'RUNNING')    AS running,
+              COUNT(t.id) FILTER (WHERE t.state = 'SLEEPING')   AS sleeping,
+              COUNT(t.id) FILTER (WHERE t.state = 'WAITING')    AS waiting,
+              COUNT(t.id) FILTER (WHERE t.state = 'COMPLETED')  AS completed,
+              COUNT(t.id) FILTER (WHERE t.state = 'FAILED')     AS failed,
+              COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')  AS cancelled,
               q.is_paused
             FROM strand.queues q
             LEFT JOIN strand.tasks t ON t.queue = q.name AND t.namespace_id = q.namespace_id
@@ -221,12 +234,13 @@ package enum ManagementQueries {
             SELECT
               q.name,
               q.created_at,
-              COUNT(t.id) FILTER (WHERE t.state = 'PENDING')                    AS pending,
-              COUNT(t.id) FILTER (WHERE t.state = 'RUNNING')                    AS running,
-              COUNT(t.id) FILTER (WHERE t.state IN ('SLEEPING', 'WAITING'))     AS sleeping,
-              COUNT(t.id) FILTER (WHERE t.state = 'COMPLETED')                  AS completed,
-              COUNT(t.id) FILTER (WHERE t.state = 'FAILED')                     AS failed,
-              COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')                  AS cancelled,
+              COUNT(t.id) FILTER (WHERE t.state = 'PENDING')    AS pending,
+              COUNT(t.id) FILTER (WHERE t.state = 'RUNNING')    AS running,
+              COUNT(t.id) FILTER (WHERE t.state = 'SLEEPING')   AS sleeping,
+              COUNT(t.id) FILTER (WHERE t.state = 'WAITING')    AS waiting,
+              COUNT(t.id) FILTER (WHERE t.state = 'COMPLETED')  AS completed,
+              COUNT(t.id) FILTER (WHERE t.state = 'FAILED')     AS failed,
+              COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')  AS cancelled,
               q.is_paused
             FROM strand.queues q
             LEFT JOIN strand.tasks t ON t.queue = q.name AND t.namespace_id = q.namespace_id
@@ -260,7 +274,8 @@ package enum ManagementQueries {
         let fetchLimit = limit + 1  // fetch one extra to detect a next page
         let stream = try await client.query(
             """
-            SELECT id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, scheduling_metadata
+            SELECT id, name, queue, state, attempt, created_at, completed_at,
+                   kind, parent_task_id, scheduling_metadata, idempotency_key
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
               AND (\(queue)::text IS NULL OR queue = \(queue))
@@ -292,7 +307,7 @@ package enum ManagementQueries {
             """
             SELECT id, name, queue, params, state, attempt, max_attempts,
                    created_at, first_run_at, completed_at, result, cancelled_at,
-                   kind, parent_task_id, scheduling_metadata
+                   kind, parent_task_id, scheduling_metadata, idempotency_key
             FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
             """,
             logger: logger
@@ -441,12 +456,18 @@ package enum ManagementQueries {
         }
         let stream = try await client.query(
             """
+            -- Each state clause uses its own terminal timestamp so the
+            -- partial indexes (strand_tasks_completed_at_idx, etc.) can be
+            -- used instead of scanning the full table.
             WITH to_delete AS (
                 SELECT id FROM strand.tasks
                 WHERE namespace_id = \(namespaceID)
                   AND (\(queue)::text IS NULL OR queue = \(queue))
-                  AND state IN ('COMPLETED', 'FAILED', 'CANCELLED')
-                  AND created_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second'
+                  AND (
+                        (state = 'COMPLETED' AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = 'CANCELLED' AND cancelled_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = 'FAILED'    AND created_at   < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                  )
                 LIMIT \(limit)
                 FOR UPDATE SKIP LOCKED
             ),
@@ -559,7 +580,8 @@ extension ManagementQueries {
         let fetchLimit = limit + 1
         let stream = try await client.query(
             """
-            SELECT id, name, queue, state, attempt, created_at, completed_at, kind, parent_task_id, scheduling_metadata
+            SELECT id, name, queue, state, attempt, created_at, completed_at,
+                   kind, parent_task_id, scheduling_metadata, idempotency_key
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
               AND parent_task_id = \(parentTaskID)
@@ -582,18 +604,24 @@ extension ManagementQueries {
 
 package struct WorkerRow: Sendable {
     package let workerID: String
-    package let runningTasks: Int
-    package let completedRecently: Int  // completed/failed in last 5 min
-    package let lastSeenAt: Date?
-    package let leaseExpiresAt: Date?
+    package let queue: String  // from strand.workers.queue
+    package let concurrency: Int  // from strand.workers.concurrency
+    package let runningTasks: Int  // from strand.workers.running
+    package let completedRecently: Int  // from strand.runs JOIN
+    package let startedAt: Date  // from strand.workers.started_at
+    package let lastSeenAt: Date?  // from strand.workers.updated_at
+    package let leaseExpiresAt: Date?  // from strand.runs JOIN
 }
 
 extension WorkerRow {
     package init(row: PostgresRow) throws {
         var col = row.makeIterator()
         workerID = try col.next()!.decode(String.self, context: .default)
+        queue = try col.next()!.decode(String.self, context: .default)
+        concurrency = try col.next()!.decode(Int.self, context: .default)
         runningTasks = try col.next()!.decode(Int.self, context: .default)
         completedRecently = try col.next()!.decode(Int.self, context: .default)
+        startedAt = try col.next()!.decode(Date.self, context: .default)
         lastSeenAt = try col.next()!.decode(Date?.self, context: .default)
         leaseExpiresAt = try col.next()!.decode(Date?.self, context: .default)
     }
@@ -628,8 +656,8 @@ extension WorkerTaskRow {
 }
 
 extension ManagementQueries {
-    /// Returns worker summaries: currently-running workers + any that were
-    /// active in the last 5 minutes.
+    /// Returns worker summaries sourced from `strand.workers` (live heartbeat rows),
+    /// LEFT JOIN `strand.runs` for `completedRecently` and `leaseExpiresAt`.
     package static func listWorkers(
         on client: PostgresClient,
         namespaceID: String,
@@ -638,21 +666,31 @@ extension ManagementQueries {
         let stream = try await client.query(
             """
             SELECT
-              worker_id,
-              COUNT(*)       FILTER (WHERE state = 'RUNNING')                       AS running_tasks,
-              COUNT(*)       FILTER (WHERE state IN ('COMPLETED','FAILED','CANCELLED')
-                                      AND finished_at > NOW() - INTERVAL '5 minutes') AS completed_recently,
-              MAX(GREATEST(COALESCE(started_at, created_at),
-                           COALESCE(finished_at, created_at)))                      AS last_seen_at,
-              MAX(lease_expires_at) FILTER (WHERE state = 'RUNNING')               AS lease_expires_at
-            FROM strand.runs
-            WHERE namespace_id = \(namespaceID)
-              AND worker_id IS NOT NULL
-              AND (state = 'RUNNING'
-                OR (state IN ('COMPLETED','FAILED','CANCELLED')
-                    AND finished_at > NOW() - INTERVAL '5 minutes'))
-            GROUP BY worker_id
-            ORDER BY running_tasks DESC, last_seen_at DESC
+              w.id              AS worker_id,
+              w.queue,
+              w.concurrency,
+              w.running         AS running_tasks,
+              COALESCE(r.completed_recently, 0) AS completed_recently,
+              w.started_at,
+              w.updated_at      AS last_seen_at,
+              r.lease_expires_at
+            FROM strand.workers w
+            LEFT JOIN (
+              SELECT
+                worker_id,
+                COUNT(*) FILTER (WHERE state IN ('COMPLETED','FAILED','CANCELLED')
+                                   AND finished_at > NOW() - INTERVAL '5 minutes') AS completed_recently,
+                MAX(lease_expires_at) FILTER (WHERE state = 'RUNNING') AS lease_expires_at
+              FROM strand.runs
+              WHERE namespace_id = \(namespaceID)
+                AND worker_id IS NOT NULL
+                AND (state = 'RUNNING'
+                  OR (state IN ('COMPLETED','FAILED','CANCELLED')
+                      AND finished_at > NOW() - INTERVAL '5 minutes'))
+              GROUP BY worker_id
+            ) r ON r.worker_id = w.id
+            WHERE w.namespace_id = \(namespaceID)
+            ORDER BY w.running DESC, w.updated_at DESC
             """,
             logger: logger
         )
@@ -662,30 +700,42 @@ extension ManagementQueries {
     }
 
     /// Returns the summary row for one worker plus its 50 most recent task runs.
-    /// Returns `nil` when the worker hasn't been seen in the last 24 hours.
+    /// Returns `nil` when the worker has no row in `strand.workers`.
     package static func getWorkerDetail(
         on client: PostgresClient,
         namespaceID: String,
         workerID: String,
         logger: Logger
     ) async throws -> (summary: WorkerRow?, recentTasks: [WorkerTaskRow]) {
-        // Summary — same aggregation as listWorkers but for one worker.
+        // Summary — same shape as listWorkers but filtered to one worker.
         let summaryStream = try await client.query(
             """
             SELECT
-              worker_id,
-              COUNT(*)       FILTER (WHERE state = 'RUNNING')                       AS running_tasks,
-              COUNT(*)       FILTER (WHERE state IN ('COMPLETED','FAILED','CANCELLED')
-                                      AND finished_at > NOW() - INTERVAL '5 minutes') AS completed_recently,
-              MAX(GREATEST(COALESCE(started_at, created_at),
-                           COALESCE(finished_at, created_at)))                      AS last_seen_at,
-              MAX(lease_expires_at) FILTER (WHERE state = 'RUNNING')               AS lease_expires_at
-            FROM strand.runs
-            WHERE namespace_id = \(namespaceID)
-              AND worker_id    = \(workerID)
-              AND (state = 'RUNNING'
-                OR started_at > NOW() - INTERVAL '24 hours')
-            GROUP BY worker_id
+              w.id              AS worker_id,
+              w.queue,
+              w.concurrency,
+              w.running         AS running_tasks,
+              COALESCE(r.completed_recently, 0) AS completed_recently,
+              w.started_at,
+              w.updated_at      AS last_seen_at,
+              r.lease_expires_at
+            FROM strand.workers w
+            LEFT JOIN (
+              SELECT
+                worker_id,
+                COUNT(*) FILTER (WHERE state IN ('COMPLETED','FAILED','CANCELLED')
+                                   AND finished_at > NOW() - INTERVAL '5 minutes') AS completed_recently,
+                MAX(lease_expires_at) FILTER (WHERE state = 'RUNNING') AS lease_expires_at
+              FROM strand.runs
+              WHERE namespace_id = \(namespaceID)
+                AND worker_id    = \(workerID)
+                AND (state = 'RUNNING'
+                  OR (state IN ('COMPLETED','FAILED','CANCELLED')
+                      AND finished_at > NOW() - INTERVAL '5 minutes'))
+              GROUP BY worker_id
+            ) r ON r.worker_id = w.id
+            WHERE w.namespace_id = \(namespaceID)
+              AND w.id           = \(workerID)
             """,
             logger: logger
         )

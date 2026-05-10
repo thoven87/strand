@@ -384,26 +384,13 @@ extension ActivityDefinition {
                 fatalDeadline?.renew()
             }
         )
-        // OTel span: one span per activity execution attempt.
-        // SpanKind.consumer: child of the outer task consumer span; ServiceContext
-        // propagates automatically via task-local storage so no addLink is needed.
-        // Zero-cost no-op when no tracing backend is bootstrapped.
+        // Worker.runTask already opens a .consumer span (with the workflow activation
+        // span as its parent) that covers the full claim lifecycle.  Opening a second
+        // identical span here produces duplicate entries in Jaeger — same name, same
+        // strand.run.id, same attempt — which look like replay bugs.
+        // The activity just runs directly inside the outer span.
         do {
-            let output = try await withSpan(Self.name, ofKind: .consumer) { span in
-                span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(Self.name)
-                span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
-                    TaskKind.activity.rawValue
-                )
-                span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
-                    claimed.taskID.uuidString.lowercased()
-                )
-                span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
-                    claimed.runID.uuidString.lowercased()
-                )
-                span.attributes[StrandLogKeys.queue] = SpanAttribute.string(exec.queue)
-                span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(Int64(claimed.attempt))
-                return try await self.run(input: input, context: ctx)
-            }
+            let output = try await self.run(input: input, context: ctx)
             return try JSON.encode(output)
         } catch let typedFailure as Failure {
             // Typed failure declared by the activity — encode the full Codable value.

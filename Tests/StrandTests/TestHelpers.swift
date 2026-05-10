@@ -141,6 +141,41 @@ func withTestEnvironment<T: Sendable>(
 
     try await Task.sleep(for: .milliseconds(100))
     try await client.verifySchema()
+
+    // ── Stale-queue sweep ─────────────────────────────────────────────────
+    // Test queues follow the pattern "t" + 12 lowercase hex chars.  If a
+    // previous `swift test` run was killed (^C, crash, timeout) before its
+    // withTestEnvironment cleanup ran, those queues accumulate tasks in the
+    // dev DB — especially scheduler tests whose StrandScheduler keeps firing
+    // every second until the connection pool eventually collapses.
+    //
+    // On every new test environment we sweep queues matching the pattern that
+    // are older than 30 minutes, deleting schedules, tasks, and the queue row.
+    // 30 min is well above the longest single test suite runtime (~10 min) so
+    // concurrent test runs on slow CI machines won’t accidentally nuke each other.
+    // This is a best-effort fire-and-forget; errors are logged, not thrown.
+    try? await postgres.query(
+        """
+        DO $$
+        DECLARE q TEXT;
+        BEGIN
+          FOR q IN
+            SELECT name FROM strand.queues
+            WHERE name ~ '^t[0-9a-f]{12}$'
+              AND created_at < NOW() - INTERVAL '30 minutes'
+          LOOP
+            DELETE FROM strand.schedules   WHERE queue = q;
+            DELETE FROM strand.events      WHERE queue = q;
+            DELETE FROM strand.event_waits WHERE queue = q;
+            DELETE FROM strand.tasks       WHERE queue = q;
+            DELETE FROM strand.queues      WHERE name  = q;
+          END LOOP;
+        END;
+        $$
+        """,
+        logger: logger
+    )
+
     try await client.createQueue(queueName)
 
     // Shared teardown: remove all test artefacts so they don't accumulate in
@@ -200,25 +235,41 @@ func startWorker(
     activities: [any ActivityBox] = [],
     metricsFactory: (any MetricsFactory)? = nil
 ) -> Task<Void, Never> {
-    let worker = StrandWorker(
-        postgres: postgres,
-        options: WorkerOptions(
-            queue: queueName,
-            workflowConcurrency: concurrency,
-            activityConcurrency: concurrency * 2,
-            pollInterval: .milliseconds(20),
-            fatalOnLeaseTimeout: false,
-            // No jitter in tests: single worker per queue, no thundering herd,
-            // and jitter would add up to 50 ms latency per task step.
-            notifyJitter: .zero
-        ),
-        workflows: workflows,
-        activityContainers: activityContainers,
-        activities: activities,
-        logger: logger,
-        metricsFactory: metricsFactory
-    )
-    return Task { try? await worker.run() }
+    // Each test worker gets its own StrandNotifier so tests remain independent.
+    // The notifier and worker run concurrently inside the same Task; cancelling
+    // the returned task shuts down both.
+    Task {
+        let notifier = StrandNotifier(
+            postgres: postgres,
+            channels: [StrandNotifier.tasksChannel],
+            logger: logger
+        )
+        let worker = StrandWorker(
+            postgres: postgres,
+            options: WorkerOptions(
+                queue: queueName,
+                workflowConcurrency: concurrency,
+                activityConcurrency: concurrency * 2,
+                pollInterval: .milliseconds(20),
+                fatalOnLeaseTimeout: false,
+                // No jitter in tests: single worker per queue, no thundering herd,
+                // and jitter would add up to 50 ms latency per task step.
+                notifyJitter: .zero
+            ),
+            notifier: notifier,
+            workflows: workflows,
+            activityContainers: activityContainers,
+            activities: activities,
+            logger: logger,
+            metricsFactory: metricsFactory
+        )
+        try? await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await notifier.run() }
+            group.addTask { try await worker.run() }
+            try await group.next()
+            group.cancelAll()
+        }
+    }
 }
 
 /// Polls `fetchTaskResult` until the task reaches a terminal state or `timeout` elapses.

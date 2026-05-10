@@ -10,19 +10,25 @@ import Foundation
 
 struct WorkerResponse: Codable, Sendable {
     let workerID: String
+    let queue: String
+    let concurrency: Int
     let runningTasks: Int
     let completedRecently: Int
+    let startedAt: Date?
     let lastSeenAt: Date?
     let leaseExpiresAt: Date?
-    let isHealthy: Bool  // true if leaseExpiresAt is in the future
+    let isHealthy: Bool
 
     init(from row: WorkerRow) {
         workerID = row.workerID
+        queue = row.queue
+        concurrency = row.concurrency
         runningTasks = row.runningTasks
         completedRecently = row.completedRecently
+        startedAt = row.startedAt
         lastSeenAt = row.lastSeenAt
         leaseExpiresAt = row.leaseExpiresAt
-        isHealthy = row.leaseExpiresAt.map { $0 > Date.now } ?? false
+        isHealthy = row.leaseExpiresAt.map { $0 > Date.now } ?? (row.lastSeenAt.map { Date.now.timeIntervalSince($0) < 30 } ?? false)
     }
 }
 extension WorkerResponse: ResponseCodable {}
@@ -61,11 +67,14 @@ struct WorkerRoutes {
             guard let s = summary else { return nil }
             return WorkerDetailResponse(
                 workerID: s.workerID,
+                queue: s.queue,
+                concurrency: s.concurrency,
                 runningTasks: s.runningTasks,
                 completedRecently: s.completedRecently,
+                startedAt: s.startedAt,
                 lastSeenAt: s.lastSeenAt,
                 leaseExpiresAt: s.leaseExpiresAt,
-                isHealthy: s.leaseExpiresAt.map { $0 > Date.now } ?? false,
+                isHealthy: s.leaseExpiresAt.map { $0 > Date.now } ?? (s.lastSeenAt.map { Date.now.timeIntervalSince($0) < 30 } ?? false),
                 recentTasks: tasks.map(WorkerTaskResponse.init)
             )
         }
