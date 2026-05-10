@@ -52,7 +52,8 @@ public enum StrandMetrics {
 
 /// Internal PostgreSQL channel names and payload type for LISTEN/NOTIFY wakeups.
 package enum StrandChannels {
-    /// Channel on which workers LISTEN and `enqueueTask` sends NOTIFY.
+    /// Channel on which workers LISTEN for new work.
+    /// All NOTIFY calls go through `PostgresConnection.notifyWorkers(namespace:queue:logger:)`.
     package static let tasks = "strand_tasks"
 
     /// Channel on which `StrandMetricsLoop` broadcasts pre-computed queue counts

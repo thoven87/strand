@@ -206,43 +206,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         }
 
         // ── 3. Signals ────────────────────────────────────────────────────────────
-        let signals = try await WorkflowStateQueries.loadPendingSignals(
-            on: exec.postgres,
-            taskID: claimed.taskID,
-            namespaceID: exec.namespace,
-            logger: exec.logger
-        )
-        for signal in signals {
-            try workflowState.handleSignal(name: signal.name, payload: signal.payload)
-        }
-        if !signals.isEmpty {
-            for signal in signals {
-                let sigData = try? JSON.encode(["name": signal.name])
-                try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres,
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    seq: historySeq,
-                    eventType: .signalReceived,
-                    eventData: sigData,
-                    logger: exec.logger
-                )
-                historySeq += 1
-            }
-            let postSignalBuf = try JSON.encode(workflowState)
-            try await WorkflowStateQueries.saveState(
-                on: exec.postgres,
-                taskID: claimed.taskID,
-                namespaceID: exec.namespace,
-                stateBuffer: postSignalBuf,
-                logger: exec.logger
-            )
-            try await WorkflowStateQueries.deleteSignals(
-                on: exec.postgres,
-                ids: signals.map { $0.id },
-                logger: exec.logger
-            )
-        }
+        try await applyAndPersistSignals(to: &workflowState, exec: exec, claimed: claimed, historySeq: &historySeq)
 
         // ── 4. Pre-load results the executor needs for fast-path replay ───────────
         let executor = StrandWorkflowExecutor()
@@ -255,20 +219,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             logger: exec.logger
         )
         executor.resolveCompleted(completedChildren)
-        for (seqNum, _, _, state, kind, name) in completedChildren
-        where kind == .workflow && state == .completed {
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .childWorkflowCompleted,
-                // seq_num is a String for consistency with CHILD_WORKFLOW_STARTED
-                eventData: try? JSON.encode(["workflow": name, "seq_num": String(seqNum)]),
-                logger: exec.logger
-            )
-            historySeq += 1
-        }
+        try await appendChildWorkflowCompletedHistory(completedChildren: completedChildren, exec: exec, claimed: claimed, historySeq: &historySeq)
 
         // ── 5. Build activation context ────────────────────────────────────────────
         // Capture wall-clock time once here so WorkflowContext.activationTime
@@ -333,42 +284,15 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         }
 
         // ── Local activity execution loop ─────────────────
-        // Local activities run in-process with no DB task row or queue dispatch.
-        // After each batch the executor flushes buffered commands and re-evaluates
-        // any pending conditions; break early if the handler has already finished.
-        localActivityLoop: while !executor.localActivityEntries.isEmpty {
-            let entries = executor.localActivityEntries  // snapshot
-            for (id, entry) in entries {
-                guard let runner = exec.localActivityLookup[entry.name] else {
-                    executor.failLocalActivity(
-                        id: id,
-                        error: StrandError.unknownTask(name: entry.name)
-                    )
-                    continue
-                }
-                do {
-                    let result = try await runner(entry.input, exec, claimed.taskID)
-                    try await Queries.setCheckpointState(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        seqNum: entry.seqNum,
-                        name: entry.name,
-                        stateBuffer: result,
-                        runID: claimed.runID,
-                        extendClaimBySeconds: claimTimeoutSecs,
-                        logger: exec.logger
-                    )
-                    activation.cacheCheckpoint(seqNum: entry.seqNum, buffer: result)
-                    executor.resolveLocalActivity(id: id, result: result)
-                } catch {
-                    executor.failLocalActivity(id: id, error: error)
-                }
-            }
-            executor.drain()
-            while executor.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
-            if handlerResult.value != nil { break localActivityLoop }
-        }
+        try await runLocalActivities(
+            exec: exec,
+            claimed: claimed,
+            executor: executor,
+            activation: activation,
+            handlerResult: handlerResult,
+            claimTimeoutSecs: claimTimeoutSecs,
+            expireConditions: false
+        )
 
         // ── 7. Apply commands, handle result, suspend or complete ─────────────────
         return try await applyScheduleCommands(
@@ -438,45 +362,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         }
 
         // ── Signals ──────────────────────────────────────────────────────────
-        // Apply directly to the live stateBox — no need to reload from DB.
-        let signals = try await WorkflowStateQueries.loadPendingSignals(
-            on: exec.postgres,
-            taskID: claimed.taskID,
-            namespaceID: exec.namespace,
-            logger: exec.logger
-        )
-        for signal in signals {
-            try stateBox.value.handleSignal(name: signal.name, payload: signal.payload)
-        }
-        if !signals.isEmpty {
-            for signal in signals {
-                let sigData = try? JSON.encode(["name": signal.name])
-                try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres,
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    seq: historySeq,
-                    eventType: .signalReceived,
-                    eventData: sigData,
-                    logger: exec.logger
-                )
-                historySeq += 1
-            }
-            let postSignalBuf = try JSON.encode(stateBox.value)
-            try await WorkflowStateQueries.saveState(
-                on: exec.postgres,
-                taskID: claimed.taskID,
-                namespaceID: exec.namespace,
-                stateBuffer: postSignalBuf,
-                logger: exec.logger
-            )
-            try await WorkflowStateQueries.deleteSignals(
-                on: exec.postgres,
-                ids: signals.map { $0.id },
-                logger: exec.logger
-            )
-
-        }
+        try await applyAndPersistSignals(to: &stateBox.value, exec: exec, claimed: claimed, historySeq: &historySeq)
 
         // ── Completed children ──────────────────────────────────────────────────
         let completedChildren = try await WorkflowStateQueries.loadCompletedChildActivities(
@@ -500,19 +386,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             )
         }
 
-        for (seqNum, _, _, state, kind, name) in completedChildren
-        where kind == .workflow && state == .completed {
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .childWorkflowCompleted,
-                eventData: try? JSON.encode(["workflow": name, "seq_num": String(seqNum)]),
-                logger: exec.logger
-            )
-            historySeq += 1
-        }
+        try await appendChildWorkflowCompletedHistory(completedChildren: completedChildren, exec: exec, claimed: claimed, historySeq: &historySeq)
 
         // ── Event/timer checkpoint (before resuming, for durability) ──────────
         if let eventName = claimed.wakeEvent,
@@ -585,7 +459,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     taskID: claimed.taskID,
                     seq: historySeq,
                     eventType: .eventReceived,
-                    eventData: try? JSON.encode(["event_name": eventName]),
+                    eventData: try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)),
                     logger: exec.logger
                 )
                 historySeq += 1
@@ -603,6 +477,119 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         while executor.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
 
         // ── Local activity execution loop ─────────────────────────────────────
+        try await runLocalActivities(
+            exec: exec,
+            claimed: claimed,
+            executor: executor,
+            activation: activation,
+            handlerResult: handlerResult,
+            claimTimeoutSecs: claimTimeoutSecs,
+            expireConditions: true
+        )
+
+        // ── Apply commands, handle result, suspend or complete ─────────────────
+        return try await applyScheduleCommands(
+            commands: executor.pendingCommands,
+            executor: executor,
+            claimed: claimed,
+            exec: exec,
+            activation: activation,
+            cache: cache,
+            handlerResult: handlerResult,
+            handlerTask: handlerTask,
+            stateBox: stateBox,
+            historySeq: &historySeq,
+            claimTimeoutSecs: claimTimeoutSecs
+        )
+    }
+
+    // MARK: - Shared activation helpers
+
+    /// Loads all pending signals, applies them to `state`, appends `SIGNAL_RECEIVED`
+    /// history events, persists the updated state, and deletes the processed signal rows.
+    /// No-op when no signals are pending.
+    private func applyAndPersistSignals(
+        to state: inout W,
+        exec: _WorkerExec,
+        claimed: ClaimedTask,
+        historySeq: inout Int
+    ) async throws {
+        let signals = try await WorkflowStateQueries.loadPendingSignals(
+            on: exec.postgres,
+            taskID: claimed.taskID,
+            namespaceID: exec.namespace,
+            logger: exec.logger
+        )
+        for signal in signals {
+            try state.handleSignal(name: signal.name, payload: signal.payload)
+        }
+        guard !signals.isEmpty else { return }
+        for signal in signals {
+            let sigData = try? JSON.encode(WorkflowStateQueries.SignalReceivedData(name: signal.name))
+            try await WorkflowStateQueries.appendHistory(
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .signalReceived,
+                eventData: sigData,
+                logger: exec.logger
+            )
+            historySeq += 1
+        }
+        let stateBuf = try JSON.encode(state)
+        try await WorkflowStateQueries.saveState(
+            on: exec.postgres,
+            taskID: claimed.taskID,
+            namespaceID: exec.namespace,
+            stateBuffer: stateBuf,
+            logger: exec.logger
+        )
+        try await WorkflowStateQueries.deleteSignals(
+            on: exec.postgres,
+            ids: signals.map { $0.id },
+            logger: exec.logger
+        )
+    }
+
+    /// Appends a `CHILD_WORKFLOW_COMPLETED` history event for every completed child
+    /// workflow in `completedChildren`. Activities and non-completed children are skipped.
+    private func appendChildWorkflowCompletedHistory(
+        completedChildren: [(seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?, state: TaskState, kind: TaskKind, name: String)],
+        exec: _WorkerExec,
+        claimed: ClaimedTask,
+        historySeq: inout Int
+    ) async throws {
+        for (seqNum, _, _, state, kind, name) in completedChildren
+        where kind == .workflow && state == .completed {
+            try await WorkflowStateQueries.appendHistory(
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: .childWorkflowCompleted,
+                eventData: try? JSON.encode(WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum)),
+                logger: exec.logger
+            )
+            historySeq += 1
+        }
+    }
+
+    /// Runs all queued local activities to completion, draining the executor after each
+    /// batch. Broken early if the handler finishes during a batch.
+    ///
+    /// - Parameter expireConditions: when `true` (cached/resume path), expired condition
+    ///   deadlines are processed after each drain — matching the behaviour of
+    ///   `resumeActivation`. Pass `false` on the fresh path (`_activate`).
+    private func runLocalActivities(
+        exec: _WorkerExec,
+        claimed: ClaimedTask,
+        executor: StrandWorkflowExecutor,
+        activation: _WorkflowActivation<W>,
+        handlerResult: ArcBox<Result<W.Output, Error>?>,
+        claimTimeoutSecs: Int,
+        expireConditions: Bool
+    ) async throws {
         localActivityLoop: while !executor.localActivityEntries.isEmpty {
             let entries = executor.localActivityEntries
             for (id, entry) in entries {
@@ -630,25 +617,12 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                 }
             }
             executor.drain()
-            while executor.resumeExpiredConditions() { executor.drain() }
+            if expireConditions {
+                while executor.resumeExpiredConditions() { executor.drain() }
+            }
             while executor.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
             if handlerResult.value != nil { break localActivityLoop }
         }
-
-        // ── Apply commands, handle result, suspend or complete ─────────────────
-        return try await applyScheduleCommands(
-            commands: executor.pendingCommands,
-            executor: executor,
-            claimed: claimed,
-            exec: exec,
-            activation: activation,
-            cache: cache,
-            handlerResult: handlerResult,
-            handlerTask: handlerTask,
-            stateBox: stateBox,
-            historySeq: &historySeq,
-            claimTimeoutSecs: claimTimeoutSecs
-        )
     }
 
 }

@@ -971,7 +971,7 @@ public struct StrandWorker: Service {
                         maxAttempts: nil,
                         cancellationBuffer: nil,
                         idempotencyKey: nil,
-                        priority: TaskPriority.normal.rawValue,
+                        priority: .normal,
                         scheduledAt: nil,
                         fairnessKey: nil,
                         fairnessWeight: 1.0,
@@ -993,57 +993,64 @@ public struct StrandWorker: Service {
             }
         } catch let typed as _TypedActivityFailure {
             // Pre-encoded failure reason from ActivityDefinition._run — use verbatim.
-            _metrics.value.makeCounter(label: StrandMetrics.tasksFailed, dimensions: taskDims)
-                .increment(by: 1)
-            metricsBuffer?.record(
-                queue: options.queue,
-                taskName: claimed.taskName,
-                state: .failed,
-                execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
-                waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
+            await failAndRecord(
+                reasonBuffer: typed.reasonBuffer,
+                claimed: claimed,
+                taskDims: taskDims,
+                taskStart: taskStart,
+                taskStartWall: taskStartWall,
+                logger: taskLogger
             )
-            do {
-                try await Queries.failRun(
-                    on: postgres,
-                    namespaceID: namespace,
-                    runID: claimed.runID,
-                    reasonBuffer: typed.reasonBuffer,
-                    logger: logger
-                )
-            } catch {
-                taskLogger.error(
-                    "failRun DB call failed — run will be swept by leaseExpiryLoop",
-                    metadata: .forError(error)
-                )
-            }
         } catch {
-            _metrics.value.makeCounter(label: StrandMetrics.tasksFailed, dimensions: taskDims)
-                .increment(by: 1)
-            metricsBuffer?.record(
-                queue: options.queue,
-                taskName: claimed.taskName,
-                state: .failed,
-                execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
-                waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
-            )
             let reason = FailureReason(error: error)
-            do {
-                let buf =
-                    (try? JSON.encode(reason))
-                    ?? ByteBuffer(string: #"{"name":"unknown","message":"encoding failed"}"#)
-                try await Queries.failRun(
-                    on: postgres,
-                    namespaceID: namespace,
-                    runID: claimed.runID,
-                    reasonBuffer: buf,
-                    logger: logger
-                )
-            } catch {
-                taskLogger.error(
-                    "failRun DB call failed — run will be swept by leaseExpiryLoop",
-                    metadata: .forError(error)
-                )
-            }
+            let buf =
+                (try? JSON.encode(reason))
+                ?? ByteBuffer(string: #"{"name":"unknown","message":"encoding failed"}"#)
+            await failAndRecord(
+                reasonBuffer: buf,
+                claimed: claimed,
+                taskDims: taskDims,
+                taskStart: taskStart,
+                taskStartWall: taskStartWall,
+                logger: taskLogger
+            )
+        }
+    }
+
+    /// Records a task failure in metrics and persists it via `Queries.failRun`.
+    ///
+    /// Shared by the typed-failure catch (`_TypedActivityFailure`) and the generic
+    /// catch in `runTask` — only `reasonBuffer` differs between the two.
+    private func failAndRecord(
+        reasonBuffer: ByteBuffer,
+        claimed: ClaimedTask,
+        taskDims: [(String, String)],
+        taskStart: ContinuousClock.Instant,
+        taskStartWall: Date,
+        logger: Logger
+    ) async {
+        _metrics.value.makeCounter(label: StrandMetrics.tasksFailed, dimensions: taskDims)
+            .increment(by: 1)
+        metricsBuffer?.record(
+            queue: options.queue,
+            taskName: claimed.taskName,
+            state: .failed,
+            execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
+            waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
+        )
+        do {
+            try await Queries.failRun(
+                on: postgres,
+                namespaceID: namespace,
+                runID: claimed.runID,
+                reasonBuffer: reasonBuffer,
+                logger: logger
+            )
+        } catch {
+            logger.error(
+                "failRun DB call failed — run will be swept by leaseExpiryLoop",
+                metadata: .forError(error)
+            )
         }
     }
 }

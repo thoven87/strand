@@ -1,4 +1,5 @@
 import NIOCore
+import PostgresNIO
 import Tracing
 
 #if canImport(FoundationEssentials)
@@ -41,6 +42,24 @@ extension WorkflowRegistration {
     ) async throws -> ByteBuffer? {
 
         // ── 1. Persist checkpoints ────────────────────────────────────────────────────
+
+        // Local helper — captures the five fixed appendHistory parameters so each
+        // call site only specifies the two that vary (eventType, eventData).
+        // A nested `func` (not a stored closure) is used because it can capture
+        // the `inout historySeq` parameter directly.
+        func record(_ type: WorkflowStateQueries.HistoryEventType, _ data: ByteBuffer?) async throws {
+            try await WorkflowStateQueries.appendHistory(
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                seq: historySeq,
+                eventType: type,
+                eventData: data,
+                logger: exec.logger
+            )
+            historySeq += 1
+        }
+
         // Non-suspending writes first — durable regardless of what follows.
         let checkpointWrites = commands.compactMap {
             cmd -> (seqNum: Int, name: String?, state: ByteBuffer)? in
@@ -68,27 +87,9 @@ extension WorkflowRegistration {
         for cmd in commands {
             switch cmd {
             case .timerFired:
-                try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres,
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    seq: historySeq,
-                    eventType: .timerFired,
-                    eventData: nil,
-                    logger: exec.logger
-                )
-                historySeq += 1
+                try await record(.timerFired, nil)
             case .eventReceived(let eventName):
-                try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres,
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    seq: historySeq,
-                    eventType: .eventReceived,
-                    eventData: try? JSON.encode(["event_name": eventName]),
-                    logger: exec.logger
-                )
-                historySeq += 1
+                try await record(.eventReceived, try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
             default:
                 break
             }
@@ -100,10 +101,7 @@ extension WorkflowRegistration {
         case .success(let output):
             // Handler completed — persist final state and return the encoded result.
             // The caller (runTask) writes COMPLETED to the run.
-            cache.remove(claimed.taskID)
-            handlerTask.cancel()
-            executor.cancelPending()
-            executor.drain()  // flush any residual jobs from cancelPending()
+            teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
             let finalStateBuf = try JSON.encode(stateBox.value)
             try await WorkflowStateQueries.saveState(
                 on: exec.postgres,
@@ -112,15 +110,7 @@ extension WorkflowRegistration {
                 stateBuffer: finalStateBuf,
                 logger: exec.logger
             )
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .workflowCompleted,
-                eventData: nil,
-                logger: exec.logger
-            )
+            try await record(.workflowCompleted, nil)
             return try JSON.encode(output)
 
         case .failure(let error):
@@ -133,26 +123,12 @@ extension WorkflowRegistration {
             // CallSiteAnnotatedError to wrap the signal — defeating the
             // `catch let signal as _ContinueAsNewSignal` in runTask.
             if let signal = error as? _ContinueAsNewSignal {
-                cache.remove(claimed.taskID)
-                handlerTask.cancel()
-                executor.cancelPending()
-                executor.drain()  // flush residual jobs from cancelPending()
+                teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
                 throw signal
             }
-            cache.remove(claimed.taskID)
-            handlerTask.cancel()
-            executor.cancelPending()
-            executor.drain()  // flush residual jobs from cancelPending()
-            let errData = try? JSON.encode(["error": String(describing: error)])
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .workflowFailed,
-                eventData: errData,
-                logger: exec.logger
-            )
+            teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
+            let errData = try? JSON.encode(WorkflowStateQueries.WorkflowFailedData(error: String(describing: error)))
+            try await record(.workflowFailed, errData)
             // Stamp the last WorkflowContext call site onto the error.
             if let site = activation.lastCallSite {
                 throw CallSiteAnnotatedError(
@@ -197,8 +173,11 @@ extension WorkflowRegistration {
             let childHeadersBuf: ByteBuffer? =
                 _spanHeaders.isEmpty ? nil : try? JSON.encode(_spanHeaders)
 
-            // Enqueue activities / child workflows (idempotent — safe if row exists).
-            var enqueued: [(seqNum: Int, taskID: UUID)] = []
+            // Collect child specs — activities and child workflows enqueued in one batch
+            // transaction after the loop.  Timer and named-event commands continue to write
+            // to the DB inline; their state transitions are independent of the child batch.
+            var pendingChildren: [Queries.ChildEnqueueSpec] = []
+            var childHistoryItems: [(eventType: WorkflowStateQueries.HistoryEventType, eventData: ByteBuffer?)] = []
             for cmd in scheduleCommands {
                 switch cmd {
                 case .scheduleActivity(
@@ -208,45 +187,41 @@ extension WorkflowRegistration {
                     let seqNum,
                     let idKey
                 ):
-                    let row = try await Queries.enqueueTask(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        queue: options.queue ?? exec.queue,
-                        taskName: name,
-                        paramsBuffer: actInput,
-                        headersBuffer: childHeadersBuf,
-                        retryStrategyBuffer: options.retryStrategy.flatMap { try? JSON.encode($0) },
-                        maxAttempts: options.maxAttempts,
-                        cancellationBuffer: nil,
-                        idempotencyKey: idKey,
-                        priority: options.priority.rawValue,
-                        scheduledAt: options.delayUntil,
-                        timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
-                        deadlineAt: options.maxDuration.map {
-                            Date.now.addingTimeInterval(
-                                Double($0.components.seconds)
-                                    + Double($0.components.attoseconds)
-                                    / 1_000_000_000_000_000_000
+                    pendingChildren.append(
+                        Queries.ChildEnqueueSpec(
+                            seqNum: seqNum,
+                            taskID: UUID.v7(),
+                            runID: UUID.v7(),
+                            queue: options.queue ?? exec.queue,
+                            taskName: name,
+                            paramsBuffer: actInput,
+                            headersBuffer: childHeadersBuf,
+                            retryStrategyBuffer: options.retryStrategy.flatMap { try? JSON.encode($0) },
+                            maxAttempts: options.maxAttempts,
+                            idempotencyKey: idKey,
+                            priority: options.priority,
+                            scheduledAt: options.delayUntil,
+                            timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
+                            deadlineAt: options.maxDuration.map {
+                                Date.now.addingTimeInterval(
+                                    Double($0.components.seconds)
+                                        + Double($0.components.attoseconds)
+                                        / 1_000_000_000_000_000_000
+                                )
+                            },
+                            fairnessKey: options.fairnessKey,
+                            fairnessWeight: options.fairnessWeight,
+                            kind: .activity
+                        )
+                    )
+                    childHistoryItems.append(
+                        (
+                            eventType: .activityScheduled,
+                            eventData: try? JSON.encode(
+                                WorkflowStateQueries.ActivityScheduledData(activity: name, seqNum: seqNum)
                             )
-                        },
-                        fairnessKey: options.fairnessKey,
-                        fairnessWeight: options.fairnessWeight,
-                        kind: .activity,
-                        parentTaskID: claimed.taskID,
-                        logger: exec.logger
+                        )
                     )
-                    enqueued.append((seqNum: seqNum, taskID: row.taskID))
-                    let actData = try? JSON.encode(["activity": name, "seq_num": String(seqNum)])
-                    try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        seq: historySeq,
-                        eventType: .activityScheduled,
-                        eventData: actData,
-                        logger: exec.logger
-                    )
-                    historySeq += 1
 
                 case .startTimer(let wakeAt, _):
                     // Transition run to SLEEPING. Both UPDATEs are one SQL statement
@@ -266,19 +241,10 @@ extension WorkflowRegistration {
                         """,
                         logger: exec.logger
                     )
-                    let timerData = try? JSON.encode([
-                        "duration_ms": Int(wakeAt.timeIntervalSinceNow * 1000)
-                    ])
-                    try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        seq: historySeq,
-                        eventType: .timerStarted,
-                        eventData: timerData,
-                        logger: exec.logger
+                    let timerData = try? JSON.encode(
+                        WorkflowStateQueries.TimerStartedData(durationMs: Int(wakeAt.timeIntervalSinceNow * 1000))
                     )
-                    historySeq += 1
+                    try await record(.timerStarted, timerData)
 
                 case .awaitEvent(let eventName, let seqNum, let timeoutAt):
                     // Atomic check-or-wait: prevents the lost-wakeup race where the
@@ -345,11 +311,7 @@ extension WorkflowRegistration {
                                 logger: exec.logger
                             )
                             // Run is PENDING — notify workers to claim immediately.
-                            let notification = StrandChannels.Notification(namespace: exec.namespace, queue: queueName)
-                            try await conn.query(
-                                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                                logger: exec.logger
-                            )
+                            try await conn.notifyWorkers(namespace: exec.namespace, queue: queueName, logger: exec.logger)
                         } else {
                             // Event not yet emitted — set run to WAITING (or SLEEPING for timed waits).
                             let availableAt =
@@ -374,166 +336,87 @@ extension WorkflowRegistration {
                             )
                         }
                     }
-                    let eventWaitData = try? JSON.encode(["event_name": eventName])
-                    try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        seq: historySeq,
-                        eventType: .eventWaitStarted,
-                        eventData: eventWaitData,
-                        logger: exec.logger
-                    )
-                    historySeq += 1
+                    let eventWaitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
+                    try await record(.eventWaitStarted, eventWaitData)
 
                 case .scheduleChildWorkflow(
                     let name,
                     let childQueue,
                     let wfInput,
                     let seqNum,
-                    let idKey
+                    let idKey,
+                    let childPriority,
+                    let childMaxAttempts,
+                    let childFairnessKey,
+                    let childFairnessWeight,
+                    let childRetryStrategy,
+                    let childScheduledAt
                 ):
-                    let targetQueue = childQueue ?? exec.queue  // use child's queue or inherit
-                    let row = try await Queries.enqueueTask(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        queue: targetQueue,
-                        taskName: name,
-                        paramsBuffer: wfInput,
-                        headersBuffer: childHeadersBuf,
-                        retryStrategyBuffer: nil,
-                        maxAttempts: nil,
-                        cancellationBuffer: nil,
-                        idempotencyKey: idKey,
-                        priority: TaskPriority.normal.rawValue,
-                        scheduledAt: nil,
-                        fairnessKey: nil,
-                        fairnessWeight: 1.0,
-                        kind: .workflow,
-                        parentTaskID: claimed.taskID,
-                        logger: exec.logger
+                    let targetQueue = childQueue ?? exec.queue
+                    pendingChildren.append(
+                        Queries.ChildEnqueueSpec(
+                            seqNum: seqNum,
+                            taskID: UUID.v7(),
+                            runID: UUID.v7(),
+                            queue: targetQueue,
+                            taskName: name,
+                            paramsBuffer: wfInput,
+                            headersBuffer: childHeadersBuf,
+                            retryStrategyBuffer: childRetryStrategy.flatMap { try? JSON.encode($0) },
+                            maxAttempts: childMaxAttempts,
+                            idempotencyKey: idKey,
+                            priority: childPriority,
+                            scheduledAt: childScheduledAt,
+                            timeoutSeconds: nil,
+                            deadlineAt: nil,
+                            fairnessKey: childFairnessKey,
+                            fairnessWeight: childFairnessWeight,
+                            kind: .workflow
+                        )
                     )
-                    enqueued.append((seqNum: seqNum, taskID: row.taskID))
-                    let childData = try? JSON.encode([
-                        "workflow": name, "seq_num": String(seqNum),
-                    ])
-                    try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        seq: historySeq,
-                        eventType: .childWorkflowStarted,
-                        eventData: childData,
-                        logger: exec.logger
+                    childHistoryItems.append(
+                        (
+                            eventType: .childWorkflowStarted,
+                            eventData: try? JSON.encode(
+                                WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum)
+                            )
+                        )
                     )
-                    historySeq += 1
 
                 case .writeCheckpoint, .timerFired, .eventReceived:
                     break  // already handled above
                 }
             }
 
-            // ── 5. Register event_waits + atomic completion check ──────────────────────
-            // Atomic check-or-wait: prevents the lost-wakeup race where a child
-            // task completes between enqueueTask() committing and this transaction
-            // committing.
-            //
-            // Without this check:
-            //   1. enqueueTask() commits — child task visible to activity workers
-            //   2. Activity worker claims, runs, and completes it immediately
-            //   3. emitTaskCompletionSignal finds no event_wait — parent not woken
-            //   4. This transaction commits — run goes WAITING and stalls forever
-            //
-            // Both the event_wait inserts and a task_completions count live in the
-            // same transaction. If all children are already done, go PENDING immediately;
-            // the next poll re-activates the workflow. Remaining event_waits fire normally.
-            if !enqueued.isEmpty {
-                try await exec.postgres.withTransaction(logger: exec.logger) { conn in
-                    // TODO: optimize this path
-                    for item in enqueued {
-                        try await conn.query(
-                            """
-                            INSERT INTO strand.event_waits
-                                (task_id, run_id, queue, seq_num, child_task_id, timeout_at)
-                            VALUES (\(claimed.taskID), \(claimed.runID), \(exec.queue),
-                                    \(item.seqNum), \(item.taskID), NULL)
-                            ON CONFLICT (run_id, seq_num) DO UPDATE
-                                SET child_task_id = EXCLUDED.child_task_id,
-                                    timeout_at    = NULL
-                            """,
-                            logger: exec.logger
-                        )
-                    }
-
-                    // Atomically check whether any child tasks already completed
-                    // (i.e. are present in task_completions) before we park the run.
-                    let childTaskIDs = enqueued.map { $0.taskID }
-                    let completedStream = try await conn.query(
-                        """
-                        SELECT COUNT(*) FROM strand.task_completions
-                        WHERE task_id = ANY(\(childTaskIDs))
-                        """,
+            // ── 5. Batch-enqueue all children + event_waits + run-state transition ──────────
+            // One Postgres transaction for N children using true batch SQL:
+            //   • multi-row VALUES INSERT for tasks (one round-trip)
+            //   • multi-row VALUES INSERT for runs (one round-trip)
+            //   • unnest-based INSERT for event_waits (one round-trip)
+            //   • pg_notify per distinct child queue (new tasks only)
+            //   • atomic task_completions count → PENDING or WAITING
+            if !pendingChildren.isEmpty {
+                try await Queries.enqueueChildTasksBatch(
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    parentTaskID: claimed.taskID,
+                    parentRunID: claimed.runID,
+                    parentQueue: exec.queue,
+                    children: pendingChildren,
+                    logger: exec.logger
+                )
+                // Append workflow history for all children (preserves submission order).
+                for historyItem in childHistoryItems {
+                    try await WorkflowStateQueries.appendHistory(
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        seq: historySeq,
+                        eventType: historyItem.eventType,
+                        eventData: historyItem.eventData,
                         logger: exec.logger
                     )
-                    var completedCount = 0
-                    for try await row in completedStream {
-                        var col = row.makeIterator()
-                        completedCount = try col.next()!.decode(Int.self, context: .default)
-                    }
-
-                    // Go PENDING if ANY child has already completed, not just ALL.
-                    // The `for try await r in group` loop delivers results one at a time,
-                    // so even a single completion requires a re-activation to make progress.
-                    //
-                    // The del_orphans CTE deletes event_waits for the completed children
-                    // in the same atomic operation.  Without this, the partial-completion
-                    // re-wait in step 7 would find them on every subsequent activation and
-                    // repeatedly go PENDING for no-op deliveries (spin loop).
-                    if completedCount > 0 {
-                        try await conn.query(
-                            """
-                            WITH
-                            del_orphans AS (
-                                DELETE FROM strand.event_waits ew
-                                USING strand.task_completions tc
-                                WHERE ew.run_id        = \(claimed.runID)
-                                  AND ew.child_task_id = tc.task_id
-                                  AND tc.task_id       = ANY(\(childTaskIDs))
-                            ),
-                            r AS (
-                                UPDATE strand.runs
-                                SET state        = \(TaskState.pending),
-                                    available_at = NOW(),
-                                    worker_id    = NULL,
-                                    lease_expires_at = NULL
-                                WHERE id = \(claimed.runID)
-                                RETURNING id
-                            )
-                            UPDATE strand.tasks SET state = \(TaskState.pending)
-                            WHERE id = \(claimed.taskID)
-                            """,
-                            logger: exec.logger
-                        )
-                        let notification = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
-                        try await conn.query(
-                            "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                            logger: exec.logger
-                        )
-                    } else {
-                        try await conn.query(
-                            """
-                            WITH r AS (
-                                UPDATE strand.runs
-                                SET state = \(TaskState.waiting), worker_id = NULL, lease_expires_at = NULL
-                                WHERE id = \(claimed.runID)
-                                RETURNING id
-                            )
-                            UPDATE strand.tasks SET state = \(TaskState.waiting)
-                            WHERE id = \(claimed.taskID)
-                            """,
-                            logger: exec.logger
-                        )
-                    }
+                    historySeq += 1
                 }
             }
         }
@@ -548,44 +431,92 @@ extension WorkflowRegistration {
         if executor.hasUnsatisfiedConditions && scheduleCommands.isEmpty {
             let condTaskID = claimed.taskID
             let condRunID = claimed.runID
+
+            // Both branches use the same post-CTE logic: read the final state from
+            // RETURNING, then notify only if PENDING and write history only if
+            // the run actually parked (SLEEPING or WAITING).
+            //
+            // If a signal arrived while the run was RUNNING it couldn't flip the run
+            // directly (the signal UPDATE only matches SLEEPING/WAITING). The
+            // pending_sigs CTE catches that race: if workflow_signals already has rows
+            // for this task we go straight to PENDING rather than parking.
+            let condStateStream: PostgresRowSequence
             if let wakeAt = executor.conditionMinWakeAt {
-                // At least one condition has a deadline — sleep until the earliest one.
-                try await exec.postgres.query(
+                condStateStream = try await exec.postgres.query(
                     """
-                    WITH r AS (
+                    WITH
+                    pending_sigs AS (
+                        SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                        WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                    ),
+                    run_upd AS (
                         UPDATE strand.runs
-                        SET state = \(TaskState.sleeping), available_at = \(wakeAt),
+                        SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN \(TaskState.pending)
+                                               ELSE \(TaskState.sleeping) END,
+                            available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN NOW()
+                                               ELSE \(wakeAt) END,
                             worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
+                        RETURNING state
                     )
-                    UPDATE strand.tasks SET state = \(TaskState.sleeping) WHERE id = \(condTaskID)
+                    UPDATE strand.tasks
+                    SET state = (SELECT state FROM run_upd)
+                    WHERE id = \(condTaskID)
+                    RETURNING state
                     """,
                     logger: exec.logger
                 )
             } else {
-                // All conditions are indefinite — wait for a signal.
-                try await exec.postgres.query(
+                condStateStream = try await exec.postgres.query(
                     """
-                    WITH r AS (
+                    WITH
+                    pending_sigs AS (
+                        SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                        WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                    ),
+                    run_upd AS (
                         UPDATE strand.runs
-                        SET state = \(TaskState.waiting), worker_id = NULL, lease_expires_at = NULL
+                        SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN \(TaskState.pending)
+                                               ELSE \(TaskState.waiting) END,
+                            available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                               THEN NOW()
+                                               ELSE available_at END,
+                            worker_id = NULL, lease_expires_at = NULL
                         WHERE id = \(condRunID)
+                        RETURNING state
                     )
-                    UPDATE strand.tasks SET state = \(TaskState.waiting) WHERE id = \(condTaskID)
+                    UPDATE strand.tasks
+                    SET state = (SELECT state FROM run_upd)
+                    WHERE id = \(condTaskID)
+                    RETURNING state
                     """,
                     logger: exec.logger
                 )
             }
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .conditionWaiting,
-                eventData: nil,
-                logger: exec.logger
-            )
-            historySeq += 1
+
+            // Read the state the CTE actually wrote.
+            var conditionState: TaskState = .waiting
+            for try await row in condStateStream {
+                var col = row.makeIterator()
+                conditionState = try col.next()!.decode(TaskState.self, context: .default)
+            }
+
+            // Notify only when the run went PENDING (signals were waiting).
+            // SLEEPING/WAITING runs don't need a notify — they wake via timer or
+            // the next _sendSignal call.
+            if conditionState == .pending {
+                try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
+            }
+
+            // Only record CONDITION_WAITING when the run actually parked.
+            // If pending signals sent us straight to PENDING the workflow never
+            // entered a wait — recording the event would mislead the history view.
+            if conditionState != .pending {
+                try await record(.conditionWaiting, nil)
+            }
         }
         // No else branch: if scheduleCommands is empty and no conditions remain,
         // suspension came from sleep/waitForEvent which already wrote its own DB update.
@@ -652,11 +583,7 @@ extension WorkflowRegistration {
             // Notify speculatively: if the run went PENDING (missed > 0) workers should
             // claim it immediately. If it went WAITING the notification is a spurious
             // wakeup that costs at most one empty poll — acceptable.
-            let notification = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
-            try await exec.postgres.query(
-                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                logger: exec.logger
-            )
+            try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
 
             // ── 7B. Post-wait snapshot-isolation recovery ───────────────────────────────
             // Step 7's CTE runs under Postgres snapshot isolation: it cannot see
@@ -715,11 +642,7 @@ extension WorkflowRegistration {
                         "strand.run_id": .stringConvertible(claimed.runID),
                     ]
                 )
-                let recoveryNote = StrandChannels.Notification(namespace: exec.namespace, queue: exec.queue)
-                try await exec.postgres.query(
-                    "SELECT pg_notify(\(StrandChannels.tasks), \(recoveryNote.payload))",
-                    logger: exec.logger
-                )
+                try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
             }
         }
 
@@ -742,5 +665,22 @@ extension WorkflowRegistration {
         )
 
         return nil
+    }
+
+    /// Tears down the cached handler Task when a workflow reaches a terminal result
+    /// (completed, failed, or continuing-as-new).
+    ///
+    /// Order matters: remove from cache first so no other activation can race with
+    /// the `cancelPending` + `drain` that follows.
+    private func teardownHandler(
+        cache: _WorkflowTaskCache<W>,
+        taskID: UUID,
+        handlerTask: Task<Void, Never>,
+        executor: StrandWorkflowExecutor
+    ) {
+        cache.remove(taskID)
+        handlerTask.cancel()
+        executor.cancelPending()
+        executor.drain()
     }
 }

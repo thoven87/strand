@@ -145,12 +145,8 @@ package enum WorkflowStateQueries {
         logger: Logger
     ) async throws {
         guard !ids.isEmpty else { return }
-        // Convert UUIDs to their canonical string form and let Postgres cast the
-        // text array to uuid[] via `::uuid[]`. This avoids any dependency on a
-        // hypothetical [UUID]: PostgresEncodable conformance in PostgresNIO.
-        let idStrings = ids.map { $0.uuidString }
         try await postgres.query(
-            "DELETE FROM strand.workflow_signals WHERE id = ANY(\(idStrings)::uuid[])",
+            "DELETE FROM strand.workflow_signals WHERE id = ANY(\(ids))",
             logger: logger
         )
     }
@@ -199,7 +195,7 @@ package enum WorkflowStateQueries {
         seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
         state: TaskState, kind: TaskKind, name: String
     )] {
-        let prefix = "\(parentTaskID.uuidString):"
+        let prefix = "\(parentTaskID):"
         let prefixPattern = prefix + "%"
         let stream = try await postgres.query(
             """
@@ -286,6 +282,86 @@ package enum WorkflowStateQueries {
         case eventReceived = "EVENT_RECEIVED"
         case childWorkflowStarted = "CHILD_WORKFLOW_STARTED"
         case childWorkflowCompleted = "CHILD_WORKFLOW_COMPLETED"
+    }
+
+    // MARK: - History event data payloads
+
+    /// Payload for `ACTIVITY_SCHEDULED`.
+    ///
+    /// JSON shape: `{"activity":"MyActivity","seq_num":"5"}`.
+    /// `seq_num` is written as a string to match the existing wire format that the
+    /// Loom dashboard reads (it accepts both `string` and `number` but the current
+    /// writer always emits a string).
+    package struct ActivityScheduledData: Encodable {
+        package let activity: String
+        package let seqNum: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case activity
+            case seqNum = "seq_num"
+        }
+
+        package func encode(to encoder: any Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(activity, forKey: .activity)
+            try c.encode(String(seqNum), forKey: .seqNum)
+        }
+    }
+
+    /// Payload for `CHILD_WORKFLOW_STARTED` and `CHILD_WORKFLOW_COMPLETED`.
+    ///
+    /// JSON shape: `{"workflow":"OrderWorkflow","seq_num":"3"}`.
+    package struct ChildWorkflowData: Encodable {
+        package let workflow: String
+        package let seqNum: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case workflow
+            case seqNum = "seq_num"
+        }
+
+        package func encode(to encoder: any Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(workflow, forKey: .workflow)
+            try c.encode(String(seqNum), forKey: .seqNum)
+        }
+    }
+
+    /// Payload for `EVENT_WAIT_STARTED` and `EVENT_RECEIVED`.
+    ///
+    /// JSON shape: `{"event_name":"order.approved"}`.
+    package struct NamedEventData: Encodable {
+        package let eventName: String
+
+        private enum CodingKeys: String, CodingKey {
+            case eventName = "event_name"
+        }
+    }
+
+    /// Payload for `TIMER_STARTED`.
+    ///
+    /// JSON shape: `{"duration_ms":5000}` — stored as a JSON number so the
+    /// dashboard can display it without parsing.
+    package struct TimerStartedData: Encodable {
+        package let durationMs: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case durationMs = "duration_ms"
+        }
+    }
+
+    /// Payload for `SIGNAL_RECEIVED`.
+    ///
+    /// JSON shape: `{"name":"pause"}`.
+    package struct SignalReceivedData: Encodable {
+        package let name: String
+    }
+
+    /// Payload for `WORKFLOW_FAILED`.
+    ///
+    /// JSON shape: `{"error":"..."}`.
+    package struct WorkflowFailedData: Encodable {
+        package let error: String
     }
 
     /// Appends a single event to this workflow's history log.

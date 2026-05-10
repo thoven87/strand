@@ -298,16 +298,25 @@ extension StrandClient {
                 """,
                 logger: logger
             )
-            try await conn.query(
+            // RETURNING queue so we can notify the correct worker channel
+            // without an extra round-trip — and only when a row was actually
+            // updated (no spurious notifies for RUNNING/PENDING runs).
+            let wakeStream = try await conn.query(
                 """
                 UPDATE strand.runs
                 SET state = 'PENDING', available_at = NOW(),
                     wake_event = NULL, event_payload = NULL,
                     worker_id = NULL, lease_expires_at = NULL
                 WHERE task_id = \(taskID) AND state IN ('SLEEPING', 'WAITING')
+                RETURNING queue
                 """,
                 logger: logger
             )
+            var wokeQueue: String? = nil
+            for try await row in wakeStream {
+                var col = row.makeIterator()
+                wokeQueue = try col.next()!.decode(String.self, context: .default)
+            }
             try await conn.query(
                 """
                 UPDATE strand.tasks SET state = 'PENDING'
@@ -315,6 +324,12 @@ extension StrandClient {
                 """,
                 logger: logger
             )
+            // Wake the worker if a run was actually transitioned to PENDING.
+            // Without this notify the worker only discovers the PENDING run on
+            // the next pollInterval tick — which is correct but needlessly slow.
+            if let queue = wokeQueue {
+                try await conn.notifyWorkers(namespace: ns, queue: queue, logger: logger)
+            }
         }
     }
 }

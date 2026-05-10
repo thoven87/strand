@@ -312,7 +312,6 @@ public struct StrandScheduler: Service {
         }
 
         // Build scheduling metadata. Passed directly to enqueueTask as SchedulingMetadata?
-        // (PostgresCodable conformance handles the BYTEA encoding inside the query binding).
         let schedulingMeta = SchedulingMetadata(
             executionTime: now,
             partitionTime: partitionTime,
@@ -325,7 +324,7 @@ public struct StrandScheduler: Service {
         // Idempotency key: schedule_id + scheduled fire time.
         // Safe across multiple scheduler instances and restarts.
         let idempotencyKey =
-            "$schedule:\(row.id.uuidString):\(row.scheduledAt.timeIntervalSince1970)"
+            "$schedule:\(row.id):\(row.scheduledAt.timeIntervalSince1970)"
 
         _ = try await Queries.enqueueTask(
             on: postgres,

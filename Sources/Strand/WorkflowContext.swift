@@ -348,7 +348,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // ── Slow path: activity not yet complete — emit command and suspend ─────────────
         let inputBuffer = try JSON.encode(input)
-        let idempotencyKey = "\(_impl.taskUUID.uuidString):\(seqNum)"
+        let idempotencyKey = "\(_impl.taskUUID):\(seqNum)"
 
         _impl.executor.emit(
             .scheduleActivity(
@@ -928,17 +928,23 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Slow path: child not yet complete — emit command and suspend via continuation.
         let inputBuffer = try JSON.encode(input)
-        let idempotencyKey = "\(_impl.taskUUID.uuidString):\(seqNum)"
+        let idempotencyKey = "\(_impl.taskUUID):\(seqNum)"
         // Note: options.headers forwarding intentionally omitted from the command —
         // the worker injects parent context headers when enqueuing the child task.
 
         _impl.executor.emit(
             .scheduleChildWorkflow(
                 name: CW.workflowName,
-                queue: options.queue,  // nil = inherit orchestrator's queue at dispatch time
+                queue: options.queue,
                 input: inputBuffer,
                 seqNum: seqNum,
-                idempotencyKey: idempotencyKey
+                idempotencyKey: idempotencyKey,
+                priority: options.priority,
+                maxAttempts: options.maxAttempts,
+                fairnessKey: options.fairnessKey,
+                fairnessWeight: options.fairnessWeight,
+                retryStrategy: options.retryStrategy,
+                scheduledAt: options.delayUntil
             )
         )
 

@@ -130,7 +130,7 @@ struct ChildWorkflowTests {
     func childWorkflowOnDifferentQueue() async throws {
         try await withTestEnvironment { client in
             let childQueue =
-                "t\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased())"
+                "t\(UUID().uuidString.replacing("-", with: "").prefix(12).lowercased())"
             try await client.createQueue(childQueue)
 
             var workerTask1: Task<Void, Never>? = nil

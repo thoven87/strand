@@ -128,7 +128,7 @@ func withTestEnvironment<T: Sendable>(
 ) async throws -> T {
     let logger = Logger(label: "test.strand")
     let queueName =
-        "t\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased())"
+        "t\(UUID().uuidString.replacing("-", with: "").prefix(12).lowercased())"
     let postgres = makePostgresClient(logger: logger)
     let client = StrandClient(
         postgres: postgres,
