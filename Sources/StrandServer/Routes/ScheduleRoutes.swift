@@ -32,6 +32,7 @@ struct ScheduleSummaryResponse: Codable, Sendable {
     let isActive: Bool
     let nextRunAt: Date?
     let lastRunAt: Date?
+    let lastTaskID: UUID?
     let runCount: Int
     let createdAt: Date
     let patternType: String
@@ -45,6 +46,7 @@ struct ScheduleSummaryResponse: Codable, Sendable {
         isActive = s.isActive
         nextRunAt = s.nextRunAt
         lastRunAt = s.lastRunAt
+        lastTaskID = s.lastTaskID
         runCount = s.runCount
         createdAt = s.createdAt
         patternType = s.pattern.typeName
@@ -64,6 +66,7 @@ struct ScheduleDetailResponse: Codable, Sendable {
     let isActive: Bool
     let nextRunAt: Date?
     let lastRunAt: Date?
+    let lastTaskID: UUID?
     let runCount: Int
     let createdAt: Date
     let patternType: String
@@ -79,6 +82,7 @@ struct ScheduleDetailResponse: Codable, Sendable {
         isActive = s.isActive
         nextRunAt = s.nextRunAt
         lastRunAt = s.lastRunAt
+        lastTaskID = s.lastTaskID
         runCount = s.runCount
         createdAt = s.createdAt
         patternType = s.pattern.typeName

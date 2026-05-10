@@ -110,6 +110,7 @@ public struct ScheduleSummary: Sendable, Codable {
     public let endsAt: Date?
     public let nextRunAt: Date?
     public let lastRunAt: Date?
+    public let lastTaskID: UUID?
     public let runCount: Int
     public let accuracy: ScheduleAccuracy
     public let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'

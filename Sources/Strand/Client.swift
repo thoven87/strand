@@ -847,8 +847,11 @@ public struct StrandClient: Sendable {
 
     // MARK: - Schedule implementation
 
+    /// Shared implementation for all `schedule()` overloads.
+    /// `now` defaults to `Date.now`; pass a fixed value in tests to make
+    /// catch-up assertions deterministic without touching the wall clock.
     @discardableResult
-    private func _schedule<P: Codable & Sendable>(
+    func _schedule<P: Codable & Sendable>(
         name: String,
         pattern: SchedulePattern,
         taskName: String,
@@ -857,7 +860,8 @@ public struct StrandClient: Sendable {
         startsAt: Date? = nil,
         endsAt: Date? = nil,
         kind: TaskKind = .workflow,
-        options: ScheduleOptions = .init()
+        options: ScheduleOptions = .init(),
+        now: Date = .now
     ) async throws -> UUID {
         let targetQueue = queue ?? queueName
         let paramsBuffer = try JSON.encode(params)
@@ -866,7 +870,30 @@ public struct StrandClient: Sendable {
         let retryBuf = try options.retryStrategy.map { try JSON.encode($0) }
         let cancelBuf = try options.cancellation.map { try JSON.encode($0) }
 
-        let base = startsAt ?? Date.now
+        // For an already-running schedule (last_run_at IS NOT NULL in the DB),
+        // anchor the catch-up computation from the last fired slot rather than
+        // Date.now.  Using Date.now produces `nextRunAt = now + interval`, which
+        // is always future and always "wins" comparisons against any overdue or
+        // correctly-pending slot in the DB.
+        //
+        // Using last_run_at lets the accuracy logic correctly identify the
+        // most-recently-missed slot (e.g. for .latest: the slot just before NOW()
+        // anchored from last_run_at) so re-registration heals rather than
+        // corrupts the schedule state.
+        let base: Date
+        if let explicit = startsAt {
+            base = explicit
+        } else if let lastSlot = try? await ScheduleQueries.lastSlotAt(
+            on: postgres,
+            namespaceID: namespaceID,
+            queue: targetQueue,
+            name: name,
+            logger: logger
+        ) {
+            base = lastSlot
+        } else {
+            base = Date.now
+        }
         var nextRunAt = try ScheduleCalculator.initialNextRunTime(
             for: pattern,
             createdAt: base,
@@ -886,7 +913,7 @@ public struct StrandClient: Sendable {
         // Only the single most-recent elapsed slot is recovered. All older
         // slots are skipped. See the public schedule() doc comment for the
         // full description of this behaviour.
-        let registrationTime = Date.now
+        let registrationTime = now
         if base < registrationTime, let first = nextRunAt, first < registrationTime {
             switch options.accuracy {
             case .latest:
@@ -1036,6 +1063,7 @@ public struct StrandClient: Sendable {
                 endsAt: row.endsAt,
                 nextRunAt: row.nextRunAt,
                 lastRunAt: row.lastRunAt,
+                lastTaskID: row.lastTaskID,
                 runCount: row.runCount,
                 accuracy: row.accuracy,
                 kind: row.kind,

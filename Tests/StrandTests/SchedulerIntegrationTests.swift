@@ -196,48 +196,48 @@ struct SchedulerIntegrationTests {
 
     // ── 3 ───────────────────────────────────────────────────────────────────────────
     //
-    // `last_run_at` stores the scheduled slot time, not the wall-clock fire time.
+    // `last_run_at` stores the WALL-CLOCK time `fire()` was actually called,
+    // not the scheduled slot time.
     //
-    // `markScheduleFired` is called with `firedAt: row.scheduledAt` — the
-    // `next_run_at` value that triggered the fire.  When the scheduler catches
-    // up a missed slot the wall-clock time and the slot time diverge (e.g. a
-    // slot due at 13:00 UTC may be processed at 12:19 UTC the following day);
-    // `last_run_at` must always reflect the slot, not the poll time, so the
-    // UI displays a coherent cadence.
+    // Users reading the dashboard see "Last run: 2 minutes ago" which reflects
+    // when the scheduler actually did work.  The slot time lives in the separate
+    // `last_slot_at` column and is used internally for catch-up arithmetic.
     //
-    // We snapshot `nextRunAt` immediately after registration (that is the slot
-    // the scheduler will fire), start the scheduler, wait for one fire, then
-    // assert `lastRunAt == snapshotted nextRunAt` within floating-point tolerance.
+    // We record the wall-clock time just before the scheduler fires, wait for
+    // one fire, then assert `lastRunAt ≈ now` (within a generous bound to
+    // absorb scheduling jitter) and that it is NOT equal to the scheduled slot
+    // (which was in the past when `startsAt` is backdated).
     //
     @Test(
-        "markScheduleFired stores the scheduled slot time, not the wall-clock fire time",
+        "markScheduleFired stores the wall-clock fire time in last_run_at",
         .tags(.integration)
     )
-    func firedAtIsScheduledSlotNotWallClock() async throws {
+    func firedAtIsWallClockNotScheduledSlot() async throws {
         try await withTestEnvironment { client in
-            // Register with startsAt in the past so the schedule is
-            // immediately due on the first scheduler poll.
+            // Register with startsAt 5 minutes ago and a 2-minute interval.
+            // accuracy .latest advances nextRunAt to the most-recent elapsed
+            // 2-minute slot, which is approximately now − 60 s — clearly in the
+            // past and clearly distinguishable from the wall-clock fire time.
             let scheduleID = try await client.schedule(
                 name: "sit-firedat-test",
-                pattern: .interval(.seconds(5)),
+                pattern: .interval(.seconds(120)),
                 workflowType: SitSimpleWorkflow.self,
                 input: .done,
-                startsAt: Date.now.addingTimeInterval(-10)
+                startsAt: Date.now.addingTimeInterval(-300)  // 5 minutes ago
             )
 
-            // Capture the scheduled slot time before the scheduler fires.
+            // Capture the scheduled slot (nextRunAt) — this will be ~60 s in the past.
             let preFireList = try await client.listSchedules(queue: client.queueName)
             guard
                 let scheduledSlot =
-                    preFireList
-                    .first(where: { $0.name == "sit-firedat-test" })?.nextRunAt
+                    preFireList.first(where: { $0.name == "sit-firedat-test" })?.nextRunAt
             else {
                 Issue.record("schedule must have a nextRunAt after registration")
                 return
             }
+            let fireStarted = Date.now  // wall-clock lower bound
 
-            // Start the scheduler (no worker needed — markScheduleFired runs
-            // independently of whether a worker processes the enqueued task).
+            // Start the scheduler.
             let scheduler = StrandScheduler(
                 client: client,
                 options: SchedulerOptions(sleepCap: .seconds(1))
@@ -245,7 +245,7 @@ struct SchedulerIntegrationTests {
             let schedulerTask = Task { try? await scheduler.run() }
             defer { schedulerTask.cancel() }
 
-            // Wait until the schedule has been fired at least once.
+            // Wait until the schedule has fired at least once.
             let deadline = ContinuousClock.now + .seconds(5)
             while ContinuousClock.now < deadline {
                 let list = try await client.listSchedules(queue: client.queueName)
@@ -254,22 +254,27 @@ struct SchedulerIntegrationTests {
                 }
                 try await Task.sleep(for: .milliseconds(200))
             }
+            let fireEnded = Date.now  // wall-clock upper bound
 
-            // lastRunAt must equal scheduledSlot (the slot the scheduler fired),
-            // not the wall-clock time the scheduler happened to poll.
             let postFireList = try await client.listSchedules(queue: client.queueName)
             let lastRunAt =
-                postFireList
-                .first(where: { $0.name == "sit-firedat-test" })?.lastRunAt
+                postFireList.first(where: { $0.name == "sit-firedat-test" })?.lastRunAt
 
             #expect(lastRunAt != nil, "lastRunAt must be set after the schedule fires")
             if let lastRunAt {
-                // Both values come from the same Postgres TIMESTAMPTZ column
-                // decoded through the same path — they must be bit-identical.
-                let drift = abs(lastRunAt.timeIntervalSince(scheduledSlot))
+                // last_run_at must be within the wall-clock window [fireStarted, fireEnded].
                 #expect(
-                    drift < 0.001,
-                    "lastRunAt (\(lastRunAt)) must equal the scheduled slot (\(scheduledSlot)), not the wall-clock fire time; drift = \(drift)s"
+                    lastRunAt >= fireStarted.addingTimeInterval(-1),
+                    "lastRunAt (\(lastRunAt)) must be ≈ now, not the scheduled slot (\(scheduledSlot))"
+                )
+                #expect(
+                    lastRunAt <= fireEnded.addingTimeInterval(1),
+                    "lastRunAt (\(lastRunAt)) must not be in the future"
+                )
+                // And it must NOT equal the scheduled slot (which was in the past).
+                #expect(
+                    abs(lastRunAt.timeIntervalSince(scheduledSlot)) > 1,
+                    "lastRunAt must differ from the scheduled slot; got lastRunAt=\(lastRunAt) slot=\(scheduledSlot)"
                 )
             }
 
@@ -279,72 +284,213 @@ struct SchedulerIntegrationTests {
 
     // ── 4 ───────────────────────────────────────────────────────────────────────────
     //
-    // `upsertSchedule` never moves `next_run_at` backwards.
-    //
-    // The ON CONFLICT clause uses `GREATEST(existing, incoming)` so that a
-    // scheduler restart — which recomputes `next_run_at` from scratch via
-    // catch-up recovery — cannot reset an already-advanced schedule to an
-    // earlier slot.  Without this guard, restarts cause spurious re-fires
-    // (idempotent at the task level but they inflate `run_count` and corrupt
-    // `last_run_at` with the catch-up wall-clock time).
+    // `upsertSchedule` uses LEAST(existing, new) so that re-registration moves
+    // `next_run_at` to the most-recent missed slot when the newly-computed value
+    // is earlier than the DB value — healing any corruption caused by a previous
+    // cold-restart that jumped `next_run_at` too far into the future.
     //
     // Test sequence:
     //  1. Register with no startsAt → next_run_at ≈ now + 3600 s (future).
-    //  2. Re-register the same name with startsAt 2 h ago → catch-up recovery
-    //     computes next_run_at ≈ now, which is earlier than the existing value.
-    //  3. Assert the DB still holds the original future next_run_at.
+    //  2. Re-register the same name with startsAt 2 h ago and accuracy .latest.
+    //     Catch-up computes the most-recent elapsed 1-hour boundary, which is
+    //     ≤ now — earlier than the existing future slot.
+    //  3. Assert next_run_at moved to that earlier slot (immediately due).
+    //  4. Re-register again with the same startsAt (second restart).
+    //     The newly-computed slot is the same as step 2 — LEAST is a no-op.
+    //  5. Assert next_run_at did not move further forward.
     //
     @Test(
-        "upsertSchedule preserves next_run_at when re-registration computes an earlier value",
+        "upsertSchedule moves next_run_at to most-recent elapsed slot on re-registration with past startsAt",
         .tags(.integration)
     )
-    func upsertPreservesNextRunAtOnReregistration() async throws {
+    func upsertMovesNextRunAtToCatchupSlotOnReregistration() async throws {
         try await withTestEnvironment { client in
+            let startsAt = Date.now.addingTimeInterval(-7200)  // 2 hours ago
+
             // Step 1: fresh registration, no startsAt → next_run_at ≈ now + 3600s.
             let scheduleID = try await client.schedule(
-                name: "sit-greatest-test",
+                name: "sit-least-test",
                 pattern: .interval(.seconds(3600)),
                 workflowType: SitSimpleWorkflow.self,
                 input: .done
             )
+            let registrationTime = Date.now
 
             let initial = try await client.listSchedules(queue: client.queueName)
             guard
                 let initialNextRunAt =
-                    initial
-                    .first(where: { $0.name == "sit-greatest-test" })?.nextRunAt
+                    initial.first(where: { $0.name == "sit-least-test" })?.nextRunAt
             else {
                 Issue.record("schedule must have nextRunAt after fresh registration")
                 return
             }
+            #expect(
+                initialNextRunAt > registrationTime,
+                "fresh registration must produce a future next_run_at"
+            )
 
-            // Step 2: re-register the same name with startsAt 2 hours ago.
-            // .latest accuracy fast-forwards nextRunAt to the most recent
-            // elapsed 1-hour boundary, which is ≤ now — well behind the
-            // already-set initialNextRunAt (≈ now + 3600s).
+            // Step 2: re-register with startsAt 2 hours ago.
+            // accuracy .latest computes the most-recently-elapsed 1-hour slot,
+            // which is somewhere between (now - 3600) and now — earlier than the
+            // existing initialNextRunAt.  LEAST should take the earlier value.
             _ = try await client.schedule(
-                name: "sit-greatest-test",  // same name → ON CONFLICT DO UPDATE
+                name: "sit-least-test",
                 pattern: .interval(.seconds(3600)),
                 workflowType: SitSimpleWorkflow.self,
                 input: .done,
-                startsAt: Date.now.addingTimeInterval(-7200)  // 2 hours ago
+                startsAt: startsAt
+            )
+            let afterCatchup = Date.now
+
+            // Step 3: next_run_at must now be the catch-up slot (≤ now).
+            let mid = try await client.listSchedules(queue: client.queueName)
+            let midNextRunAt = mid.first(where: { $0.name == "sit-least-test" })?.nextRunAt
+
+            #expect(midNextRunAt != nil, "nextRunAt must remain set after re-registration")
+            if let t = midNextRunAt {
+                #expect(
+                    t <= afterCatchup.addingTimeInterval(1),
+                    "catch-up must move next_run_at to an immediately-due slot; got \(t)"
+                )
+                #expect(
+                    t < initialNextRunAt,
+                    "catch-up slot must be earlier than the original future slot; was \(initialNextRunAt), got \(t)"
+                )
+            }
+
+            // Step 4: re-register again (simulates a second restart) — same startsAt.
+            _ = try await client.schedule(
+                name: "sit-least-test",
+                pattern: .interval(.seconds(3600)),
+                workflowType: SitSimpleWorkflow.self,
+                input: .done,
+                startsAt: startsAt
             )
 
-            // Step 3: next_run_at must not have moved backward.
+            // Step 5: next_run_at must not have drifted further forward.
             let after = try await client.listSchedules(queue: client.queueName)
-            let afterNextRunAt =
-                after
-                .first(where: { $0.name == "sit-greatest-test" })?.nextRunAt
+            let afterNextRunAt = after.first(where: { $0.name == "sit-least-test" })?.nextRunAt
 
-            #expect(afterNextRunAt != nil, "nextRunAt must remain set after re-registration")
-            if let afterNextRunAt {
+            #expect(afterNextRunAt != nil)
+            if let before = midNextRunAt, let after = afterNextRunAt {
                 #expect(
-                    afterNextRunAt >= initialNextRunAt.addingTimeInterval(-1),
-                    "next_run_at must not regress on re-registration: was \(initialNextRunAt), got \(afterNextRunAt)"
+                    after <= before.addingTimeInterval(1),
+                    "second restart must not advance next_run_at; was \(before), got \(after)"
                 )
             }
 
             try? await client.deleteSchedule(id: scheduleID)
+        }
+    }
+}
+
+// MARK: - Catch-up unit tests (injected `now`, no scheduler process)
+
+/// Parses an ISO 8601 UTC date string. File-level so it is never captured
+/// as `self` inside `#expect` closures (Swift 6 Sendable requirement).
+private func catchupDate(_ s: String) -> Date {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f.date(from: s)!
+}
+
+/// Formats a date as ISO 8601 UTC for assertion messages.
+private func catchupFmt(_ d: Date?) -> String {
+    guard let d else { return "nil" }
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f.string(from: d)
+}
+
+/// Seeds a schedule row with an explicit `next_run_at` + `last_slot_at` (the state
+/// `markScheduleFired` would have written), then re-registers with an injected `now`
+/// (the state `_schedule` produces on a restart).  Returns the resulting `next_run_at`.
+private func catchupNextRunAt(
+    client: StrandClient,
+    name: String,
+    interval: Duration,
+    existingNextRunAt: Date,  // what markScheduleFired last set (may be correct or corrupted)
+    lastSlot: Date,  // last successfully-fired slot boundary
+    now: Date  // injected current time for the restart
+) async throws -> Date? {
+    // Step 1: create the row (use injected now to avoid real-time contamination).
+    _ = try await client._schedule(
+        name: name,
+        pattern: .interval(interval),
+        taskName: SitSimpleWorkflow.workflowName,
+        params: StrandVoid.done,
+        now: now
+    )
+    // Step 2: seed the pre-existing DB state directly.
+    try await client.postgres.query(
+        """
+        UPDATE strand.schedules
+        SET next_run_at  = \(existingNextRunAt),
+            last_slot_at = \(lastSlot)
+        WHERE queue = \(client.queueName) AND name = \(name)
+        """,
+        logger: client.logger
+    )
+    // Step 3: simulate restart — re-register with injected now.
+    _ = try await client._schedule(
+        name: name,
+        pattern: .interval(interval),
+        taskName: SitSimpleWorkflow.workflowName,
+        params: StrandVoid.done,
+        now: now
+    )
+    let schedules = try await client.listSchedules(queue: client.queueName)
+    return schedules.first(where: { $0.name == name })?.nextRunAt
+}
+
+/// Catch-up arithmetic tests with an injected `now` so every assertion is
+/// expressed as a fixed (existingNextRunAt, lastSlot, now) → expected triple.
+/// No scheduler process is started; only `_schedule` and the DB are exercised.
+@Suite("Unit — Schedule catch-up (injected now)", .tags(.integration), .serialized)
+struct ScheduleCatchupUnitTests {
+
+    // When existingNextRunAt is a future value that is LATER than the most-recent
+    // elapsed slot (e.g. a previous restart jumped it past pending intervals),
+    // re-registration must heal it by computing the correct catch-up slot and
+    // letting LEAST(existing, computed) pick the earlier value.
+    @Test("interval 90 min: corrupted future next_run_at healed to most-recent missed slot")
+    func catchupInterval90MinCorruptedNextRunAt() async throws {
+        try await withTestEnvironment { client in
+            let result = try await catchupNextRunAt(
+                client: client,
+                name: "cu-90min-corrupt",
+                interval: .seconds(5400),
+                existingNextRunAt: catchupDate("2026-05-10T18:35:00Z"),
+                lastSlot: catchupDate("2026-05-10T13:29:00Z"),
+                now: catchupDate("2026-05-10T17:29:00Z")
+            )
+            // base=13:29 → first=14:59, steps=⌊150 / 90⌋=1 → computed=16:29
+            // LEAST(18:35, 16:29) = 16:29
+            let expected = catchupDate("2026-05-10T16:29:00Z")
+            let got = catchupFmt(result)
+            #expect(result == expected, "expected 16:29, got \(got)")
+        }
+    }
+
+    // When existingNextRunAt is already the correct next slot (set by markScheduleFired)
+    // and the restart happens before that slot is due, re-registration must leave it
+    // untouched — LEAST(existing, computed) is a no-op when both values are equal.
+    @Test("interval 90 min: correct future next_run_at preserved on restart within window")
+    func catchupInterval90MinCorrectNextRunAtPreserved() async throws {
+        try await withTestEnvironment { client in
+            let result = try await catchupNextRunAt(
+                client: client,
+                name: "cu-90min-correct",
+                interval: .seconds(5400),
+                existingNextRunAt: catchupDate("2026-05-10T17:59:00Z"),
+                lastSlot: catchupDate("2026-05-10T16:29:00Z"),
+                now: catchupDate("2026-05-10T17:00:00Z")
+            )
+            // base=16:29 → first=17:59, 17:59 > 17:00 → no catch-up, computed=17:59
+            // LEAST(17:59, 17:59) = 17:59
+            let expected = catchupDate("2026-05-10T17:59:00Z")
+            let got = catchupFmt(result)
+            #expect(result == expected, "expected 17:59, got \(got)")
         }
     }
 }
