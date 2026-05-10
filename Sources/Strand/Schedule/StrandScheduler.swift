@@ -242,10 +242,9 @@ public struct StrandScheduler: Service {
         }
     }
 
-    private func fireSchedules() async throws {
+    private func fireSchedules(now: Date = .now) async throws {
         let postgres = client.postgres
         let logger = client.logger
-        let now = Date.now
 
         let rows = try await ScheduleQueries.pollDueSchedules(
             on: postgres,
@@ -326,7 +325,7 @@ public struct StrandScheduler: Service {
         let idempotencyKey =
             "$schedule:\(row.id):\(row.scheduledAt.timeIntervalSince1970)"
 
-        _ = try await Queries.enqueueTask(
+        let enqueuedRow = try await Queries.enqueueTask(
             on: postgres,
             namespaceID: client.namespaceID,
             queue: row.queue,
@@ -346,14 +345,17 @@ public struct StrandScheduler: Service {
             on: postgres,
             namespaceID: client.namespaceID,
             id: row.id,
-            // Use the scheduled slot time, not the wall-clock fire time.
-            // When the scheduler catches up a missed slot, `now` is the
-            // catch-up time (e.g. 12:19 UTC) while the slot was due at
-            // 13:00 UTC the previous day — using `now` makes last_run_at
-            // misleading and inconsistent with nextRunAt (which already
-            // anchors to row.scheduledAt to prevent drift).
-            firedAt: row.scheduledAt,
+            // firedAt = wall-clock time the task was actually enqueued.
+            // Shown in the dashboard as "Last run" so users see when the
+            // schedule most recently did work, not when the slot was due.
+            firedAt: now,
+            // slotAt = the canonical slot boundary this fire covers.
+            // Stored in last_slot_at and used by _schedule as the
+            // catch-up base so interval arithmetic stays pinned to the
+            // original cadence rather than drifting toward wall-clock time.
+            slotAt: row.scheduledAt,
             nextRunAt: nextRunAt,
+            lastTaskID: enqueuedRow.taskID,
             logger: logger
         )
 

@@ -429,9 +429,10 @@ CREATE TABLE IF NOT EXISTS strand.schedules (
     ends_at   TIMESTAMPTZ,  -- NULL = runs indefinitely
 
     -- StandScheduler execution state
-    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
-    next_run_at TIMESTAMPTZ,
-    last_run_at TIMESTAMPTZ,
+    is_active    BOOLEAN     NOT NULL DEFAULT TRUE,
+    next_run_at  TIMESTAMPTZ,
+    last_run_at  TIMESTAMPTZ,   -- wall-clock time of the most recent fire (for display)
+    last_slot_at TIMESTAMPTZ,   -- scheduled slot time of the most recent fire (for catch-up base)
     last_task_id UUID,
     run_count    INTEGER     NOT NULL DEFAULT 0,
 

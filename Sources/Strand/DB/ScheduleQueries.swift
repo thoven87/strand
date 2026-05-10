@@ -41,6 +41,7 @@ package struct ScheduleSummaryRow: Sendable {
     let endsAt: Date?
     let nextRunAt: Date?
     let lastRunAt: Date?
+    let lastTaskID: UUID?
     let runCount: Int
     let accuracy: ScheduleAccuracy
     let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
@@ -111,6 +112,35 @@ package enum ScheduleQueries {
         return rows
     }
 
+    /// Returns the `last_slot_at` (scheduled slot time of the last fire) for a
+    /// named schedule, or `nil` if the schedule does not exist or has never fired.
+    ///
+    /// Used by `StrandClient._schedule` to anchor catch-up computation from the
+    /// last successfully-fired slot boundary, not from the wall-clock fire time.
+    /// The distinction matters: `last_run_at` stores the actual enqueue time
+    /// (displayed in the dashboard), while `last_slot_at` stores the canonical
+    /// slot the scheduler was covering (used for interval arithmetic).
+    package static func lastSlotAt(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        name: String,
+        logger: Logger
+    ) async throws -> Date? {
+        let stream = try await client.query(
+            """
+            SELECT last_slot_at FROM strand.schedules
+            WHERE namespace_id = \(namespaceID)
+              AND queue        = \(queue)
+              AND name         = \(name)
+            """,
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else { return nil }
+        var col = row.makeIterator()
+        return try col.next()!.decode(Date?.self, context: .default)
+    }
+
     /// Returns the earliest `next_run_at` across all active schedules in the
     /// namespace. The scheduler sleeps until this time (capped at `sleepCap`).
     package static func nextScheduledFireTime(
@@ -139,22 +169,33 @@ package enum ScheduleQueries {
 
     /// Advances `next_run_at` after a successful fire.
     /// Passing `nextRunAt: nil` automatically deactivates one-shot schedules.
+    ///
+    /// - Parameters:
+    ///   - firedAt: Actual wall-clock time the scheduler enqueued the task.
+    ///     Stored in `last_run_at` and shown in the dashboard as "Last run".
+    ///   - slotAt: The scheduled slot boundary this fire covers (e.g. 16:29 UTC).
+    ///     Stored in `last_slot_at` and used by `_schedule` as the catch-up base
+    ///     so interval arithmetic stays pinned to the original cadence.
     package static func markScheduleFired(
         on client: PostgresClient,
         namespaceID: String,
         id: UUID,
         firedAt: Date,
+        slotAt: Date,
         nextRunAt: Date?,
+        lastTaskID: UUID,
         logger: Logger
     ) async throws {
         try await client.query(
             """
             UPDATE strand.schedules
-            SET last_run_at = \(firedAt),
-                run_count   = run_count + 1,
-                next_run_at = \(nextRunAt),
-                is_active   = \(nextRunAt != nil),
-                updated_at  = NOW()
+            SET last_run_at  = \(firedAt),
+                last_slot_at = \(slotAt),
+                last_task_id = \(lastTaskID),
+                run_count    = run_count + 1,
+                next_run_at  = \(nextRunAt),
+                is_active    = \(nextRunAt != nil),
+                updated_at   = NOW()
             WHERE namespace_id = \(namespaceID)
               AND id = \(id)
             """,
@@ -208,15 +249,28 @@ package enum ScheduleQueries {
                 kind            = EXCLUDED.kind,
                 starts_at       = EXCLUDED.starts_at,
                 ends_at         = EXCLUDED.ends_at,
-                -- GREATEST preserves whichever date is further ahead.
-                -- On a scheduler restart the freshly-computed next_run_at
-                -- (from catch-up recovery) can be earlier than what the DB
-                -- already has, which would reset the schedule backwards and
-                -- cause spurious re-fires (idempotent but inflates run_count
-                -- and corrupts last_run_at).  PostgreSQL GREATEST ignores
-                -- NULLs, so a fresh insert still gets EXCLUDED.next_run_at.
-                next_run_at     = GREATEST(strand.schedules.next_run_at, EXCLUDED.next_run_at),
-                is_active       = (GREATEST(strand.schedules.next_run_at, EXCLUDED.next_run_at) IS NOT NULL),
+                -- next_run_at merge: take the EARLIER of the two values.
+                --
+                -- The caller supplies EXCLUDED.next_run_at anchored to last_run_at
+                -- (not Date.now), so it correctly identifies the most-recent missed
+                -- slot or the next future slot.  LEAST means:
+                --
+                --   • Existing overdue + new future  → keep existing (don't skip).
+                --   • Existing future (corrupted)   + new earlier correct → heal it.
+                --   • Both future, new < existing   → fire the earlier slot first
+                --     (desirable after a pattern change).
+                --   • Existing NULL                 → use new (fresh registration).
+                --   • New NULL                      → keep existing (one-shot ended).
+                next_run_at     = CASE
+                                      WHEN strand.schedules.next_run_at IS NULL
+                                      THEN EXCLUDED.next_run_at
+                                      WHEN EXCLUDED.next_run_at IS NULL
+                                      THEN strand.schedules.next_run_at
+                                      ELSE LEAST(strand.schedules.next_run_at,
+                                                 EXCLUDED.next_run_at)
+                                  END,
+                is_active       = COALESCE(strand.schedules.next_run_at,
+                                            EXCLUDED.next_run_at) IS NOT NULL,
                 updated_at      = NOW()
             RETURNING id
             """,
@@ -274,7 +328,7 @@ package enum ScheduleQueries {
         let stream = try await client.query(
             """
             SELECT id, queue, name, task_name, pattern, is_active,
-                   starts_at, ends_at, next_run_at, last_run_at, run_count, accuracy, kind, created_at
+                   starts_at, ends_at, next_run_at, last_run_at, last_task_id, run_count, accuracy, kind, created_at
             FROM strand.schedules
             WHERE namespace_id = \(namespaceID)
               AND (\(queue)::text IS NULL OR queue = \(queue))
@@ -297,6 +351,7 @@ package enum ScheduleQueries {
                     endsAt: try col.next()!.decode(Date?.self, context: .default),
                     nextRunAt: try col.next()!.decode(Date?.self, context: .default),
                     lastRunAt: try col.next()!.decode(Date?.self, context: .default),
+                    lastTaskID: try col.next()!.decode(UUID?.self, context: .default),
                     runCount: try col.next()!.decode(Int.self, context: .default),
                     accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
                     kind: try col.next()!.decode(TaskKind.self, context: .default),
