@@ -403,7 +403,7 @@ struct WorkerLifecycleTests {
             // Build a second client scoped to a unique namespace B but the same queue.
             let nsBSuffix = UUID()
                 .uuidString
-                .replacingOccurrences(of: "-", with: "")
+                .replacing("-", with: "")
                 .prefix(12)
                 .lowercased()
             let nsB = "wlt-nsb-\(nsBSuffix)"

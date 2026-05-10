@@ -245,10 +245,10 @@ public struct StrandClient: Sendable {
             maxAttempts: options.maxAttempts ?? self.options.defaultMaxAttempts,
             cancellationBuffer: nil,
             idempotencyKey: resolvedID,  // always set — enables client.workflow(id:) lookup
-            priority: options.priority.rawValue,
+            priority: options.priority,
             scheduledAt: options.delayUntil,
-            fairnessKey: nil,
-            fairnessWeight: 1.0,
+            fairnessKey: options.fairnessKey,
+            fairnessWeight: options.fairnessWeight,
             kind: .workflow,
             parentTaskID: nil,
             logger: logger
@@ -415,7 +415,7 @@ public struct StrandClient: Sendable {
                 maxAttempts: maxAttempts,
                 cancellationBuffer: try cancellation.map { try JSON.encode($0) },
                 idempotencyKey: idempotencyKey,
-                priority: priority.rawValue,
+                priority: priority,
                 scheduledAt: delayUntil,
                 deadlineAt: deadlineAt,
                 fairnessKey: fairnessKey,
@@ -476,6 +476,23 @@ public struct StrandClient: Sendable {
             on: postgres,
             namespaceID: namespaceID,
             taskID: taskID,
+            logger: logger
+        )
+    }
+
+    /// Cancels multiple tasks atomically.
+    ///
+    /// Each task’s descendants are also cancelled. Any `awaitTaskResult`
+    /// calls waiting on these tasks are unblocked with a `.cancelled` state.
+    ///
+    /// For cancelling a single task prefer ``cancelTask(id:)``.
+    /// For a large batch consider chunking into groups of 500–1000.
+    @discardableResult
+    public func cancelTasks(_ taskIDs: [UUID]) async throws -> Int {
+        try await Queries.cancelTasksBatch(
+            on: postgres,
+            namespaceID: namespaceID,
+            taskIDs: taskIDs,
             logger: logger
         )
     }

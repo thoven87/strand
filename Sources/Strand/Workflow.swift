@@ -308,6 +308,13 @@ public struct WorkflowOptions: Sendable {
     public var retryStrategy: RetryStrategy?
     /// Key-value metadata forwarded with the task.
     public var headers: [String: String]
+    /// Fairness group key — e.g. a tenant ID or customer name (max 64 bytes).
+    /// Tasks sharing a key are FIFO within that key; keys compete via weighted dispatch.
+    public var fairnessKey: String?
+    /// Relative throughput weight for this fairness key. Default `1.0`.
+    /// A key with weight `5.0` is dispatched approximately 5× more often than a key with `1.0`.
+    /// Only meaningful when `fairnessKey` is set.
+    public var fairnessWeight: Float
 
     public init(
         id: String? = nil,
@@ -316,7 +323,9 @@ public struct WorkflowOptions: Sendable {
         delayUntil: Date? = nil,
         maxAttempts: Int? = nil,
         retryStrategy: RetryStrategy? = nil,
-        headers: [String: String] = [:]
+        headers: [String: String] = [:],
+        fairnessKey: String? = nil,
+        fairnessWeight: Float = 1.0
     ) {
         self.id = id
         self.queue = queue
@@ -325,6 +334,8 @@ public struct WorkflowOptions: Sendable {
         self.maxAttempts = maxAttempts
         self.retryStrategy = retryStrategy
         self.headers = headers
+        self.fairnessKey = fairnessKey
+        self.fairnessWeight = max(fairnessWeight, 0.001)
     }
 }
 
@@ -332,20 +343,41 @@ public struct WorkflowOptions: Sendable {
 
 /// Options for ``WorkflowContext/runChildWorkflow(_:options:input:)``.
 public struct ChildWorkflowOptions: Sendable {
+    /// Target queue for this child workflow. `nil` inherits the parent’s queue.
     public var queue: String?
+    /// Dispatch priority. Default: `.normal`.
     public var priority: TaskPriority
+    /// Maximum activation attempts before the child is marked FAILED.
+    /// `nil` inherits the worker default.
     public var maxAttempts: Int?
+    /// Key-value metadata forwarded with the child workflow task.
     public var headers: [String: String]
+    /// Fairness group key for this child workflow. See ``WorkflowOptions/fairnessKey``.
+    public var fairnessKey: String?
+    /// Relative throughput weight for this child's fairness key. Default `1.0`.
+    public var fairnessWeight: Float
+    /// Retry policy on failure. `nil` inherits the worker default.
+    public var retryStrategy: RetryStrategy?
+    /// Earliest time this child workflow may be claimed. `nil` = immediately.
+    public var delayUntil: Date?
 
     public init(
         queue: String? = nil,
         priority: TaskPriority = .normal,
         maxAttempts: Int? = nil,
-        headers: [String: String] = [:]
+        headers: [String: String] = [:],
+        fairnessKey: String? = nil,
+        fairnessWeight: Float = 1.0,
+        retryStrategy: RetryStrategy? = nil,
+        delayUntil: Date? = nil
     ) {
         self.queue = queue
         self.priority = priority
         self.maxAttempts = maxAttempts
         self.headers = headers
+        self.fairnessKey = fairnessKey
+        self.fairnessWeight = max(fairnessWeight, 0.001)
+        self.retryStrategy = retryStrategy
+        self.delayUntil = delayUntil
     }
 }

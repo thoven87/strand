@@ -57,16 +57,29 @@ enum Queries {
 
     // MARK: - Queues
 
+    /// Connection-level implementation — the single source of truth for queue registration.
+    static func createQueue(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        name: String,
+        logger: Logger
+    ) async throws {
+        try await conn.query(
+            "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(name)) ON CONFLICT (namespace_id, name) DO NOTHING",
+            logger: logger
+        )
+    }
+
+    /// Pool-level overload — acquires a connection then delegates to the connection overload.
     static func createQueue(
         on client: PostgresClient,
         namespaceID: String,
         name: String,
         logger: Logger
     ) async throws {
-        try await client.query(
-            "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(name)) ON CONFLICT (namespace_id, name) DO NOTHING",
-            logger: logger
-        )
+        try await client.withConnection { conn in
+            try await createQueue(on: conn, namespaceID: namespaceID, name: name, logger: logger)
+        }
     }
 
     static func dropQueue(
@@ -141,7 +154,7 @@ enum Queries {
         maxAttempts: Int?,
         cancellationBuffer: ByteBuffer?,
         idempotencyKey: String?,
-        priority: Int = 3,
+        priority: TaskPriority = .normal,
         scheduledAt: Date? = nil,
         timeoutSeconds: Int? = nil,
         deadlineAt: Date? = nil,
@@ -155,11 +168,7 @@ enum Queries {
             let taskID = UUID.v7()
             let runID = UUID.v7()
             // Auto-register the queue so strand.queues always reflects active queues.
-            // ON CONFLICT DO NOTHING makes this safe for concurrent enqueues.
-            try await conn.query(
-                "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(queue)) ON CONFLICT (namespace_id, name) DO NOTHING",
-                logger: logger
-            )
+            try await createQueue(on: conn, namespaceID: namespaceID, name: queue, logger: logger)
             try await conn.query(
                 """
                 INSERT INTO strand.tasks
@@ -202,14 +211,8 @@ enum Queries {
                         "strand.kind": .string(kind.rawValue),
                     ]
                 )
-                // Notify any listening workers that a new task is available for this queue.
-                // pg_notify is transactional — the notification is only delivered after this
-                // transaction commits, so listeners always see a task that can be claimed.
-                let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
-                try await conn.query(
-                    "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                    logger: logger
-                )
+                // pg_notify is transactional — delivered only after this transaction commits.
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
                 return EnqueueRow(taskID: taskID, runID: runID, attempt: 1, created: true)
             } else {
                 let existStream = try await conn.query(
@@ -233,6 +236,301 @@ enum Queries {
                 let eAttempt = try col.next()!.decode(Int.self, context: .default)
                 return EnqueueRow(taskID: eTaskID, runID: eRunID, attempt: eAttempt, created: false)
             }
+        }
+    }
+
+    // MARK: - ChildEnqueueSpec
+
+    /// One child task to enqueue as part of a batch spawned by a single workflow activation.
+    ///
+    /// Pre-generate `taskID` and `runID` (both UUIDv7) at the call site; they are used as
+    /// the "new row" probe and discarded on an idempotency-key conflict.
+    struct ChildEnqueueSpec: Sendable {
+        let seqNum: Int
+        let taskID: UUID  // pre-generated UUIDv7; used as new-row probe
+        let runID: UUID  // pre-generated UUIDv7 for the first run row
+        let queue: String
+        let taskName: String
+        let paramsBuffer: ByteBuffer
+        let headersBuffer: ByteBuffer?
+        let retryStrategyBuffer: ByteBuffer?
+        let maxAttempts: Int?
+        let idempotencyKey: String  // always set for workflow-spawned children
+        let priority: TaskPriority
+        let scheduledAt: Date?
+        let timeoutSeconds: Int?
+        let deadlineAt: Date?
+        let fairnessKey: String?
+        let fairnessWeight: Float
+        let kind: TaskKind  // .activity or .workflow
+    }
+
+    // MARK: - enqueueChildTasksBatch
+
+    /// Batch-enqueue every child task (activity or child workflow) spawned by one workflow
+    /// activation in a **single Postgres transaction** using true batch SQL — O(1)
+    /// round-trips regardless of how many children are scheduled.
+    ///
+    /// The following all happen atomically inside one transaction:
+    ///   1. Queue auto-registration (one per distinct child queue, idempotent)
+    ///   2. One multi-row `VALUES` INSERT for all tasks (idempotent via `ON CONFLICT DO NOTHING`)
+    ///   3. One multi-row `VALUES` INSERT for genuinely new runs
+    ///   4. `pg_notify` per distinct new child queue (via `notifyWorkers`)
+    ///   5. One `unnest`-based INSERT for all `event_waits` (idempotent)
+    ///   6. `task_completions` count — if any child already done: delete its `event_wait`,
+    ///      set parent to PENDING + notify; otherwise set parent to WAITING.
+    ///
+    /// - Returns: `(seqNum, taskID)` pairs in the same order as `children`.
+    @discardableResult
+    static func enqueueChildTasksBatch(
+        on client: PostgresClient,
+        namespaceID: String,
+        parentTaskID: UUID,
+        parentRunID: UUID,
+        parentQueue: String,
+        children: [ChildEnqueueSpec],
+        logger: Logger
+    ) async throws -> [(seqNum: Int, taskID: UUID)] {
+        guard !children.isEmpty else { return [] }
+
+        return try await client.withTransaction(logger: logger) { conn in
+            // ── 1. Register all distinct child queues ────────────────────────────────
+            var seenQueues: Set<String> = []
+            for child in children {
+                guard seenQueues.insert(child.queue).inserted else { continue }
+                try await createQueue(on: conn, namespaceID: namespaceID, name: child.queue, logger: logger)
+            }
+
+            // ── 2. Insert all task rows — one multi-row VALUES statement ──────────────
+            // Built via PostgresQuery.StringInterpolation so every field, including
+            // nullable BYTEAs (headers, retry_strategy), is bound as an individual
+            // typed parameter — one round-trip for all N tasks.
+            var taskInterp = PostgresQuery.StringInterpolation(
+                literalCapacity: 300 + children.count * 256,
+                interpolationCount: children.count * 17
+            )
+            taskInterp.appendLiteral(
+                "INSERT INTO strand.tasks "
+                    + "(namespace_id, id, queue, name, params, headers, "
+                    + "retry_strategy, max_attempts, timeout_seconds, "
+                    + "idempotency_key, priority, fairness_key, fairness_weight, "
+                    + "state, kind, parent_task_id, deadline_at) VALUES "
+            )
+            for (i, child) in children.enumerated() {
+                if i > 0 { taskInterp.appendLiteral(", ") }
+                taskInterp.appendLiteral("(")
+                taskInterp.appendInterpolation(namespaceID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.taskID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.queue)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.taskName)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.paramsBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.headersBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.retryStrategyBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.maxAttempts)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.timeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.idempotencyKey)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(child.priority)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.fairnessKey)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.fairnessWeight)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(TaskState.pending)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(child.kind)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(parentTaskID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.deadlineAt)
+                taskInterp.appendLiteral(")")
+            }
+            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING")
+            try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger)
+
+            // ── 3. Identify which tasks were genuinely inserted ──────────────────────
+            // A generated taskID present in the DB means the INSERT succeeded (new row).
+            // An absent generated taskID means the conflict clause fired (idempotency hit).
+            let generatedIDs = children.map { $0.taskID }
+            let newIDsStream = try await conn.query(
+                "SELECT id FROM strand.tasks WHERE namespace_id = \(namespaceID) AND id = ANY(\(generatedIDs))",
+                logger: logger
+            )
+            var newIDSet: Set<UUID> = []
+            for try await row in newIDsStream {
+                var col = row.makeIterator()
+                newIDSet.insert(try col.next()!.decode(UUID.self, context: .default))
+            }
+
+            // ── 4. Insert runs for genuinely new tasks — one multi-row VALUES statement ──
+            let newChildren = children.filter { newIDSet.contains($0.taskID) }
+            if !newChildren.isEmpty {
+                var runInterp = PostgresQuery.StringInterpolation(
+                    literalCapacity: 220 + newChildren.count * 160,
+                    interpolationCount: newChildren.count * 11
+                )
+                runInterp.appendLiteral(
+                    "INSERT INTO strand.runs "
+                        + "(namespace_id, id, task_id, queue, attempt, state, "
+                        + "available_at, priority, fairness_key, fairness_weight, kind) VALUES "
+                )
+                for (i, child) in newChildren.enumerated() {
+                    if i > 0 { runInterp.appendLiteral(", ") }
+                    runInterp.appendLiteral("(")
+                    runInterp.appendInterpolation(namespaceID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(child.runID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(child.taskID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(child.queue)
+                    runInterp.appendLiteral(", 1, ")
+                    try runInterp.appendInterpolation(TaskState.pending)
+                    runInterp.appendLiteral(", COALESCE(")
+                    runInterp.appendInterpolation(child.scheduledAt)
+                    runInterp.appendLiteral(", NOW()), ")
+                    try runInterp.appendInterpolation(child.priority)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(child.fairnessKey)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(child.fairnessWeight)
+                    runInterp.appendLiteral(", ")
+                    try runInterp.appendInterpolation(child.kind)
+                    runInterp.appendLiteral(")")
+                }
+                try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
+            }
+
+            // ── 5. Notify workers — one pg_notify per distinct new child queue ────────
+            var notifiedQueues: Set<String> = []
+            for child in newChildren {
+                guard notifiedQueues.insert(child.queue).inserted else { continue }
+                try await conn.notifyWorkers(namespace: namespaceID, queue: child.queue, logger: logger)
+            }
+
+            // ── 6. Resolve final taskID for every child ───────────────────────────────
+            // New tasks: keep the pre-generated taskID.
+            // Idempotency hits: query the DB by idempotency_key to find the original taskID.
+            var idKeyToTaskID: [String: UUID] = [:]
+            for child in children where newIDSet.contains(child.taskID) {
+                idKeyToTaskID[child.idempotencyKey] = child.taskID
+            }
+            let hitSpecs = children.filter { !newIDSet.contains($0.taskID) }
+            if !hitSpecs.isEmpty {
+                let hitKeys = hitSpecs.map { $0.idempotencyKey }
+                let hitStream = try await conn.query(
+                    """
+                    SELECT id, idempotency_key FROM strand.tasks
+                    WHERE namespace_id    = \(namespaceID)
+                      AND idempotency_key = ANY(\(hitKeys))
+                    """,
+                    logger: logger
+                )
+                for try await row in hitStream {
+                    var col = row.makeIterator()
+                    let existID = try col.next()!.decode(UUID.self, context: .default)
+                    let existKey = try col.next()!.decode(String.self, context: .default)
+                    idKeyToTaskID[existKey] = existID
+                }
+            }
+            let result: [(seqNum: Int, taskID: UUID)] = try children.map { child in
+                guard let taskID = idKeyToTaskID[child.idempotencyKey] else {
+                    throw StrandError.database(
+                        underlying: QueryError(
+                            "enqueueChildTasksBatch: no taskID for idempotency_key \(child.idempotencyKey)"
+                        )
+                    )
+                }
+                return (seqNum: child.seqNum, taskID: taskID)
+            }
+
+            // ── 7. Register event_waits for all children — one unnest statement ─────────
+            // unnest zips the two arrays row-by-row: one INSERT for all N children.
+            // [Int] encodes as int8[]; Postgres silently casts to the int4 column.
+            let ewSeqNums = result.map { $0.seqNum }
+            let ewChildIDs = result.map { $0.taskID }
+            try await conn.query(
+                """
+                INSERT INTO strand.event_waits
+                    (task_id, run_id, queue, seq_num, child_task_id, timeout_at)
+                SELECT \(parentTaskID), \(parentRunID), \(parentQueue),
+                       u.seq_num, u.child_task_id, NULL
+                FROM unnest(\(ewSeqNums), \(ewChildIDs)) AS u(seq_num, child_task_id)
+                ON CONFLICT (run_id, seq_num) DO UPDATE
+                    SET child_task_id = EXCLUDED.child_task_id,
+                        timeout_at    = NULL
+                """,
+                logger: logger
+            )
+
+            // ── 8. Atomic completion-check + parent-run state transition ─────────────
+            // If ANY child has already completed, delete its event_wait and go PENDING
+            // immediately.  Otherwise park the parent as WAITING.
+            let childTaskIDs = result.map { $0.taskID }
+            let completedStream = try await conn.query(
+                "SELECT COUNT(*) FROM strand.task_completions WHERE task_id = ANY(\(childTaskIDs))",
+                logger: logger
+            )
+            var completedCount = 0
+            for try await row in completedStream {
+                var col = row.makeIterator()
+                completedCount = try col.next()!.decode(Int.self, context: .default)
+            }
+
+            if completedCount > 0 {
+                try await conn.query(
+                    """
+                    WITH
+                    del_orphans AS (
+                        DELETE FROM strand.event_waits ew
+                        USING strand.task_completions tc
+                        WHERE ew.run_id        = \(parentRunID)
+                          AND ew.child_task_id = tc.task_id
+                          AND tc.task_id       = ANY(\(childTaskIDs))
+                    ),
+                    r AS (
+                        UPDATE strand.runs
+                        SET state        = \(TaskState.pending),
+                            available_at = NOW(),
+                            worker_id    = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = \(parentRunID)
+                        RETURNING id
+                    )
+                    UPDATE strand.tasks SET state = \(TaskState.pending)
+                    WHERE id = \(parentTaskID)
+                    """,
+                    logger: logger
+                )
+                try await conn.notifyWorkers(namespace: namespaceID, queue: parentQueue, logger: logger)
+            } else {
+                try await conn.query(
+                    """
+                    WITH r AS (
+                        UPDATE strand.runs
+                        SET state = \(TaskState.waiting),
+                            worker_id = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = \(parentRunID)
+                        RETURNING id
+                    )
+                    UPDATE strand.tasks SET state = \(TaskState.waiting)
+                    WHERE id = \(parentTaskID)
+                    """,
+                    logger: logger
+                )
+            }
+
+            return result
         }
     }
 
@@ -534,11 +832,7 @@ enum Queries {
                 if let qRow = try await qStream.first(where: { _ in true }) {
                     var qCol = qRow.makeIterator()
                     let q = try qCol.next()!.decode(String.self, context: .default)
-                    let notification = StrandChannels.Notification(namespace: namespaceID, queue: q)
-                    try await conn.query(
-                        "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                        logger: logger
-                    )
+                    try await conn.notifyWorkers(namespace: namespaceID, queue: q, logger: logger)
                 }
             }
         }
@@ -571,24 +865,7 @@ enum Queries {
 
     /// Extends the claim lease. Throws ``InternalError/cancelled`` if the run
     /// is no longer in 'running' state (task was cancelled or failed externally).
-    static func extendClaim(
-        on client: PostgresClient,
-        namespaceID: String,
-        runID: UUID,
-        extendBySeconds: Int,
-        logger: Logger
-    ) async throws {
-        let stream = try await client.query(
-            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = \(TaskState.running) AND namespace_id = \(namespaceID) RETURNING id",
-            logger: logger
-        )
-        if try await stream.first(where: { _ in true }) == nil {
-            throw InternalError.cancelled
-        }
-    }
-
-    /// `PostgresConnection` overload — used inside an open transaction (e.g. ``batchSetCheckpoints``).
-    /// Semantics are identical to the `PostgresClient` variant.
+    /// Connection-level implementation — the single source of truth for claim extension.
     static func extendClaim(
         on conn: PostgresConnection,
         namespaceID: String,
@@ -602,6 +879,25 @@ enum Queries {
         )
         if try await stream.first(where: { _ in true }) == nil {
             throw InternalError.cancelled
+        }
+    }
+
+    /// Pool-level overload — acquires a connection then delegates to the connection overload.
+    static func extendClaim(
+        on client: PostgresClient,
+        namespaceID: String,
+        runID: UUID,
+        extendBySeconds: Int,
+        logger: Logger
+    ) async throws {
+        try await client.withConnection { conn in
+            try await extendClaim(
+                on: conn,
+                namespaceID: namespaceID,
+                runID: runID,
+                extendBySeconds: extendBySeconds,
+                logger: logger
+            )
         }
     }
 
@@ -703,6 +999,129 @@ enum Queries {
             "task cancelled",
             metadata: ["strand.task_id": .stringConvertible(taskID)]
         )
+    }
+
+    // MARK: - Batch cancel
+
+    /// Cancels a batch of tasks in one transaction.
+    ///
+    /// Compared to calling `cancelTask` N times (N×5 queries), this runs:
+    ///   - 1 task UPDATE (bulk)
+    ///   - 1 descendant task UPDATE (recursive CTE, bulk)
+    ///   - 1 run UPDATE (bulk)
+    ///   - 1 descendant run UPDATE (bulk)
+    ///   - N calls to emitTaskCompletionSignal (one per task — needed so any
+    ///     `awaitTaskResult` callers are unblocked)
+    ///
+    /// Returns the number of tasks that were actually cancelled (i.e. were not
+    /// already terminal before this call).
+    @discardableResult
+    static func cancelTasksBatch(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskIDs: [UUID],
+        logger: Logger
+    ) async throws -> Int {
+        guard !taskIDs.isEmpty else { return 0 }
+
+        let count: Int = try await client.withTransaction(logger: logger) { conn in
+            // ── Step 1: Cancel root task rows, collect IDs actually updated ────────────────
+            var cancelledIDs: [UUID] = []
+            let cancelStream = try await conn.query(
+                """
+                UPDATE strand.tasks
+                SET state = \(TaskState.cancelled), cancelled_at = NOW()
+                WHERE id = ANY(\(taskIDs))
+                  AND namespace_id = \(namespaceID)
+                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                RETURNING id
+                """,
+                logger: logger
+            )
+            for try await row in cancelStream {
+                var col = row.makeIterator()
+                cancelledIDs.append(try col.next()!.decode(UUID.self, context: .default))
+            }
+
+            guard !cancelledIDs.isEmpty else { return 0 }
+
+            // ── Step 2: Cancel/interrupt run rows for root tasks ────────────────────────
+            try await conn.query(
+                """
+                UPDATE strand.runs
+                SET state = \(TaskState.cancelled)
+                WHERE task_id = ANY(\(cancelledIDs))
+                  AND namespace_id = \(namespaceID)
+                  AND state IN (\(TaskState.pending), \(TaskState.sleeping),
+                                \(TaskState.waiting), \(TaskState.running))
+                """,
+                logger: logger
+            )
+
+            // ── Step 3: Cascade to all descendant tasks (recursive CTE, bulk) ────────
+            try await conn.query(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id FROM strand.tasks
+                    WHERE parent_task_id = ANY(\(cancelledIDs))
+                      AND namespace_id   = \(namespaceID)
+                    UNION ALL
+                    SELECT t.id
+                    FROM strand.tasks t
+                    JOIN descendants d ON t.parent_task_id = d.id
+                    WHERE t.namespace_id = \(namespaceID)
+                )
+                UPDATE strand.tasks
+                SET state = \(TaskState.cancelled), cancelled_at = NOW()
+                WHERE id IN (SELECT id FROM descendants)
+                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                """,
+                logger: logger
+            )
+
+            // ── Step 4: Cancel/interrupt all descendant runs (bulk) ────────────────
+            try await conn.query(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id FROM strand.tasks
+                    WHERE parent_task_id = ANY(\(cancelledIDs))
+                      AND namespace_id   = \(namespaceID)
+                    UNION ALL
+                    SELECT t.id
+                    FROM strand.tasks t
+                    JOIN descendants d ON t.parent_task_id = d.id
+                    WHERE t.namespace_id = \(namespaceID)
+                )
+                UPDATE strand.runs
+                SET state = \(TaskState.cancelled)
+                WHERE task_id IN (SELECT id FROM descendants)
+                  AND namespace_id = \(namespaceID)
+                  AND state IN (\(TaskState.pending), \(TaskState.sleeping),
+                                \(TaskState.waiting), \(TaskState.running))
+                """,
+                logger: logger
+            )
+
+            // ── Step 5: Wake any awaitTaskResult callers (one signal per root task) ─
+            for taskID in cancelledIDs {
+                try await emitTaskCompletionSignal(
+                    conn: conn,
+                    namespaceID: namespaceID,
+                    taskID: taskID,
+                    state: .cancelled,
+                    resultBuffer: nil,
+                    logger: logger
+                )
+            }
+
+            return cancelledIDs.count
+        }
+
+        logger.debug(
+            "tasks cancelled (batch)",
+            metadata: ["strand.cancelled_count": .stringConvertible(count)]
+        )
+        return count
     }
 
     /// Returns the current state and result of a task.
@@ -982,11 +1401,7 @@ enum Queries {
             )
             if !waits.isEmpty {
                 // Wake workers: runs transitioned to PENDING above.
-                let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
-                try await conn.query(
-                    "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                    logger: logger
-                )
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             }
         }
     }
@@ -1059,11 +1474,7 @@ enum Queries {
                 "re-queued \(count) run(s) with expired lease—worker was likely restarted",
                 metadata: ["queue": "\(queue)"]
             )
-            let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
-            try await client.query(
-                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                logger: logger
-            )
+            try await client.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
         }
     }
 
@@ -1329,11 +1740,7 @@ enum Queries {
             if let qRow = try await qStream.first(where: { _ in true }) {
                 var qCol = qRow.makeIterator()
                 let q = try qCol.next()!.decode(String.self, context: .default)
-                let notification = StrandChannels.Notification(namespace: namespaceID, queue: q)
-                try await conn.query(
-                    "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                    logger: logger
-                )
+                try await conn.notifyWorkers(namespace: namespaceID, queue: q, logger: logger)
             }
             return (newRunID, nextAttempt)
         }
@@ -1376,7 +1783,7 @@ enum Queries {
             let retryStrategy = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
             let cancellation = try col.next()!.decode(ByteBuffer?.self, context: .default)
-            let priority = try col.next()!.decode(Int.self, context: .default)
+            let priority = try col.next()!.decode(TaskPriority.self, context: .default)
             let fairnessKey = try col.next()!.decode(String?.self, context: .default)
             let fairnessWeight = try col.next()!.decode(Float.self, context: .default)
             let kind = try col.next()!.decode(TaskKind.self, context: .default)
@@ -1385,10 +1792,7 @@ enum Queries {
             let newRunID = UUID.v7()
 
             // Create the queue row if not present (idempotent).
-            try await conn.query(
-                "INSERT INTO strand.queues (namespace_id, name) VALUES (\(namespaceID), \(queue)) ON CONFLICT DO NOTHING",
-                logger: logger
-            )
+            try await createQueue(on: conn, namespaceID: namespaceID, name: queue, logger: logger)
 
             try await conn.query(
                 """
@@ -1413,11 +1817,7 @@ enum Queries {
                 """,
                 logger: logger
             )
-            let notification = StrandChannels.Notification(namespace: namespaceID, queue: queue)
-            try await conn.query(
-                "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
-                logger: logger
-            )
+            try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             return EnqueueRow(taskID: newTaskID, runID: newRunID, attempt: 1, created: true)
         }
     }
@@ -1511,4 +1911,31 @@ private func retryDelay(strategy buf: ByteBuffer?, attempt: Int) -> TimeInterval
 private struct QueryError: Error, CustomStringConvertible {
     let description: String
     init(_ msg: String) { self.description = msg }
+}
+
+// MARK: - Worker notification helpers
+
+extension PostgresConnection {
+    /// Sends a `pg_notify` on `strand_tasks` for the given `(namespace, queue)` pair.
+    ///
+    /// `pg_notify` is transactional — the notification is delivered only after the
+    /// enclosing transaction commits, so callers inside a `withTransaction` block
+    /// never produce phantom wakeups for tasks that haven't landed yet.
+    func notifyWorkers(namespace: String, queue: String, logger: Logger) async throws {
+        let notification = StrandChannels.Notification(namespace: namespace, queue: queue)
+        try await query(
+            "SELECT pg_notify(\(StrandChannels.tasks), \(notification.payload))",
+            logger: logger
+        )
+    }
+}
+
+extension PostgresClient {
+    /// Pool-level convenience — acquires a connection then delegates to
+    /// ``PostgresConnection/notifyWorkers(namespace:queue:logger:)``.
+    func notifyWorkers(namespace: String, queue: String, logger: Logger) async throws {
+        try await withConnection { conn in
+            try await conn.notifyWorkers(namespace: namespace, queue: queue, logger: logger)
+        }
+    }
 }

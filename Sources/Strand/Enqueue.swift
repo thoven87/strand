@@ -108,7 +108,6 @@ public struct EnqueueOptions: Sendable {
 // MARK: - EnqueueResult
 
 /// Result returned after successfully enqueuing a task.
-/// `taskID` and `runID` are `UUID` — use `.uuidString` if a `String` is needed.
 public struct EnqueueResult: Sendable {
     public let taskID: UUID
     public let runID: UUID
@@ -201,6 +200,34 @@ extension ScheduleAccuracy: PostgresCodable {
         // Unknown / future values fall back to .latest so old rows stay safe.
         let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
         self.init(dbString: raw)
+    }
+}
+
+extension TaskPriority: PostgresCodable {
+    public static var psqlType: PostgresDataType { .int8 }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        // Delegate to Int's encoding so the wire format matches what
+        // PostgresNIO uses for bare Int parameters (bigint / int8).
+        // Postgres implicitly casts int8 → int4 for the INTEGER column.
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try Int(from: &byteBuffer, type: type, format: format, context: context)
+        guard let priority = TaskPriority(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = priority
     }
 }
 

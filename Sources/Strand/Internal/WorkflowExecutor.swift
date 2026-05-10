@@ -54,7 +54,13 @@ enum WorkflowCommand: Sendable {
         queue: String?,  // nil = inherit orchestrator's queue
         input: ByteBuffer,
         seqNum: Int,  // monotonic activation counter — unique per command within this activation
-        idempotencyKey: String
+        idempotencyKey: String,
+        priority: TaskPriority,  // .normal when unspecified
+        maxAttempts: Int?,  // nil = worker default
+        fairnessKey: String?,  // nil = no per-tenant isolation
+        fairnessWeight: Float,  // 1.0 = default weight
+        retryStrategy: RetryStrategy?,  // nil = worker default
+        scheduledAt: Date?  // nil = immediately
     )
 }
 

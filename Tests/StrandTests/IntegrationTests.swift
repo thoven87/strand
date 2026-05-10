@@ -365,7 +365,7 @@ struct TaskExecutionTests {
     @Test("startWorkflow with the same id returns the same task for both calls")
     func idempotencyKey() async throws {
         try await withTestEnvironment { client in
-            let key = "idem:\(UUID().uuidString)"
+            let key = "idem:\(UUID())"
 
             let h1 = try await client.startWorkflow(
                 EchoWorkflow.self,
@@ -424,7 +424,7 @@ struct EventTests {
     @Test("workflow suspends on waitForEvent, then resumes when event is emitted")
     func suspendAndResume() async throws {
         try await withTestEnvironment { client in
-            let eventName = "resume:\(UUID().uuidString)"
+            let eventName = "resume:\(UUID())"
 
             let workerTask = startWorker(
                 postgres: client.postgres,
@@ -459,7 +459,7 @@ struct EventTests {
     @Test("timed-out waitForEvent persists a sentinel so replay skips re-suspension")
     func timeoutPersistsSentinel() async throws {
         try await withTestEnvironment { client in
-            let eventName = "never:\(UUID().uuidString)"
+            let eventName = "never:\(UUID())"
 
             let workerTask = startWorker(
                 postgres: client.postgres,

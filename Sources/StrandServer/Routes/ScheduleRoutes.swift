@@ -159,7 +159,7 @@ struct ScheduleRoutes {
             let scheduleID = try ctx.parameters.require("id", as: UUID.self)
             let limit = req.uri.queryParameters.get("limit").flatMap(Int.init) ?? 20
 
-            let prefix = "$schedule:\(scheduleID.uuidString):"
+            let prefix = "$schedule:\(scheduleID):"
             let stream = try await self.client.postgres.query(
                 """
                 SELECT id, state, attempt, created_at, completed_at
