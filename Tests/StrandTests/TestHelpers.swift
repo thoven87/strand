@@ -153,8 +153,7 @@ func withTestEnvironment<T: Sendable>(
     // are older than 30 minutes, deleting schedules, tasks, and the queue row.
     // 30 min is well above the longest single test suite runtime (~10 min) so
     // concurrent test runs on slow CI machines won’t accidentally nuke each other.
-    // This is a best-effort fire-and-forget; errors are logged, not thrown.
-    try? await postgres.query(
+    _ = try await postgres.query(
         """
         DO $$
         DECLARE q TEXT;

@@ -2,10 +2,12 @@ import Testing
 
 @testable import Strand
 
-#if canImport(FoundationEssentials)
-import FoundationEssentials
-#else
-import Foundation
+#if canImport(Darwin)
+import Darwin  // For macOS, iOS, watchOS, tvOS
+#elseif canImport(Glibc)
+import Glibc  // For Linux
+#elseif os(Windows)
+import ucrt  // For Windows
 #endif
 
 @Suite("DDSketch")
@@ -157,12 +159,35 @@ struct DDSketchTests {
 
     // ── 7. Correctness constants ──────────────────────────────────────────
 
-    @Test("gamma and invLogGamma constants are consistent")
+    @Test("DDSketch constants satisfy the algebraic invariants of the 2% error specification")
     func constantsConsistency() {
-        // invLogGamma must equal 1/log(gamma)
-        let recomputed = 1.0 / log(DDSketch.gamma)
-        #expect(abs(DDSketch.invLogGamma - recomputed) < 1e-10)
-        // gamma > 1 (otherwise log would be <= 0)
-        #expect(DDSketch.gamma > 1.0)
+        // ── 1. gamma encodes the claimed error rate ───────────────────────
+        // For gamma = (1+ε)/(1-ε), algebra gives (γ-1)/(γ+1) = ε.
+        // Checking this avoids restating the formula while still verifying
+        // that gamma is tuned to the right error bound.
+        let derivedError = (DDSketch.gamma - 1.0) / (DDSketch.gamma + 1.0)
+        #expect(abs(derivedError - DDSketch.errorRate) < 1e-14)
+        #expect(DDSketch.gamma > 1.0)  // log(γ) must be positive
+
+        // ── 2. Cross-constant identity (independent of source formulas) ───
+        // invLogGamma × log2gamma = 1/log(γ) × log₂(γ)
+        //                         = log₂(γ)/log(γ)  (change of base)
+        //                         = 1/log(2)           = log₂(e)
+        // This holds for any γ > 1 and is derivable from mathematics alone,
+        // not by reading the source code.
+        let log2e = 1.0 / log(2.0)  // ≈ 1.4426950408889634
+        #expect(abs(DDSketch.invLogGamma * DDSketch.log2gamma - log2e) < 1e-10)
+
+        // ── 3. exp2 optimisation is numerically equivalent to pow ────────
+        // The quantile path uses exp2((k-0.5) × log2gamma) instead of
+        // pow(gamma, k-0.5). Test several bin indices to confirm equivalence.
+        for k in [1, 10, 50, 100, 500] {
+            let exp2val = exp2((Double(k) - 0.5) * DDSketch.log2gamma)
+            let powval = pow(DDSketch.gamma, Double(k) - 0.5)
+            #expect(
+                abs(exp2val - powval) / powval < 1e-10,
+                "exp2 and pow diverge at bin \(k)"
+            )
+        }
     }
 }
