@@ -90,6 +90,48 @@ extension WorkflowRegistration {
                 try await record(.timerFired, nil)
             case .eventReceived(let eventName):
                 try await record(.eventReceived, try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
+            case .eventWaitTimedOut(let eventName, let seqNum):
+                try await Queries.writeEventWaitTimedOut(
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    taskID: claimed.taskID,
+                    runID: claimed.runID,
+                    seqNum: seqNum,
+                    historySeq: historySeq,
+                    eventName: eventName,
+                    logger: exec.logger
+                )
+                historySeq += 1
+            case .conditionMet(let seqNum):
+                if let seqNum = seqNum {
+                    // Timeout variant — write sentinel + history atomically.
+                    try await Queries.writeConditionResult(
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        runID: claimed.runID,
+                        seqNum: seqNum,
+                        historySeq: historySeq,
+                        met: true,
+                        logger: exec.logger
+                    )
+                    historySeq += 1
+                } else {
+                    // No-timeout variant — no checkpoint guard, just write history.
+                    try await record(.conditionMet, nil)
+                }
+            case .conditionTimedOut(let seqNum):
+                try await Queries.writeConditionResult(
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    taskID: claimed.taskID,
+                    runID: claimed.runID,
+                    seqNum: seqNum,
+                    historySeq: historySeq,
+                    met: false,
+                    logger: exec.logger
+                )
+                historySeq += 1
             case .childWorkflowCompleted(let name, let seqNum):
                 // Record child workflow completion. runChildWorkflow emits this command
                 // exactly once; the accompanying checkpoint ensures replays return from
@@ -175,7 +217,8 @@ extension WorkflowRegistration {
             switch cmd {
             case .scheduleActivity, .startTimer, .awaitEvent, .scheduleChildWorkflow:
                 return true
-            case .writeCheckpoint, .timerFired, .eventReceived, .emitEvent, .childWorkflowCompleted:
+            case .writeCheckpoint, .timerFired, .eventReceived, .eventWaitTimedOut,
+                .conditionMet, .conditionTimedOut, .emitEvent, .childWorkflowCompleted:
                 return false
             }
         }
@@ -365,7 +408,7 @@ extension WorkflowRegistration {
                                 INSERT INTO strand.event_triggers
                                     (id, namespace_id, queue, event_name, emission_id, task_id, run_id)
                                 VALUES (\(UUID.v7()), \(exec.namespace), \(queueName), \(eventName), \(emissionID), \(taskID), \(runID))
-                                ON CONFLICT DO NOTHING
+                                ON CONFLICT (emission_id, task_id) WHERE emission_id IS NOT NULL DO NOTHING
                                 """,
                                 logger: exec.logger
                             )
@@ -395,7 +438,7 @@ extension WorkflowRegistration {
                             )
                         }
                     }
-                    let eventWaitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
+                    let eventWaitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName, timeoutAt: timeoutAt))
                     try await record(.eventWaitStarted, eventWaitData)
 
                 case .scheduleChildWorkflow(
@@ -442,7 +485,8 @@ extension WorkflowRegistration {
                         )
                     )
 
-                case .writeCheckpoint, .timerFired, .eventReceived, .childWorkflowCompleted:
+                case .writeCheckpoint, .timerFired, .eventReceived, .eventWaitTimedOut,
+                    .conditionMet, .conditionTimedOut, .childWorkflowCompleted:
                     break  // processed in step-2 (non-suspending, not enqueued as child tasks)
                 }
             }

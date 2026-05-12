@@ -22,8 +22,6 @@ import ucrt  // For Windows
 /// for millisecond timings (1 ms – 10 min) is roughly 300 bins regardless of
 /// how many measurements were recorded.
 ///
-/// ## Thread safety
-///
 /// `DDSketch` is a value type (`struct`).  Use a `Mutex` or similar when
 /// sharing across tasks; see ``AggregatedMetricsBuffer``.
 public struct DDSketch: Sendable {
@@ -129,6 +127,25 @@ public struct DDSketch: Sendable {
                 }
             }
             return nil
+        }
+
+        /// Merge multiple serialised sketches into one so callers can query
+        /// cross-queue quantiles without duplicating the quantile algorithm.
+        /// Returns `nil` when the input array is empty.
+        public static func merged(_ sketches: [Serialized]) -> Serialized? {
+            guard !sketches.isEmpty else { return nil }
+            var mergedBins: [String: Int] = [:]
+            var mergedSize = 0
+            for s in sketches {
+                for (k, v) in s.bins { mergedBins[k, default: 0] += v }
+                mergedSize += s.size
+            }
+            return Serialized(bins: mergedBins, size: mergedSize)
+        }
+
+        private init(bins: [String: Int], size: Int) {
+            self.bins = bins
+            self.size = size
         }
     }
 }

@@ -324,6 +324,19 @@ CREATE INDEX IF NOT EXISTS strand_event_triggers_emission_idx
     ON strand.event_triggers (emission_id)
     WHERE emission_id IS NOT NULL;
 
+-- Uniqueness guard: one trigger row per (emission, task) pair.
+-- Prevents duplicate rows when applyScheduleCommands fast-path re-fires for
+-- the same emission after a run retries (fresh _activate re-processes .awaitEvent).
+-- Partial (WHERE emission_id IS NOT NULL) because emission_id is nullable for
+-- pre-migration rows that pre-date the append-only log.
+-- Migration note: if existing duplicate rows block index creation, delete them first:
+--   DELETE FROM strand.event_triggers a USING strand.event_triggers b
+--   WHERE a.id > b.id AND a.emission_id = b.emission_id
+--     AND a.task_id = b.task_id AND a.emission_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
+    ON strand.event_triggers (emission_id, task_id)
+    WHERE emission_id IS NOT NULL;
+
 -- Migration for existing databases:
 -- ALTER TABLE strand.events DROP CONSTRAINT strand_events_pkey;
 -- ALTER TABLE strand.events ADD COLUMN id UUID;

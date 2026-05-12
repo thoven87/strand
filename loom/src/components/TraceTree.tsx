@@ -23,7 +23,7 @@ import {
     ChevronsDownUp,
     ChevronsUpDown,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, fmtDuration } from "@/lib/utils";
 import { TimeBrush } from "@/components/TimeBrush";
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -305,18 +305,6 @@ function tickLabel(ms: number): string {
     return `${m}m\u00a0${s}s`; // non-breaking space keeps "m Xs" together
 }
 
-/** Duration label — < 1 s → "Xms", < 1 m → "X.Xs", ≥ 1 m → "Xm Xs". */
-function fmtDuration(ms: number): string {
-    if (ms < 1_000) return `${ms}ms`;
-    if (ms < 60_000) {
-        const s = ms / 1_000;
-        return Number.isInteger(s) ? `${s}s` : `${s.toFixed(1)}s`;
-    }
-    const m = Math.floor(ms / 60_000);
-    const s = Math.floor((ms % 60_000) / 1_000);
-    return `${m}m ${s}s`;
-}
-
 /** Fine-grained cursor time (two decimal places). */
 function fmtCursorTime(ms: number): string {
     if (ms < 1_000) return `${ms}ms`;
@@ -328,10 +316,24 @@ function fmtCursorTime(ms: number): string {
 
 function barClass(kind: TraceSpan["kind"], state: SpanState): string {
     // Suspension spans use a striped/dashed style to distinguish from execution.
-    if (kind === "WAIT")
+    // TIMED_OUT variant gets orange to signal the timeout visually.
+    if (kind === "WAIT") {
+        if (state === "TIMED_OUT")
+            return "bg-orange-500/20 border border-dashed border-orange-400/60";
         return "bg-indigo-500/25 border border-dashed border-indigo-400/60";
-    if (kind === "SLEEP")
+    }
+    if (kind === "SLEEP") {
+        if (state === "TIMED_OUT")
+            return "bg-orange-500/20 border border-dashed border-orange-400/60";
         return "bg-slate-500/30 border border-dashed border-slate-400/60";
+    }
+    if (kind === "CONDITION") {
+        if (state === "TIMED_OUT")
+            return "bg-orange-500/20 border border-dashed border-orange-400/60";
+        if (state === "WAITING")
+            return "bg-violet-500/20 border border-dashed border-violet-400/50";
+        return "bg-violet-500/30 border border-dashed border-violet-400/70";
+    }
     // SIGNAL and EMIT are point-in-time — rendered as diamond markers, not bars.
     if (kind === "SIGNAL" || kind === "EMIT") return "bg-transparent";
 
@@ -1530,6 +1532,7 @@ export function TraceTree({
                                             SLEEP: "Duration",
                                             SIGNAL: "Signal name",
                                             EMIT: "Event name",
+                                            CONDITION: "Predicate",
                                         };
                                         const label =
                                             kindLabel[selected.kind] ?? "Name";
@@ -1537,7 +1540,10 @@ export function TraceTree({
                                             selected.state === "WAITING"
                                                 ? selected.kind === "SLEEP"
                                                     ? "Still sleeping"
-                                                    : "Still waiting"
+                                                    : selected.kind ===
+                                                        "CONDITION"
+                                                      ? "Still waiting on predicate"
+                                                      : "Still waiting"
                                                 : selected.state === "TIMED_OUT"
                                                   ? "Timed out"
                                                   : "Completed";
@@ -1559,6 +1565,22 @@ export function TraceTree({
                                                         {stateLabel}
                                                     </p>
                                                 </div>
+                                                {selected.kind === "WAIT" &&
+                                                    selected.state ===
+                                                        "TIMED_OUT" &&
+                                                    selected.durationMs > 0 && (
+                                                        <div className="space-y-1">
+                                                            <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                                                                Timed out after
+                                                            </p>
+                                                            <p className="font-mono text-[11px] text-foreground/80">
+                                                                {selected.durationMs <
+                                                                60_000
+                                                                    ? `${(selected.durationMs / 1000).toFixed(0)}s`
+                                                                    : `${Math.floor(selected.durationMs / 60_000)}m ${Math.floor((selected.durationMs % 60_000) / 1000)}s`}
+                                                            </p>
+                                                        </div>
+                                                    )}
                                                 {selected.kind === "WAIT" &&
                                                     selected.state ===
                                                         "COMPLETED" &&

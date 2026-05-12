@@ -102,10 +102,10 @@ export function TaskTracePage() {
     };
 
     const handleViewEmission = (emissionId: string) => {
-        // Copy emission ID to clipboard and open the events page so the user
-        // can find the emission row (currently no direct permalink per emission).
+        // Copy emission ID to clipboard so the user can paste it into the
+        // events page search — there is no direct permalink per emission yet.
         void navigator.clipboard.writeText(emissionId).catch(() => undefined);
-        window.location.href = `/${namespace}/events`;
+        void navigate({ to: "/$namespace/events", params: { namespace } });
     };
 
     const terminal = task ? isTerminal(task.state) : false;

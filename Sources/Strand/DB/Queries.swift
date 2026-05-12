@@ -1187,18 +1187,18 @@ enum Queries {
     ///
     /// `name` is an optional debug label stored as metadata — it is never used as a key.
     /// On conflict, the attempt guard prevents a stale retry from overwriting a newer run's data.
+    /// Connection overload — SQL lives here.
     static func setCheckpointState(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         namespaceID: String,
         taskID: UUID,
         seqNum: Int,
         name: String?,
         stateBuffer: ByteBuffer,
         runID: UUID,
-        extendClaimBySeconds: Int?,
         logger: Logger
     ) async throws {
-        try await client.query(
+        try await conn.query(
             """
             INSERT INTO strand.checkpoints (namespace_id, task_id, seq_num, name, state, run_id)
             VALUES (\(namespaceID), \(taskID), \(seqNum), \(name), \(stateBuffer), \(runID))
@@ -1212,6 +1212,32 @@ enum Queries {
             """,
             logger: logger
         )
+    }
+
+    /// Client overload — delegates to the connection overload; also extends the claim lease when requested.
+    static func setCheckpointState(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        seqNum: Int,
+        name: String?,
+        stateBuffer: ByteBuffer,
+        runID: UUID,
+        extendClaimBySeconds: Int?,
+        logger: Logger
+    ) async throws {
+        try await client.withConnection { conn in
+            try await setCheckpointState(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seqNum: seqNum,
+                name: name,
+                stateBuffer: stateBuffer,
+                runID: runID,
+                logger: logger
+            )
+        }
         if let secs = extendClaimBySeconds {
             try await extendClaim(
                 on: client,
@@ -1360,7 +1386,86 @@ enum Queries {
         }
     }
 
-    /// Emits an event into the append-only log and wakes any tasks waiting for it.
+    /// Writes the TimeoutSentinel checkpoint and the `EVENT_WAIT_TIMED_OUT` history row
+    /// in a single transaction so they are always present or absent together.
+    ///
+    /// Called from `applyScheduleCommands` when processing `.eventWaitTimedOut`.
+    static func writeEventWaitTimedOut(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        runID: UUID,
+        seqNum: Int,
+        historySeq: Int,
+        eventName: String,
+        logger: Logger
+    ) async throws {
+        let sentinel = try JSON.encode(TimeoutSentinel())
+        let eventData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
+        let cpName: String = "waitForEvent:\(eventName)"
+        let rawType = WorkflowStateQueries.HistoryEventType.eventWaitTimedOut.rawValue
+        try await client.withTransaction(logger: logger) { conn in
+            try await Queries.setCheckpointState(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seqNum: seqNum,
+                name: cpName,
+                stateBuffer: sentinel,
+                runID: runID,
+                logger: logger
+            )
+            try await conn.query(
+                """
+                INSERT INTO strand.workflow_history (namespace_id, task_id, seq, event_type, event_data)
+                VALUES (\(namespaceID), \(taskID), \(historySeq), \(rawType), \(eventData))
+                ON CONFLICT (task_id, seq) DO NOTHING
+                """,
+                logger: logger
+            )
+        }
+    }
+
+    /// Atomically writes the `ConditionResultSentinel` checkpoint and the
+    /// `CONDITION_MET` or `CONDITION_TIMED_OUT` history row for a `condition(timeout:)` call.
+    /// Uses the same `seqNum` slot as the deadline checkpoint (overwrites it).
+    static func writeConditionResult(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        runID: UUID,
+        seqNum: Int,
+        historySeq: Int,
+        met: Bool,
+        logger: Logger
+    ) async throws {
+        let sentinel = try JSON.encode(ConditionResultSentinel(met: met))
+        let rawType =
+            (met
+            ? WorkflowStateQueries.HistoryEventType.conditionMet
+            : WorkflowStateQueries.HistoryEventType.conditionTimedOut).rawValue
+        try await client.withTransaction(logger: logger) { conn in
+            try await Queries.setCheckpointState(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seqNum: seqNum,
+                name: "conditionResult",
+                stateBuffer: sentinel,
+                runID: runID,
+                logger: logger
+            )
+            try await conn.query(
+                """
+                INSERT INTO strand.workflow_history (namespace_id, task_id, seq, event_type, event_data)
+                VALUES (\(namespaceID), \(taskID), \(historySeq), \(rawType), NULL)
+                ON CONFLICT (task_id, seq) DO NOTHING
+                """,
+                logger: logger
+            )
+        }
+    }
+
     static func emitEvent(
         on client: PostgresClient,
         namespaceID: String,
@@ -1414,7 +1519,7 @@ enum Queries {
                     INSERT INTO strand.event_triggers
                         (id, namespace_id, queue, event_name, emission_id, task_id, run_id)
                     VALUES (\(UUID.v7()), \(namespaceID), \(queue), \(eventName), \(emissionID), \(wait.taskID), \(wait.runID))
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (emission_id, task_id) WHERE emission_id IS NOT NULL DO NOTHING
                     """,
                     logger: logger
                 )

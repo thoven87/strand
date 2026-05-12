@@ -301,5 +301,52 @@ struct MetricsRoutes {
                 windowHours: hours
             )
         }
+
+        // GET /api/:namespace/metrics/task/:taskName
+        // Returns per-task DDSketch percentiles and counts for the named task.
+        // Sourced from the broadcast cache (zero DB queries when cache is warm).
+        router.get("metrics/task/:taskName") { _, ctx -> TaskMetricsResponse in
+            let taskName = try ctx.parameters.require("taskName")
+            let ns = ctx.namespaceID
+
+            var execSketches: [DDSketch.Serialized] = []
+            var waitSketches: [DDSketch.Serialized] = []
+            var completedCount = 0
+            var failedCount = 0
+            var ratePerSec: Double = 0
+
+            if let broadcast = self.cache?.current(forNamespace: ns),
+                let timings = broadcast.timings
+            {
+                for t in timings where t.taskName == taskName {
+                    switch t.state {
+                    case .completed:
+                        execSketches.append(t.execTime)
+                        if let wt = t.waitTime { waitSketches.append(wt) }
+                        completedCount += t.count
+                        ratePerSec += t.ratePerSec
+                    case .failed:
+                        failedCount += t.count
+                    default:
+                        break
+                    }
+                }
+            }
+
+            let exec = DDSketch.Serialized.merged(execSketches)
+            let wait = DDSketch.Serialized.merged(waitSketches)
+
+            return TaskMetricsResponse(
+                taskName: taskName,
+                completedCount: completedCount,
+                failedCount: failedCount,
+                p50Ms: exec?.quantile(0.50),
+                p95Ms: exec?.quantile(0.95),
+                p99Ms: exec?.quantile(0.99),
+                p50WaitMs: wait?.quantile(0.50),
+                p95WaitMs: wait?.quantile(0.95),
+                ratePerSec: ratePerSec > 0 ? ratePerSec : nil
+            )
+        }
     }
 }

@@ -199,7 +199,8 @@ extension EventRow {
         payloadBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
         createdAt = try col.next()!.decode(Date.self, context: .default)
         queue = try col.next()!.decode(String.self, context: .default)
-        // triggered_tasks comes from a json_agg subquery: always a ByteBuffer
+        // triggered_tasks is a json_agg result; uniqueness enforced by the
+        // (emission_id, task_id) partial index on event_triggers.
         let triggeredBuf = try col.next()!.decode(ByteBuffer.self, context: .default)
         triggeredTasks = (try? JSON.decode([TriggeredTask].self, from: triggeredBuf)) ?? []
     }
@@ -464,6 +465,7 @@ package enum ManagementQueries {
                             ON  t.id = et.task_id
                             AND t.namespace_id = e.namespace_id
                      WHERE  et.emission_id = e.id
+                    ),
                     '[]'::json
                 ) AS triggered_tasks
             FROM strand.events e
@@ -522,6 +524,7 @@ package enum ManagementQueries {
                             ON  t.id = et.task_id
                             AND t.namespace_id = e.namespace_id
                      WHERE  et.emission_id = e.id
+                    ),
                     '[]'::json
                 ) AS triggered_tasks
             FROM strand.events e
@@ -566,7 +569,6 @@ package enum ManagementQueries {
         return try EventTriggerRow(row: row)
     }
 
-    /// One execution history span derived from `strand.workflow_history` events.
     /// Represents a real workflow step (WAIT / SLEEP / SIGNAL / EMIT) that is
     /// stored in the history log rather than as a separate `strand.tasks` row.
     package struct ExecutionHistorySpanRow: Sendable {
@@ -585,6 +587,17 @@ package enum ManagementQueries {
         /// Raw JSON payload received when the waitForEvent resolved (nil on timeout or
         /// if the wait is still open). Sourced from `strand.checkpoints`.
         package let receivedPayload: ByteBuffer?
+    }
+
+    // ── Parse event_data helpers ──────────────────────────────────────────
+    private static func eventName(from buf: ByteBuffer?) -> String? {
+        guard let b = buf else { return nil }
+        return (try? JSON.decode(WorkflowStateQueries.NamedEventData.self, from: b))?.eventName
+    }
+
+    private static func signalName(from buf: ByteBuffer?) -> String? {
+        guard let b = buf else { return nil }
+        return (try? JSON.decode(WorkflowStateQueries.SignalReceivedData.self, from: b))?.name
     }
 
     /// Derives execution history spans from `strand.workflow_history` for all given
@@ -610,9 +623,10 @@ package enum ManagementQueries {
             FROM   strand.workflow_history wh
             WHERE  wh.task_id    = ANY(\(workflowTaskIDs))
               AND  wh.event_type IN (
-                    'EVENT_WAIT_STARTED', 'EVENT_RECEIVED',
+                    'EVENT_WAIT_STARTED', 'EVENT_RECEIVED', 'EVENT_WAIT_TIMED_OUT',
                     'TIMER_STARTED',      'TIMER_FIRED',
-                    'SIGNAL_RECEIVED',    'EVENT_EMITTED'
+                    'SIGNAL_RECEIVED',    'EVENT_EMITTED',
+                    'CONDITION_WAITING',  'CONDITION_MET',  'CONDITION_TIMED_OUT'
                    )
             ORDER  BY wh.task_id, wh.seq
             """,
@@ -665,12 +679,11 @@ package enum ManagementQueries {
             if let emissionID { emissionMap[taskID, default: [:]][eventName] = emissionID }
         }
 
-        // ── 3. Fetch received payloads for resolved WAIT spans ────────────────────────
-        // The checkpoint written by waitForEvent on success is named
-        // "waitForEvent:<eventName>" (no ":timeout" suffix).
-        // Checkpoints are keyed by run_id; join strand.runs to resolve task_id.
-        // DISTINCT ON picks the highest-attempt run per (task_id, checkpoint name).
+        // ── 3. Fetch waitForEvent checkpoints (received payloads only) ─────────────────
+        // Checkpoints hold the actual event payload for resolved EVENT_RECEIVED spans.
+        // Timed-out waits are now detected exclusively via EVENT_WAIT_TIMED_OUT history rows.
         var waitPayloads: [UUID: [String: ByteBuffer]] = [:]
+        let wfPrefix = "waitForEvent:"
         let cpStream = try await client.query(
             """
             SELECT DISTINCT ON (r.task_id, c.name)
@@ -679,7 +692,6 @@ package enum ManagementQueries {
             JOIN   strand.runs r ON r.id = c.run_id
             WHERE  r.task_id = ANY(\(workflowTaskIDs))
               AND  c.name LIKE 'waitForEvent:%'
-              AND  c.name NOT LIKE '%:timeout'
             ORDER  BY r.task_id, c.name, r.attempt DESC
             """,
             logger: logger
@@ -688,35 +700,17 @@ package enum ManagementQueries {
             var col = row.makeIterator()
             let taskID = try col.next()!.decode(UUID.self, context: .default)
             let cpName = try col.next()!.decode(String.self, context: .default)
-            let payload = try col.next()!.decode(ByteBuffer?.self, context: .default)
-            let prefix = "waitForEvent:"
-            guard cpName.hasPrefix(prefix), let payload else { continue }
-            let eName = String(cpName.dropFirst(prefix.count))
-            waitPayloads[taskID, default: [:]][eName] = payload
+            let cpState = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            guard cpName.hasPrefix(wfPrefix), let buf = cpState else { continue }
+            let eName = String(cpName.dropFirst(wfPrefix.count))
+            // Only store actual payloads — TimeoutSentinel rows are no longer needed
+            // here because EVENT_WAIT_TIMED_OUT in workflow_history is the source of truth.
+            if !TimeoutSentinel.detect(in: buf) {
+                waitPayloads[taskID, default: [:]][eName] = buf
+            }
         }
 
-        // ── 4. Parse event_data helpers ──────────────────────────────────────────
-        func eventName(from buf: ByteBuffer?) -> String? {
-            guard let b = buf else { return nil }
-            return (try? JSON.decode(WorkflowStateQueries.NamedEventData.self, from: b))?.eventName
-        }
-        func signalName(from buf: ByteBuffer?) -> String? {
-            guard let b = buf else { return nil }
-            return (try? JSON.decode(WorkflowStateQueries.SignalReceivedData.self, from: b))?.name
-        }
-        func sleepLabel(from buf: ByteBuffer?) -> String {
-            guard let b = buf,
-                let d = try? JSON.decode(WorkflowStateQueries.TimerStartedData.self, from: b)
-            else { return "sleep" }
-            let ms = d.durationMs
-            if ms < 1_000 { return "\(ms)ms" }
-            if ms < 60_000 { return "\(ms / 1_000)s" }
-            let m = ms / 60_000
-            let s = (ms % 60_000) / 1_000
-            return s > 0 ? "\(m)m \(s)s" : "\(m)m"
-        }
-
-        // ── 5. Pair events and emit ExecutionHistorySpanRows ─────────────────────
+        // ── 5. Pair events and emit ExecutionHistorySpanRows ─────────────────
         var results: [ExecutionHistorySpanRow] = []
 
         for (taskID, events) in byTask {
@@ -726,7 +720,11 @@ package enum ManagementQueries {
                 switch evt.eventType {
 
                 case .timerStarted:
-                    let label = sleepLabel(from: evt.eventData)
+                    let durationMs =
+                        evt.eventData
+                        .flatMap { try? JSON.decode(WorkflowStateQueries.TimerStartedData.self, from: $0) }
+                        .map(\.durationMs) ?? 0
+                    let label = ManagementQueries.sleepLabel(durationMs: durationMs)
                     // Find the next TIMER_FIRED for this task (seq > N).
                     if let endIdx = events[(i + 1)...].firstIndex(where: { $0.eventType == .timerFired }) {
                         results.append(
@@ -762,7 +760,7 @@ package enum ManagementQueries {
 
                 case .eventWaitStarted:
                     let eName = eventName(from: evt.eventData) ?? WorkflowSpanKind.wait.displayName
-                    // Find the next EVENT_RECEIVED with the same event_name.
+                    // First: EVENT_RECEIVED — event arrived successfully.
                     if let endIdx = events[(i + 1)...].firstIndex(where: {
                         $0.eventType == .eventReceived && eventName(from: $0.eventData) == eName
                     }) {
@@ -783,7 +781,27 @@ package enum ManagementQueries {
                         )
                         i = endIdx + 1
                         continue
+                        // EVENT_WAIT_TIMED_OUT — exact end time recorded when the deadline fired.
+                    } else if let endIdx = events[(i + 1)...].firstIndex(where: {
+                        $0.eventType == .eventWaitTimedOut && eventName(from: $0.eventData) == eName
+                    }) {
+                        results.append(
+                            ExecutionHistorySpanRow(
+                                workflowTaskID: taskID,
+                                spanKind: .wait,
+                                name: eName,
+                                seqNum: evt.seq,
+                                startedAt: evt.createdAt,
+                                endedAt: events[endIdx].createdAt,
+                                state: .timedOut,
+                                emissionID: nil,
+                                receivedPayload: nil
+                            )
+                        )
+                        i = endIdx + 1
+                        continue
                     } else {
+                        // No completion event found — wait is still open.
                         results.append(
                             ExecutionHistorySpanRow(
                                 workflowTaskID: taskID,
@@ -831,6 +849,52 @@ package enum ManagementQueries {
                         )
                     )
 
+                case .conditionWaiting:
+                    // Look ahead for the completion event, stepping over any intermediate
+                    // CONDITION_WAITING re-parks (predicate still false after a signal).
+                    if let endIdx = events[(i + 1)...].firstIndex(where: {
+                        $0.eventType == .conditionMet || $0.eventType == .conditionTimedOut
+                    }) {
+                        results.append(
+                            ExecutionHistorySpanRow(
+                                workflowTaskID: taskID,
+                                spanKind: .condition,
+                                name: "condition",
+                                seqNum: evt.seq,
+                                startedAt: evt.createdAt,
+                                endedAt: events[endIdx].createdAt,
+                                state: events[endIdx].eventType == .conditionMet ? .completed : .timedOut,
+                                emissionID: nil,
+                                receivedPayload: nil
+                            )
+                        )
+                        i = endIdx + 1
+                        continue
+                    } else {
+                        // No completion found — still waiting or only re-parks remain.
+                        results.append(
+                            ExecutionHistorySpanRow(
+                                workflowTaskID: taskID,
+                                spanKind: .condition,
+                                name: "condition",
+                                seqNum: evt.seq,
+                                startedAt: evt.createdAt,
+                                endedAt: nil,
+                                state: .waiting,
+                                emissionID: nil,
+                                receivedPayload: nil
+                            )
+                        )
+                        // Skip subsequent CONDITION_WAITING entries — they are re-parks of
+                        // the same condition call and do not produce separate spans.
+                        while i + 1 < events.count && events[i + 1].eventType == .conditionWaiting {
+                            i += 1
+                        }
+                    }
+
+                case .conditionMet, .conditionTimedOut:
+                    break  // consumed by the .conditionWaiting look-ahead above
+
                 default:
                     break
                 }
@@ -839,6 +903,39 @@ package enum ManagementQueries {
         }
 
         return results
+    }
+
+    // MARK: - Formatting helpers
+
+    /// Formats a timer duration (in milliseconds) as a compact, locale-independent
+    /// human-readable string. Used as the SLEEP span name in the trace view.
+    ///
+    /// Example output: `"500ms"`, `"30s"`, `"1m 30s"`, `"2h"`, `"1d 12h"`.
+    ///
+    /// `Duration.milliseconds(ms).formatted(.units(..., width: .narrow))` would be
+    /// shorter but is unsuitable here for two reasons:
+    /// 1. `DateComponentsFormatter` is not available in `FoundationEssentials`
+    ///    (used on Linux), so the `.narrow` style would require full Foundation.
+    /// 2. Both formatters produce locale-sensitive output (e.g. `"30 сек"` on a
+    ///    Russian-locale server). This function runs server-side and its output is
+    ///    stored as span name data returned to all clients — consistent,
+    ///    locale-independent output is required.
+    package static func sleepLabel(durationMs ms: Int) -> String {
+        if ms < 1_000 { return "\(ms)ms" }
+        if ms < 60_000 { return "\(ms / 1_000)s" }
+        if ms < 3_600_000 {
+            let m = ms / 60_000
+            let s = (ms % 60_000) / 1_000
+            return s > 0 ? "\(m)m \(s)s" : "\(m)m"
+        }
+        if ms < 86_400_000 {
+            let h = ms / 3_600_000
+            let m = (ms % 3_600_000) / 60_000
+            return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+        }
+        let days = ms / 86_400_000
+        let h = (ms % 86_400_000) / 3_600_000
+        return h > 0 ? "\(days)d \(h)h" : "\(days)d"
     }
 
     // MARK: - Cleanup

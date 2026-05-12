@@ -399,3 +399,26 @@ struct WorkerDetailResponse: Codable, Sendable {
     let recentTasks: [WorkerTaskResponse]
 }
 extension WorkerDetailResponse: ResponseCodable {}
+
+/// Per-task performance metrics sourced from the DDSketch broadcast.
+/// Returned by `GET /api/:namespace/metrics/task/:taskName`.
+struct TaskMetricsResponse: Codable, Sendable {
+    let taskName: String
+    /// Total completions in the broadcast window (across all queues).
+    let completedCount: Int
+    /// Total failures in the broadcast window (across all queues).
+    let failedCount: Int
+    /// p50 execution time in ms (nil when no data in broadcast window).
+    let p50Ms: Double?
+    /// p95 execution time in ms.
+    let p95Ms: Double?
+    /// p99 execution time in ms.
+    let p99Ms: Double?
+    /// p50 queue-wait time in ms (time from PENDING to claimed).
+    let p50WaitMs: Double?
+    /// p95 queue-wait time in ms.
+    let p95WaitMs: Double?
+    /// Executions per second across all queues in the last broadcast cycle.
+    let ratePerSec: Double?
+}
+extension TaskMetricsResponse: ResponseCodable {}
