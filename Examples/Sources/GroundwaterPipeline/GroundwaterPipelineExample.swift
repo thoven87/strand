@@ -69,93 +69,75 @@ import Foundation
             backgroundLogger: logger
         )
 
-        // ── Client (orchestrator queue) ────────────────────────────────────────
-        let client = StrandClient(
+        // ── StrandService: four queues sharing one notifier connection ──────────
+        let strand = StrandService(
             postgres: postgres,
-            queue: "gw-orchestrator",
-            namespace: "groundwater-pipeline",
-            options: StrandOptions(logger: logger)
+            options: .init(
+                queues: [
+                    // Orchestrator — top-level pipeline + discovery
+                    .init(
+                        name: "gw-orchestrator",
+                        namespace: "groundwater-pipeline",
+                        workflows: [GroundwaterPipelineWorkflow.self, StatsWorkflow.self],
+                        activities: [
+                            DiscoverActivity(postgres: postgres),
+                            DiscoverCountiesActivity(postgres: postgres),
+                        ],
+                        workflowConcurrency: 4,
+                        activityConcurrency: 8,
+                        claimTimeout: .seconds(120)
+                    ),
+                    // Ingestion — 20 concurrent chunk workflows × 40 download activities.
+                    // Each download can take 30–120 s; claimTimeout gives 10 min.
+                    .init(
+                        name: "gw-ingestion",
+                        namespace: "groundwater-pipeline",
+                        workflows: [IngestChunkWorkflow.self],
+                        activities: [DownloadAndInsertActivity(postgres: postgres)],
+                        workflowConcurrency: 20,
+                        activityConcurrency: 40,
+                        claimTimeout: .seconds(600)
+                    ),
+                    // Analytics — stats computation
+                    .init(
+                        name: "gw-analytics",
+                        namespace: "groundwater-pipeline",
+                        workflows: [StatsWorkflow.self],
+                        activities: [
+                            ComputeCountyStatsActivity(postgres: postgres),
+                            // DiscoverCountiesActivity runs inside StatsWorkflow on
+                            // gw-analytics so it must be registered here too.
+                            DiscoverCountiesActivity(postgres: postgres),
+                        ],
+                        workflowConcurrency: 10,
+                        activityConcurrency: 20,
+                        claimTimeout: .seconds(300)
+                    ),
+                    // AI — rate-limited; Ollama is the bottleneck
+                    .init(
+                        name: "gw-ai",
+                        namespace: "groundwater-pipeline",
+                        workflows: [AIAnalysisWorkflow.self],
+                        activities: [
+                            OllamaTrendActivity(postgres: postgres),
+                            FetchCountyStatsActivity(postgres: postgres),
+                        ],
+                        workflowConcurrency: 5,
+                        activityConcurrency: 10,
+                        claimTimeout: .seconds(180)
+                    ),
+                ],
+                logger: logger
+            )
         )
 
-        // ── Worker pool: orchestrator ──────────────────────────────────────────
-        let orchestratorWorker = StrandWorker(
-            postgres: postgres,
-            options: WorkerOptions(
-                queue: "gw-orchestrator",
-                namespace: "groundwater-pipeline",
-                workflowConcurrency: 4,
-                activityConcurrency: 8,
-                claimTimeout: .seconds(120)
-            ),
-            workflows: [GroundwaterPipelineWorkflow.self, StatsWorkflow.self],
-            activities: [
-                DiscoverActivity(postgres: postgres),
-                DiscoverCountiesActivity(postgres: postgres),
-            ],
-            logger: logger
-        )
-
-        // ── Worker pool: ingestion (high concurrency) ──────────────────────────
-        // 20 concurrent chunk workflows × up to 40 download activities.
-        // Each download can take 30–120s; claimTimeout gives 10 min.
-        let ingestionWorker = StrandWorker(
-            postgres: postgres,
-            options: WorkerOptions(
-                queue: "gw-ingestion",
-                namespace: "groundwater-pipeline",
-                workflowConcurrency: 20,
-                activityConcurrency: 40,
-                claimTimeout: .seconds(600)  // 10 min — long enough for 50k-row download
-            ),
-            workflows: [IngestChunkWorkflow.self],
-            activities: [DownloadAndInsertActivity(postgres: postgres)],
-            logger: logger
-        )
-
-        // ── Worker pool: analytics ──────────────────────────────────────────────────
-        let analyticsWorker = StrandWorker(
-            postgres: postgres,
-            options: WorkerOptions(
-                queue: "gw-analytics",
-                namespace: "groundwater-pipeline",
-                workflowConcurrency: 10,
-                activityConcurrency: 20,
-                claimTimeout: .seconds(300)
-            ),
-            workflows: [StatsWorkflow.self],
-            activities: [
-                ComputeCountyStatsActivity(postgres: postgres),
-                // DiscoverCountiesActivity runs inside StatsWorkflow on gw-analytics
-                // so it must be registered here, not only on gw-orchestrator.
-                DiscoverCountiesActivity(postgres: postgres),
-            ],
-            logger: logger
-        )
-
-        // ── Worker pool: AI (rate-limited — Ollama is the bottleneck) ──────────
-        let aiWorker = StrandWorker(
-            postgres: postgres,
-            options: WorkerOptions(
-                queue: "gw-ai",
-                namespace: "groundwater-pipeline",
-                workflowConcurrency: 5,
-                activityConcurrency: 10,
-                claimTimeout: .seconds(180)
-            ),
-            workflows: [AIAnalysisWorkflow.self],
-            activities: [
-                OllamaTrendActivity(postgres: postgres),
-                FetchCountyStatsActivity(postgres: postgres),
-            ],
-            logger: logger
-        )
+        let client = strand.client(queue: "gw-orchestrator", namespace: "groundwater-pipeline")
 
         // ── Pipeline launch task ───────────────────────────────────────────────────
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
         Task {
             do {
                 try await Task.sleep(for: .milliseconds(500))
-                try await client.verifySchema()
 
                 // Apply CNRA schema (idempotent — uses IF NOT EXISTS everywhere)
                 try await applySchema(postgres: postgres, logger: logger)
@@ -232,17 +214,9 @@ import Foundation
         }
 
         try await ServiceGroup(
-            configuration: .init(
-                services: [
-                    .init(service: postgres),
-                    .init(service: orchestratorWorker),
-                    .init(service: ingestionWorker),
-                    .init(service: analyticsWorker),
-                    .init(service: aiWorker),
-                ],
-                gracefulShutdownSignals: [.sigterm, .sigint],
-                logger: logger
-            )
+            services: [postgres, strand],
+            gracefulShutdownSignals: [.sigterm, .sigint],
+            logger: logger
         ).run()
 
         for await _ in stream {}
