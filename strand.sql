@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
 
     max_attempts    INTEGER,
     timeout_seconds INTEGER,                  -- per-attempt execution cap in seconds; NULL = worker's claimTimeout
+    heartbeat_timeout_seconds INTEGER,        -- max seconds between heartbeats; NULL = claimTimeout
     idempotency_key TEXT,
 
     -- Dispatch routing
@@ -199,6 +200,11 @@ CREATE TABLE IF NOT EXISTS strand.runs (
     -- Re-activation metadata (set when woken from an event wait)
     wake_event    TEXT,
     event_payload BYTEA,
+
+    -- Last heartbeat payload written by context.heartbeat(_:).
+    -- Loaded into ClaimedTask on the next attempt so the activity can resume
+    -- exactly where it left off. NULL until the activity first calls heartbeat(_:).
+    heartbeat_details BYTEA,
 
     failure_reason BYTEA,
 
@@ -336,6 +342,9 @@ CREATE INDEX IF NOT EXISTS strand_event_triggers_emission_idx
 CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
     ON strand.event_triggers (emission_id, task_id)
     WHERE emission_id IS NOT NULL;
+
+-- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS heartbeat_details BYTEA;
+-- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS heartbeat_timeout_seconds INTEGER;
 
 -- Migration for existing databases:
 -- ALTER TABLE strand.events DROP CONSTRAINT strand_events_pkey;

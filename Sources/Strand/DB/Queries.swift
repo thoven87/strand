@@ -157,6 +157,7 @@ enum Queries {
         priority: TaskPriority = .normal,
         scheduledAt: Date? = nil,
         timeoutSeconds: Int? = nil,
+        heartbeatTimeoutSeconds: Int? = nil,
         deadlineAt: Date? = nil,
         fairnessKey: String? = nil,
         fairnessWeight: Float = 1.0,
@@ -173,13 +174,14 @@ enum Queries {
                 """
                 INSERT INTO strand.tasks
                     (namespace_id, id, queue, name, params, headers, scheduling_metadata,
-                     retry_strategy, max_attempts, timeout_seconds, cancellation,
-                     idempotency_key, priority, fairness_key, fairness_weight,
+                     retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds,
+                     cancellation, idempotency_key, priority, fairness_key, fairness_weight,
                      state, kind, parent_task_id, deadline_at)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
                         \(headersBuffer), \(schedulingMetadata),
                         \(retryStrategyBuffer), \(maxAttempts),
-                        \(timeoutSeconds), \(cancellationBuffer), \(idempotencyKey), \(priority),
+                        \(timeoutSeconds), \(heartbeatTimeoutSeconds),
+                        \(cancellationBuffer), \(idempotencyKey), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
                         \(kind), \(parentTaskID), \(deadlineAt))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
@@ -259,6 +261,7 @@ enum Queries {
         let priority: TaskPriority
         let scheduledAt: Date?
         let timeoutSeconds: Int?
+        let heartbeatTimeoutSeconds: Int?
         let deadlineAt: Date?
         let fairnessKey: String?
         let fairnessWeight: Float
@@ -307,12 +310,12 @@ enum Queries {
             // typed parameter — one round-trip for all N tasks.
             var taskInterp = PostgresQuery.StringInterpolation(
                 literalCapacity: 300 + children.count * 256,
-                interpolationCount: children.count * 17
+                interpolationCount: children.count * 18
             )
             taskInterp.appendLiteral(
                 "INSERT INTO strand.tasks "
                     + "(namespace_id, id, queue, name, params, headers, "
-                    + "retry_strategy, max_attempts, timeout_seconds, "
+                    + "retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, "
                     + "idempotency_key, priority, fairness_key, fairness_weight, "
                     + "state, kind, parent_task_id, deadline_at) VALUES "
             )
@@ -336,6 +339,8 @@ enum Queries {
                 taskInterp.appendInterpolation(child.maxAttempts)
                 taskInterp.appendLiteral(", ")
                 taskInterp.appendInterpolation(child.timeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.heartbeatTimeoutSeconds)
                 taskInterp.appendLiteral(", ")
                 taskInterp.appendInterpolation(child.idempotencyKey)
                 taskInterp.appendLiteral(", ")
@@ -607,7 +612,7 @@ enum Queries {
                     lease_expires_at = NOW() + COALESCE(NULLIF(c.timeout_seconds, 0), \(claimTimeoutSeconds)) * INTERVAL '1 second',
                     started_at       = COALESCE(r.started_at, NOW())
                 FROM candidate c WHERE r.id = c.id
-                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload, r.available_at
+                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload, r.available_at, r.heartbeat_details
             ),
             task_upd AS (
                 UPDATE strand.tasks t
@@ -619,8 +624,8 @@ enum Queries {
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
                    c.wake_event, c.event_payload,
-                   t.parent_task_id, t.kind, t.timeout_seconds, t.scheduling_metadata,
-                   c.available_at
+                   t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
+                   t.scheduling_metadata, c.available_at, c.heartbeat_details
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
@@ -822,9 +827,9 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at, priority,
-                                       fairness_key, fairness_weight)
+                                       fairness_key, fairness_weight, heartbeat_details)
                 SELECT namespace_id, \(newRunID), task_id, queue, \(nextAttempt), \(newState), \(wakeAt),
-                       priority, fairness_key, fairness_weight
+                       priority, fairness_key, fairness_weight, heartbeat_details
                 FROM strand.runs WHERE id = \(runID)
                 """,
                 logger: logger
@@ -876,15 +881,26 @@ enum Queries {
     /// Extends the claim lease. Throws ``InternalError/cancelled`` if the run
     /// is no longer in 'running' state (task was cancelled or failed externally).
     /// Connection-level implementation — the single source of truth for claim extension.
+    /// `heartbeatDetails` is stored when non-nil; when nil the existing value is preserved
+    /// (`COALESCE(NULL, heartbeat_details) = heartbeat_details`).
     static func extendClaim(
         on conn: PostgresConnection,
         namespaceID: String,
         runID: UUID,
         extendBySeconds: Int,
+        heartbeatDetails: ByteBuffer? = nil,
         logger: Logger
     ) async throws {
         let stream = try await conn.query(
-            "UPDATE strand.runs SET lease_expires_at = NOW() + \(extendBySeconds) * INTERVAL '1 second' WHERE id = \(runID) AND state = \(TaskState.running) AND namespace_id = \(namespaceID) RETURNING id",
+            """
+            UPDATE strand.runs
+            SET lease_expires_at  = NOW() + \(extendBySeconds) * INTERVAL '1 second',
+                heartbeat_details = COALESCE(\(heartbeatDetails), heartbeat_details)
+            WHERE id = \(runID)
+              AND state = \(TaskState.running)
+              AND namespace_id = \(namespaceID)
+            RETURNING id
+            """,
             logger: logger
         )
         if try await stream.first(where: { _ in true }) == nil {
@@ -898,6 +914,7 @@ enum Queries {
         namespaceID: String,
         runID: UUID,
         extendBySeconds: Int,
+        heartbeatDetails: ByteBuffer? = nil,
         logger: Logger
     ) async throws {
         try await client.withConnection { conn in
@@ -906,6 +923,7 @@ enum Queries {
                 namespaceID: namespaceID,
                 runID: runID,
                 extendBySeconds: extendBySeconds,
+                heartbeatDetails: heartbeatDetails,
                 logger: logger
             )
         }
@@ -1831,11 +1849,20 @@ enum Queries {
                 """
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
                                        priority, fairness_key, fairness_weight,
-                                       kind, parent_task_id)
+                                       kind, parent_task_id, heartbeat_details)
                 SELECT namespace_id, \(newRunID), id, queue, \(nextAttempt), \(TaskState.pending), NOW(),
                        priority, fairness_key, fairness_weight,
-                       kind, parent_task_id
-                FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
+                       kind, parent_task_id,
+                       -- Carry over the last heartbeat checkpoint when continuing (resetHistory=false)
+                       -- so the activity can resume from its last progress marker.
+                       -- Clean-slate retries (resetHistory=true) start fresh with NULL.
+                       CASE WHEN NOT \(resetHistory)
+                            THEN (SELECT r.heartbeat_details FROM strand.runs r
+                                  WHERE r.task_id = t.id
+                                  ORDER BY r.attempt DESC LIMIT 1)
+                            ELSE NULL
+                       END
+                FROM strand.tasks t WHERE t.id = \(taskID) AND t.namespace_id = \(namespaceID)
                 """,
                 logger: logger
             )
