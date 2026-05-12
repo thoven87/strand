@@ -48,6 +48,22 @@ enum WorkflowCommand: Sendable {
     /// (replay fast-path). Non-suspending — the worker writes an EVENT_RECEIVED history event.
     case eventReceived(eventName: String)
 
+    /// Emitted by `waitForEvent` when the deadline elapsed without an event arriving.
+    /// Carries `seqNum` so `applyScheduleCommands` can write the TimeoutSentinel
+    /// checkpoint and `EVENT_WAIT_TIMED_OUT` history row atomically.
+    case eventWaitTimedOut(eventName: String, seqNum: Int)
+
+    /// Emitted by `condition(_:timeout:)` when the predicate became true.
+    /// `seqNum` is non-nil only for the timeout variant — used by `applyScheduleCommands`
+    /// to write the `ConditionResultSentinel` checkpoint and `CONDITION_MET` history row
+    /// atomically. `nil` for the no-timeout `condition(_:)` overload (no checkpoint guard).
+    case conditionMet(seqNum: Int?)
+
+    /// Emitted by `condition(_:timeout:)` when the deadline elapsed.
+    /// Always carries `seqNum` (the deadline checkpoint slot) so `applyScheduleCommands`
+    /// can atomically write the `ConditionResultSentinel` and `CONDITION_TIMED_OUT`.
+    case conditionTimedOut(seqNum: Int)
+
     /// Records that a child workflow result was delivered to the handler.
     /// Non-suspending — processed by the step-2 loop to write a `CHILD_WORKFLOW_COMPLETED`
     /// history event. A checkpoint is written alongside this command so the same

@@ -157,7 +157,88 @@ struct DDSketchTests {
         }
     }
 
-    // ── 7. Correctness constants ──────────────────────────────────────────
+    // ── 7. Serialized.merged ──────────────────────────────────────────────
+
+    @Test("Serialized.merged returns nil for an empty array")
+    func serializedMergedEmpty() {
+        #expect(DDSketch.Serialized.merged([]) == nil)
+    }
+
+    @Test("Serialized.merged of a single sketch is identity")
+    func serializedMergedSingle() {
+        var sketch = DDSketch()
+        for i in 1...100 { sketch.insert(Double(i)) }
+        let s = DDSketch.Serialized(from: sketch)
+        let merged = DDSketch.Serialized.merged([s])!
+
+        #expect(merged.size == s.size)
+        for q in [0.50, 0.95, 0.99] {
+            #expect(merged.quantile(q) == s.quantile(q), "q=\(q) diverged")
+        }
+    }
+
+    @Test("Serialized.merged combines sizes correctly")
+    func serializedMergedSize() {
+        var a = DDSketch()
+        var b = DDSketch()
+        for i in 1...300 { a.insert(Double(i)) }
+        for i in 301...500 { b.insert(Double(i)) }
+        let merged = DDSketch.Serialized.merged([
+            DDSketch.Serialized(from: a),
+            DDSketch.Serialized(from: b),
+        ])!
+        #expect(merged.size == 500)
+    }
+
+    @Test("Serialized.merged produces the same quantiles as a direct in-memory merge")
+    func serializedMergedQuantiles() {
+        // Build two non-overlapping sketches [1…500] and [501…1000] then merge
+        // both in-memory and via Serialized.merged. Quantiles must agree.
+        var a = DDSketch()
+        var b = DDSketch()
+        for i in 1...500 { a.insert(Double(i)) }
+        for i in 501...1000 { b.insert(Double(i)) }
+
+        // In-memory merge (the existing DDSketch.merge path)
+        var inMemory = a
+        inMemory.merge(b)
+
+        // Serialized merge
+        let serializedMerge = DDSketch.Serialized.merged([
+            DDSketch.Serialized(from: a),
+            DDSketch.Serialized(from: b),
+        ])!
+
+        #expect(serializedMerge.size == inMemory.count)
+        for q in [0.25, 0.50, 0.75, 0.95, 0.99] {
+            let fromMerged = serializedMerge.quantile(q)!
+            let fromInMemory = DDSketch.Serialized(from: inMemory).quantile(q)!
+            #expect(
+                fromMerged == fromInMemory,
+                "q=\(q): serialized=\(fromMerged) != in-memory=\(fromInMemory)"
+            )
+        }
+    }
+
+    @Test("Serialized.merged across many sketches accumulates all values")
+    func serializedMergedMany() {
+        // Split [1…1000] across 10 sketches of 100 values each.
+        let sketches: [DDSketch.Serialized] = (0..<10).map { chunk in
+            var s = DDSketch()
+            for i in (chunk * 100 + 1)...(chunk * 100 + 100) { s.insert(Double(i)) }
+            return DDSketch.Serialized(from: s)
+        }
+        let merged = DDSketch.Serialized.merged(sketches)!
+        #expect(merged.size == 1000)
+        // p50 of [1…1000] ≈ 500 ±2%
+        let p50 = merged.quantile(0.50)!
+        #expect(
+            p50 >= 500 * 0.98 && p50 <= 500 * 1.02,
+            "p50=\(p50) outside [490, 510]"
+        )
+    }
+
+    // ── 8. Correctness constants ──────────────────────────────────────────
 
     @Test("DDSketch constants satisfy the algebraic invariants of the 2% error specification")
     func constantsConsistency() {

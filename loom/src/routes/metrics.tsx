@@ -22,6 +22,7 @@ import type { DailyActivity, TaskKindEntry } from "@/api/workflows";
 import { getWorkers } from "@/api/workers";
 import type { Worker } from "@/api/workers";
 import { qk } from "@/lib/queryKeys";
+import { fmtDuration } from "@/lib/utils";
 
 // ── Formatters ────────────────────────────────────────────────────────────
 
@@ -56,15 +57,6 @@ function fmtRate(ratePerSec: number | null | undefined): string {
     if (perMin < 1) return "< 1/min";
     if (ratePerSec < 1) return `${perMin.toFixed(perMin < 10 ? 1 : 0)}/min`;
     return `${ratePerSec >= 10 ? ratePerSec.toFixed(0) : ratePerSec.toFixed(1)}/s`;
-}
-
-function fmtDuration(ms: number | null | undefined): string {
-    if (ms == null || !isFinite(ms) || ms < 0) return "—";
-    if (ms < 1000) return `${Math.round(ms)}ms`;
-    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-    const m = Math.floor(ms / 60_000);
-    const s = Math.floor((ms % 60_000) / 1000);
-    return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
 function fmtPct(ratio: number): string {

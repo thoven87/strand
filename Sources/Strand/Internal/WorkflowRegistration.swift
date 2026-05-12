@@ -407,18 +407,6 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     logger: exec.logger
                 )
                 activation.cacheCheckpoint(seqNum: seqNum, buffer: payload)
-            } else {
-                let sentinel = try JSON.encode(TimeoutSentinel())
-                try await Queries.batchSetCheckpoints(
-                    on: exec.postgres,
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    runID: claimed.runID,
-                    checkpoints: [(seqNum: seqNum, name: "waitForEvent:\(eventName):timeout", state: sentinel)],
-                    extendClaimBySeconds: claimTimeoutSecs,
-                    logger: exec.logger
-                )
-                activation.cacheCheckpoint(seqNum: seqNum, buffer: sentinel)
             }
         }
 

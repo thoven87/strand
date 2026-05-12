@@ -34,6 +34,20 @@ struct SleepCompletedSentinel: Codable {
     }
 }
 
+/// Checkpoint sentinel written when a `condition(timeout:)` call resolves (either
+/// predicate satisfied or deadline elapsed). Overrides the deadline checkpoint so
+/// replay can return the result immediately without re-evaluating the predicate.
+/// Stored in the same `seqNum` slot as the deadline timestamp.
+struct ConditionResultSentinel: Codable {
+    /// `true` = predicate was satisfied; `false` = deadline elapsed.
+    let met: Bool
+    private enum CodingKeys: String, CodingKey { case met = "$conditionMet" }
+    /// Returns the stored result if `buffer` contains this sentinel, `nil` otherwise.
+    static func detect(in buffer: ByteBuffer) -> Bool? {
+        (try? JSON.decode(ConditionResultSentinel.self, from: buffer))?.met
+    }
+}
+
 // MARK: - _WorkflowActivation
 
 /// Holds all mutable per-activation state for a single workflow execution attempt.
@@ -590,13 +604,9 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 _impl.executor.emit(.eventReceived(eventName: name))
                 return try JSON.decode(T.self, from: payload)
             } else {
-                // Woken by timeout — write sentinel so replay fast-paths correctly,
-                // then throw the user-facing error type (not StrandError).
-                let sentinel = try JSON.encode(TimeoutSentinel())
-                _impl.checkpointCache[seqNum] = sentinel
-                _impl.executor.emit(
-                    .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: sentinel)
-                )
+                // Woken by timeout — applyScheduleCommands writes the sentinel checkpoint
+                // and EVENT_WAIT_TIMED_OUT history row atomically via writeEventWaitTimedOut.
+                _impl.executor.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
                 throw EventWaitTimeoutError(eventName: name)
             }
         }
@@ -627,7 +637,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 _impl.executor.suspendEvent(seqNum: seqNum, eventName: name, continuation: cont)
             }
         } catch let err as StrandError {
-            if case .timeout = err { throw EventWaitTimeoutError(eventName: name) }
+            if case .timeout = err {
+                _impl.executor.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
+                throw EventWaitTimeoutError(eventName: name)
+            }
             throw err
         }
 
@@ -749,6 +762,11 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
             _impl.executor.linkConditionContinuation(cont, forID: id)
         }
+        // No seqNum / no completion sentinel — no-timeout conditions have no checkpoint
+        // guard, so conditionMet may appear more than once in history across replays.
+        // This is benign: ON CONFLICT DO NOTHING in appendHistory prevents duplicate rows
+        // for the same seq, and executionHistorySpansForTrace uses only the first CONDITION_MET.
+        _impl.executor.emit(.conditionMet(seqNum: nil))
     }
 
     /// Suspends the workflow until `predicate` evaluates `true` on current state,
@@ -780,6 +798,11 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         let seqNum = _impl.nextSeqNum()
         let wakeAt: Date
         if let cached = _impl.checkpointCache[seqNum] {
+            // Completion sentinel — condition already resolved in a prior activation.
+            if let result = ConditionResultSentinel.detect(in: cached) {
+                return result
+            }
+            // Not a completion sentinel: must be the deadline timestamp.
             let ts = (try? JSON.decode(Double.self, from: cached)) ?? 0
             wakeAt = Date(timeIntervalSince1970: ts)
         } else {
@@ -796,7 +819,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Deadline already passed — re-activation after the sleep timer fired
         // with the predicate still `false`. Return false immediately.
+        // Emit conditionTimedOut so applyScheduleCommands writes the completion
+        // sentinel and CONDITION_TIMED_OUT history row atomically.
         if Date.now >= wakeAt {
+            _impl.executor.emit(.conditionTimedOut(seqNum: seqNum))
             return false
         }
 
@@ -808,9 +834,16 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             wakeAt: wakeAt,
             timeout: timeout
         )
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
+        let result = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
             _impl.executor.linkConditionContinuation(cont, forID: id)
         }
+        // Record the result so applyScheduleCommands writes sentinel + history atomically.
+        if result {
+            _impl.executor.emit(.conditionMet(seqNum: seqNum))
+        } else {
+            _impl.executor.emit(.conditionTimedOut(seqNum: seqNum))
+        }
+        return result
     }
 
     // MARK: - continueAsNew

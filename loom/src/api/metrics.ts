@@ -37,6 +37,28 @@ export interface MetricsData {
     windowHours: number;
 }
 
+export interface TaskMetrics {
+    taskName: string;
+    completedCount: number;
+    failedCount: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+    p99Ms: number | null;
+    p50WaitMs: number | null;
+    p95WaitMs: number | null;
+    ratePerSec: number | null;
+}
+
+export const getTaskMetrics = (
+    namespace: string,
+    taskName: string,
+): Promise<TaskMetrics> =>
+    api
+        .get<TaskMetrics>(
+            `/api/${namespace}/metrics/task/${encodeURIComponent(taskName)}`,
+        )
+        .then((r) => r.data);
+
 export const getMetrics = (
     namespace: string,
     hours = 24,

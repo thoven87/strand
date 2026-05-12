@@ -30,21 +30,26 @@ struct EventRoutes {
                 Date(timeIntervalSince1970: $0)
             }
 
-            let since: Date? = qp.get("since").flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
-            let page = try await ManagementQueries.listEventsGlobal(
-                on: self.postgres,
-                namespaceID: ctx.namespaceID,
-                queue: queue,
-                name: name,
-                since: since,
-                cursor: cursor,
-                limit: min(limit, 200),
-                logger: self.client.logger
-            )
-            return CursorPageResponse(
-                items: page.items.map(EventResponse.init),
-                nextCursor: page.nextCursor
-            )
+            do {
+                let since: Date? = qp.get("since").flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
+                let page = try await ManagementQueries.listEventsGlobal(
+                    on: self.postgres,
+                    namespaceID: ctx.namespaceID,
+                    queue: queue,
+                    name: name,
+                    since: since,
+                    cursor: cursor,
+                    limit: min(limit, 200),
+                    logger: self.client.logger
+                )
+                return CursorPageResponse(
+                    items: page.items.map(EventResponse.init),
+                    nextCursor: page.nextCursor
+                )
+            } catch {
+                client.logger.error("Failed to list events:", metadata: ["error": "\(String(reflecting: error))"])
+                throw error
+            }
         }
 
         router.get("queues/:queue/events") { req, ctx -> CursorPageResponse<EventResponse> in

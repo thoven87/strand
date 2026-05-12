@@ -9,6 +9,7 @@ import {
 } from "@tanstack/react-router";
 import { getTask, cancelTask, requeueTask, getChildTasks } from "@/api/tasks";
 import { getEventTriggerForTask } from "@/api/events";
+import { getTaskMetrics, type TaskMetrics } from "@/api/metrics";
 import { RetryDialog } from "@/components/RetryDialog";
 import { SignalDialog } from "@/components/SignalDialog";
 import type { RetryOptions } from "@/api/types";
@@ -36,6 +37,7 @@ import {
 } from "lucide-react";
 import { TriggerDialog } from "@/components/TriggerDialog";
 import type { Checkpoint, Run, TaskState, HistoryEvent } from "@/api/types";
+import { fmtDuration } from "@/lib/utils";
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -176,14 +178,6 @@ function FailureReasonView({ raw }: { raw: string }) {
 const isTerminal = (s: string) =>
     ["COMPLETED", "FAILED", "CANCELLED", "CONTINUED_AS_NEW"].includes(s);
 
-function formatDurationMs(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
-    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-    const m = Math.floor(ms / 60_000);
-    const s = Math.floor((ms % 60_000) / 1000);
-    return s > 0 ? `${m}m ${s}s` : `${m}m`;
-}
-
 function taskDurationMs(
     startAt: string, // firstRunAt ?? createdAt
     completedAt: string | null,
@@ -228,9 +222,9 @@ function eventSummary(_type: string, raw: string | null): string | null {
         if (typeof d.name === "string") return d.name;
         // Event-received / event-wait events carry `event_name`.
         if (typeof d.event_name === "string") return d.event_name;
-        // Timer-started carries `duration_ms`.
+        // Timer-started carries `duration_ms` — format as human-readable duration.
         if (typeof d.duration_ms === "number")
-            return `${(d.duration_ms as number).toLocaleString()} ms`;
+            return fmtDuration(d.duration_ms as number);
         return null;
     } catch {
         return null;
@@ -405,7 +399,7 @@ function ActivityTimeline({
                                         {isExpanded ? "▴" : "▾"}
                                     </span>
                                     <span className="text-[11px] text-muted-foreground/60 ml-auto shrink-0 tabular-nums">
-                                        +{formatDurationMs(offsetMs)}
+                                        +{fmtDuration(offsetMs)}
                                     </span>
                                 </div>
                             </div>
@@ -483,10 +477,7 @@ function ActivityTimeline({
                                                     </span>
                                                 )}
                                                 <span className="text-[11px] text-muted-foreground/60 ml-auto shrink-0 tabular-nums">
-                                                    +
-                                                    {formatDurationMs(
-                                                        evtOffsetMs,
-                                                    )}
+                                                    +{fmtDuration(evtOffsetMs)}
                                                 </span>
                                             </div>
                                         </div>
@@ -561,7 +552,7 @@ function ChildActivities({
                                 {child.name}
                             </Link>
                             <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">
-                                {formatDurationMs(childDurationMs)}
+                                {fmtDuration(childDurationMs)}
                             </span>
                             {/* Mini Gantt bar */}
                             <div className="relative w-24 h-2 bg-secondary/40 rounded-full shrink-0 overflow-hidden">
@@ -673,7 +664,7 @@ function RunRow({
               new Date(run.startedAt).getTime()
             : null;
 
-    const duration = ms !== null ? formatDurationMs(ms) : null;
+    const duration = ms !== null ? fmtDuration(ms) : null;
 
     return (
         <div className="rounded border border-border/60 overflow-hidden">
@@ -896,6 +887,14 @@ export function TaskDetailPage() {
         enabled: !!task,
     });
 
+    const { data: taskMetrics } = useQuery<TaskMetrics>({
+        queryKey: [...qk.tasks.detail(namespace, queue, taskId), "metrics"],
+        queryFn: () => getTaskMetrics(namespace, task!.name),
+        enabled: !!task,
+        staleTime: 15_000,
+        refetchInterval: 30_000,
+    });
+
     const [runsOpen, setRunsOpen] = useState(false);
     const [stateOpen, setStateOpen] = useState(false);
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
@@ -1069,7 +1068,7 @@ export function TaskDetailPage() {
                     <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground flex-wrap">
                         {durationMs !== null ? (
                             <span className="text-foreground font-medium">
-                                {formatDurationMs(durationMs)}
+                                {fmtDuration(durationMs)}
                             </span>
                         ) : !terminal && task.firstRunAt ? (
                             <LiveTimer
@@ -1180,10 +1179,92 @@ export function TaskDetailPage() {
                 </div>
             </div>
 
-            {/* ── Schedule card (full width, below header) ──────────────────── */}
+            {/* ── Schedule card (full width, below header) ────────────────── */}
             {task.scheduling && <ScheduleCard scheduling={task.scheduling} />}
 
-            {/* ── Woken by event card ──────────────────────────────────── */}
+            {/* Performance metrics — sourced from DDSketch broadcast */}
+            {taskMetrics &&
+                (taskMetrics.p50Ms != null ||
+                    taskMetrics.completedCount > 0) && (
+                    <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3">
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-2.5">
+                            Performance
+                        </p>
+                        <div className="flex flex-wrap gap-x-6 gap-y-1.5">
+                            {taskMetrics.p50Ms != null && (
+                                <div>
+                                    <span className="text-[10px] text-muted-foreground">
+                                        p50{" "}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-foreground">
+                                        {taskMetrics.p50Ms < 1000
+                                            ? `${Math.round(taskMetrics.p50Ms)}ms`
+                                            : `${(taskMetrics.p50Ms / 1000).toFixed(1)}s`}
+                                    </span>
+                                </div>
+                            )}
+                            {taskMetrics.p95Ms != null && (
+                                <div>
+                                    <span className="text-[10px] text-muted-foreground">
+                                        p95{" "}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-foreground">
+                                        {taskMetrics.p95Ms < 1000
+                                            ? `${Math.round(taskMetrics.p95Ms)}ms`
+                                            : `${(taskMetrics.p95Ms / 1000).toFixed(1)}s`}
+                                    </span>
+                                </div>
+                            )}
+                            {taskMetrics.p99Ms != null && (
+                                <div>
+                                    <span className="text-[10px] text-muted-foreground">
+                                        p99{" "}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-foreground">
+                                        {taskMetrics.p99Ms < 1000
+                                            ? `${Math.round(taskMetrics.p99Ms)}ms`
+                                            : `${(taskMetrics.p99Ms / 1000).toFixed(1)}s`}
+                                    </span>
+                                </div>
+                            )}
+                            {taskMetrics.ratePerSec != null && (
+                                <div>
+                                    <span className="text-[10px] text-muted-foreground">
+                                        rate{" "}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-foreground">
+                                        {taskMetrics.ratePerSec.toFixed(2)}/s
+                                    </span>
+                                </div>
+                            )}
+                            {taskMetrics.completedCount > 0 && (
+                                <div>
+                                    <span className="text-[10px] text-muted-foreground">
+                                        ok{" "}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-green-400">
+                                        {taskMetrics.completedCount}
+                                    </span>
+                                </div>
+                            )}
+                            {taskMetrics.failedCount > 0 && (
+                                <div>
+                                    <span className="text-[10px] text-muted-foreground">
+                                        fail{" "}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-red-400">
+                                        {taskMetrics.failedCount}
+                                    </span>
+                                </div>
+                            )}
+                        </div>
+                        <p className="text-[9px] text-muted-foreground/40 mt-2">
+                            From broadcast window · refreshes every 30s
+                        </p>
+                    </div>
+                )}
+
+            {/* ── Woken by event card ─────────────────────────────── */}
             {eventTrigger && (
                 <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3 flex items-center gap-3">
                     <div className="w-2 h-2 rounded-full bg-purple-400 shrink-0" />
@@ -1254,11 +1335,11 @@ export function TaskDetailPage() {
                 </div>
             </div>
 
-            {/* ── Activity Timeline (workflows only) ──────────────────────── */}
+            {/* ── Run Timeline (workflows only) ──────────────────────────── */}
             {isWorkflow && (
                 <section>
                     <h2 className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
-                        Execution Timeline
+                        Run Timeline
                     </h2>
                     <div className="rounded-lg border border-border bg-card/40 p-4">
                         <ActivityTimeline

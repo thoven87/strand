@@ -280,6 +280,9 @@ package enum WorkflowStateQueries {
         case conditionWaiting = "CONDITION_WAITING"
         case eventWaitStarted = "EVENT_WAIT_STARTED"
         case eventReceived = "EVENT_RECEIVED"
+        case eventWaitTimedOut = "EVENT_WAIT_TIMED_OUT"
+        case conditionMet = "CONDITION_MET"
+        case conditionTimedOut = "CONDITION_TIMED_OUT"
         case childWorkflowStarted = "CHILD_WORKFLOW_STARTED"
         case childWorkflowCompleted = "CHILD_WORKFLOW_COMPLETED"
         case eventEmitted = "EVENT_EMITTED"  // ctx.emitEvent(...)
@@ -328,14 +331,26 @@ package enum WorkflowStateQueries {
         }
     }
 
-    /// Payload for `EVENT_WAIT_STARTED` and `EVENT_RECEIVED`.
+    /// Payload for `EVENT_WAIT_STARTED`, `EVENT_RECEIVED`, and `EVENT_WAIT_TIMED_OUT`.
     ///
-    /// JSON shape: `{"event_name":"order.approved"}`.
+    /// JSON shape: `{"event_name":"order.approved"}` for received/timed-out rows;
+    /// `{"event_name":"order.approved","timeout_at":"2026-05-12T06:27:54Z"}` for
+    /// started rows where a deadline was configured. `timeout_at` is omitted when
+    /// `waitForEvent` was called without a timeout (`nil`).
     package struct NamedEventData: Codable {
         package let eventName: String
+        /// Absolute deadline passed to `waitForEvent(timeout:)`. Nil when no
+        /// timeout was set. Written only on `EVENT_WAIT_STARTED` rows.
+        package let timeoutAt: Date?
+
+        package init(eventName: String, timeoutAt: Date? = nil) {
+            self.eventName = eventName
+            self.timeoutAt = timeoutAt
+        }
 
         private enum CodingKeys: String, CodingKey {
             case eventName = "event_name"
+            case timeoutAt = "timeout_at"
         }
     }
 
@@ -366,6 +381,28 @@ package enum WorkflowStateQueries {
     }
 
     /// Appends a single event to this workflow's history log.
+    /// Connection overload — SQL lives here.
+    package static func appendHistory(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        taskID: UUID,
+        seq: Int,
+        eventType: HistoryEventType,
+        eventData: ByteBuffer?,
+        logger: Logger
+    ) async throws {
+        let rawType = eventType.rawValue
+        try await conn.query(
+            """
+            INSERT INTO strand.workflow_history (namespace_id, task_id, seq, event_type, event_data)
+            VALUES (\(namespaceID), \(taskID), \(seq), \(rawType), \(eventData))
+            ON CONFLICT (task_id, seq) DO NOTHING
+            """,
+            logger: logger
+        )
+    }
+
+    /// Client overload — one-liner that delegates.
     package static func appendHistory(
         on postgres: PostgresClient,
         namespaceID: String,
@@ -375,15 +412,17 @@ package enum WorkflowStateQueries {
         eventData: ByteBuffer?,
         logger: Logger
     ) async throws {
-        let rawType = eventType.rawValue
-        try await postgres.query(
-            """
-            INSERT INTO strand.workflow_history (namespace_id, task_id, seq, event_type, event_data)
-            VALUES (\(namespaceID), \(taskID), \(seq), \(rawType), \(eventData))
-            ON CONFLICT (task_id, seq) DO NOTHING
-            """,
-            logger: logger
-        )
+        try await postgres.withConnection { conn in
+            try await appendHistory(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seq: seq,
+                eventType: eventType,
+                eventData: eventData,
+                logger: logger
+            )
+        }
     }
 
     // MARK: - listHistory
