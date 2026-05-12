@@ -17,6 +17,7 @@ extension SchedulePattern {
         case .daily: return "daily"
         case .weekly: return "weekly"
         case .monthly: return "monthly"
+        case .yearly: return "yearly"
         case .once: return "once"
         }
     }
@@ -104,6 +105,15 @@ struct ScheduleRunResponse: Codable, Sendable {
 }
 extension ScheduleRunResponse: ResponseCodable {}
 
+// MARK: - Upcoming response
+
+/// One upcoming fire-time slot returned by `GET /api/:namespace/schedules/:id/upcoming`.
+struct UpcomingSlotResponse: Codable, Sendable {
+    /// The wall-clock UTC time when this slot will fire.
+    let slot: Date
+}
+extension UpcomingSlotResponse: ResponseCodable {}
+
 // MARK: - Routes
 
 struct ScheduleRoutes {
@@ -114,9 +124,15 @@ struct ScheduleRoutes {
         // GET /api/:namespace/schedules?queue=
         router.get("schedules") { req, ctx -> [ScheduleSummaryResponse] in
             let queue = req.uri.queryParameters.get("queue")
+            let limit = req.uri.queryParameters.get("limit").flatMap(Int.init) ?? 200
+            let afterQueue = req.uri.queryParameters.get("afterQueue")
+            let afterName = req.uri.queryParameters.get("afterName")
             let summaries = try await self.client.listSchedules(
                 queue: queue,
-                namespaceID: ctx.namespaceID
+                namespaceID: ctx.namespaceID,
+                limit: min(limit, 500),
+                afterQueue: afterQueue,
+                afterName: afterName
             )
             return summaries.map(ScheduleSummaryResponse.init)
         }
@@ -124,11 +140,12 @@ struct ScheduleRoutes {
         // GET /api/:namespace/schedules/:id
         router.get("schedules/:id") { _, ctx -> ScheduleDetailResponse in
             let uuid = try ctx.parameters.require("id", as: UUID.self)
-            let summaries = try await self.client.listSchedules(
-                queue: nil,
-                namespaceID: ctx.namespaceID
-            )
-            guard let s = summaries.first(where: { $0.id == uuid }) else {
+            guard
+                let s = try await self.client.getSchedule(
+                    id: uuid,
+                    namespaceID: ctx.namespaceID
+                )
+            else {
                 throw HTTPError(.notFound, message: "Schedule not found")
             }
             return ScheduleDetailResponse(from: s)
@@ -149,10 +166,14 @@ struct ScheduleRoutes {
         // POST /api/:namespace/schedules/:id/resume
         router.post("schedules/:id/resume") { _, ctx -> SimpleResponse in
             let uuid = try ctx.parameters.require("id", as: UUID.self)
+            // Default: skip slots missed during the pause and resume from now.
+            // Clients that want to replay missed slots should omit or send a
+            // custom recomputeFrom via a future query param.
             try await ScheduleQueries.resumeSchedule(
                 on: self.client.postgres,
                 namespaceID: ctx.namespaceID,
                 id: uuid,
+                recomputeFrom: Date.now,
                 logger: self.client.logger
             )
             return SimpleResponse(message: "resumed", id: uuid.uuidString)
@@ -162,38 +183,59 @@ struct ScheduleRoutes {
         router.get("schedules/:id/runs") { req, ctx -> [ScheduleRunResponse] in
             let scheduleID = try ctx.parameters.require("id", as: UUID.self)
             let limit = req.uri.queryParameters.get("limit").flatMap(Int.init) ?? 20
-
-            let prefix = "$schedule:\(scheduleID):"
-            let stream = try await self.client.postgres.query(
-                """
-                SELECT id, state, attempt, created_at, completed_at
-                FROM strand.tasks
-                WHERE namespace_id = \(ctx.namespaceID)
-                  AND idempotency_key LIKE \(prefix + "%")
-                ORDER BY created_at DESC
-                LIMIT \(min(limit, 100))
-                """,
+            let runs = try await ScheduleQueries.listScheduleRuns(
+                on: self.client.postgres,
+                namespaceID: ctx.namespaceID,
+                scheduleID: scheduleID,
+                limit: limit,
                 logger: self.client.logger
             )
-            var rows: [ScheduleRunResponse] = []
-            for try await row in stream {
-                var col = row.makeIterator()
-                let id = try col.next()!.decode(UUID.self, context: .default)
-                let state = try col.next()!.decode(String.self, context: .default)
-                let attempt = try col.next()!.decode(Int.self, context: .default)
-                let createdAt = try col.next()!.decode(Date.self, context: .default)
-                let completedAt = try col.next()!.decode(Date?.self, context: .default)
-                rows.append(
-                    ScheduleRunResponse(
-                        id: id.uuidString,
-                        state: state,
-                        attempt: attempt,
-                        createdAt: createdAt,
-                        completedAt: completedAt
-                    )
+            return runs.map { row in
+                ScheduleRunResponse(
+                    id: row.id.uuidString,
+                    state: row.state,
+                    attempt: row.attempt,
+                    createdAt: row.createdAt,
+                    completedAt: row.completedAt
                 )
             }
-            return rows
+        }
+
+        // GET /api/:namespace/schedules/:id/upcoming?count=5
+        // Returns the next N scheduled fire times starting from nextRunAt.
+        // Uses ScheduleCalculator.nextRunTime to iterate forward from the schedule's
+        // current nextRunAt so the list is always in sync with what the scheduler
+        // will actually fire next.
+        router.get("schedules/:id/upcoming") { req, ctx -> [UpcomingSlotResponse] in
+            let uuid = try ctx.parameters.require("id", as: UUID.self)
+            let count = min(req.uri.queryParameters.get("count").flatMap(Int.init) ?? 5, 20)
+            guard
+                let s = try await self.client.getSchedule(
+                    id: uuid,
+                    namespaceID: ctx.namespaceID
+                )
+            else {
+                throw HTTPError(.notFound, message: "Schedule not found")
+            }
+            // If the schedule has no nextRunAt (e.g. paused before ever firing, or
+            // endsAt has passed), return an empty list rather than an error.
+            guard let nextRunAt = s.nextRunAt else { return [] }
+            var slots: [UpcomingSlotResponse] = []
+            // Start the iteration one millisecond before nextRunAt so that
+            // nextRunTime(after:) returns nextRunAt itself as the first result.
+            var cursor = nextRunAt.addingTimeInterval(-0.001)
+            for _ in 0..<count {
+                guard
+                    let next = try? ScheduleCalculator.nextRunTime(
+                        for: s.pattern,
+                        after: cursor,
+                        timezone: s.pattern.timezone
+                    )
+                else { break }
+                slots.append(UpcomingSlotResponse(slot: next))
+                cursor = next
+            }
+            return slots
         }
 
         // DELETE /api/:namespace/schedules/:id

@@ -37,6 +37,9 @@
 
     --color-card: hsl(var(--card));
     --color-card-foreground: hsl(var(--card-foreground));
+    --color-sidebar: hsl(var(--sidebar));
+    --color-sidebar-item-active: hsl(var(--sidebar-item-active));
+    --color-main-bg: hsl(var(--main-bg));
 
     /* Border radius */
     --radius-lg: var(--radius);
@@ -72,6 +75,11 @@
     --ring: 222.2 84% 4.9%;
     --radius: 0.5rem;
     --brand: 212 100% 60%;
+    /* Sidebar surface */
+    --sidebar: 220 18% 96%;
+    --sidebar-item-active: 220 14% 88%;
+    /* Main shell content area */
+    --main-bg: 0 0% 100%;
 }
 
 /* ── CSS custom properties (dark theme) ─────────────────────────── */
@@ -96,6 +104,11 @@
     --input: 217.2 32.6% 17.5%;
     --ring: 212.7 26.8% 83.9%;
     --brand: 212 100% 60%;
+    /* Sidebar surface — slate-950 (#020617) = hsl(229,84%,5%) */
+    --sidebar: 229 84% 5%;
+    --sidebar-item-active: 215 28% 17%;
+    /* Main shell content area — original #050A23 ≈ hsl(230,75%,8%) */
+    --main-bg: 230 75% 8%;
 }
 
 /* ── Base resets ─────────────────────────────────────────────────── */

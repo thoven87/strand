@@ -1,6 +1,4 @@
 import { useState } from "react";
-import { cn } from "@/lib/utils";
-import { WorkflowDag } from "@/components/WorkflowDag";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -57,8 +55,6 @@ export function TaskTracePage() {
     });
 
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
-    const [activeView, setActiveView] = useState<"tree" | "dag">("tree");
-
     const cancelMutation = useMutation({
         mutationFn: () => cancelTask(namespace, queue, taskId),
         onSuccess: () => {
@@ -103,6 +99,13 @@ export function TaskTracePage() {
             params: { namespace, taskId: spanTaskId },
             search: queue ? { queue } : {},
         });
+    };
+
+    const handleViewEmission = (emissionId: string) => {
+        // Copy emission ID to clipboard and open the events page so the user
+        // can find the emission row (currently no direct permalink per emission).
+        void navigator.clipboard.writeText(emissionId).catch(() => undefined);
+        window.location.href = `/${namespace}/events`;
     };
 
     const terminal = task ? isTerminal(task.state) : false;
@@ -176,24 +179,6 @@ export function TaskTracePage() {
                 </div>
             </div>
 
-            {/* ── View tabs ───────────────────────────────────────────────── */}
-            <div className="shrink-0 border-b border-border px-4 flex items-center gap-1 bg-background">
-                {(["tree", "dag"] as const).map((v) => (
-                    <button
-                        key={v}
-                        onClick={() => setActiveView(v)}
-                        className={cn(
-                            "px-3 py-2 text-xs font-medium transition-colors border-b-2 -mb-px",
-                            activeView === v
-                                ? "border-brand text-foreground"
-                                : "border-transparent text-muted-foreground hover:text-foreground",
-                        )}
-                    >
-                        {v === "tree" ? "Timeline" : "Graph"}
-                    </button>
-                ))}
-            </div>
-
             {/* ── Trace body ─────────────────────────────────────────────────── */}
             {/* flex-1 + min-h-0 lets the view fill all remaining height without
           overflowing — min-h-0 overrides the default flex min-height:auto  */}
@@ -214,47 +199,48 @@ export function TaskTracePage() {
                     </div>
                 )}
 
-                {traceSpans &&
-                    traceSpans.length > 0 &&
-                    activeView === "tree" && (
-                        <TraceTree
-                            spans={traceSpans}
-                            totalMs={rootDurationMs}
-                            isLive={!terminal}
-                            traceStartEpochMs={
-                                task?.createdAt
-                                    ? new Date(task.createdAt).getTime()
-                                    : undefined
+                {traceSpans && traceSpans.length > 0 && (
+                    <TraceTree
+                        spans={traceSpans}
+                        totalMs={rootDurationMs}
+                        isLive={!terminal}
+                        traceStartEpochMs={
+                            task?.createdAt
+                                ? new Date(task.createdAt).getTime()
+                                : undefined
+                        }
+                        className="h-full"
+                        onViewTask={handleViewTask}
+                        onViewEmission={handleViewEmission}
+                        rootSummary={
+                            task
+                                ? {
+                                      name: task.name,
+                                      state: task.state,
+                                      createdAt: task.createdAt,
+                                      startedAt: task.firstRunAt ?? undefined,
+                                      completedAt:
+                                          task.completedAt ?? undefined,
+                                  }
+                                : undefined
+                        }
+                        onLoadSpanDetail={async (spanTaskId) => {
+                            try {
+                                const t = await getTask(
+                                    namespace,
+                                    queue || "",
+                                    spanTaskId,
+                                );
+                                return {
+                                    input: t.params ?? null,
+                                    output: t.result ?? null,
+                                };
+                            } catch {
+                                return { input: null, output: null };
                             }
-                            className="h-full"
-                            onViewTask={handleViewTask}
-                            onLoadSpanDetail={async (spanTaskId) => {
-                                try {
-                                    const t = await getTask(
-                                        namespace,
-                                        queue || "",
-                                        spanTaskId,
-                                    );
-                                    return {
-                                        input: t.params ?? null,
-                                        output: t.result ?? null,
-                                    };
-                                } catch {
-                                    return { input: null, output: null };
-                                }
-                            }}
-                        />
-                    )}
-
-                {traceSpans &&
-                    traceSpans.length > 0 &&
-                    activeView === "dag" && (
-                        <WorkflowDag
-                            spans={traceSpans}
-                            totalMs={rootDurationMs}
-                            onViewTask={handleViewTask}
-                        />
-                    )}
+                        }}
+                    />
+                )}
             </div>
 
             {task && (

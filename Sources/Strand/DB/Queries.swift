@@ -456,25 +456,46 @@ enum Queries {
             // ── 7. Register event_waits for all children — one unnest statement ─────────
             // unnest zips the two arrays row-by-row: one INSERT for all N children.
             // [Int] encodes as int8[]; Postgres silently casts to the int4 column.
+            //
+            // namespace_id MUST be included: omitting it gives DEFAULT='default',
+            // which breaks cross-namespace isolation and causes emitTaskCompletionSignal
+            // to mis-match or leave orphaned rows when the parent namespace differs.
             let ewSeqNums = result.map { $0.seqNum }
             let ewChildIDs = result.map { $0.taskID }
             try await conn.query(
                 """
                 INSERT INTO strand.event_waits
-                    (task_id, run_id, queue, seq_num, child_task_id, timeout_at)
-                SELECT \(parentTaskID), \(parentRunID), \(parentQueue),
+                    (namespace_id, task_id, run_id, queue, seq_num, child_task_id, timeout_at)
+                SELECT \(namespaceID), \(parentTaskID), \(parentRunID), \(parentQueue),
                        u.seq_num, u.child_task_id, NULL
                 FROM unnest(\(ewSeqNums), \(ewChildIDs)) AS u(seq_num, child_task_id)
                 ON CONFLICT (run_id, seq_num) DO UPDATE
-                    SET child_task_id = EXCLUDED.child_task_id,
-                        timeout_at    = NULL
+                    SET child_task_id  = EXCLUDED.child_task_id,
+                        namespace_id   = EXCLUDED.namespace_id,
+                        timeout_at     = NULL
                 """,
                 logger: logger
             )
 
             // ── 8. Atomic completion-check + parent-run state transition ─────────────
-            // If ANY child has already completed, delete its event_wait and go PENDING
-            // immediately.  Otherwise park the parent as WAITING.
+            //
+            // State decision:
+            //   • ALL batch children completed (completedCount == result.count)
+            //     → PENDING: delete orphaned event_waits, wake immediately.
+            //   • SOME children still running (completedCount < result.count)
+            //     → WAITING: park until emitTaskCompletionSignal fires for each one.
+            //
+            // The condition is completedCount == result.count (not > 0) because
+            // a partial completion must keep the run WAITING. Transitioning to
+            // PENDING while sibling children are still running would cause
+            // RUNNING → PENDING → RUNNING loops on every subsequent completion.
+            //
+            // Guard: AND state != SLEEPING
+            //   Prevents overwriting a SLEEPING state that .awaitEvent (waitForEvent /
+            //   sleep) already set in the same applyScheduleCommands loop. Without this
+            //   guard, replay activations that emit both .scheduleActivity (fast-pathed
+            //   completed activities) AND .awaitEvent would have the named-event sleep
+            //   immediately overwritten by PENDING.
             let childTaskIDs = result.map { $0.taskID }
             let completedStream = try await conn.query(
                 "SELECT COUNT(*) FROM strand.task_completions WHERE task_id = ANY(\(childTaskIDs))",
@@ -486,48 +507,37 @@ enum Queries {
                 completedCount = try col.next()!.decode(Int.self, context: .default)
             }
 
-            if completedCount > 0 {
-                try await conn.query(
-                    """
-                    WITH
-                    del_orphans AS (
-                        DELETE FROM strand.event_waits ew
-                        USING strand.task_completions tc
-                        WHERE ew.run_id        = \(parentRunID)
-                          AND ew.child_task_id = tc.task_id
-                          AND tc.task_id       = ANY(\(childTaskIDs))
-                    ),
-                    r AS (
-                        UPDATE strand.runs
-                        SET state        = \(TaskState.pending),
-                            available_at = NOW(),
-                            worker_id    = NULL,
-                            lease_expires_at = NULL
-                        WHERE id = \(parentRunID)
-                        RETURNING id
-                    )
-                    UPDATE strand.tasks SET state = \(TaskState.pending)
-                    WHERE id = \(parentTaskID)
-                    """,
-                    logger: logger
+            let allDone = completedCount == result.count
+            let newState = allDone ? TaskState.pending : TaskState.waiting
+            try await conn.query(
+                """
+                WITH
+                del_orphans AS (
+                    -- Remove event_waits for children that already have completions.
+                    -- Runs in same snapshot as the state UPDATE, so no lost-delete race.
+                    DELETE FROM strand.event_waits ew
+                    USING strand.task_completions tc
+                    WHERE ew.run_id        = \(parentRunID)
+                      AND ew.child_task_id = tc.task_id
+                      AND tc.task_id       = ANY(\(childTaskIDs))
+                ),
+                r AS (
+                    UPDATE strand.runs
+                    SET state        = \(newState),
+                        available_at = CASE WHEN \(allDone) THEN NOW() ELSE available_at END,
+                        worker_id    = NULL,
+                        lease_expires_at = NULL
+                    WHERE id    = \(parentRunID)
+                      AND state != \(TaskState.sleeping)  -- do not overwrite named-event / timer sleep
+                    RETURNING id
                 )
+                UPDATE strand.tasks SET state = \(newState)
+                FROM r WHERE strand.tasks.id = \(parentTaskID)
+                """,
+                logger: logger
+            )
+            if allDone {
                 try await conn.notifyWorkers(namespace: namespaceID, queue: parentQueue, logger: logger)
-            } else {
-                try await conn.query(
-                    """
-                    WITH r AS (
-                        UPDATE strand.runs
-                        SET state = \(TaskState.waiting),
-                            worker_id = NULL,
-                            lease_expires_at = NULL
-                        WHERE id = \(parentRunID)
-                        RETURNING id
-                    )
-                    UPDATE strand.tasks SET state = \(TaskState.waiting)
-                    WHERE id = \(parentTaskID)
-                    """,
-                    logger: logger
-                )
             }
 
             return result
@@ -1277,6 +1287,7 @@ enum Queries {
     /// Checks for an existing event; if absent, registers a wait and suspends the run.
     static func awaitEvent(
         on client: PostgresClient,
+        namespaceID: String,
         queue: String,
         taskID: UUID,
         runID: UUID,
@@ -1292,7 +1303,7 @@ enum Queries {
         }
         return try await client.withTransaction(logger: logger) { conn in
             let evtStream = try await conn.query(
-                "SELECT payload FROM strand.events WHERE queue = \(queue) AND name = \(eventName)",
+                "SELECT payload FROM strand.events WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND name = \(eventName) ORDER BY created_at DESC LIMIT 1",
                 logger: logger
             )
             if let row = try await evtStream.first(where: { _ in true }) {
@@ -1349,7 +1360,7 @@ enum Queries {
         }
     }
 
-    /// Emits an event (first-write-wins) and wakes any tasks waiting for it.
+    /// Emits an event into the append-only log and wakes any tasks waiting for it.
     static func emitEvent(
         on client: PostgresClient,
         namespaceID: String,
@@ -1359,20 +1370,18 @@ enum Queries {
         logger: Logger
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
-            let insertStream = try await conn.query(
+            // Always insert a new row — append-only log.
+            let emissionID = UUID.v7()
+            try await conn.query(
                 """
-                INSERT INTO strand.events (namespace_id, queue, name, payload)
-                VALUES (\(namespaceID), \(queue), \(eventName), \(payloadBuffer))
-                ON CONFLICT (namespace_id, queue, name) DO UPDATE
-                SET payload = EXCLUDED.payload, created_at = NOW()
-                WHERE strand.events.payload IS NULL
-                RETURNING 1
+                INSERT INTO strand.events (id, namespace_id, queue, name, payload)
+                VALUES (\(emissionID), \(namespaceID), \(queue), \(eventName), \(payloadBuffer))
                 """,
                 logger: logger
             )
-            guard try await insertStream.first(where: { _ in true }) != nil else { return }
+            // namespace_id filter is essential for tenant isolation.
             let waitsStream = try await conn.query(
-                "SELECT task_id, run_id FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
+                "SELECT task_id, run_id FROM strand.event_waits WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND event_name = \(eventName)",
                 logger: logger
             )
             var waits: [(taskID: UUID, runID: UUID)] = []
@@ -1395,12 +1404,26 @@ enum Queries {
                     logger: logger
                 )
             }
+            // Record each triggered task in strand.event_triggers with emission_id linkage.
+            // These rows power the "workflows triggered by this event" display in
+            // the dashboard and are cleaned up automatically via ON DELETE CASCADE
+            // when StrandPruner deletes the parent task.
+            for wait in waits {
+                try await conn.query(
+                    """
+                    INSERT INTO strand.event_triggers
+                        (id, namespace_id, queue, event_name, emission_id, task_id, run_id)
+                    VALUES (\(UUID.v7()), \(namespaceID), \(queue), \(eventName), \(emissionID), \(wait.taskID), \(wait.runID))
+                    ON CONFLICT DO NOTHING
+                    """,
+                    logger: logger
+                )
+            }
             try await conn.query(
-                "DELETE FROM strand.event_waits WHERE queue = \(queue) AND event_name = \(eventName)",
+                "DELETE FROM strand.event_waits WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND event_name = \(eventName)",
                 logger: logger
             )
             if !waits.isEmpty {
-                // Wake workers: runs transitioned to PENDING above.
                 try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             }
         }
@@ -1527,9 +1550,6 @@ enum Queries {
 
     /// Graceful-shutdown helper: expires in-flight run leases and removes the
     /// worker heartbeat row in a single round-trip.
-    ///
-    /// Previously these were two separate queries (two pool checkouts, two
-    /// network round-trips). The CTE folds them into one atomic statement.
     static func shutdownWorker(
         on client: PostgresClient,
         workerID: String,

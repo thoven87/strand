@@ -143,9 +143,8 @@ private struct TimeoutEventWorkflow: Workflow {
                 as: String.self,
                 timeout: .seconds(1)
             )
-        } catch let err as StrandError {
-            if case .timeout = err { return "timed-out" }
-            throw err
+        } catch is EventWaitTimeoutError {
+            return "timed-out"
         }
     }
 }

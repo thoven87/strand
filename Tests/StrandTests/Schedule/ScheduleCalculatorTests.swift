@@ -9,6 +9,7 @@ struct ScheduleCalculatorTests {
 
     @Test("Calculate next execution time for intervals")
     func testIntervalScheduleNextExecution() async throws {
+        let intervalSecs = 7200.0  // 2 hours
         let pattern = SchedulePattern.interval(.hours(2))
 
         let baseTime = Date()
@@ -17,9 +18,19 @@ struct ScheduleCalculatorTests {
         #expect(nextExecution != nil)
         #expect(nextExecution! > baseTime)
 
-        // Should be approximately 2 hours from now
+        // Next execution must land on an epoch-aligned 2-hour boundary
+        // (00:00, 02:00, 04:00 … UTC) regardless of registration time.
+        let remainder = nextExecution!.timeIntervalSince1970
+            .truncatingRemainder(dividingBy: intervalSecs)
+        #expect(
+            remainder < 0.01 || remainder > intervalSecs - 0.01,
+            "next execution should be at a 2h epoch boundary"
+        )
+
+        // Must be strictly after base time and at most one interval ahead.
         let timeDiff = nextExecution!.timeIntervalSince(baseTime)
-        #expect(abs(timeDiff - 7200) < 60)  // Within 1 minute tolerance
+        #expect(timeDiff > 0)
+        #expect(timeDiff <= intervalSecs + 1)
     }
 
     @Test("Calculate next execution time for cron expressions")
@@ -193,6 +204,94 @@ struct ScheduleCalculatorTests {
 
         #expect(nextExecution != nil)
         #expect(nextExecution! > utcDate)
+    }
+
+    // MARK: - Epoch-boundary & offset tests
+
+    // All tests below use fixed UTC epoch times so they are fully deterministic.
+    //
+    // Reference: Unix epoch day-zero boundaries (1970-01-01 UTC)
+    //   0 s  = 00:00   420 s = 00:07   600 s = 00:10   900 s = 00:15
+    //   1800 s = 00:30  2700 s = 00:45  5400 s = 01:30  6300 s = 01:45
+    //   8100 s = 02:15  9900 s = 02:45
+
+    @Test("5-min interval snaps to epoch boundary: from 0:07 → 0:10")
+    func testInterval5MinEpochBoundary() throws {
+        let from = Date(timeIntervalSince1970: 420)  // 00:07:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(300))
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 600, "expected 00:10:00 UTC (600 s)")
+    }
+
+    @Test("15-min interval snaps to epoch boundary: from 0:07 → 0:15")
+    func testInterval15MinEpochBoundary() throws {
+        let from = Date(timeIntervalSince1970: 420)  // 00:07:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(900))
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 900, "expected 00:15:00 UTC (900 s)")
+    }
+
+    @Test("30-min interval snaps to epoch boundary: from 0:07 → 0:30")
+    func testInterval30MinEpochBoundary() throws {
+        let from = Date(timeIntervalSince1970: 420)  // 00:07:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(1800))
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 1800, "expected 00:30:00 UTC (1800 s)")
+    }
+
+    @Test("45-min interval snaps to epoch boundary: from 0:07 → 0:45")
+    func testInterval45MinEpochBoundary() throws {
+        let from = Date(timeIntervalSince1970: 420)  // 00:07:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(2700))
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 2700, "expected 00:45:00 UTC (2700 s)")
+    }
+
+    // 90-min + PT45M offset  →  slot grid: 0:45, 2:15, 3:45, 5:15 …
+
+    @Test("90-min interval + PT45M offset: from 0:10 → first slot is 0:45 (not 2:15)")
+    func testInterval90MinOffset45FromBefore() throws {
+        // Bug: old code found boundary 1:30 then applied +45 min → 2:15, skipping 0:45.
+        let from = Date(timeIntervalSince1970: 600)  // 00:10:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(5400), offset: "PT45M")
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 2700, "expected 00:45:00 UTC (2700 s)")
+    }
+
+    @Test("90-min interval + PT45M offset: from 0:45 (on the slot) → next slot is 2:15")
+    func testInterval90MinOffset45FromSlot() throws {
+        // From exactly the slot time, epsilon ensures we advance to the next slot.
+        let from = Date(timeIntervalSince1970: 2700)  // 00:45:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(5400), offset: "PT45M")
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 8100, "expected 02:15:00 UTC (8100 s)")
+    }
+
+    @Test("90-min interval no offset: from 0:10 → 1:30 (unchanged by fix)")
+    func testInterval90MinNoOffset() throws {
+        let from = Date(timeIntervalSince1970: 600)  // 00:10:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(5400))
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 5400, "expected 01:30:00 UTC (5400 s)")
+    }
+
+    // 1-hour special path + PT45M offset  →  slot grid: 1:45, 2:45, 3:45 …
+    // (uses the if seconds == 3600 branch, which was already correct)
+
+    @Test("1h interval + PT45M offset: from 0:10 → 1:45")
+    func testInterval1HourOffset45FromBefore() throws {
+        let from = Date(timeIntervalSince1970: 600)  // 00:10:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(3600), offset: "PT45M")
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 6300, "expected 01:45:00 UTC (6300 s)")
+    }
+
+    @Test("1h interval + PT45M offset: from 1:45 (on the slot) → 2:45")
+    func testInterval1HourOffset45FromSlot() throws {
+        let from = Date(timeIntervalSince1970: 6300)  // 01:45:00 UTC
+        let pattern = SchedulePattern.interval(.seconds(3600), offset: "PT45M")
+        let next = try pattern.nextRunTime(after: from)
+        #expect(next?.timeIntervalSince1970 == 9900, "expected 02:45:00 UTC (9900 s)")
     }
 
     @Test("Test partition offset calculation")

@@ -8,6 +8,7 @@ import {
     useSearch,
 } from "@tanstack/react-router";
 import { getTask, cancelTask, requeueTask, getChildTasks } from "@/api/tasks";
+import { getEventTriggerForTask } from "@/api/events";
 import { RetryDialog } from "@/components/RetryDialog";
 import { SignalDialog } from "@/components/SignalDialog";
 import type { RetryOptions } from "@/api/types";
@@ -31,7 +32,9 @@ import {
     ArrowUpRight,
     Send,
     GitBranch,
+    Zap,
 } from "lucide-react";
+import { TriggerDialog } from "@/components/TriggerDialog";
 import type { Checkpoint, Run, TaskState, HistoryEvent } from "@/api/types";
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -54,6 +57,33 @@ function parseFailureMessage(raw: string): string {
         return JSON.stringify(obj, null, 2);
     } catch {
         return raw;
+    }
+}
+
+/**
+ * Walks a parsed JSON value and replaces every primitive (string, number,
+ * boolean) with `null`, keeping the structural shape (objects and arrays).
+ * Used to pre-seed the TriggerDialog editor with the input schema of a past
+ * run so the user can see what fields are expected without reusing stale values.
+ */
+function nullifyValues(v: unknown): unknown {
+    if (v === null || v === undefined) return null;
+    if (typeof v !== "object") return null; // primitive → null
+    if (Array.isArray(v)) return v.map(nullifyValues);
+    return Object.fromEntries(
+        Object.entries(v as Record<string, unknown>).map(([k, val]) => [
+            k,
+            nullifyValues(val),
+        ]),
+    );
+}
+
+function paramsTemplate(raw: string | null | undefined): string {
+    if (!raw) return "{}";
+    try {
+        return JSON.stringify(nullifyValues(JSON.parse(raw)), null, 2);
+    } catch {
+        return "{}";
     }
 }
 
@@ -263,9 +293,15 @@ function ActivityTimeline({
         refetchInterval: 3_000,
     });
     const [expanded, setExpanded] = useState<Set<number>>(new Set());
+    const [typeFilter, setTypeFilter] = useState<string | null>(null);
 
     const baseMs = new Date(taskCreatedAt).getTime();
-    const groups = groupEvents(data);
+    const allGroups = groupEvents(data);
+    // Unique event types for the filter pills (preserve order of first appearance)
+    const eventTypes = Array.from(new Set(data.map((e) => e.eventType)));
+    const groups = typeFilter
+        ? allGroups.filter((g) => g.eventType === typeFilter)
+        : allGroups;
 
     if (isLoading)
         return (
@@ -274,7 +310,7 @@ function ActivityTimeline({
             </p>
         );
 
-    if (groups.length === 0)
+    if (allGroups.length === 0)
         return (
             <p className="text-xs text-muted-foreground py-4 text-center">
                 No history events yet.
@@ -283,6 +319,36 @@ function ActivityTimeline({
 
     return (
         <div className="space-y-0">
+            {/* Event-type filter pills */}
+            {eventTypes.length > 1 && (
+                <div className="flex flex-wrap gap-1 mb-3">
+                    <button
+                        onClick={() => setTypeFilter(null)}
+                        className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
+                            typeFilter === null
+                                ? "bg-secondary text-foreground border-border"
+                                : "border-border/40 text-muted-foreground hover:text-foreground"
+                        }`}
+                    >
+                        All
+                    </button>
+                    {eventTypes.map((t) => (
+                        <button
+                            key={t}
+                            onClick={() =>
+                                setTypeFilter(typeFilter === t ? null : t)
+                            }
+                            className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
+                                typeFilter === t
+                                    ? "bg-secondary text-foreground border-border"
+                                    : "border-border/40 text-muted-foreground hover:text-foreground"
+                            }`}
+                        >
+                            {eventLabel(t)}
+                        </button>
+                    ))}
+                </div>
+            )}
             {groups.map((grp, gi) => {
                 const offsetMs =
                     new Date(grp.firstCreatedAt).getTime() - baseMs;
@@ -295,22 +361,17 @@ function ActivityTimeline({
 
                 return (
                     <div key={grp.firstSeq}>
-                        {/* Group header row */}
+                        {/* Group header row — always clickable */}
                         <div
-                            className={`flex gap-3 group ${
-                                grp.count > 1 ? "cursor-pointer" : ""
-                            }`}
-                            onClick={
-                                grp.count > 1
-                                    ? () =>
-                                          setExpanded((prev) => {
-                                              const next = new Set(prev);
-                                              next.has(grp.firstSeq)
-                                                  ? next.delete(grp.firstSeq)
-                                                  : next.add(grp.firstSeq);
-                                              return next;
-                                          })
-                                    : undefined
+                            className="flex gap-3 group cursor-pointer"
+                            onClick={() =>
+                                setExpanded((prev) => {
+                                    const next = new Set(prev);
+                                    next.has(grp.firstSeq)
+                                        ? next.delete(grp.firstSeq)
+                                        : next.add(grp.firstSeq);
+                                    return next;
+                                })
                             }
                         >
                             <div className="flex flex-col items-center w-5 shrink-0 pt-0.5">
@@ -340,13 +401,9 @@ function ActivityTimeline({
                                             ×{grp.count}
                                         </span>
                                     )}
-                                    {grp.count > 1 && (
-                                        <span className="text-[10px] text-muted-foreground/50">
-                                            {isExpanded
-                                                ? "▴ collapse"
-                                                : "▾ expand"}
-                                        </span>
-                                    )}
+                                    <span className="text-[10px] text-muted-foreground/40">
+                                        {isExpanded ? "▴" : "▾"}
+                                    </span>
                                     <span className="text-[11px] text-muted-foreground/60 ml-auto shrink-0 tabular-nums">
                                         +{formatDurationMs(offsetMs)}
                                     </span>
@@ -354,8 +411,29 @@ function ActivityTimeline({
                             </div>
                         </div>
 
-                        {/* Expanded individual events */}
+                        {/* Expanded content */}
                         {isExpanded &&
+                            grp.count === 1 &&
+                            grp.events[0].eventData && (
+                                <div className="ml-8 mb-3 rounded border border-border/30 bg-secondary/10 p-2 overflow-auto max-h-48">
+                                    <JsonView
+                                        value={(() => {
+                                            const raw = grp.events[0].eventData;
+                                            try {
+                                                return JSON.stringify(
+                                                    JSON.parse(raw),
+                                                    null,
+                                                    2,
+                                                );
+                                            } catch {
+                                                return raw;
+                                            }
+                                        })()}
+                                    />
+                                </div>
+                            )}
+                        {isExpanded &&
+                            grp.count > 1 &&
                             grp.events.map((evt, ei) => {
                                 const evtOffsetMs =
                                     new Date(evt.createdAt).getTime() - baseMs;
@@ -777,8 +855,14 @@ export function TaskDetailPage() {
         taskId: string;
         namespace: string;
     };
-    const search = useSearch({ strict: false }) as { queue?: string };
+    const search = useSearch({ strict: false }) as {
+        queue?: string;
+        prevId?: string;
+        nextId?: string;
+    };
     const queue = search.queue ?? "";
+    const prevId = search.prevId;
+    const nextId = search.nextId;
     const qc = useQueryClient();
 
     const {
@@ -801,10 +885,25 @@ export function TaskDetailPage() {
         refetchInterval: task && isTerminal(task.state) ? false : 3_000,
     });
 
+    // Event trigger — set when this task was woken from a waitForEvent suspension
+    const { data: eventTrigger } = useQuery({
+        queryKey: [
+            ...qk.tasks.detail(namespace, queue, taskId),
+            "event-trigger",
+        ],
+        queryFn: () => getEventTriggerForTask(namespace, taskId),
+        staleTime: 60_000,
+        enabled: !!task,
+    });
+
     const [runsOpen, setRunsOpen] = useState(false);
     const [stateOpen, setStateOpen] = useState(false);
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
     const [signalDialogOpen, setSignalDialogOpen] = useState(false);
+    const [triggerOpen, setTriggerOpen] = useState(false);
+    const [triggerMode, setTriggerMode] = useState<"template" | "exact">(
+        "template",
+    );
 
     const signalMutation = useMutation({
         mutationFn: ({ name, payload }: { name: string; payload?: string }) =>
@@ -886,6 +985,31 @@ export function TaskDetailPage() {
                 <div className="min-w-0">
                     {/* Breadcrumb */}
                     <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2 font-mono">
+                        {prevId && (
+                            <Link
+                                to="/$namespace/tasks/$taskId"
+                                params={{ namespace, taskId: prevId }}
+                                search={{ queue }}
+                                className="hover:text-foreground transition-colors"
+                                title="Previous task"
+                            >
+                                ←
+                            </Link>
+                        )}
+                        {nextId && (
+                            <Link
+                                to="/$namespace/tasks/$taskId"
+                                params={{ namespace, taskId: nextId }}
+                                search={{ queue }}
+                                className="hover:text-foreground transition-colors"
+                                title="Next task"
+                            >
+                                →
+                            </Link>
+                        )}
+                        {(prevId || nextId) && (
+                            <span className="opacity-30">|</span>
+                        )}
                         <Link
                             to="/$namespace/tasks"
                             params={{ namespace }}
@@ -1025,11 +1149,77 @@ export function TaskDetailPage() {
                             {task.state === "COMPLETED" ? "Re-run" : "Retry"}
                         </Button>
                     )}
+                    {isWorkflow && (
+                        <div className="flex">
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                    setTriggerMode("template");
+                                    setTriggerOpen(true);
+                                }}
+                                className="gap-1.5 rounded-r-none border-r-0"
+                            >
+                                <Zap size={12} />
+                                Run Again
+                            </Button>
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                    setTriggerMode("exact");
+                                    setTriggerOpen(true);
+                                }}
+                                className="rounded-l-none px-2"
+                                title="Replay with exact input from this run"
+                            >
+                                ↺
+                            </Button>
+                        </div>
+                    )}
                 </div>
             </div>
 
-            {/* ── Schedule card (full width, below header) ────────────────── */}
+            {/* ── Schedule card (full width, below header) ──────────────────── */}
             {task.scheduling && <ScheduleCard scheduling={task.scheduling} />}
+
+            {/* ── Woken by event card ──────────────────────────────────── */}
+            {eventTrigger && (
+                <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3 flex items-center gap-3">
+                    <div className="w-2 h-2 rounded-full bg-purple-400 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-0.5">
+                            Woken by event
+                        </p>
+                        <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-mono text-sm text-foreground">
+                                {eventTrigger.eventName}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                                in{" "}
+                                <span className="font-mono">
+                                    {eventTrigger.queue}
+                                </span>
+                            </span>
+                            <RelativeTime iso={eventTrigger.triggeredAt} />
+                        </div>
+                        {eventTrigger.emissionId && (
+                            <p className="font-mono text-[10px] text-muted-foreground/50 mt-0.5 select-all">
+                                {eventTrigger.emissionId}
+                            </p>
+                        )}
+                    </div>
+                    {eventTrigger.emissionId && (
+                        <Link
+                            to="/$namespace/events"
+                            params={{ namespace }}
+                            className="text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                        >
+                            View emission →
+                        </Link>
+                    )}
+                </div>
+            )}
 
             {/* ── Input / Output ───────────────────────────────────────── */}
             <div className="grid md:grid-cols-2 gap-3">
@@ -1181,6 +1371,18 @@ export function TaskDetailPage() {
                     signalMutation.mutate({ name, payload })
                 }
                 isPending={signalMutation.isPending}
+            />
+            <TriggerDialog
+                open={triggerOpen}
+                onClose={() => setTriggerOpen(false)}
+                namespace={namespace}
+                initialWorkflowName={task.name}
+                initialQueue={task.queue}
+                initialInput={
+                    triggerMode === "exact"
+                        ? (task.params ?? "{}")
+                        : paramsTemplate(task.params)
+                }
             />
         </div>
     );

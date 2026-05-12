@@ -48,14 +48,29 @@ package struct ScheduleSummaryRow: Sendable {
     let createdAt: Date
 }
 
+/// A task row fired by a specific schedule, returned by ``ScheduleQueries/listScheduleRuns``.
+package struct ScheduleRunRow: Sendable {
+    package let id: UUID
+    package let state: String
+    package let attempt: Int
+    package let createdAt: Date
+    package let completedAt: Date?
+}
+
 // MARK: - Queries
 
 package enum ScheduleQueries {
 
     // MARK: Scheduler operations
 
-    /// Finds all due schedules and claims them with `FOR UPDATE SKIP LOCKED`
-    /// so multiple `StrandScheduler` instances never double-fire the same schedule.
+    /// Returns all schedules with `next_run_at <= now`.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` is a best-effort hint that reduces wasted work
+    /// when multiple `StrandScheduler` instances run concurrently: rows being
+    /// processed by another instance are skipped in this poll.  The real
+    /// double-fire guard is the CAS in `markScheduleFired` (`AND next_run_at = $slot`),
+    /// which ensures only one instance advances the schedule regardless of
+    /// how many instances observe the same row here.
     package static func pollDueSchedules(
         on client: PostgresClient,
         namespaceID: String,
@@ -168,25 +183,37 @@ package enum ScheduleQueries {
     }
 
     /// Advances `next_run_at` after a successful fire.
-    /// Passing `nextRunAt: nil` automatically deactivates one-shot schedules.
+    ///
+    /// Uses a CAS guard (`AND next_run_at = \(scheduledAt)`) so concurrent
+    /// `StrandScheduler` instances that both observe the same slot are safe:
+    /// only one UPDATE lands, only one `run_count` increment occurs, and the
+    /// loser detects the collision via the `false` return value.
+    ///
+    /// Crash recovery: if the process crashes after `enqueueTask` but before
+    /// this call, the next poll re-runs `enqueueTask` (idempotency key → no-op)
+    /// and retries this UPDATE against the still-unchanged `next_run_at`.
     ///
     /// - Parameters:
+    ///   - scheduledAt: The slot being claimed; used as the CAS guard.
     ///   - firedAt: Actual wall-clock time the scheduler enqueued the task.
     ///     Stored in `last_run_at` and shown in the dashboard as "Last run".
     ///   - slotAt: The scheduled slot boundary this fire covers (e.g. 16:29 UTC).
     ///     Stored in `last_slot_at` and used by `_schedule` as the catch-up base
     ///     so interval arithmetic stays pinned to the original cadence.
+    /// - Returns: `true` when this instance won the CAS race and advanced the
+    ///   schedule; `false` when another instance already fired this slot.
     package static func markScheduleFired(
         on client: PostgresClient,
         namespaceID: String,
         id: UUID,
+        scheduledAt: Date,
         firedAt: Date,
         slotAt: Date,
         nextRunAt: Date?,
         lastTaskID: UUID,
         logger: Logger
-    ) async throws {
-        try await client.query(
+    ) async throws -> Bool {
+        let stream = try await client.query(
             """
             UPDATE strand.schedules
             SET last_run_at  = \(firedAt),
@@ -197,10 +224,13 @@ package enum ScheduleQueries {
                 is_active    = \(nextRunAt != nil),
                 updated_at   = NOW()
             WHERE namespace_id = \(namespaceID)
-              AND id = \(id)
+              AND id           = \(id)
+              AND next_run_at  = \(scheduledAt)
+            RETURNING id
             """,
             logger: logger
         )
+        return try await stream.first(where: { _ in true }) != nil
     }
 
     // MARK: Management operations
@@ -248,7 +278,13 @@ package enum ScheduleQueries {
                 accuracy        = EXCLUDED.accuracy,
                 kind            = EXCLUDED.kind,
                 starts_at       = EXCLUDED.starts_at,
-                ends_at         = EXCLUDED.ends_at,
+                -- Preserve an existing deadline when the caller omits endsAt:.
+                -- A bare re-registration (e.g. on scheduler restart) defaults
+                -- endsAt to nil, which would otherwise silently clear the window.
+                -- Use COALESCE so the deadline can only be set or extended,
+                -- never cleared by accident — use deleteSchedule + re-register
+                -- to intentionally remove a deadline.
+                ends_at         = COALESCE(EXCLUDED.ends_at, strand.schedules.ends_at),
                 -- next_run_at merge: take the EARLIER of the two values.
                 --
                 -- The caller supplies EXCLUDED.next_run_at anchored to last_run_at
@@ -295,14 +331,29 @@ package enum ScheduleQueries {
         )
     }
 
+    /// Reactivates a paused schedule.
+    ///
+    /// - Parameter recomputeFrom: When provided, `next_run_at` is advanced to
+    ///   this date before reactivation, skipping any slots that fell due while
+    ///   the schedule was paused.  Pass `Date.now` to resume from the present
+    ///   moment.  When `nil` the existing `next_run_at` is preserved — for
+    ///   `accuracy: .all` schedules this fires every missed slot since the pause.
     package static func resumeSchedule(
         on client: PostgresClient,
         namespaceID: String,
         id: UUID,
+        recomputeFrom: Date? = nil,
         logger: Logger
     ) async throws {
         try await client.query(
-            "UPDATE strand.schedules SET is_active = TRUE, updated_at = NOW() WHERE namespace_id = \(namespaceID) AND id = \(id)",
+            """
+            UPDATE strand.schedules
+            SET is_active   = TRUE,
+                next_run_at = COALESCE(\(recomputeFrom), next_run_at),
+                updated_at  = NOW()
+            WHERE namespace_id = \(namespaceID)
+              AND id = \(id)
+            """,
             logger: logger
         )
     }
@@ -319,10 +370,62 @@ package enum ScheduleQueries {
         )
     }
 
+    /// Fetches a single schedule by primary key.  Returns `nil` when not found.
+    package static func getSchedule(
+        on client: PostgresClient,
+        namespaceID: String,
+        id: UUID,
+        logger: Logger
+    ) async throws -> ScheduleSummaryRow? {
+        let stream = try await client.query(
+            """
+            SELECT id, queue, name, task_name, pattern, is_active,
+                   starts_at, ends_at, next_run_at, last_run_at, last_task_id,
+                   run_count, accuracy, kind, created_at
+            FROM strand.schedules
+            WHERE namespace_id = \(namespaceID)
+              AND id           = \(id)
+            LIMIT 1
+            """,
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else { return nil }
+        var col = row.makeIterator()
+        return ScheduleSummaryRow(
+            id: try col.next()!.decode(UUID.self, context: .default),
+            queue: try col.next()!.decode(String.self, context: .default),
+            name: try col.next()!.decode(String.self, context: .default),
+            taskName: try col.next()!.decode(String.self, context: .default),
+            patternBuffer: try col.next()!.decode(ByteBuffer.self, context: .default),
+            isActive: try col.next()!.decode(Bool.self, context: .default),
+            startsAt: try col.next()!.decode(Date?.self, context: .default),
+            endsAt: try col.next()!.decode(Date?.self, context: .default),
+            nextRunAt: try col.next()!.decode(Date?.self, context: .default),
+            lastRunAt: try col.next()!.decode(Date?.self, context: .default),
+            lastTaskID: try col.next()!.decode(UUID?.self, context: .default),
+            runCount: try col.next()!.decode(Int.self, context: .default),
+            accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
+            kind: try col.next()!.decode(TaskKind.self, context: .default),
+            createdAt: try col.next()!.decode(Date.self, context: .default)
+        )
+    }
+
+    /// Lists schedules with keyset pagination ordered by `(queue ASC, name ASC)`.
+    ///
+    /// Pass `afterQueue` + `afterName` (the last row's values from the previous page)
+    /// to advance to the next page.  When both are `nil` the first page is returned.
+    ///
+    /// - Parameters:
+    ///   - limit: Maximum rows to return. Defaults to 200; cap at a reasonable value in callers.
+    ///   - afterQueue: Keyset cursor — `queue` value of the last row on the previous page.
+    ///   - afterName:  Keyset cursor — `name` value of the last row on the previous page.
     package static func listSchedules(
         on client: PostgresClient,
         namespaceID: String,
         queue: String?,
+        limit: Int = 200,
+        afterQueue: String? = nil,
+        afterName: String? = nil,
         logger: Logger
     ) async throws -> [ScheduleSummaryRow] {
         let stream = try await client.query(
@@ -332,7 +435,13 @@ package enum ScheduleQueries {
             FROM strand.schedules
             WHERE namespace_id = \(namespaceID)
               AND (\(queue)::text IS NULL OR queue = \(queue))
-            ORDER BY queue, name
+              AND (
+                \(afterQueue)::text IS NULL
+                OR queue > \(afterQueue)
+                OR (queue = \(afterQueue) AND name > \(afterName))
+              )
+            ORDER BY queue ASC, name ASC
+            LIMIT \(limit)
             """,
             logger: logger
         )
@@ -356,6 +465,45 @@ package enum ScheduleQueries {
                     accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
                     kind: try col.next()!.decode(TaskKind.self, context: .default),
                     createdAt: try col.next()!.decode(Date.self, context: .default)
+                )
+            )
+        }
+        return rows
+    }
+
+    /// Returns tasks fired by the given schedule, newest first.
+    ///
+    /// Tasks are identified by their idempotency key prefix
+    /// `"$schedule:<scheduleID>:"`.  The `limit` is capped at 100.
+    package static func listScheduleRuns(
+        on client: PostgresClient,
+        namespaceID: String,
+        scheduleID: UUID,
+        limit: Int,
+        logger: Logger
+    ) async throws -> [ScheduleRunRow] {
+        let prefixPattern = "$schedule:\(scheduleID):%"
+        let stream = try await client.query(
+            """
+            SELECT id, state, attempt, created_at, completed_at
+            FROM strand.tasks
+            WHERE namespace_id    = \(namespaceID)
+              AND idempotency_key LIKE \(prefixPattern)
+            ORDER BY created_at DESC
+            LIMIT \(min(limit, 100))
+            """,
+            logger: logger
+        )
+        var rows: [ScheduleRunRow] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            rows.append(
+                ScheduleRunRow(
+                    id: try col.next()!.decode(UUID.self, context: .default),
+                    state: try col.next()!.decode(String.self, context: .default),
+                    attempt: try col.next()!.decode(Int.self, context: .default),
+                    createdAt: try col.next()!.decode(Date.self, context: .default),
+                    completedAt: try col.next()!.decode(Date?.self, context: .default)
                 )
             )
         }

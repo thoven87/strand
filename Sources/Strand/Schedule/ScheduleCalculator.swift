@@ -111,6 +111,31 @@ public struct ScheduleCalculator {
                     timezone: tz
                 )
             }
+        case .yearly(let offset, let tz):
+            do {
+                let duration = try ISO8601Duration(offset)
+                let month = duration.months + 1
+                let day = duration.days + 1
+                let hour = duration.hours
+                let minute = duration.minutes
+                return calculateYearlyScheduledTime(
+                    month: month,
+                    day: day,
+                    hour: hour,
+                    minute: minute,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
+            } catch {
+                return calculateYearlyScheduledTime(
+                    month: 1,
+                    day: 1,
+                    hour: 0,
+                    minute: 0,
+                    executionTime: executionTime,
+                    timezone: tz
+                )
+            }
         }
     }
 
@@ -239,7 +264,10 @@ public struct ScheduleCalculator {
                 from: searchDate
             )
 
-            if components.weekday == dayOfWeek + 1 {  // Calendar weekday is 1-based
+            // Same mapping as calculateWeeklyNextRunTime: dayOfWeek 0 → Saturday (7),
+            // dayOfWeek 1 → Sunday (1), ..., dayOfWeek 6 → Friday (6).
+            let targetWeekday = dayOfWeek == 0 ? 7 : dayOfWeek
+            if components.weekday == targetWeekday {
                 var scheduledComponents = components
                 scheduledComponents.hour = hour
                 scheduledComponents.minute = minute
@@ -297,6 +325,35 @@ public struct ScheduleCalculator {
         return nil
     }
 
+    private static func calculateYearlyScheduledTime(
+        month: Int,
+        day: Int,
+        hour: Int,
+        minute: Int,
+        executionTime: Date,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timezone
+
+        // Try in the current year first, then the previous year.
+        for yearOffset in [0, -1] {
+            let ref = calendar.date(byAdding: .year, value: yearOffset, to: executionTime) ?? executionTime
+            let year = calendar.component(.year, from: ref)
+            var comps = DateComponents()
+            comps.year = year
+            comps.month = month
+            comps.day = day
+            comps.hour = hour
+            comps.minute = minute
+            comps.second = 0
+            if let candidate = calendar.date(from: comps), candidate <= executionTime {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     // MARK: - Job State Management
 
     /// Calculate the initial nextRunAt time for a new recurring job
@@ -311,7 +368,7 @@ public struct ScheduleCalculator {
     // MARK: - Validation and Utilities
 
     /// Validate that a schedule configuration is valid
-    public static func validateSchedule(_ schedule: SchedulePattern) throws {
+    public static func validateSchedule(_ schedule: SchedulePattern, now: Date = .now) throws {
         switch schedule {
         case .cron(let expression, let offset, _):
             guard !expression.isEmpty else {
@@ -326,21 +383,22 @@ public struct ScheduleCalculator {
             try validateOffset(offset)
         case .monthly(let offset, _):
             try validateOffset(offset)
+        case .yearly(let offset, _):
+            try validateOffset(offset)
         case .interval(let duration, let offset, _):
             guard duration.components.seconds > 0 else {
                 throw SchedulingError.invalidSchedule("Interval must be greater than 0 seconds")
             }
             try validateOffset(offset)
         case .once(let date, let offset, _):
-            guard date > Date() else {
+            guard date > now else {
                 throw SchedulingError.invalidSchedule("One-time schedule must be in the future")
             }
             try validateOffset(offset)
         }
 
         // Try to calculate a next run time to validate the schedule works
-        let testDate = Date()
-        _ = try nextRunTime(for: schedule, after: testDate, timezone: TimeZone(identifier: "UTC")!)
+        _ = try nextRunTime(for: schedule, after: now, timezone: TimeZone(identifier: "UTC")!)
     }
 
     /// Validate that an offset string is valid
@@ -516,8 +574,8 @@ public struct ScheduleCalculator {
             )
             return Date(timeIntervalSince1970: Double(intervalsSinceEpoch * Int(intervalSeconds)))
 
-        case .cron(_, _, _), .once(_, _, _):
-            // For cron and once schedules, use simple offset subtraction if available
+        case .cron(_, _, _), .once(_, _, _), .yearly(_, _):
+            // For cron, once, and yearly schedules, use simple offset subtraction if available
             return partitionOffset.offset.subtract(from: executionTime, calendar: utcCalendar)
         }
     }
@@ -546,8 +604,8 @@ public struct ScheduleCalculator {
             } else {
                 return ISO8601Duration(seconds: Int(seconds))
             }
-        case .cron(_, _, _), .once(_, _, _):
-            return nil  // No default offset for cron/once schedules
+        case .cron(_, _, _), .once(_, _, _), .yearly(_, _):
+            return nil  // No default offset for cron/once/yearly schedules
         // All schedules now have built-in offset support
         }
     }

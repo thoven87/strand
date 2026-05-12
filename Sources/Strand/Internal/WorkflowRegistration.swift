@@ -219,7 +219,10 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             logger: exec.logger
         )
         executor.resolveCompleted(completedChildren)
-        try await appendChildWorkflowCompletedHistory(completedChildren: completedChildren, exec: exec, claimed: claimed, historySeq: &historySeq)
+        // CHILD_WORKFLOW_COMPLETED history is written by the step-2 loop in
+        // applyScheduleCommands when it processes the .childWorkflowCompleted command.
+        // runChildWorkflow emits that command exactly once — a checkpoint written
+        // alongside it causes subsequent replays to short-circuit at fast-path-1.
 
         // ── 5. Build activation context ────────────────────────────────────────────
         // Capture wall-clock time once here so WorkflowContext.activationTime
@@ -386,7 +389,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             )
         }
 
-        try await appendChildWorkflowCompletedHistory(completedChildren: completedChildren, exec: exec, claimed: claimed, historySeq: &historySeq)
+        // CHILD_WORKFLOW_COMPLETED history is written by the step-2 loop — see _activate.
 
         // ── Event/timer checkpoint (before resuming, for durability) ──────────
         if let eventName = claimed.wakeEvent,
@@ -452,17 +455,12 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             let seqNum = executor.seqNum(forEventName: eventName)
         {
             if let payload = claimed.eventPayloadBuffer {
+                // Resume the parked waitForEvent continuation. The slow-path code
+                // in WorkflowContext.waitForEvent emits .eventReceived after the
+                // continuation returns, which applyScheduleCommands (step-2 loop)
+                // records in workflow_history. Writing it here as well would produce
+                // a duplicate EVENT_RECEIVED entry in the audit log.
                 executor.resumeEvent(seqNum: seqNum, payload: payload)
-                try await WorkflowStateQueries.appendHistory(
-                    on: exec.postgres,
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    seq: historySeq,
-                    eventType: .eventReceived,
-                    eventData: try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)),
-                    logger: exec.logger
-                )
-                historySeq += 1
             } else {
                 executor.resumeEventWithTimeout(seqNum: seqNum, eventName: eventName)
             }
@@ -550,29 +548,6 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             ids: signals.map { $0.id },
             logger: exec.logger
         )
-    }
-
-    /// Appends a `CHILD_WORKFLOW_COMPLETED` history event for every completed child
-    /// workflow in `completedChildren`. Activities and non-completed children are skipped.
-    private func appendChildWorkflowCompletedHistory(
-        completedChildren: [(seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?, state: TaskState, kind: TaskKind, name: String)],
-        exec: _WorkerExec,
-        claimed: ClaimedTask,
-        historySeq: inout Int
-    ) async throws {
-        for (seqNum, _, _, state, kind, name) in completedChildren
-        where kind == .workflow && state == .completed {
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: .childWorkflowCompleted,
-                eventData: try? JSON.encode(WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum)),
-                logger: exec.logger
-            )
-            historySeq += 1
-        }
     }
 
     /// Runs all queued local activities to completion, draining the executor after each

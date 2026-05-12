@@ -1,6 +1,7 @@
 services:
     db:
         image: postgres:18-alpine
+        command: postgres -c 'max_connections=500' -c 'shared_preload_libraries=auto_explain' -c 'auto_explain.log_min_duration=1000' -c 'auto_explain.log_analyze=on' -c 'auto_explain.log_verbose=on' -c 'auto_explain.log_timing=on' -c 'auto_explain.log_buffers=on' -c 'auto_explain.log_wal=on' -c 'auto_explain.log_triggers=on' -c 'auto_explain.log_format=text'
         environment:
             POSTGRES_USER: strand
             POSTGRES_PASSWORD: strand
@@ -8,20 +9,34 @@ services:
         ports:
             - "5499:5432"
         volumes:
+            - ./strand.sql:/docker-entrypoint-initdb.d/strand.sql
             - db_data:/var/lib/postgresql/data
+        shm_size: 4g
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U strand -d strand_dev"]
             interval: 5s
             timeout: 5s
             retries: 5
 
-    jaeger:
-        image: jaegertracing/all-in-one:1.57
+    # jaeger:
+    #     image: jaegertracing/all-in-one:1.57
+    #     ports:
+    #         - "16686:16686" # Web UI → http://localhost:16686
+    #         - "4317:4317" # OTLP gRPC (default port — no config needed)
+    #     environment:
+    #         COLLECTOR_OTLP_ENABLED: "true"
+    hyperdx:
+        image: docker.hyperdx.io/hyperdx/hyperdx-all-in-one:latest
+        container_name: strand-hyperdx
         ports:
-            - "16686:16686" # Web UI → http://localhost:16686
-            - "4317:4317" # OTLP gRPC (default port — no config needed)
-        environment:
-            COLLECTOR_OTLP_ENABLED: "true"
+            - "8081:8080" # HyperDX UI
+            - "4317:4317" # OTLP gRPC
+            - "4318:4318" # OTLP HTTP
+        volumes:
+            - strand_data:/data/db
+            - strand_data:/var/lib/clickhouse
+            - strand_data:/var/log/clickhouse-server
 
 volumes:
+    strand_data:
     db_data:

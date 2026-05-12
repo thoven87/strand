@@ -22,8 +22,10 @@ import Foundation
 public final class MetricsCache: Sendable {
 
     private struct _State {
-        var broadcast: StrandMetricsBroadcast?
-        var receivedAt: Date = .distantPast
+        var entries: [String: (broadcast: StrandMetricsBroadcast, receivedAt: Date)] = [:]
+        /// Last non-nil timings per namespace, preserved for up to `timingsTTL`
+        /// so a quiet broadcast window doesn't evict good DDSketch data.
+        var lastTimings: [String: (timings: [StrandMetricsBroadcast.TimingSnapshot], preservedAt: Date)] = [:]
     }
 
     private let _mutex: Mutex<_State> = Mutex(_State())
@@ -33,26 +35,65 @@ public final class MetricsCache: Sendable {
     /// interval, so a single missed cycle never forces a live query.
     public let ttl: Duration
 
-    public init(ttl: Duration = .seconds(30)) {
+    /// Time-to-live for preserved timings when broadcasts emit nil timings.
+    /// Longer than `ttl` so a few quiet 5 s windows never evict good data.
+    public let timingsTTL: Duration
+
+    public init(ttl: Duration = .seconds(30), timingsTTL: Duration = .seconds(120)) {
         self.ttl = ttl
+        self.timingsTTL = timingsTTL
     }
 
-    /// Replaces the cached broadcast with a freshly received one.
+    /// Replaces the cached broadcast for its namespace with a freshly received one.
+    /// When the broadcast carries nil timings, merges in the last preserved
+    /// timings (if within `timingsTTL`) so a quiet window never evicts good data.
     func update(_ broadcast: StrandMetricsBroadcast) {
         _mutex.withLock { s in
-            s.broadcast = broadcast
-            s.receivedAt = Date.now
+            // Persist any non-nil timings so quiet windows don't evict them.
+            if let newTimings = broadcast.timings {
+                s.lastTimings[broadcast.namespace] = (newTimings, Date.now)
+            }
+
+            // Merge: use the broadcast's own timings if present; fall back to
+            // last preserved timings (provided they are within timingsTTL).
+            let mergedTimings: [StrandMetricsBroadcast.TimingSnapshot]?
+            if let preserved = s.lastTimings[broadcast.namespace] {
+                let age = Date.now.timeIntervalSince(preserved.preservedAt)
+                let ttlSecs = Double(timingsTTL.components.seconds)
+                mergedTimings = (age < ttlSecs) ? (broadcast.timings ?? preserved.timings) : broadcast.timings
+            } else {
+                mergedTimings = broadcast.timings
+            }
+
+            let merged = StrandMetricsBroadcast(
+                namespace: broadcast.namespace,
+                at: broadcast.at,
+                queues: broadcast.queues,
+                timings: mergedTimings
+            )
+            s.entries[broadcast.namespace] = (merged, Date.now)
         }
     }
 
-    /// Returns the cached broadcast if one exists and is younger than ``ttl``,
-    /// otherwise `nil` (routes should fall back to live DB queries).
+    /// Returns the cached broadcast for `namespace` if it is younger than ``ttl``.
+    public func current(forNamespace namespace: String) -> StrandMetricsBroadcast? {
+        _mutex.withLock { s in
+            guard let entry = s.entries[namespace] else { return nil }
+            let age = Date.now.timeIntervalSince(entry.receivedAt)
+            guard age < Double(ttl.components.seconds) else { return nil }
+            return entry.broadcast
+        }
+    }
+
+    /// Returns the most recently received broadcast across all namespaces if younger than ``ttl``.
+    /// Used by callers that do not filter by namespace.
     public func current() -> StrandMetricsBroadcast? {
         _mutex.withLock { s in
-            guard let b = s.broadcast else { return nil }
-            let age = Date.now.timeIntervalSince(s.receivedAt)
+            guard let (_, entry) = s.entries.max(by: { $0.value.receivedAt < $1.value.receivedAt })
+            else { return nil }
+            let age = Date.now.timeIntervalSince(entry.receivedAt)
             guard age < Double(ttl.components.seconds) else { return nil }
-            return b
+            return entry.broadcast
         }
     }
 }

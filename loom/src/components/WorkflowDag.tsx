@@ -35,7 +35,13 @@ function kindBadge(kind: TraceSpan["kind"]): { label: string; fill: string } {
         case "SLEEP":
             return { label: "S", fill: "#94a3b8" };
         case "WAIT":
-            return { label: "~", fill: "#94a3b8" };
+            return { label: "~", fill: "#6366f1" };
+        case "SIGNAL":
+            return { label: "sig", fill: "#a855f7" };
+        case "EMIT":
+            return { label: "emit", fill: "#f59e0b" };
+        case "CONDITION":
+            return { label: "cond", fill: "#94a3b8" };
         case "LOG":
             return { label: "L", fill: "#64748b" };
     }

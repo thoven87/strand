@@ -35,6 +35,16 @@ export interface Queue {
 
 export type TaskKind = "WORKFLOW" | "ACTIVITY";
 
+/** All possible span kinds in a workflow trace. */
+export type SpanKind =
+    | "WORKFLOW"
+    | "ACTIVITY"
+    | "WAIT" // ctx.waitForEvent(...)
+    | "SLEEP" // ctx.sleep(for:)
+    | "SIGNAL" // handleSignal delivery
+    | "EMIT" // ctx.emitEvent(...)
+    | "CONDITION"; // ctx.condition(...) — reserved
+
 // ─── Retry ──────────────────────────────────────────────────────────────────
 
 export type RetryMode = "all" | "failed_only" | "failed_and_dependents";
@@ -51,6 +61,7 @@ export interface TaskSummary {
     state: TaskState;
     attempt: number;
     createdAt: string;
+    firstRunAt: string | null;
     completedAt: string | null;
     /** "WORKFLOW" for root orchestrators, "ACTIVITY" for child leaf tasks. */
     kind: TaskKind;
@@ -118,10 +129,26 @@ export interface Checkpoint {
 
 // ─── Events ────────────────────────────────────────────────────────────────
 
+export interface TriggeredTask {
+    taskId: string;
+    taskName: string;
+    taskState: string;
+    taskKind: string; // "WORKFLOW" | "ACTIVITY"
+}
+
 export interface StrandEvent {
+    id: string; // emission UUID — new in append-only log
     name: string;
     payload: string | null; // raw JSON string
     createdAt: string;
+    triggeredTasks: TriggeredTask[]; // tasks woken by this event (newest first, up to 5)
+}
+
+export interface EventTrigger {
+    emissionId: string | null; // UUID of the specific emission that woke this task; null for pre-migration rows
+    eventName: string;
+    queue: string;
+    triggeredAt: string;
 }
 
 // ─── Misc ──────────────────────────────────────────────────────────────────
@@ -134,9 +161,25 @@ export interface EnqueueResult {
 
 // ─── Workflow history ───────────────────────────────────────────────────────
 
+/** All known history event types written by the Strand worker. */
+export type HistoryEventType =
+    | "WORKFLOW_STARTED"
+    | "WORKFLOW_COMPLETED"
+    | "WORKFLOW_FAILED"
+    | "SIGNAL_RECEIVED"
+    | "ACTIVITY_SCHEDULED"
+    | "TIMER_STARTED"
+    | "TIMER_FIRED"
+    | "CONDITION_WAITING"
+    | "EVENT_WAIT_STARTED"
+    | "EVENT_RECEIVED"
+    | "CHILD_WORKFLOW_STARTED"
+    | "CHILD_WORKFLOW_COMPLETED"
+    | "EVENT_EMITTED";
+
 export interface HistoryEvent {
     seq: number;
-    eventType: string;
+    eventType: HistoryEventType;
     eventData: string | null; // raw JSON string
     createdAt: string;
 }
@@ -150,17 +193,11 @@ export interface WorkflowState {
 // ─── Trace ─────────────────────────────────────────────────────────────────
 
 /** Raw shape returned by GET /api/:namespace/tasks/:taskID/trace */
-export interface TraceSpanData {
+export interface TraceSpanResponse {
     id: string;
     name: string;
-    kind: "WORKFLOW" | "ACTIVITY";
-    state:
-        | "COMPLETED"
-        | "RUNNING"
-        | "WAITING"
-        | "FAILED"
-        | "CANCELLED"
-        | "PENDING";
+    kind: SpanKind; // was "WORKFLOW" | "ACTIVITY" (TaskKind)
+    state: string;
     startMs: number;
     durationMs: number;
     queuedMs?: number;
@@ -168,9 +205,12 @@ export interface TraceSpanData {
     maxAttempts?: number;
     errorMessage?: string;
     workerID?: string;
-    createdAt: string;
-    startedAt?: string | null;
-    completedAt?: string | null;
-    taskId: string;
-    children: TraceSpanData[];
+    createdAt?: string;
+    startedAt?: string;
+    completedAt?: string;
+    taskId?: string; // null for synthetic spans (WAIT/SLEEP/SIGNAL/EMIT)
+    children: TraceSpanResponse[];
+    emissionId?: string; // only for WAIT spans: links to the emission event
+    /** Raw JSON payload received when a waitForEvent resolved. Only set on completed WAIT spans. */
+    eventPayload?: string;
 }

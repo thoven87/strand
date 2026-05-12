@@ -48,6 +48,23 @@ enum WorkflowCommand: Sendable {
     /// (replay fast-path). Non-suspending — the worker writes an EVENT_RECEIVED history event.
     case eventReceived(eventName: String)
 
+    /// Records that a child workflow result was delivered to the handler.
+    /// Non-suspending — processed by the step-2 loop to write a `CHILD_WORKFLOW_COMPLETED`
+    /// history event. A checkpoint is written alongside this command so the same
+    /// seqNum returns via fast-path-1 on all future replays without re-emitting.
+    case childWorkflowCompleted(name: String, seqNum: Int)
+
+    /// Emits a named event on the workflow's queue.
+    ///
+    /// Non-suspending: the handler continues immediately after emitting this command.
+    /// `applyScheduleCommands` writes the event to `strand.events` after `drain()` returns,
+    /// keeping the handler body 100% free of DB I/O.
+    ///
+    /// First-write-wins semantics apply: if an event with the same
+    /// `(namespace_id, queue, name)` already exists with a non-null payload this
+    /// is a no-op (idempotent replay safety).
+    case emitEvent(name: String, payload: ByteBuffer)
+
     /// Schedule a child workflow and suspend until it completes.
     case scheduleChildWorkflow(
         name: String,
@@ -103,7 +120,8 @@ struct ConditionEntry {
     let timeout: Duration?
     /// Parked continuation. Linked immediately after the task suspends via
     /// `linkConditionContinuation(_:forID:)`.
-    var continuation: CheckedContinuation<Void, Error>?
+    /// Resumed with `true` when the predicate is satisfied, `false` on timeout.
+    var continuation: CheckedContinuation<Bool, Error>?
 }
 
 final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Sendable {
@@ -439,10 +457,9 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
         for (id, entry) in conditionEntries {
             if let wakeAt = entry.wakeAt, now >= wakeAt {
                 conditionEntries.removeValue(forKey: id)
-                let msg =
-                    entry.timeout.map { "condition timed out after \($0)" }
-                    ?? "condition timed out"
-                entry.continuation?.resume(throwing: StrandError.timeout(message: msg))
+                // Timeout is normal control flow — resume with false so the
+                // caller can decide what to do (e.g. auto-approve after SLA).
+                entry.continuation?.resume(returning: false)
                 return true
             }
         }
@@ -483,7 +500,7 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
 
     /// Store the `CheckedContinuation` for a registered condition (called synchronously
     /// from within `withCheckedThrowingContinuation` while the task is suspending).
-    func linkConditionContinuation(_ cont: CheckedContinuation<Void, Error>, forID id: Int) {
+    func linkConditionContinuation(_ cont: CheckedContinuation<Bool, Error>, forID id: Int) {
         conditionEntries[id]?.continuation = cont
     }
 
@@ -496,7 +513,7 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     func evaluateAndResumeFirstSatisfiedCondition() -> Bool {
         for (id, entry) in conditionEntries where entry.predicate() {
             conditionEntries.removeValue(forKey: id)
-            entry.continuation?.resume()
+            entry.continuation?.resume(returning: true)
             return true
         }
         return false

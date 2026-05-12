@@ -243,23 +243,29 @@ public struct StrandScheduler: Service {
     }
 
     private func fireSchedules(now: Date = .now) async throws {
-        let postgres = client.postgres
-        let logger = client.logger
-
         let rows = try await ScheduleQueries.pollDueSchedules(
-            on: postgres,
+            on: client.postgres,
             namespaceID: client.namespaceID,
             now: now,
-            logger: logger
+            limit: options.pollLimit,
+            logger: client.logger
         )
+        guard !rows.isEmpty else { return }
 
-        for row in rows {
-            do {
-                try await fire(row, now: now)
-            } catch {
-                logger.error(
-                    "failed to fire schedule '\(row.name)': \(String(reflecting: error))"
-                )
+        // Fire all due schedules concurrently — each fire() is independently
+        // idempotent so parallel execution is safe.  Errors are isolated per
+        // schedule: one failure does not cancel the others.
+        await withTaskGroup(of: Void.self) { group in
+            for row in rows {
+                group.addTask { [self] in
+                    do {
+                        try await self.fire(row, now: now)
+                    } catch {
+                        self.client.logger.error(
+                            "failed to fire schedule '\(row.name)': \(String(reflecting: error))"
+                        )
+                    }
+                }
             }
         }
     }
@@ -267,100 +273,156 @@ public struct StrandScheduler: Service {
     private func fire(_ row: ScheduleRow, now: Date) async throws {
         let postgres = client.postgres
         let logger = client.logger
-
         let pattern = try JSON.decode(SchedulePattern.self, from: row.patternBuffer)
 
-        // Advance from the SCHEDULED fire time, not the actual wall-clock time.
-        // Using `now` here would accumulate drift: a scheduler that fires 30 s
-        // late on every poll shifts every subsequent slot by 30 s. Using
-        // `row.scheduledAt` keeps fire times pinned to the original cadence.
+        // ── Build the list of slots to fire ──────────────────────────────────────
+        // .latest (default): only the single slot in row.scheduledAt.
+        // .all:              every overdue slot from row.scheduledAt up to now.
+        // .last(n):          the last n overdue slots (oldest-first order).
+        //
+        // For .all and .last(n), _schedule set next_run_at to the OLDEST overdue
+        // slot.  We iterate forward here so a single fire() call catches up the
+        // full backlog in one pass instead of requiring one poll cycle per slot.
+        let slotsToFire: [Date]
+        switch row.accuracy {
+        case .latest:
+            slotsToFire = [row.scheduledAt]
+
+        case .all:
+            // Cap at options.maxCatchupSlots per fire() invocation.  If the
+            // backlog is larger, markScheduleFired advances next_run_at to the
+            // slot after the last one fired and the remainder is handled on the
+            // next poll cycle — no slots are skipped, just spread across polls.
+            var slots: [Date] = []
+            var cursor = row.scheduledAt
+            while cursor <= now && slots.count < options.maxCatchupSlots {
+                slots.append(cursor)
+                guard
+                    let next = try? ScheduleCalculator.nextRunTime(
+                        for: pattern,
+                        after: cursor,
+                        timezone: pattern.timezone
+                    )
+                else { break }
+                cursor = next
+            }
+            slotsToFire = slots
+
+        case .last(let n) where n > 0:
+            var slots: [Date] = []
+            var cursor = row.scheduledAt
+            while cursor <= now && slots.count < options.maxCatchupSlots {
+                slots.append(cursor)
+                guard
+                    let next = try? ScheduleCalculator.nextRunTime(
+                        for: pattern,
+                        after: cursor,
+                        timezone: pattern.timezone
+                    )
+                else { break }
+                cursor = next
+            }
+            // Fire in chronological order, keeping only the last n.
+            slotsToFire = Array(slots.suffix(n))
+
+        default:
+            slotsToFire = [row.scheduledAt]
+        }
+
+        guard !slotsToFire.isEmpty else { return }
+
+        // ── Enqueue one task per slot ─────────────────────────────────────────────
+        // Idempotency keys are slot-specific ("$schedule:<id>:<epochSecs>") so
+        // concurrent scheduler instances that both observe the same slot produce
+        // at most one task row regardless of how many enqueue attempts are made.
+        //
+        // Crash recovery: if the process crashes after enqueueTask but before
+        // markScheduleFired, the next poll re-runs enqueueTask with the same key
+        // (ON CONFLICT DO NOTHING → no-op) and retries markScheduleFired.
+        let partitionConfig = try PartitionOffsetConfig(offset: "PT0M")
+        var lastTaskID = UUID()
+        for slotAt in slotsToFire {
+            let partitionTime: Date?
+            do {
+                partitionTime = try ScheduleCalculator.calculatePartitionTime(
+                    executionTime: slotAt,
+                    schedule: pattern,
+                    partitionOffset: partitionConfig
+                )
+            } catch {
+                logger.info(
+                    "schedule '\(row.name)': could not compute partition time for slot \(slotAt.ISO8601Format())",
+                    metadata: ["error": "\(error)", "strand.schedule_id": "\(row.id)"]
+                )
+                partitionTime = nil
+            }
+
+            let schedulingMeta = SchedulingMetadata(
+                executionTime: now,
+                partitionTime: partitionTime,
+                scheduleOffset: pattern.partitionOffset,
+                scheduleId: row.id.uuidString,
+                scheduledBy: row.name
+            )
+
+            let idempotencyKey = "$schedule:\(row.id):\(slotAt.timeIntervalSince1970)"
+            let enqueued = try await Queries.enqueueTask(
+                on: postgres,
+                namespaceID: client.namespaceID,
+                queue: row.queue,
+                taskName: row.taskName,
+                paramsBuffer: row.paramsBuffer,
+                headersBuffer: row.headersBuffer,
+                schedulingMetadata: schedulingMeta,
+                retryStrategyBuffer: row.retryStrategyBuffer,
+                maxAttempts: row.maxAttempts,
+                cancellationBuffer: row.cancellationBuffer,
+                idempotencyKey: idempotencyKey,
+                kind: row.kind,
+                logger: logger
+            )
+            lastTaskID = enqueued.taskID
+        }
+
+        // ── Advance next_run_at past the last slot fired ──────────────────────────
+        let lastSlot = slotsToFire.last!
         var nextRunAt = try ScheduleCalculator.nextRunTime(
             for: pattern,
-            after: row.scheduledAt,
+            after: lastSlot,
             timezone: pattern.timezone
         )
-
-        // Respect ends_at: disable the schedule once no more valid runs exist.
         if let endsAt = row.endsAt, let next = nextRunAt, next >= endsAt {
             nextRunAt = nil
         }
 
-        // Compute partition time: the period boundary the task covers, with the
-        // schedule's own offset stripped. Pass PT0M as the partition-offset config
-        // so calculatePartitionTime truncates to the boundary (day/week/month/interval)
-        // without any additional look-back.
-        //
-        // Examples:
-        //   .daily(offset: "PT15M")   fires 00:15 → partitionTime 00:00
-        //   .weekly(offset: "P6DT9H") fires Fri 09:00 → partitionTime Sun 00:00
-        //   .interval(90 min)         fires 01:45 → partitionTime 01:30
-        let partitionConfig = try PartitionOffsetConfig(offset: "PT0M")
-        let partitionTime: Date?
-        do {
-            partitionTime = try ScheduleCalculator.calculatePartitionTime(
-                executionTime: row.scheduledAt,
-                schedule: pattern,
-                partitionOffset: partitionConfig
-            )
-        } catch {
-            logger.info(
-                "schedule '\(row.name)': could not compute partition time — metadata will be nil",
-                metadata: ["error": "\(error)", "schedule_id": "\(row.id)"]
-            )
-            partitionTime = nil
-        }
-
-        // Build scheduling metadata. Passed directly to enqueueTask as SchedulingMetadata?
-        let schedulingMeta = SchedulingMetadata(
-            executionTime: now,
-            partitionTime: partitionTime,
-            scheduleOffset: pattern.partitionOffset,  // nil when offset is PT0M/PT0H
-            scheduleId: row.id.uuidString,
-            scheduledBy: row.name
-        )
-        let headersBuf = row.headersBuffer  // user-provided headers only; no mutation needed
-
-        // Idempotency key: schedule_id + scheduled fire time.
-        // Safe across multiple scheduler instances and restarts.
-        let idempotencyKey =
-            "$schedule:\(row.id):\(row.scheduledAt.timeIntervalSince1970)"
-
-        let enqueuedRow = try await Queries.enqueueTask(
-            on: postgres,
-            namespaceID: client.namespaceID,
-            queue: row.queue,
-            taskName: row.taskName,
-            paramsBuffer: row.paramsBuffer,
-            headersBuffer: headersBuf,
-            schedulingMetadata: schedulingMeta,
-            retryStrategyBuffer: row.retryStrategyBuffer,
-            maxAttempts: row.maxAttempts,
-            cancellationBuffer: row.cancellationBuffer,
-            idempotencyKey: idempotencyKey,
-            kind: row.kind,
-            logger: logger
-        )
-
-        try await ScheduleQueries.markScheduleFired(
+        // CAS guard: markScheduleFired only advances next_run_at when it still
+        // equals row.scheduledAt.  A concurrent instance that already fired this
+        // slot will have changed next_run_at — we detect that and return early.
+        let won = try await ScheduleQueries.markScheduleFired(
             on: postgres,
             namespaceID: client.namespaceID,
             id: row.id,
-            // firedAt = wall-clock time the task was actually enqueued.
-            // Shown in the dashboard as "Last run" so users see when the
-            // schedule most recently did work, not when the slot was due.
+            scheduledAt: row.scheduledAt,
             firedAt: now,
-            // slotAt = the canonical slot boundary this fire covers.
-            // Stored in last_slot_at and used by _schedule as the
-            // catch-up base so interval arithmetic stays pinned to the
-            // original cadence rather than drifting toward wall-clock time.
-            slotAt: row.scheduledAt,
+            slotAt: lastSlot,
             nextRunAt: nextRunAt,
-            lastTaskID: enqueuedRow.taskID,
+            lastTaskID: lastTaskID,
             logger: logger
         )
 
+        guard won else {
+            logger.info(
+                "schedule '\(row.name)' already advanced by another instance — skipping",
+                metadata: ["strand.schedule_id": .stringConvertible(row.id)]
+            )
+            return
+        }
+
+        let slotCount = slotsToFire.count
         logger.debug(
-            "schedule fired",
+            slotCount == 1
+                ? "schedule fired"
+                : "schedule fired (\(slotCount) catch-up slots)",
             metadata: [
                 "strand.schedule_name": .string(row.name),
                 "strand.schedule_id": .stringConvertible(row.id),

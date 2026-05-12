@@ -162,6 +162,58 @@ extension TaskKind: PostgresCodable {
     }
 }
 
+// MARK: - WorkflowSpanKind
+
+/// All possible span kinds in a workflow trace.
+/// Named `WorkflowSpanKind` (not `SpanKind`) to avoid a naming conflict with
+/// `swift-distributed-tracing`'s `SpanKind` (.client / .server / .producer / .consumer).
+///
+/// `workflow` and `activity` come from actual `strand.tasks` rows.
+/// The rest are synthesised from `strand.workflow_history` events by the
+/// trace-building route in StrandServer.
+public enum WorkflowSpanKind: String, Sendable, Codable, CaseIterable {
+    case workflow = "WORKFLOW"
+    case activity = "ACTIVITY"
+    case wait = "WAIT"  // ctx.waitForEvent(...)
+    case sleep = "SLEEP"  // ctx.sleep(for:)
+    case signal = "SIGNAL"  // handleSignal delivery
+    case emit = "EMIT"  // ctx.emitEvent(...)
+    case condition = "CONDITION"  // ctx.condition(...) — reserved for future use
+}
+
+extension WorkflowSpanKind {
+    /// Converts a `TaskKind` (DB column value) to the corresponding `WorkflowSpanKind`.
+    public init(taskKind: TaskKind) {
+        switch taskKind {
+        case .workflow: self = .workflow
+        case .activity: self = .activity
+        }
+    }
+
+    /// Human-readable lowercase label for use in trace span names.
+    /// Used as a fallback when the event name or signal name cannot be decoded
+    /// from the history event payload.
+    var displayName: String { rawValue.lowercased() }
+}
+
+// MARK: - WorkflowSpanState
+
+/// State of a span in the workflow trace view.
+/// Used by both real task spans (derived from `TaskState`) and
+/// execution history spans (WAIT / SLEEP / SIGNAL / EMIT).
+public enum WorkflowSpanState: String, Sendable, Codable {
+    case pending = "PENDING"
+    case running = "RUNNING"
+    case waiting = "WAITING"
+    case retrying = "RETRYING"
+    case failed = "FAILED"
+    case timedOut = "TIMED_OUT"
+    case crashed = "CRASHED"
+    case cancelled = "CANCELLED"
+    case delayed = "DELAYED"
+    case completed = "COMPLETED"
+}
+
 // MARK: - Task result types
 
 public enum TaskState: String, Sendable, Codable {

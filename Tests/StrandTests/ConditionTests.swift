@@ -62,8 +62,8 @@ private struct PauseableWorkflow: Workflow {
 }
 
 // ── 3. ConditionTimeout — no signal ─────────────────────────────────────────
-// 600 ms deadline; no signal is ever sent, so the deadline passes and the
-// workflow catches `StrandError.timeout`, returning "timed-out" as its output.
+// 600 ms deadline; no signal is ever sent, so the deadline passes and
+// condition returns `false`. The workflow maps false → "timed-out".
 // `unpaused` is `Bool?` for the same decoding reason as PauseableWorkflow.
 // Used by: conditionWithTimeoutTimedOut
 
@@ -78,13 +78,8 @@ private struct ConditionTimeoutWorkflow: Workflow {
     }
 
     mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String {
-        do {
-            try await context.condition({ $0.unpaused == true }, timeout: .milliseconds(600))
-            return "unpaused"
-        } catch let err as StrandError {
-            if case .timeout = err { return "timed-out" }
-            throw err
-        }
+        let met = try await context.condition({ $0.unpaused == true }, timeout: .milliseconds(600))
+        return met ? "unpaused" : "timed-out"
     }
 }
 
@@ -105,13 +100,8 @@ private struct ConditionTimeoutSignalWorkflow: Workflow {
     }
 
     mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String {
-        do {
-            try await context.condition({ $0.unpaused == true }, timeout: .seconds(10))
-            return "unpaused"
-        } catch let err as StrandError {
-            if case .timeout = err { return "timed-out" }
-            throw err
-        }
+        let met = try await context.condition({ $0.unpaused == true }, timeout: .seconds(10))
+        return met ? "unpaused" : "timed-out"
     }
 }
 
@@ -222,9 +212,9 @@ struct ConditionTests {
 
     // ── 4 ───────────────────────────────────────────────────────────────────
     // `condition(_:timeout:)` with a 600 ms deadline. No signal is ever sent.
-    // The timer fires, the predicate is still `false`, and `StrandError.timeout`
-    // is thrown. The workflow catches it and returns "timed-out" as output.
-    @Test("condition with timeout throws StrandError.timeout when deadline passes without a signal")
+    // The timer fires, the predicate is still `false`, and condition returns `false`.
+    // The workflow maps false → "timed-out" as output.
+    @Test("condition with timeout returns false when deadline passes without a signal")
     func conditionWithTimeoutTimedOut() async throws {
         try await withTestEnvironment { client in
             let workerTask = startWorker(

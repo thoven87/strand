@@ -25,7 +25,7 @@ extension UUID {
     /// This keeps B-tree index inserts sequential on `strand.tasks` and
     /// `strand.runs`, dramatically reducing index fragmentation compared to
     /// random UUIDv4.
-    static func v7() -> UUID {
+    package static func v7() -> UUID {
         // 48-bit Unix timestamp in milliseconds
         let ms = UInt64(Date().timeIntervalSince1970 * 1000)
 

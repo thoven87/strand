@@ -372,12 +372,14 @@ private func seedOnePodcast(client: StrandClient, logger: Logger) async {
         //
         // Override the endpoint for other collectors:
         //   OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io:443 \
-        //   OTEL_EXPORTER_OTLP_AUTH=<base64-api-key> \
+        //   OTEL_EXPORTER_OTLP_AUTH=<api-key> \
         //   swift run DevServer
         let otlpEndpoint = env["OTEL_EXPORTER_OTLP_ENDPOINT"] ?? "http://localhost:4317"
+        // For HyperDX (local all-in-one): set to your HyperDX API key.
+        // For cloud collectors: set to the full header value, e.g. "Bearer <token>".
         let otlpHeaders: [(String, String)] =
             env["OTEL_EXPORTER_OTLP_AUTH"].map {
-                [("Authorization", "Basic \($0)")]
+                [("Authorization", $0)]
             } ?? []
 
         var otelConfig = OTel.Configuration.default

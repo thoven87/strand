@@ -460,33 +460,35 @@ struct ScheduleCatchupUnitTests {
                 lastSlot: catchupDate("2026-05-10T13:29:00Z"),
                 now: catchupDate("2026-05-10T17:29:00Z")
             )
-            // base=13:29 → first=14:59, steps=⌊150 / 90⌋=1 → computed=16:29
-            // LEAST(18:35, 16:29) = 16:29
-            let expected = catchupDate("2026-05-10T16:29:00Z")
+            // base=13:29 → first epoch boundary = 13:30 (9×90min from midnight)
+            // steps=⌊(17:29-13:30)/90min⌋=⌊239/90⌋=2 → computed=13:30+180min=16:30
+            // LEAST(18:35, 16:30) = 16:30
+            let expected = catchupDate("2026-05-10T16:30:00Z")
             let got = catchupFmt(result)
-            #expect(result == expected, "expected 16:29, got \(got)")
+            #expect(result == expected, "expected 16:30, got \(got)")
         }
     }
 
-    // When existingNextRunAt is already the correct next slot (set by markScheduleFired)
-    // and the restart happens before that slot is due, re-registration must leave it
-    // untouched — LEAST(existing, computed) is a no-op when both values are equal.
-    @Test("interval 90 min: correct future next_run_at preserved on restart within window")
+    // When existingNextRunAt is already the correct epoch-aligned next slot
+    // and the restart happens before that slot is due, re-registration must
+    // leave it untouched — LEAST(existing, computed) is a no-op when equal.
+    @Test("interval 90 min: correct epoch-aligned next_run_at preserved on restart within window")
     func catchupInterval90MinCorrectNextRunAtPreserved() async throws {
         try await withTestEnvironment { client in
             let result = try await catchupNextRunAt(
                 client: client,
                 name: "cu-90min-correct",
                 interval: .seconds(5400),
-                existingNextRunAt: catchupDate("2026-05-10T17:59:00Z"),
-                lastSlot: catchupDate("2026-05-10T16:29:00Z"),
+                existingNextRunAt: catchupDate("2026-05-10T18:00:00Z"),  // epoch-aligned: 12×90min
+                lastSlot: catchupDate("2026-05-10T16:30:00Z"),  // epoch-aligned: 11×90min
                 now: catchupDate("2026-05-10T17:00:00Z")
             )
-            // base=16:29 → first=17:59, 17:59 > 17:00 → no catch-up, computed=17:59
-            // LEAST(17:59, 17:59) = 17:59
-            let expected = catchupDate("2026-05-10T17:59:00Z")
+            // base=16:30 → first epoch boundary = 18:00 (12×90min from midnight)
+            // 18:00 > 17:00 → no catch-up, computed=18:00
+            // LEAST(18:00, 18:00) = 18:00
+            let expected = catchupDate("2026-05-10T18:00:00Z")
             let got = catchupFmt(result)
-            #expect(result == expected, "expected 17:59, got \(got)")
+            #expect(result == expected, "expected 18:00, got \(got)")
         }
     }
 }

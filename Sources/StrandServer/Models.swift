@@ -70,6 +70,7 @@ struct TaskSummaryResponse: Codable, Sendable {
     let attempt: Int
     let createdAt: Date
     let completedAt: Date?
+    let firstRunAt: Date?
     /// `.workflow` or `.activity` — lets the UI distinguish root workflows from child activities.
     let kind: TaskKind
     /// UUID of the parent workflow task, or `null` for root tasks.
@@ -89,6 +90,7 @@ struct TaskSummaryResponse: Codable, Sendable {
         attempt = row.attempt
         createdAt = row.createdAt
         completedAt = row.completedAt
+        firstRunAt = row.firstRunAt
         kind = row.kind
         parentTaskId = row.parentTaskId
         scheduleName = row.scheduleName
@@ -184,23 +186,107 @@ struct CheckpointResponse: Codable, Sendable {
 extension CheckpointResponse: ResponseCodable {}
 
 struct EventResponse: Codable, Sendable {
+    struct TriggeredTaskResponse: Codable, Sendable {
+        let taskId: String
+        let taskName: String
+        let taskState: String
+        let taskKind: String
+    }
+    let id: String  // emission UUID (lowercase) — new in append-only log
     let name: String
     let payload: String?  // raw JSON
     let createdAt: Date
     let queue: String
+    let triggeredTasks: [TriggeredTaskResponse]
     init(from row: EventRow) {
+        id = row.id.uuidString.lowercased()
         name = row.name
         payload = row.payloadBuffer.map { String(buffer: $0) }
         createdAt = row.createdAt
         queue = row.queue
+        triggeredTasks = row.triggeredTasks.map {
+            TriggeredTaskResponse(
+                taskId: $0.taskId.uuidString,
+                taskName: $0.taskName,
+                taskState: $0.taskState,
+                taskKind: $0.taskKind
+            )
+        }
     }
 }
 extension EventResponse: ResponseCodable {}
+
+struct EventWaiterResponse: Codable, Sendable {
+    let taskId: String  // UUID as lowercase string
+    let taskName: String
+    let taskState: String
+    let seqNum: Int
+    let timeoutAt: Date?
+
+    init(from row: EventWaiterRow) {
+        taskId = row.taskId.uuidString.lowercased()
+        taskName = row.taskName
+        taskState = row.taskState.rawValue
+        seqNum = row.seqNum
+        timeoutAt = row.timeoutAt
+    }
+}
+extension EventWaiterResponse: ResponseCodable {}
+
+/// Response returned by `GET /api/:namespace/tasks/:taskId/event-trigger`.
+/// Links a workflow task back to the specific event emission that woke it.
+struct EventTriggerResponse: Codable, Sendable {
+    /// UUID of the specific `strand.events` row (emission) that woke this task.
+    /// `nil` for tasks triggered before the append-only migration.
+    let emissionId: String?
+    let eventName: String
+    let queue: String
+    let triggeredAt: Date
+
+    init(from row: EventTriggerRow) {
+        emissionId = row.emissionID?.uuidString.lowercased()
+        eventName = row.eventName
+        queue = row.queue
+        triggeredAt = row.triggeredAt
+    }
+}
+extension EventTriggerResponse: ResponseCodable {}
 
 struct SimpleResponse: Codable, Sendable {
     let message: String
     let id: String
 }
+
+/// One row per `(name, kind)` for root task definitions.
+/// Returned by `GET /api/:namespace/task-definitions`.
+struct TaskDefinitionResponse: Codable, Sendable {
+    let name: String
+    let kind: TaskKind
+    let totalRuns: Int
+    let runningRuns: Int
+    let queuedRuns: Int
+    let failedRuns: Int
+    let lastSeenAt: Date?
+    let avgDurationMs: Double?
+
+    init(from row: WorkflowRow) {
+        name = row.name
+        kind = row.kind
+        totalRuns = row.totalRuns
+        runningRuns = row.runningRuns
+        queuedRuns = row.queuedRuns
+        failedRuns = row.failedRuns
+        lastSeenAt = row.lastSeenAt
+        avgDurationMs = row.avgDurationMs
+    }
+}
+struct DailyRunCountResponse: Codable, Sendable {
+    let date: Date
+    let total: Int
+    let failed: Int
+}
+extension DailyRunCountResponse: ResponseCodable {}
+
 extension SimpleResponse: ResponseCodable {}
 
 struct EnqueueResultResponse: Codable, Sendable {
@@ -223,7 +309,7 @@ struct HistoryEventResponse: Codable, Sendable {
 
     init(from row: WorkflowStateQueries.HistoryEventRow) {
         seq = row.seq
-        eventType = row.eventType
+        eventType = row.eventType.rawValue  // decode from enum — was row.eventType directly
         eventData = row.eventData.map { String(buffer: $0) }
         createdAt = row.createdAt
     }
@@ -238,22 +324,32 @@ struct WorkflowStateResponse: Codable, Sendable {
 extension WorkflowStateResponse: ResponseCodable {}
 
 struct TraceSpanResponse: Codable, Sendable {
-    let id: UUID
+    /// Stable unique key for the span.
+    /// Task spans use `task.id.uuidString`.
+    /// Execution history spans use `"<workflowUUID>-<seqNum>"` — their natural
+    /// composite identifier. `String` (not `UUID`) so both forms are representable.
+    let id: String
     let name: String
-    let kind: TaskKind  // "WORKFLOW" | "ACTIVITY"
-    let state: String  // SpanState: "COMPLETED" | "RUNNING" | "WAITING" | "FAILED" | "CANCELLED" | "PENDING"
-    let startMs: Double  // milliseconds from root task creation
-    let durationMs: Double  // total span duration in ms
-    let queuedMs: Double?  // ms from creation to worker claim (nil when never started)
+    let kind: WorkflowSpanKind
+    let state: WorkflowSpanState
+    let startMs: Double
+    let durationMs: Double
+    let queuedMs: Double?
     let attempt: Int
     let maxAttempts: Int?
-    let errorMessage: String?  // raw failure JSON string, nil on success
+    let errorMessage: String?
     let workerID: String?
     let createdAt: Date
-    let startedAt: Date?  // when worker claimed the run
-    let completedAt: Date?  // when the run finished
-    let taskId: UUID  // same as id — for UI deep-link convenience
+    let startedAt: Date?
+    let completedAt: Date?
+    /// Task to navigate to when the inspector’s "View task" button is tapped.
+    /// `nil` for execution history spans that have no independent task row.
+    let taskId: UUID?
     let children: [TraceSpanResponse]
+    /// The `strand.events` emission that resolved this WAIT span, if known.
+    let emissionId: UUID?
+    /// Raw JSON payload received when a `waitForEvent` resolved (WAIT spans only).
+    let eventPayload: String?
 }
 extension TraceSpanResponse: ResponseCodable {}
 
