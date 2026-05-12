@@ -606,12 +606,10 @@ export function EventsPage() {
     );
 
     const since = useMemo(() => {
-        const now = Date.now();
-        if (timeRange === "1h") return new Date(now - 3_600_000).toISOString();
-        if (timeRange === "24h")
-            return new Date(now - 86_400_000).toISOString();
-        if (timeRange === "7d")
-            return new Date(now - 7 * 86_400_000).toISOString();
+        const nowSec = Date.now() / 1000;
+        if (timeRange === "1h") return String(Math.floor(nowSec - 3_600));
+        if (timeRange === "24h") return String(Math.floor(nowSec - 86_400));
+        if (timeRange === "7d") return String(Math.floor(nowSec - 7 * 86_400));
         return undefined;
     }, [timeRange]);
 

@@ -30,8 +30,7 @@ struct EventRoutes {
                 Date(timeIntervalSince1970: $0)
             }
 
-            let sinceStr = qp.get("since")
-            let since: Date? = sinceStr.flatMap { ISO8601DateFormatter().date(from: $0) }
+            let since: Date? = qp.get("since").flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
             let page = try await ManagementQueries.listEventsGlobal(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,
@@ -55,8 +54,7 @@ struct EventRoutes {
             let cursor: Date? = qp.get("cursor")
                 .flatMap { Double($0) }
                 .map { Date(timeIntervalSince1970: $0) }
-            let sinceStr = qp.get("since")
-            let since: Date? = sinceStr.flatMap { ISO8601DateFormatter().date(from: $0) }
+            let since: Date? = qp.get("since").flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
             let page = try await ManagementQueries.listEvents(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,
@@ -114,17 +112,9 @@ struct EventRoutes {
             let queue = try ctx.parameters.require("queue")
             let body = try await req.decode(as: EmitEventBody.self, context: ctx)
             // Trim whitespace; nil or empty payload → JSON null (event delivered, no data).
-            // Validate non-empty payloads are well-formed JSON so malformed bytes
-            // never reach strand.events and cause decode failures in waitForEvent.
-            let buf: ByteBuffer? = try body.payload.flatMap { raw -> ByteBuffer? in
+            let buf: ByteBuffer? = body.payload.flatMap { raw -> ByteBuffer? in
                 let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !t.isEmpty else { return nil }
-                guard let data = t.data(using: .utf8),
-                    (try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)) != nil
-                else {
-                    throw HTTPError(.badRequest, message: "payload must be valid JSON")
-                }
-                return ByteBuffer(string: t)
+                return t.isEmpty ? nil : ByteBuffer(string: t)
             }
             try await self.client.emitEvent(
                 body.name,
