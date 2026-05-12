@@ -41,33 +41,32 @@ import Foundation
             backgroundLogger: logger
         )
 
-        let client = StrandClient(
+        let strand = StrandService(
             postgres: postgres,
-            queue: "ci-pipeline",
-            namespace: "ci-pipeline-demo",
-            options: StrandOptions(logger: logger)
+            options: .init(
+                queues: [
+                    .init(
+                        name: "ci-pipeline",
+                        namespace: "ci-pipeline-demo",
+                        workflows: [CIPipelineWorkflow.self],
+                        activities: [
+                            CheckoutActivity(),
+                            LintActivity(),
+                            UnitTestActivity(),
+                            SecurityScanActivity(),
+                            BuildActivity(),
+                            DeployActivity(),
+                        ],
+                        workflowConcurrency: 4,
+                        activityConcurrency: 8,
+                        pollInterval: .milliseconds(100)
+                    )
+                ],
+                logger: logger
+            )
         )
 
-        let worker = StrandWorker(
-            postgres: postgres,
-            options: WorkerOptions(
-                queue: "ci-pipeline",
-                namespace: "ci-pipeline-demo",
-                workflowConcurrency: 4,
-                activityConcurrency: 8,
-                pollInterval: .milliseconds(100)
-            ),
-            workflows: [CIPipelineWorkflow.self],
-            activities: [
-                CheckoutActivity(),
-                LintActivity(),
-                UnitTestActivity(),
-                SecurityScanActivity(),
-                BuildActivity(),
-                DeployActivity(),
-            ],
-            logger: logger
-        )
+        let client = strand.client(queue: "ci-pipeline", namespace: "ci-pipeline-demo")
 
         Task {
             do {
@@ -95,17 +94,8 @@ import Foundation
 
                 // Simulate a CI bot approving the deployment automatically
                 // after enough time for all pipeline stages to complete.
-                //
-                // In production this would be a human reviewing the build
-                // artifacts and sending the signal via the Loom dashboard or
-                // their own tooling:
-                //
-                //   let handle = client.workflowHandle(id: taskID)
-                //   try await handle.signal(CIPipelineWorkflow.Approve.self,
-                //                           payload: ApprovalDecision(approved: true, approver: "alice"))
                 Task {
-                    // Wait long enough for checkout + parallel gates + build
-                    // (roughly 4 s checkout/lint/security + 6 s tests-with-retry + 4 s build = ~14 s)
+                    // checkout + parallel gates + build ≈ 14 s; give a small buffer
                     try await Task.sleep(for: .seconds(18))
                     print("\nCI bot: all stages passed — auto-approving deployment")
                     try await handle.signal(
@@ -122,23 +112,17 @@ import Foundation
                     print("Pipeline finished without deploying")
                 }
 
-                // Let the final log lines flush before shutdown.
                 try await Task.sleep(for: .milliseconds(200))
-                try await client.cancelTask(id: handle.taskID)  // clean up
+                try await client.cancelTask(id: handle.taskID)
             } catch {
                 print("Pipeline error:", error)
             }
         }
 
         let group = ServiceGroup(
-            configuration: .init(
-                services: [
-                    .init(service: postgres),
-                    .init(service: worker),
-                ],
-                gracefulShutdownSignals: [.sigterm, .sigint],
-                logger: logger
-            )
+            services: [postgres, strand],
+            gracefulShutdownSignals: [.sigterm, .sigint],
+            logger: logger
         )
         try await group.run()
     }

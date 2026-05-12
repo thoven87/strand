@@ -169,6 +169,13 @@ public struct StrandScheduler: Service {
         logger.info("scheduler starting")
         defer { logger.info("scheduler stopped") }
 
+        // Ensure the namespace exists before any schedule upsert. Workers call
+        // registerNamespace in their own run(), but the scheduler starts
+        // concurrently and may fire upsertSchedule before any worker has had a
+        // chance to register the namespace — causing a FK violation on
+        // strand.schedules.namespace_id. Idempotent: ON CONFLICT DO NOTHING.
+        try await client.registerNamespace()
+
         // Upsert all statically-declared schedules before the poll loop starts.
         // Any failure is propagated immediately — a bad schedule definition is
         // a programming error (wrong pattern, invalid input encoding, DB schema

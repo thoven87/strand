@@ -662,6 +662,15 @@ public struct StrandClient: Sendable {
         logger.info("schema verified")
     }
 
+    /// Ensures this client's namespace exists in `strand.namespaces`.
+    /// Idempotent — safe to call on every boot (`ON CONFLICT DO NOTHING`).
+    /// `StrandWorker` calls this automatically; call it explicitly when a
+    /// service (e.g. `StrandScheduler`) operates in a namespace before any
+    /// worker has had a chance to register it.
+    public func registerNamespace() async throws {
+        try await Queries.registerNamespace(on: postgres, namespaceID: namespaceID, logger: logger)
+    }
+
     // MARK: - Queue management
 
     public func createQueue(_ name: String, namespaceID overrideNS: String? = nil) async throws {

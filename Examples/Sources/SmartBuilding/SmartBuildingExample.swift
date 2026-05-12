@@ -44,32 +44,25 @@ import Foundation
             backgroundLogger: logger
         )
 
-        let client = StrandClient(
+        let strand = StrandService(
             postgres: postgres,
-            queue: "iot-building",
-            namespace: "iot-demo",
-            options: StrandOptions(logger: logger)
+            options: .init(
+                queues: [
+                    .init(
+                        name: "iot-building",
+                        namespace: "iot-demo",
+                        workflows: [BuildingMonitorWorkflow.self, RoomMonitorWorkflow.self],
+                        activities: [ReadSensorsActivity(), SendAlertActivity()],
+                        workflowConcurrency: 8,
+                        activityConcurrency: 16,
+                        pollInterval: .milliseconds(100)
+                    )
+                ],
+                logger: logger
+            )
         )
 
-        let worker = StrandWorker(
-            postgres: postgres,
-            options: WorkerOptions(
-                queue: "iot-building",
-                namespace: "iot-demo",
-                workflowConcurrency: 8,
-                activityConcurrency: 16,
-                pollInterval: .milliseconds(100)
-            ),
-            workflows: [
-                BuildingMonitorWorkflow.self,
-                RoomMonitorWorkflow.self,
-            ],
-            activities: [
-                ReadSensorsActivity(),
-                SendAlertActivity(),
-            ],
-            logger: logger
-        )
+        let client = strand.client(queue: "iot-building", namespace: "iot-demo")
 
         Task {
             do {
@@ -104,34 +97,14 @@ import Foundation
                 // Ops team signal: after the server-room thermal spike on cycle 3,
                 // raise the temperature ceiling to acknowledge the incident and
                 // suppress further alerts while HVAC repair is in progress.
-                //
-                // We signal the parent BuildingMonitorWorkflow handle here because
-                // child workflow handles are not directly accessible from the client
-                // without an explicit idempotency key. In production you would obtain
-                // the server-room child's handle via:
-                //
-                //   let roomHandle = try await client.workflow(
-                //       id: "<taskID>:<seqNum>",
-                //       as: RoomMonitorWorkflow.self)
-                //   try await roomHandle.signal(RoomMonitorWorkflow.UpdateThresholds.self,
-                //       payload: ThresholdUpdate(...))
-                //
-                // Here we use the untyped signal API so the parent can receive and
-                // record the update in its own durable state. The signal name is
-                // derived from the `WorkflowSignalDefinition` type name ("updatethresholds").
                 Task {
-                    // Cycle 3 starts around t=8 s (2 s sleep × 2 prior cycles + activity time).
-                    // Wait until after the spike has been detected.
                     try await Task.sleep(for: .seconds(9))
-                    print(
-                        "\nOps team: raising server-room temp ceiling"
-                            + " after spike investigation"
-                    )
+                    print("\nOps team: raising server-room temp ceiling after spike investigation")
                     try await handle.signal(
                         name: RoomMonitorWorkflow.UpdateThresholds.signalName,
                         payload: ThresholdUpdate(
                             newThresholds: RoomThresholds(
-                                maxTemperatureCelsius: 90.0,  // raised ceiling
+                                maxTemperatureCelsius: 90.0,
                                 maxCO2PPM: 800.0,
                                 minHumidityPercent: 35.0
                             ),
@@ -150,14 +123,9 @@ import Foundation
         }
 
         let group = ServiceGroup(
-            configuration: .init(
-                services: [
-                    .init(service: postgres),
-                    .init(service: worker),
-                ],
-                gracefulShutdownSignals: [.sigterm, .sigint],
-                logger: logger
-            )
+            services: [postgres, strand],
+            gracefulShutdownSignals: [.sigterm, .sigint],
+            logger: logger
         )
         try await group.run()
     }
