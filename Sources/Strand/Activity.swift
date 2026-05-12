@@ -1,5 +1,5 @@
 public import Logging  // Logger in ActivityContext.logger is public API
-import NIOCore  // ByteBuffer used internally in _activityToken() closure; not in Activity.swift's own public API
+package import NIOCore  // ByteBuffer is part of the package-internal interface (_heartbeatImpl signature, init heartbeatDetailsBuffer)
 import PostgresNIO  // PostgresClient captured in heartbeatImpl closure; internal to _run()
 import Tracing
 
@@ -35,6 +35,18 @@ public struct ActivityOptions: Sendable {
     /// Maximum time this activity attempt may run. `nil` defers to the
     /// worker's claim timeout.
     public var timeout: Duration?
+
+    /// Maximum time between successive `context.heartbeat()` calls.
+    ///
+    /// If the activity does not heartbeat within this window the worker lease
+    /// expires and the run is re-queued as a new attempt — without waiting the
+    /// full `timeout` (StartToClose) budget. Useful for long-running activities
+    /// (e.g. `timeout: .hours(2), heartbeatTimeout: .seconds(30)`) where you
+    /// want fast re-scheduling on a stuck worker without a very short claim window.
+    ///
+    /// `nil` = extend the lease by the worker's `claimTimeout` on each heartbeat
+    /// (the existing behaviour).
+    public var heartbeatTimeout: Duration?
 
     /// Maximum total wall-clock time from when the activity is first scheduled
     /// until it permanently completes, across ALL retry attempts.
@@ -84,6 +96,7 @@ public struct ActivityOptions: Sendable {
 
     public init(
         timeout: Duration? = nil,
+        heartbeatTimeout: Duration? = nil,
         maxDuration: Duration? = nil,
         maxAttempts: Int? = nil,
         retryStrategy: RetryStrategy? = nil,
@@ -97,6 +110,7 @@ public struct ActivityOptions: Sendable {
         cancellation: CancellationPolicy? = nil
     ) {
         self.timeout = timeout
+        self.heartbeatTimeout = heartbeatTimeout
         self.maxDuration = maxDuration
         self.maxAttempts = maxAttempts
         self.retryStrategy = retryStrategy
@@ -139,8 +153,11 @@ public struct ActivityContext: Sendable {
     // Package-internal: the parent workflow's task UUID (for parent_task_id FK).
     package let parentWorkflowID: UUID?
 
-    // Package-internal: heartbeat implementation injected by the worker.
-    package let _heartbeatImpl: @Sendable () async throws -> Void
+    // Package-internal: heartbeat details from the previous attempt.
+    private let _heartbeatDetailsBuffer: ByteBuffer?
+
+    // Package-internal: heartbeat implementation — accepts optional progress details.
+    package let _heartbeatImpl: @Sendable (ByteBuffer?) async throws -> Void
 
     package init(
         activityID: UUID,
@@ -149,7 +166,8 @@ public struct ActivityContext: Sendable {
         attempt: Int,
         logger: Logger,
         parentWorkflowID: UUID?,
-        heartbeatImpl: @escaping @Sendable () async throws -> Void = {}  // default no-op
+        heartbeatDetailsBuffer: ByteBuffer? = nil,
+        heartbeatImpl: @escaping @Sendable (ByteBuffer?) async throws -> Void = { _ in }  // default no-op
     ) {
         self.activityID = activityID
         self.activityName = activityName
@@ -157,6 +175,7 @@ public struct ActivityContext: Sendable {
         self.attempt = attempt
         self.logger = logger
         self.parentWorkflowID = parentWorkflowID
+        self._heartbeatDetailsBuffer = heartbeatDetailsBuffer
         self._heartbeatImpl = heartbeatImpl
     }
 
@@ -174,7 +193,42 @@ public struct ActivityContext: Sendable {
     /// }
     /// ```
     public func heartbeat() async throws {
-        try await _heartbeatImpl()
+        try await _heartbeatImpl(nil)
+    }
+
+    /// Extends the activity's lease **and** persists `details` as the heartbeat
+    /// progress checkpoint.
+    ///
+    /// On the next retry attempt, call ``heartbeatDetails(as:)`` to retrieve this
+    /// value and resume exactly where you left off:
+    ///
+    /// ```swift
+    /// func run(input: FileInput, context: ActivityContext) async throws -> StrandVoid {
+    ///     let startLine = context.heartbeatDetails(as: Int.self) ?? 0
+    ///     for line in startLine ..< input.totalLines {
+    ///         process(line)
+    ///         if line.isMultiple(of: 100) {
+    ///             try await context.heartbeat(line)   // survive any crash here
+    ///         }
+    ///     }
+    ///     return .done
+    /// }
+    /// ```
+    public func heartbeat<T: Codable & Sendable>(_ details: T) async throws {
+        let buf = try JSON.encode(details)
+        try await _heartbeatImpl(buf)
+    }
+
+    /// Returns the heartbeat details stored by the **previous** attempt, decoded
+    /// as `T`. Returns `nil` on the first attempt or if the previous attempt
+    /// never called ``heartbeat(_:)``.
+    ///
+    /// ```swift
+    /// let startLine = context.heartbeatDetails(as: Int.self) ?? 0
+    /// ```
+    public func heartbeatDetails<T: Codable & Sendable>(as type: T.Type = T.self) -> T? {
+        guard let buf = _heartbeatDetailsBuffer else { return nil }
+        return try? JSON.decode(T.self, from: buf)
     }
 }
 
@@ -331,7 +385,7 @@ extension ActivityDefinition {
             attempt: 1,
             logger: exec.logger,
             parentWorkflowID: parentWorkflowID,
-            heartbeatImpl: {}  // no-op: local activities run synchronously in the activation
+            heartbeatImpl: { _ in }  // no-op: local activities run synchronously in the activation
         )
         let output = try await self.run(input: decodedInput, context: ctx)
         return try JSON.encode(output)
@@ -360,6 +414,15 @@ extension ActivityDefinition {
         } else {
             claimTimeoutSecs = Int(exec.options.claimTimeout.components.seconds)
         }
+        // Use heartbeatTimeout for lease extension if set; otherwise fall back to the
+        // worker's claimTimeout. This ensures the activity is re-queued quickly when
+        // it stops heartbeating, without requiring a very short claimTimeout.
+        let heartbeatExtendSecs: Int
+        if let ht = claimed.heartbeatTimeoutSeconds, ht > 0 {
+            heartbeatExtendSecs = ht
+        } else {
+            heartbeatExtendSecs = claimTimeoutSecs
+        }
         let heartbeatLogger = exec.logger
 
         let ctx = ActivityContext(
@@ -369,13 +432,17 @@ extension ActivityDefinition {
             attempt: claimed.attempt,
             logger: exec.logger,
             parentWorkflowID: claimed.parentWorkflowID,
-            heartbeatImpl: {
+            heartbeatDetailsBuffer: claimed.heartbeatDetails,
+            heartbeatImpl: { details in
                 // Extend the Postgres lease to signal that the activity is still alive.
+                // When `details` is non-nil, persists the heartbeat progress checkpoint
+                // so the next retry attempt can resume exactly where it left off.
                 try await Queries.extendClaim(
                     on: postgres,
                     namespaceID: namespace,
                     runID: runID,
-                    extendBySeconds: claimTimeoutSecs,
+                    extendBySeconds: heartbeatExtendSecs,
+                    heartbeatDetails: details,
                     logger: heartbeatLogger
                 )
                 // Also renew the in-process fatal deadline so a long-running

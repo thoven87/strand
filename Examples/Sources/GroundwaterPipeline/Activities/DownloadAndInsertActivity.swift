@@ -13,10 +13,12 @@ import Foundation
 /// Key design decisions:
 /// - **Streaming download**: `URLSession.bytes` reads the HTTP body incrementally
 ///   so we never load a 50k-row CSV entirely into memory.
-/// - **`context.heartbeat()`**: called every 1 000 rows to renew the worker lease
-///   during what can be a 30–60 second download+insert cycle.
-/// - **Batch insert**: rows are accumulated in groups of 200 and inserted in a
-///   single transaction, balancing round-trips against memory usage.
+/// - **`context.heartbeat(rowsDownloaded)`**: called every 1 000 rows.
+///   Stores the running row count so a failed attempt knows exactly where to
+///   resume: `offset += lastHeartbeat`, `limit -= lastHeartbeat`. This avoids
+///   re-downloading already-inserted rows on retry.
+/// - **Batch insert**: rows are accumulated in groups of 1 000 and flushed in a
+///   single UNNEST transaction, balancing round-trips against memory usage.
 /// - **Idempotent progress tracking**: `cnra.chunk_progress` uses ON CONFLICT so
 ///   a retried activity updates the existing row rather than inserting a duplicate.
 struct DownloadAndInsertActivity: ActivityDefinition {
@@ -32,15 +34,36 @@ struct DownloadAndInsertActivity: ActivityDefinition {
     let postgres: PostgresClient
 
     func run(input: Input, context: ActivityContext) async throws -> Output {
+        // Resume from the last heartbeat checkpoint if this is a retry.
+        // On attempt 1 (or if the previous attempt never heartbeated) this is 0.
+        let resumeFromRow = context.heartbeatDetails(as: Int.self) ?? 0
+
+        // All rows were already processed in a previous attempt (failed after the
+        // last insert but before returning). The inserts would be no-ops anyway,
+        // but skip the redundant network request entirely.
+        guard resumeFromRow < input.limit else {
+            context.logger.info(
+                "Chunk already complete (resumeFromRow=\(resumeFromRow) >= limit=\(input.limit)), skipping",
+                metadata: ["job_id": .string(input.jobID)]
+            )
+            return IngestChunkOutput(offset: input.offset, rowsDownloaded: input.limit, rowsInserted: 0)
+        }
+
+        // Adjust the API offset/limit to skip rows already inserted.
+        let resumeOffset = input.offset + resumeFromRow
+        let resumeLimit = input.limit - resumeFromRow
+
         let chunkURL = URL(
-            string: "\(CNRA.dumpBase)?limit=\(input.limit)&offset=\(input.offset)"
+            string: "\(CNRA.dumpBase)?limit=\(resumeLimit)&offset=\(resumeOffset)"
         )!
         context.logger.info(
-            "Downloading chunk offset=\(input.offset) limit=\(input.limit)",
+            resumeFromRow == 0
+                ? "Downloading chunk offset=\(input.offset) limit=\(input.limit)"
+                : "Resuming chunk offset=\(input.offset) from row \(resumeFromRow) (apiOffset=\(resumeOffset) remaining=\(resumeLimit))",
             metadata: ["job_id": .string(input.jobID)]
         )
 
-        // ── 1. Record chunk start (idempotent) ──────────────────────────────────
+        // ── 1. Record chunk start (idempotent) ───────────────────────────────────────
         try await postgres.query(
             """
             INSERT INTO cnra.chunk_progress
@@ -61,7 +84,9 @@ struct DownloadAndInsertActivity: ActivityDefinition {
         }
 
         var batch: [GroundwaterRow] = []
-        var rowsDownloaded = 0
+        // Start the counter at resumeFromRow so heartbeats store the cumulative
+        // position within the original chunk across all attempts.
+        var rowsDownloaded = resumeFromRow
         var rowsInserted = 0
         var headerSkipped = false
 
@@ -76,9 +101,10 @@ struct DownloadAndInsertActivity: ActivityDefinition {
             batch.append(row)
             rowsDownloaded += 1
 
-            // Heartbeat every N rows to keep the lease alive
+            // Heartbeat every N rows: extend the lease AND persist the current
+            // row count so a retry knows exactly where to resume.
             if rowsDownloaded % Self.heartbeatEvery == 0 {
-                try await context.heartbeat()
+                try await context.heartbeat(rowsDownloaded)
                 context.logger.debug(
                     "offset=\(input.offset) downloaded=\(rowsDownloaded)",
                     metadata: ["job_id": .string(input.jobID)]

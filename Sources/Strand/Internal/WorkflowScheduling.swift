@@ -272,6 +272,7 @@ extension WorkflowRegistration {
                             priority: options.priority,
                             scheduledAt: options.delayUntil,
                             timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
+                            heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
                             deadlineAt: options.maxDuration.map {
                                 Date.now.addingTimeInterval(
                                     Double($0.components.seconds)
@@ -470,6 +471,7 @@ extension WorkflowRegistration {
                             priority: childPriority,
                             scheduledAt: childScheduledAt,
                             timeoutSeconds: nil,
+                            heartbeatTimeoutSeconds: nil,
                             deadlineAt: nil,
                             fairnessKey: childFairnessKey,
                             fairnessWeight: childFairnessWeight,

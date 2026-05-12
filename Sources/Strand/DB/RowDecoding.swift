@@ -45,6 +45,11 @@ struct ClaimedTask: Sendable {
     /// Stored in `strand.tasks.timeout_seconds`; decoded from the claim CTE result.
     let timeoutSeconds: Int?
 
+    /// Heartbeat timeout in seconds. When set, `context.heartbeat()` extends the
+    /// lease by this duration instead of the worker's `claimTimeout`. Allows fast
+    /// re-scheduling when an activity stalls without requiring a short `claimTimeout`.
+    let heartbeatTimeoutSeconds: Int?
+
     /// Scheduling metadata injected by `StrandScheduler`. `nil` for directly-enqueued tasks.
     let schedulingMetadata: SchedulingMetadata?
 
@@ -52,6 +57,11 @@ struct ClaimedTask: Sendable {
     /// for claiming).  Used to compute `wait_time` — how long the task spent in the queue
     /// before a worker picked it up.
     let availableAt: Date
+
+    /// Heartbeat details written by the previous attempt via `context.heartbeat(_:)`.
+    /// `nil` on the first attempt or if the previous attempt never called `heartbeat(_:)`.
+    /// Exposed to the activity handler via `ActivityContext.heartbeatDetails(as:)`.
+    let heartbeatDetails: ByteBuffer?
 
     /// `true` when this attempt is the last one allowed.
     ///
@@ -68,7 +78,8 @@ extension ClaimedTask {
     /// Decode from the column order returned by the claim CTE:
     /// run_id, task_id, attempt, version, task_name, params,
     /// retry_strategy, max_attempts, headers, wake_event, event_payload,
-    /// parent_task_id, kind, timeout_seconds, scheduling_metadata, available_at
+    /// parent_task_id, kind, timeout_seconds, heartbeat_timeout_seconds,
+    /// scheduling_metadata, available_at, heartbeat_details
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -93,8 +104,10 @@ extension ClaimedTask {
         parentWorkflowID = try col.next()!.decode(UUID?.self, context: .default)
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         timeoutSeconds = try col.next()!.decode(Int?.self, context: .default)
+        heartbeatTimeoutSeconds = try col.next()!.decode(Int?.self, context: .default)
         schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
         availableAt = try col.next()!.decode(Date.self, context: .default)
+        heartbeatDetails = try col.next()!.decode(ByteBuffer?.self, context: .default)
     }
 }
 
