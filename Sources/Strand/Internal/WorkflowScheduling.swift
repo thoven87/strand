@@ -90,6 +90,33 @@ extension WorkflowRegistration {
                 try await record(.timerFired, nil)
             case .eventReceived(let eventName):
                 try await record(.eventReceived, try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
+            case .childWorkflowCompleted(let name, let seqNum):
+                // Record child workflow completion. runChildWorkflow emits this command
+                // exactly once; the accompanying checkpoint ensures replays return from
+                // fast-path-1 without re-emitting.
+                try await record(
+                    .childWorkflowCompleted,
+                    try? JSON.encode(WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum))
+                )
+            case .emitEvent(let eventName, let payload):
+                // Non-suspending: write to strand.events directly here.
+                // Processed in this step-2 loop (before the terminal-result check in step 3)
+                // so the DB write happens whether the handler completed or suspended —
+                // a workflow that calls emitEvent and then returns in the same activation
+                // would never reach the step-4 scheduleCommands loop.
+                // Append-only: replay inserts a second row, but duplicate emits find no
+                // active waiters (already woken by the first), so wakeups are exactly-once.
+                try await Queries.emitEvent(
+                    on: exec.postgres,
+                    namespaceID: exec.namespace,
+                    queue: exec.queue,
+                    eventName: eventName,
+                    payloadBuffer: payload,
+                    logger: exec.logger
+                )
+                // Record the emission in workflow history so it appears in the trace view.
+                let emitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
+                try await record(.eventEmitted, emitData)
             default:
                 break
             }
@@ -148,7 +175,7 @@ extension WorkflowRegistration {
             switch cmd {
             case .scheduleActivity, .startTimer, .awaitEvent, .scheduleChildWorkflow:
                 return true
-            case .writeCheckpoint, .timerFired, .eventReceived:
+            case .writeCheckpoint, .timerFired, .eventReceived, .emitEvent, .childWorkflowCompleted:
                 return false
             }
         }
@@ -246,6 +273,20 @@ extension WorkflowRegistration {
                     )
                     try await record(.timerStarted, timerData)
 
+                case .emitEvent(let eventName, let payload):
+                    // Append-only insert; duplicate emits find no active waiters so wakeups
+                    // are still exactly-once. .emitEvent is excluded from scheduleCommands
+                    // by the filter above — this case is unreachable at runtime but required
+                    // for switch exhaustiveness.
+                    try await Queries.emitEvent(
+                        on: exec.postgres,
+                        namespaceID: exec.namespace,
+                        queue: exec.queue,
+                        eventName: eventName,
+                        payloadBuffer: payload,
+                        logger: exec.logger
+                    )
+
                 case .awaitEvent(let eventName, let seqNum, let timeoutAt):
                     // Atomic check-or-wait: prevents the lost-wakeup race where the
                     // event fires between drain() returning and this transaction committing.
@@ -263,30 +304,37 @@ extension WorkflowRegistration {
                     let queueName = exec.queue
                     try await exec.postgres.withTransaction(logger: exec.logger) { conn in
                         // Always register the event_wait so emitEvent can find this run later.
+                        // namespace_id is required for tenant isolation — never rely on the
+                        // column DEFAULT ('default') for non-default namespaces.
                         try await conn.query(
                             """
                             INSERT INTO strand.event_waits
-                                (task_id, run_id, queue, seq_num, event_name, timeout_at)
-                            VALUES (\(taskID), \(runID), \(queueName), \(seqNum), \(eventName), \(timeoutAt))
+                                (namespace_id, task_id, run_id, queue, seq_num, event_name, timeout_at)
+                            VALUES (\(exec.namespace), \(taskID), \(runID), \(queueName), \(seqNum), \(eventName), \(timeoutAt))
                             ON CONFLICT (run_id, seq_num) DO UPDATE
                                 SET event_name = EXCLUDED.event_name, timeout_at = EXCLUDED.timeout_at
                             """,
                             logger: exec.logger
                         )
                         // Check if the event was already emitted (race window detection).
+                        // SELECT id so we can write an event_triggers row for the fast-path
+                        // case, giving the task detail page a "Woken by event" link even when
+                        // the event arrived before the waitForEvent was registered.
                         let evtStream = try await conn.query(
                             """
-                            SELECT payload FROM strand.events
+                            SELECT id, payload FROM strand.events
                             WHERE namespace_id = \(exec.namespace)
                               AND queue = \(queueName)
                               AND name  = \(eventName)
-                              AND payload IS NOT NULL
+                            ORDER BY created_at DESC
+                            LIMIT 1
                             """,
                             logger: exec.logger
                         )
                         if let evtRow = try await evtStream.first(where: { _ in true }) {
                             // Event already in strand.events — wake the run immediately.
                             var col = evtRow.makeIterator()
+                            let emissionID = try col.next()!.decode(UUID.self, context: .default)
                             let existingPayload = try col.next()!.decode(
                                 ByteBuffer?.self,
                                 context: .default
@@ -307,6 +355,17 @@ extension WorkflowRegistration {
                                 )
                                 UPDATE strand.tasks SET state = \(TaskState.pending)
                                 WHERE id = \(taskID)
+                                """,
+                                logger: exec.logger
+                            )
+                            // Record the event_triggers linkage for the fast-path case so
+                            // the dashboard can link the task back to the specific emission.
+                            try await conn.query(
+                                """
+                                INSERT INTO strand.event_triggers
+                                    (id, namespace_id, queue, event_name, emission_id, task_id, run_id)
+                                VALUES (\(UUID.v7()), \(exec.namespace), \(queueName), \(eventName), \(emissionID), \(taskID), \(runID))
+                                ON CONFLICT DO NOTHING
                                 """,
                                 logger: exec.logger
                             )
@@ -383,8 +442,8 @@ extension WorkflowRegistration {
                         )
                     )
 
-                case .writeCheckpoint, .timerFired, .eventReceived:
-                    break  // already handled above
+                case .writeCheckpoint, .timerFired, .eventReceived, .childWorkflowCompleted:
+                    break  // processed in step-2 (non-suspending, not enqueued as child tasks)
                 }
             }
 

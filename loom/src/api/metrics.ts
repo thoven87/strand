@@ -34,7 +34,13 @@ export interface MetricsData {
     throughputPerHour: MetricsBucket[];
     errorRatePerHour: MetricsBucket[];
     taskTimings: TaskTiming[] | null;
+    windowHours: number;
 }
 
-export const getMetrics = (namespace: string): Promise<MetricsData> =>
-    api.get<MetricsData>(`/api/${namespace}/metrics`).then((r) => r.data);
+export const getMetrics = (
+    namespace: string,
+    hours = 24,
+): Promise<MetricsData> =>
+    api
+        .get<MetricsData>(`/api/${namespace}/metrics`, { params: { hours } })
+        .then((r) => r.data);

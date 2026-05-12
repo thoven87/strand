@@ -397,7 +397,7 @@ public struct StrandClient: Sendable {
             span.attributes[StrandLogKeys.queue] = SpanAttribute.string(queue)
             span.attributes[StrandLogKeys.namespace] = SpanAttribute.string(namespaceID)
 
-            // Inject inside the producer span — ServiceContext.current is now the
+            // Inject inside the producer span — ServiceContext.current is the
             // producer span itself, which is what the consumer will link back to.
             var h = headers
             if let ctx = ServiceContext.current {
@@ -435,15 +435,45 @@ public struct StrandClient: Sendable {
 
     // MARK: - Events
 
+    /// Forwards raw payload bytes to `Queries.emitEvent`. Used by server routes
+    /// that receive JSON directly from an HTTP request body and must not re-encode it.
+    /// Not part of the public API — call sites outside `StrandServer` should use
+    /// the `Codable` overload instead.
+    package func emitEvent(
+        _ name: String,
+        payloadBuffer: ByteBuffer?,
+        queue: String? = nil,
+        namespaceID: String? = nil
+    ) async throws {
+        let stored = payloadBuffer ?? ByteBuffer(string: "null")
+        try await Queries.emitEvent(
+            on: postgres,
+            namespaceID: namespaceID ?? self.namespaceID,
+            queue: queue ?? queueName,
+            eventName: name,
+            payloadBuffer: stored,
+            logger: logger
+        )
+    }
+
     /// Emits a named event by string — for dynamic names (e.g. `"order.shipped:\(id)"`).
+    ///
+    /// Pass `namespaceID: ctx.namespaceID` when calling from a server route so
+    /// the event lands in the correct tenant. Defaults to the client's own namespace.
+    ///
+    /// - Parameters:
+    ///   - namespaceID: Namespace to scope the emission to. Pass the request-level
+    ///     namespace (e.g. `ctx.namespaceID`) when calling from a server route so
+    ///     the event lands in the correct tenant. Defaults to the client's own namespace.
     public func emitEvent(
         _ name: String,
         payload: some Codable & Sendable,
-        queue: String? = nil
+        queue: String? = nil,
+        namespaceID: String? = nil
     ) async throws {
         try await Queries.emitEvent(
             on: postgres,
-            namespaceID: namespaceID,
+            namespaceID: namespaceID ?? self.namespaceID,
             queue: queue ?? queueName,
             eventName: name,
             payloadBuffer: try JSON.encode(payload),
@@ -471,10 +501,10 @@ public struct StrandClient: Sendable {
 
     // MARK: - Task control
 
-    public func cancelTask(id taskID: UUID) async throws {
+    public func cancelTask(id taskID: UUID, namespaceID overrideNS: String? = nil) async throws {
         try await Queries.cancelTask(
             on: postgres,
-            namespaceID: namespaceID,
+            namespaceID: overrideNS ?? namespaceID,
             taskID: taskID,
             logger: logger
         )
@@ -506,15 +536,17 @@ public struct StrandClient: Sendable {
     @discardableResult
     public func requeueTask(
         id taskID: UUID,
-        options: RetryOptions = .init()
+        options: RetryOptions = .init(),
+        namespaceID overrideNS: String? = nil
     ) async throws
         -> EnqueueResult
     {
+        let ns = overrideNS ?? namespaceID
         // Peek at state to choose the right path.
         guard
             let snap = try await ManagementQueries.getTask(
                 on: postgres,
-                namespaceID: namespaceID,
+                namespaceID: ns,
                 taskID: taskID,
                 logger: logger
             )
@@ -527,7 +559,7 @@ public struct StrandClient: Sendable {
             // The reRunTask path is unaffected by RetryOptions.
             let row = try await Queries.reRunTask(
                 on: postgres,
-                namespaceID: namespaceID,
+                namespaceID: ns,
                 taskID: taskID,
                 logger: logger
             )
@@ -541,7 +573,7 @@ public struct StrandClient: Sendable {
             // FAILED, CANCELLED, or any other terminal state — same task, next attempt.
             let (runID, attempt) = try await Queries.retryTask(
                 on: postgres,
-                namespaceID: namespaceID,
+                namespaceID: ns,
                 taskID: taskID,
                 resetHistory: options.resetHistory,
                 logger: logger
@@ -632,37 +664,37 @@ public struct StrandClient: Sendable {
 
     // MARK: - Queue management
 
-    public func createQueue(_ name: String) async throws {
+    public func createQueue(_ name: String, namespaceID overrideNS: String? = nil) async throws {
         try await Queries.createQueue(
             on: postgres,
-            namespaceID: namespaceID,
+            namespaceID: overrideNS ?? namespaceID,
             name: name,
             logger: logger
         )
     }
 
-    public func dropQueue(_ name: String) async throws {
+    public func dropQueue(_ name: String, namespaceID overrideNS: String? = nil) async throws {
         try await Queries.dropQueue(
             on: postgres,
-            namespaceID: namespaceID,
+            namespaceID: overrideNS ?? namespaceID,
             name: name,
             logger: logger
         )
     }
 
-    public func pauseQueue(_ name: String) async throws {
+    public func pauseQueue(_ name: String, namespaceID overrideNS: String? = nil) async throws {
         try await Queries.pauseQueue(
             on: postgres,
-            namespaceID: namespaceID,
+            namespaceID: overrideNS ?? namespaceID,
             name: name,
             logger: logger
         )
     }
 
-    public func resumeQueue(_ name: String) async throws {
+    public func resumeQueue(_ name: String, namespaceID overrideNS: String? = nil) async throws {
         try await Queries.resumeQueue(
             on: postgres,
-            namespaceID: namespaceID,
+            namespaceID: overrideNS ?? namespaceID,
             name: name,
             logger: logger
         )
@@ -945,7 +977,9 @@ public struct StrandClient: Sendable {
                     nextRunAt = candidate
                 }
             case .all:
-                // Keep the oldest missed slot so the scheduler fires them in order.
+                // Set next_run_at to the oldest missed slot.  fire() will iterate
+                // forward from there, enqueuing every overdue slot in a single
+                // invocation (up to SchedulerOptions.maxCatchupSlots per poll).
                 nextRunAt = first
 
             case .last(let n) where n > 0:
@@ -1017,11 +1051,17 @@ public struct StrandClient: Sendable {
     }
 
     /// Resumes a previously paused schedule.
-    public func resumeSchedule(id: UUID) async throws {
+    ///
+    /// - Parameter recomputeFrom: When provided, `next_run_at` is advanced to
+    ///   this date before reactivation, skipping any slots that fell due while
+    ///   the schedule was paused.  Pass `Date.now` to resume from the present
+    ///   moment.  When `nil` the existing `next_run_at` is preserved.
+    public func resumeSchedule(id: UUID, recomputeFrom: Date? = nil) async throws {
         try await ScheduleQueries.resumeSchedule(
             on: postgres,
             namespaceID: namespaceID,
             id: id,
+            recomputeFrom: recomputeFrom,
             logger: logger
         )
     }
@@ -1036,18 +1076,65 @@ public struct StrandClient: Sendable {
         )
     }
 
+    /// Fetches a single schedule by ID.  Returns `nil` when not found.
+    public func getSchedule(
+        id: UUID,
+        queue: String? = nil,
+        namespaceID overrideNS: String? = nil
+    ) async throws -> ScheduleSummary? {
+        let ns = overrideNS ?? namespaceID
+        guard
+            let row = try await ScheduleQueries.getSchedule(
+                on: postgres,
+                namespaceID: ns,
+                id: id,
+                logger: logger
+            )
+        else { return nil }
+        guard let pattern = try? JSON.decode(SchedulePattern.self, from: row.patternBuffer) else {
+            return nil
+        }
+        return ScheduleSummary(
+            id: row.id,
+            name: row.name,
+            queue: row.queue,
+            taskName: row.taskName,
+            pattern: pattern,
+            isActive: row.isActive,
+            startsAt: row.startsAt,
+            endsAt: row.endsAt,
+            nextRunAt: row.nextRunAt,
+            lastRunAt: row.lastRunAt,
+            lastTaskID: row.lastTaskID,
+            runCount: row.runCount,
+            accuracy: row.accuracy,
+            kind: row.kind,
+            createdAt: row.createdAt
+        )
+    }
+
     /// Lists schedules for `queue` (or all queues when `queue` is `nil`).
     /// Pass an explicit `namespaceID` to override the client's default (used by
     /// the dashboard API layer to honour the per-request namespace from the URL).
+    /// Lists schedules with optional keyset pagination.
+    ///
+    /// To advance through pages pass the `queue` and `name` of the **last row**
+    /// on the current page as `afterQueue` and `afterName` respectively.
     public func listSchedules(
         queue: String? = nil,
-        namespaceID overrideNS: String? = nil
+        namespaceID overrideNS: String? = nil,
+        limit: Int = 200,
+        afterQueue: String? = nil,
+        afterName: String? = nil
     ) async throws -> [ScheduleSummary] {
         let ns = overrideNS ?? namespaceID
         let rows = try await ScheduleQueries.listSchedules(
             on: postgres,
             namespaceID: ns,
             queue: queue,
+            limit: limit,
+            afterQueue: afterQueue,
+            afterName: afterName,
             logger: logger
         )
         return try rows.map { row in
@@ -1105,21 +1192,21 @@ public struct StrandClient: Sendable {
     /// When deploying new code with a ``WorkflowContext/version(changeID:)`` guard,
     /// ALL workflow activations (both new and in-flight) return `true` on their first
     /// encounter of that `changeID`. Call this method on existing in-flight workflows
-    /// to force them to take the **old** code path on their next activation.
+    /// to force them to take the **pre-change** code path on their next activation.
     ///
     /// ```swift
-    /// // Before deploying new code, mark in-flight workflows to use old path:
+    /// // Before deploying the updated code, mark in-flight workflows to use the pre-change path:
     /// let inFlightIDs: [UUID] = try await client.listInFlightTaskIDs(queue: "orders")
     /// for id in inFlightIDs {
     ///     try await client.markVersion(changeID: "v2-parallel-charge", value: false, taskID: id)
     /// }
-    /// // Now deploy the new code — existing workflows use the old path, new ones use new path.
+    /// // Deploy the updated code — in-flight workflows follow the pre-change path, new ones the post-change path.
     /// ```
     ///
     /// - Parameters:
     ///   - changeID: Must match exactly what's passed to ``WorkflowContext/version(changeID:)``.
-    ///   - value: `false` forces old code path; `true` forces new code path (the default
-    ///     for new executions that haven't encountered this `changeID` yet).
+    ///   - value: `false` pins the workflow to the pre-change code path; `true` to the post-change
+    ///     path (the default for new executions that haven't encountered this `changeID` yet).
     ///   - taskID: The task UUID of the in-flight workflow.
     ///   - callSiteIndex: Which call site to target when `version(changeID:)` is called
     ///     multiple times with the same `changeID`. Defaults to `1` (the first call site).

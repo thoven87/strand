@@ -132,7 +132,83 @@ public struct SchedulerOptions: Sendable {
     /// are no imminent fires or when a new schedule is added at runtime.
     public var sleepCap: Duration
 
-    public init(sleepCap: Duration = .seconds(60)) {
+    /// Maximum number of missed slots fired in a single `fire()` invocation
+    /// when `accuracy` is `.all` or `.last(n)`.
+    ///
+    /// After `maxCatchupSlots` slots have been enqueued, `markScheduleFired`
+    /// advances `next_run_at` to the slot immediately after the last one fired.
+    /// The remaining overdue slots are picked up on the next poll cycle.
+    ///
+    /// This bounds the latency of a single `fire()` call regardless of backlog
+    /// size.  Defaults to 1 000; set lower for very high-frequency schedules or
+    /// resource-constrained environments.
+    public var maxCatchupSlots: Int
+
+    /// Maximum number of due schedules claimed per poll cycle.
+    ///
+    /// When more than `pollLimit` schedules fire simultaneously (e.g. after an
+    /// outage), the remainder are left for the next poll cycle.  Increasing
+    /// this value reduces catch-up time at the cost of a wider burst of
+    /// concurrent `fire()` invocations per poll.  Defaults to 100.
+    public var pollLimit: Int
+
+    public init(
+        sleepCap: Duration = .seconds(60),
+        maxCatchupSlots: Int = 1_000,
+        pollLimit: Int = 100
+    ) {
         self.sleepCap = sleepCap
+        self.maxCatchupSlots = maxCatchupSlots
+        self.pollLimit = pollLimit
     }
+}
+
+// MARK: - Month
+
+/// A calendar month for use with `.yearly` schedule patterns.
+///
+/// Raw values are 1-indexed (January = 1) matching `Calendar.Component.month`.
+///
+/// ```swift
+/// .yearly(month: .march, day: 15, hour: 10)  // March 15th at 10:00 UTC every year
+/// ```
+public enum Month: Int, Sendable, Comparable, CaseIterable {
+    case january = 1
+    case february = 2
+    case march = 3
+    case april = 4
+    case may = 5
+    case june = 6
+    case july = 7
+    case august = 8
+    case september = 9
+    case october = 10
+    case november = 11
+    case december = 12
+
+    public static func < (lhs: Month, rhs: Month) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+// MARK: - Weekday
+
+/// A day of the week for use with `.weekly` schedule patterns.
+///
+/// The raw value encodes the internal P{n}D ISO 8601 duration offset:
+/// `.saturday` = `P0D`, `.sunday` = `P1D`, `.monday` = `P2D`, etc.
+///
+/// ```swift
+/// .weekly(on: .monday, hour: 9)        // every Monday at 09:00 UTC
+/// .weekly(on: .friday, hour: 17, minute: 30)  // every Friday at 17:30 UTC
+/// ```
+public enum Weekday: Int, Sendable, CaseIterable {
+    /// P0D — the internal epoch origin for weekly schedules.
+    case saturday = 0
+    case sunday = 1
+    case monday = 2
+    case tuesday = 3
+    case wednesday = 4
+    case thursday = 5
+    case friday = 6
 }

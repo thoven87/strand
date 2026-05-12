@@ -282,6 +282,7 @@ package enum WorkflowStateQueries {
         case eventReceived = "EVENT_RECEIVED"
         case childWorkflowStarted = "CHILD_WORKFLOW_STARTED"
         case childWorkflowCompleted = "CHILD_WORKFLOW_COMPLETED"
+        case eventEmitted = "EVENT_EMITTED"  // ctx.emitEvent(...)
     }
 
     // MARK: - History event data payloads
@@ -330,7 +331,7 @@ package enum WorkflowStateQueries {
     /// Payload for `EVENT_WAIT_STARTED` and `EVENT_RECEIVED`.
     ///
     /// JSON shape: `{"event_name":"order.approved"}`.
-    package struct NamedEventData: Encodable {
+    package struct NamedEventData: Codable {
         package let eventName: String
 
         private enum CodingKeys: String, CodingKey {
@@ -342,7 +343,7 @@ package enum WorkflowStateQueries {
     ///
     /// JSON shape: `{"duration_ms":5000}` — stored as a JSON number so the
     /// dashboard can display it without parsing.
-    package struct TimerStartedData: Encodable {
+    package struct TimerStartedData: Codable {
         package let durationMs: Int
 
         private enum CodingKeys: String, CodingKey {
@@ -353,7 +354,7 @@ package enum WorkflowStateQueries {
     /// Payload for `SIGNAL_RECEIVED`.
     ///
     /// JSON shape: `{"name":"pause"}`.
-    package struct SignalReceivedData: Encodable {
+    package struct SignalReceivedData: Codable {
         package let name: String
     }
 
@@ -388,9 +389,11 @@ package enum WorkflowStateQueries {
     // MARK: - listHistory
 
     /// A single decoded row from `strand.workflow_history`.
+    /// Unknown `event_type` values (e.g. from future schema additions) are
+    /// silently skipped during decoding — see `listHistory`.
     package struct HistoryEventRow: Sendable {
         package let seq: Int
-        package let eventType: String
+        package let eventType: HistoryEventType
         package let eventData: ByteBuffer?
         package let createdAt: Date
     }
@@ -413,12 +416,18 @@ package enum WorkflowStateQueries {
         var events: [HistoryEventRow] = []
         for try await row in stream {
             var col = row.makeIterator()
+            let seq = try col.next()!.decode(Int.self, context: .default)
+            let rawType = try col.next()!.decode(String.self, context: .default)
+            let eventData = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let createdAt = try col.next()!.decode(Date.self, context: .default)
+            // Skip rows whose event_type is not in the enum (future schema additions, etc.)
+            guard let eventType = HistoryEventType(rawValue: rawType) else { continue }
             events.append(
                 HistoryEventRow(
-                    seq: try col.next()!.decode(Int.self, context: .default),
-                    eventType: try col.next()!.decode(String.self, context: .default),
-                    eventData: try col.next()!.decode(ByteBuffer?.self, context: .default),
-                    createdAt: try col.next()!.decode(Date.self, context: .default)
+                    seq: seq,
+                    eventType: eventType,
+                    eventData: eventData,
+                    createdAt: createdAt
                 )
             )
         }

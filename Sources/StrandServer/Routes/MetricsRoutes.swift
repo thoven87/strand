@@ -51,6 +51,8 @@ struct MetricsResponse: Codable, Sendable {
     /// Present only when ``StrandMetricsLoop`` and ``AggregatedMetricsBuffer``
     /// are wired in and at least one task completed since the last broadcast.
     let taskTimings: [TaskTiming]?
+    /// The time window in hours for terminal counts and charts (1, 6, 24, or 168).
+    let windowHours: Int
 }
 extension MetricsResponse: ResponseCodable {}
 
@@ -63,8 +65,16 @@ struct MetricsRoutes {
     func register(on router: some RouterMethods<StrandRequestContext>) {
 
         // GET /api/:namespace/metrics
-        router.get("metrics") { _, ctx -> MetricsResponse in
+        router.get("metrics") { req, ctx -> MetricsResponse in
             let ns = ctx.namespaceID
+
+            // Time window for terminal counts and hourly charts.
+            // Valid values: 1, 6, 24, 168 (7 days). Default: 24.
+            let rawHours = req.uri.queryParameters.get("hours").flatMap(Int.init) ?? 24
+            let validHours = [1, 6, 24, 168]
+            let hours = validHours.min(by: { abs($0 - rawHours) < abs($1 - rawHours) }) ?? 24
+            let cutoff = Date(timeIntervalSinceNow: -Double(hours) * 3600)
+            let useDaily = hours > 24
 
             // ── Live counts: cache XOR DB ─────────────────────────────────────────────────────
             //
@@ -78,7 +88,7 @@ struct MetricsRoutes {
             let pending: Int
             let running: Int
 
-            if let broadcast = self.cache?.current(), broadcast.namespace == ns {
+            if let broadcast = self.cache?.current(forNamespace: ns) {
                 // Cache hit — no DB query at all for live counts.
                 pending = broadcast.queues.reduce(0) { $0 + $1.pending }
                 running = broadcast.queues.reduce(0) {
@@ -122,23 +132,23 @@ struct MetricsRoutes {
                   (SELECT COUNT(*) FROM strand.tasks
                    WHERE namespace_id = \(ns)
                      AND state = 'COMPLETED'
-                     AND completed_at >= NOW() - INTERVAL '24 hours') AS completed,
+                     AND completed_at >= \(cutoff)) AS completed,
 
                   (SELECT COUNT(*) FROM strand.tasks
                    WHERE namespace_id = \(ns)
                      AND state = 'FAILED'
-                     AND created_at >= NOW() - INTERVAL '24 hours') AS failed,
+                     AND created_at >= \(cutoff)) AS failed,
 
                   (SELECT COUNT(*) FROM strand.tasks
                    WHERE namespace_id = \(ns)
                      AND state = 'CANCELLED'
-                     AND cancelled_at >= NOW() - INTERVAL '24 hours') AS cancelled,
+                     AND cancelled_at >= \(cutoff)) AS cancelled,
 
                   (SELECT AVG(EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)::bigint
                    FROM strand.tasks
                    WHERE namespace_id = \(ns)
                      AND state = 'COMPLETED'
-                     AND completed_at >= NOW() - INTERVAL '24 hours') AS avg_ms
+                     AND completed_at >= \(cutoff)) AS avg_ms
                 """,
                 logger: self.logger
             )
@@ -160,20 +170,27 @@ struct MetricsRoutes {
             // Bucket by completed_at (not created_at) so the partial index is
             // usable and so the bucket represents when tasks *finished*, not
             // when they were enqueued.
-            let throughputStream = try await self.postgres.query(
-                """
-                SELECT
-                  date_trunc('hour', completed_at) AS hour,
-                  COUNT(*) AS cnt
-                FROM strand.tasks
-                WHERE namespace_id = \(ns)
-                  AND state = 'COMPLETED'
-                  AND completed_at >= NOW() - INTERVAL '24 hours'
-                GROUP BY 1
-                ORDER BY 1
-                """,
-                logger: self.logger
-            )
+            let throughputQuery: PostgresQuery
+            if useDaily {
+                throughputQuery = """
+                    SELECT date_trunc('day', completed_at) AS bucket, COUNT(*) AS cnt
+                    FROM strand.tasks
+                    WHERE namespace_id = \(ns)
+                      AND state = 'COMPLETED'
+                      AND completed_at >= \(cutoff)
+                    GROUP BY 1 ORDER BY 1
+                    """
+            } else {
+                throughputQuery = """
+                    SELECT date_trunc('hour', completed_at) AS bucket, COUNT(*) AS cnt
+                    FROM strand.tasks
+                    WHERE namespace_id = \(ns)
+                      AND state = 'COMPLETED'
+                      AND completed_at >= \(cutoff)
+                    GROUP BY 1 ORDER BY 1
+                    """
+            }
+            let throughputStream = try await self.postgres.query(throughputQuery, logger: self.logger)
             var throughput: [MetricsResponse.Bucket] = []
             for try await row in throughputStream {
                 var col = row.makeIterator()
@@ -187,20 +204,27 @@ struct MetricsRoutes {
             // FAILED tasks have no failed_at column so created_at is used;
             // strand_tasks_failed_idx covers (namespace_id, queue, created_at DESC)
             // WHERE state = 'FAILED' so this is index-bound.
-            let errorStream = try await self.postgres.query(
-                """
-                SELECT
-                  date_trunc('hour', created_at) AS hour,
-                  COUNT(*) AS cnt
-                FROM strand.tasks
-                WHERE namespace_id = \(ns)
-                  AND state = 'FAILED'
-                  AND created_at >= NOW() - INTERVAL '24 hours'
-                GROUP BY 1
-                ORDER BY 1
-                """,
-                logger: self.logger
-            )
+            let errorQuery: PostgresQuery
+            if useDaily {
+                errorQuery = """
+                    SELECT date_trunc('day', created_at) AS bucket, COUNT(*) AS cnt
+                    FROM strand.tasks
+                    WHERE namespace_id = \(ns)
+                      AND state = 'FAILED'
+                      AND created_at >= \(cutoff)
+                    GROUP BY 1 ORDER BY 1
+                    """
+            } else {
+                errorQuery = """
+                    SELECT date_trunc('hour', created_at) AS bucket, COUNT(*) AS cnt
+                    FROM strand.tasks
+                    WHERE namespace_id = \(ns)
+                      AND state = 'FAILED'
+                      AND created_at >= \(cutoff)
+                    GROUP BY 1 ORDER BY 1
+                    """
+            }
+            let errorStream = try await self.postgres.query(errorQuery, logger: self.logger)
             var errors: [MetricsResponse.Bucket] = []
             for try await row in errorStream {
                 var col = row.makeIterator()
@@ -218,8 +242,7 @@ struct MetricsRoutes {
             // When the cache has fresh timing data use weighted p50 across all
             // completed tasks rather than the DB AVG (which is for last 24h).
             // DB avgDurationMs is already computed above but may be overridden here.
-            if let broadcast = self.cache?.current(),
-                broadcast.namespace == ns,
+            if let broadcast = self.cache?.current(forNamespace: ns),
                 let timings = broadcast.timings
             {
                 let completedTimings = timings.filter { $0.state == .completed }
@@ -237,9 +260,7 @@ struct MetricsRoutes {
             // DB queries when the cache is warm.
             var throughputPerSec: Double? = nil
             let taskTimings: [MetricsResponse.TaskTiming]?
-            if let broadcast = self.cache?.current(),
-                broadcast.namespace == ns
-            {
+            if let broadcast = self.cache?.current(forNamespace: ns) {
                 // Namespace-wide throughput: sum queue-level rates from the broadcast.
                 let total = broadcast.queues.compactMap(\.throughputPerSec).reduce(0, +)
                 throughputPerSec = total > 0 ? total : nil
@@ -276,7 +297,8 @@ struct MetricsRoutes {
                 throughputPerSec: throughputPerSec,
                 throughputPerHour: throughput,
                 errorRatePerHour: errors,
-                taskTimings: taskTimings
+                taskTimings: taskTimings,
+                windowHours: hours
             )
         }
     }

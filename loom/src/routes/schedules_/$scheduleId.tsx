@@ -8,8 +8,10 @@ import {
     pauseSchedule,
     resumeSchedule,
     deleteSchedule,
+    getScheduleUpcoming,
+    type ScheduleRun,
+    type UpcomingSlot,
 } from "@/api/schedules";
-import type { ScheduleRun } from "@/api/schedules";
 import type { TaskState } from "@/api/types";
 import { qk } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
@@ -87,6 +89,13 @@ export function ScheduleDetailPage() {
         queryKey: qk.schedules.runs(namespace, scheduleId),
         queryFn: () => getScheduleRuns(namespace, scheduleId),
         refetchInterval: schedule?.isActive ? 30_000 : false,
+    });
+
+    const { data: upcoming = [] } = useQuery({
+        queryKey: [...qk.schedules.detail(namespace, scheduleId), "upcoming"],
+        queryFn: () => getScheduleUpcoming(namespace, scheduleId, 5),
+        enabled: !!schedule?.isActive,
+        refetchInterval: 60_000,
     });
 
     const pauseMut = useMutation({
@@ -263,6 +272,33 @@ export function ScheduleDetailPage() {
                             <OptionalTime iso={schedule.endsAt} />
                         </DetailRow>
                     </section>
+
+                    {/* Upcoming fire times */}
+                    {upcoming.length > 0 && (
+                        <section className="rounded-lg border border-border bg-card/40 p-4">
+                            <h2 className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-3">
+                                Upcoming fire times
+                            </h2>
+                            <ol className="space-y-1.5">
+                                {upcoming.map((s: UpcomingSlot, i: number) => (
+                                    <li
+                                        key={s.slot}
+                                        className="flex items-center gap-3 text-xs"
+                                    >
+                                        <span className="w-4 text-right text-muted-foreground/50 tabular-nums shrink-0">
+                                            {i + 1}
+                                        </span>
+                                        <span className="font-mono text-foreground">
+                                            {fmtUTC(s.slot)}
+                                        </span>
+                                        <span className="text-muted-foreground ml-auto shrink-0">
+                                            <RelativeTime iso={s.slot} />
+                                        </span>
+                                    </li>
+                                ))}
+                            </ol>
+                        </section>
+                    )}
 
                     {/* Recent Runs */}
                     <section className="rounded-lg border border-border bg-card/40 overflow-hidden">

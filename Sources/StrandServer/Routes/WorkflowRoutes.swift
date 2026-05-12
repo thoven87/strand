@@ -10,23 +10,6 @@ import FoundationEssentials
 import Foundation
 #endif
 
-struct WorkflowResponse: Codable, Sendable {
-    let name: String
-    let totalRuns: Int
-    let activeRuns: Int
-    let failedRuns: Int
-    let lastSeenAt: Date?
-
-    init(from row: WorkflowRow) {
-        name = row.name
-        totalRuns = row.totalRuns
-        activeRuns = row.activeRuns
-        failedRuns = row.failedRuns
-        lastSeenAt = row.lastSeenAt
-    }
-}
-extension WorkflowResponse: ResponseCodable {}
-
 struct WorkflowRoutes {
     let client: StrandClient
     // Convenience accessors — kept for clarity in route handlers.
@@ -42,16 +25,6 @@ struct WorkflowRoutes {
     }
 
     func register(on router: some RouterMethods<StrandRequestContext>) {
-
-        // GET /api/:namespace/workflows
-        router.get("workflows") { _, ctx -> [WorkflowResponse] in
-            let rows = try await ManagementQueries.listWorkflows(
-                on: self.postgres,
-                namespaceID: ctx.namespaceID,
-                logger: self.logger
-            )
-            return rows.map(WorkflowResponse.init)
-        }
 
         // POST /api/:namespace/workflows/run
         // Body: { "workflowName": "MyWorkflow", "queue": "orders", "input": "{...}" }

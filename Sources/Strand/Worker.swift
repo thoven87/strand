@@ -90,10 +90,8 @@ public struct WorkerOptions: Sendable {
     /// Override the claim batch size. `nil` uses `workflowConcurrency + activityConcurrency`.
     public var batchSize: Int?
 
-    /// No-op. Previously controlled whether the worker called `exit(1)` at
-    /// 2 × claimTimeout. Timeout enforcement is now handled by a racing child
-    /// task inside `withThrowingTaskGroup` in `runTask` — no `exit(1)` is ever
-    /// called. Kept for API source-compatibility.
+    /// No-op, retained for API source-compatibility. Timeout enforcement
+    /// uses a racing child task inside `withThrowingTaskGroup` in `runTask`.
     public var fatalOnLeaseTimeout: Bool
 
     /// How long the worker waits for in-flight tasks to finish after receiving a

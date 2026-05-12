@@ -21,7 +21,7 @@ struct QueueRoutes {
 
         router.post("queues") { req, ctx -> SimpleResponse in
             let body = try await req.decode(as: CreateQueueBody.self, context: ctx)
-            try await self.client.createQueue(body.name)
+            try await self.client.createQueue(body.name, namespaceID: ctx.namespaceID)
             return SimpleResponse(message: "created", id: body.name)
         }
 
@@ -42,21 +42,21 @@ struct QueueRoutes {
 
         router.delete("queues/:queue") { _, ctx -> SimpleResponse in
             let queue = try ctx.parameters.require("queue")
-            try await self.client.dropQueue(queue)
+            try await self.client.dropQueue(queue, namespaceID: ctx.namespaceID)
             return SimpleResponse(message: "dropped", id: queue)
         }
 
         // POST /api/:namespace/queues/:queue/pause
         router.post("queues/:queue/pause") { _, ctx -> SimpleResponse in
             let queue = try ctx.parameters.require("queue")
-            try await self.client.pauseQueue(queue)
+            try await self.client.pauseQueue(queue, namespaceID: ctx.namespaceID)
             return SimpleResponse(message: "paused", id: queue)
         }
 
         // POST /api/:namespace/queues/:queue/resume
         router.post("queues/:queue/resume") { _, ctx -> SimpleResponse in
             let queue = try ctx.parameters.require("queue")
-            try await self.client.resumeQueue(queue)
+            try await self.client.resumeQueue(queue, namespaceID: ctx.namespaceID)
             return SimpleResponse(message: "resumed", id: queue)
         }
 

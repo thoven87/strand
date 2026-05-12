@@ -276,7 +276,8 @@ extension StrandClient {
     package func _sendSignal(
         name: String,
         payload: ByteBuffer?,
-        toWorkflowTaskID taskID: UUID
+        toWorkflowTaskID taskID: UUID,
+        namespaceID overrideNS: String? = nil
     ) async throws {
         // Signal insertion and run wake must be a single transaction.
         //
@@ -288,7 +289,7 @@ extension StrandClient {
         //
         // The UPDATE on strand.runs is a no-op when the run is already PENDING
         // or RUNNING, so it is safe to call unconditionally after every signal.
-        let ns = namespaceID
+        let ns = overrideNS ?? namespaceID
         try await postgres.withTransaction(logger: logger) { conn in
             try await conn.query(
                 """

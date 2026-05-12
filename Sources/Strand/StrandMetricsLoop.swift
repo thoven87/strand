@@ -26,6 +26,20 @@ public struct StrandMetricsBroadcast: Codable, Sendable {
     /// broadcast.  `nil` when no tasks completed in this cycle.
     public let timings: [TimingSnapshot]?
 
+    /// Explicit public memberwise initializer required because Swift only
+    /// synthesises an `internal` memberwise init for public structs.
+    public init(
+        namespace: String,
+        at: Double,
+        queues: [QueueSnapshot],
+        timings: [TimingSnapshot]?
+    ) {
+        self.namespace = namespace
+        self.at = at
+        self.queues = queues
+        self.timings = timings
+    }
+
     public struct QueueSnapshot: Codable, Sendable {
         public let queue: String
         public let pending: Int
@@ -140,6 +154,13 @@ public struct StrandMetricsLoop: Service {
         // exact-vs-estimate decision on the next one.
         var previousCounts: [String: Int] = [:]
 
+        // EWMA-smoothed throughput rate per queue (tasks/second).
+        // α = 0.25 → effective window ≈ (1-α)/α × interval = 3 × 5 s = 15 s.
+        // A raw 5 s window is too noisy for low-throughput jobs (e.g. one 11 s
+        // VoiceTraining job completes every other cycle, so the unsmoothed rate
+        // alternates between 0/s and 0.4/s). EWMA shows a stable ~0.2/s.
+        var smoothedRates: [String: Double] = [:]
+
         while !Task.isShuttingDownGracefully && !Task.isCancelled {
             // cancelWhenGracefulShutdown exits the sleep quickly on shutdown
             // without leaking the NIO runTimer continuation.
@@ -149,7 +170,7 @@ public struct StrandMetricsLoop: Service {
             guard !Task.isShuttingDownGracefully && !Task.isCancelled else { break }
 
             do {
-                try await broadcast(previousCounts: &previousCounts)
+                try await broadcast(previousCounts: &previousCounts, smoothedRates: &smoothedRates)
             } catch {
                 logger.error(
                     "metrics loop broadcast failed",
@@ -161,7 +182,10 @@ public struct StrandMetricsLoop: Service {
 
     // MARK: - Private
 
-    private func broadcast(previousCounts: inout [String: Int]) async throws {
+    private func broadcast(
+        previousCounts: inout [String: Int],
+        smoothedRates: inout [String: Double]
+    ) async throws {
         let queues = try await client.listQueues()
         guard !queues.isEmpty else { return }
 
@@ -190,6 +214,21 @@ public struct StrandMetricsLoop: Service {
                 let q = String(parts[0])
                 queueThroughput[q, default: 0] += Double(entry.execTime.count) / intervalSecs
             }
+
+            // Apply EWMA smoothing per queue so quiet 5 s windows don't
+            // spike the rate to 0 when a longer-running job happens to not
+            // complete in this exact window.
+            // α = 0.25 → effective window ≈ 15 s at the default 5 s interval.
+            let alpha = 0.25
+            for queue in queues {
+                let raw = queueThroughput[queue, default: 0]
+                if let prev = smoothedRates[queue] {
+                    smoothedRates[queue] = alpha * raw + (1 - alpha) * prev
+                } else {
+                    // First cycle: seed with the raw rate (no prior to average against).
+                    smoothedRates[queue] = raw
+                }
+            }
         }
 
         // ── Queue count snapshots (async DB queries) ──────────────────────────
@@ -216,9 +255,12 @@ public struct StrandMetricsLoop: Service {
                     running: r,
                     sleeping: sl,
                     waiting: w,
-                    // nil when no metricsBuffer is wired; 0.0 when wired but idle
+                    // nil when no metricsBuffer is wired.
+                    // Uses the EWMA-smoothed rate (α=0.25, ~15 s effective window)
+                    // rather than the raw per-cycle count so low-throughput jobs
+                    // don't flicker between 0/s and a spike every few cycles.
                     throughputPerSec: metricsBuffer != nil
-                        ? queueThroughput[queue, default: 0]
+                        ? smoothedRates[queue, default: 0]
                         : nil
                 )
             )

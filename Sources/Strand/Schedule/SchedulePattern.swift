@@ -15,6 +15,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     case daily(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case weekly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case monthly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case yearly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case once(at: Date, offset: String = "PT0M", timezone: TimeZone = TimeZone(identifier: "UTC")!)
 
     /// Calculate the next run time after the given date
@@ -77,28 +78,36 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
                 guard let boundaryTime = calendar.date(from: nextDay) else { return nil }
                 return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
             } else {
-                // For other intervals, check if we have a default offset (PT0M)
-                // If so, use simple addition; otherwise use boundary alignment
-                if offset == "PT0M" {
-                    // Simple interval: just add the duration to the current time
-                    let nextTime = date.addingTimeInterval(TimeInterval(seconds))
-                    return scheduleOffset.apply(to: nextTime, calendar: calendar)
-                } else {
-                    // Custom intervals with specific offsets, align to boundaries
-                    // Convert to timezone-aware calculation using Unix epoch alignment
-                    let intervalSeconds = Double(seconds)
-
-                    // Get timezone offset to ensure boundaries align correctly in local time
-                    let timezoneOffset = Double(scheduleTimezone.secondsFromGMT(for: date))
-                    let adjustedTime = date.timeIntervalSince1970 + timezoneOffset
-
-                    // Add a small epsilon to ensure we go to NEXT boundary if exactly on current one
-                    let epsilon = 0.001  // 1ms to handle floating point precision
-                    let nextBoundary =
-                        ((adjustedTime + epsilon) / intervalSeconds).rounded(.up) * intervalSeconds
-                    let boundaryTime = Date(timeIntervalSince1970: nextBoundary - timezoneOffset)
-                    return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
-                }
+                // All non-standard intervals snap to epoch-aligned boundaries.
+                //
+                //   .interval(.hours(1))                   → 00:00, 01:00, 02:00 …
+                //   .interval(.seconds(5400))              → 00:00, 01:30, 03:00 …  (90 min)
+                //   .interval(.hours(1), offset: "PT45M")  → 00:45, 01:45, 02:45 …
+                //   .interval(.seconds(5400), offset: "PT5M") → 00:05, 01:35, 03:05 …
+                //
+                // A schedule registered at 3:10 fires first at the next grid boundary,
+                // not at 3:10 + interval.
+                let intervalSeconds = Double(seconds)
+                let timezoneOffset = Double(scheduleTimezone.secondsFromGMT(for: date))
+                let adjustedTime = date.timeIntervalSince1970 + timezoneOffset
+                // Small epsilon so a time that falls exactly ON a boundary advances to
+                // the NEXT one rather than staying at the current one.
+                let epsilon = 0.001
+                // Shift the reference time back by the offset before computing the
+                // epoch boundary.  Slot times are (offsetSecs + n*intervalSecs), so
+                // subtracting offsetSecs here maps the problem onto the plain
+                // epoch-grid, and the subsequent scheduleOffset.apply() adds it back.
+                //
+                // Without this, from 0:10 with offset PT45M and a 90-min interval the
+                // code found the epoch boundary at 1:30 then added 45 min → 2:15,
+                // skipping the 0:45 slot entirely.
+                let offsetSecs = scheduleOffset.timeInterval
+                let adjustedTimeForBoundary = adjustedTime - offsetSecs
+                let nextBoundary =
+                    ((adjustedTimeForBoundary + epsilon) / intervalSeconds).rounded(.up)
+                    * intervalSeconds
+                let boundaryTime = Date(timeIntervalSince1970: nextBoundary - timezoneOffset)
+                return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
             }
 
         case .daily(let offset, let scheduleTimezone):
@@ -117,6 +126,13 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
         case .monthly(let offset, let scheduleTimezone):
             return try calculateMonthlyNextRunTime(
+                offset: offset,
+                after: date,
+                timezone: scheduleTimezone
+            )
+
+        case .yearly(let offset, let scheduleTimezone):
+            return try calculateYearlyNextRunTime(
                 offset: offset,
                 after: date,
                 timezone: scheduleTimezone
@@ -186,6 +202,25 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
         return cal.nextDate(after: date, matching: comps, matchingPolicy: .nextTime)
     }
 
+    private func calculateYearlyNextRunTime(
+        offset: String,
+        after date: Date,
+        timezone: TimeZone
+    ) throws -> Date? {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timezone
+        let duration = try ISO8601Duration(offset)
+        let month = duration.months + 1  // 0-indexed → 1-indexed Calendar month
+        let day = duration.days + 1  // 0-indexed → 1-indexed Calendar day
+        var comps = DateComponents()
+        comps.month = month
+        comps.day = day
+        comps.hour = duration.hours
+        comps.minute = duration.minutes
+        comps.second = 0
+        return cal.nextDate(after: date, matching: comps, matchingPolicy: .nextTime)
+    }
+
     /// Human-readable description of the schedule
     public var description: String {
         // Helper function to check if timezone is UTC/GMT
@@ -246,6 +281,28 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             return
                 "Monthly on the \(dayOfMonth)\(suffix) at \(hhmm(timeMin / 60, timeMin % 60))\(tzSuffix(timezone))"
 
+        case .yearly(let offset, let timezone):
+            guard let d = try? ISO8601Duration(offset) else {
+                return "Yearly (offset: \(offset))\(tzSuffix(timezone))"
+            }
+            let monthNames = [
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December",
+            ]
+            let monthIdx = max(0, min(d.months, 11))
+            let dayOfMonth = d.days + 1
+            let timeMin = d.hours * 60 + d.minutes
+            let suffix: String
+            switch dayOfMonth {
+            case 1: suffix = "st"
+            case 2: suffix = "nd"
+            case 3: suffix = "rd"
+            default: suffix = "th"
+            }
+            return
+                "Yearly on \(monthNames[monthIdx]) \(dayOfMonth)\(suffix)"
+                + " at \(hhmm(timeMin / 60, timeMin % 60))\(tzSuffix(timezone))"
+
         case .once(let date, _, let timezone):
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = timezone
@@ -274,6 +331,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             .daily(let offset, _),
             .weekly(let offset, _),
             .monthly(let offset, _),
+            .yearly(let offset, _),
             .once(_, let offset, _):
             return offset != "PT0M" && offset != "PT0H" ? offset : nil
         }
@@ -287,6 +345,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             .daily(_, let timezone),
             .weekly(_, let timezone),
             .monthly(_, let timezone),
+            .yearly(_, let timezone),
             .once(_, _, let timezone):
             return timezone
         }
@@ -332,40 +391,150 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
         ):
             return lhsDate == rhsDate && lhsOffset == rhsOffset && lhsTimezone == rhsTimezone
 
+        case (
+            .yearly(let lhsOffset, let lhsTimezone),
+            .yearly(let rhsOffset, let rhsTimezone)
+        ):
+            return lhsOffset == rhsOffset && lhsTimezone == rhsTimezone
+
         default:
             return false
         }
     }
 
-    // MARK: - Hashable Implementation
+    // MARK: - Hashable
     public func hash(into hasher: inout Hasher) {
-        // Use deterministic hashing for consistent shard placement and routing
-        let deterministicHash =
-            switch self {
-            case .cron(let expression, let offset, let timezone):
-                DeterministicHasher.hash("cron:\(expression):\(offset):\(timezone.identifier)")
-
-            case .interval(let duration, let offset, let timezone):
-                DeterministicHasher.hash("interval:\(duration):\(offset):\(timezone.identifier)")
-
-            case .daily(let offset, let timezone):
-                DeterministicHasher.hash("daily:\(offset):\(timezone.identifier)")
-
-            case .weekly(let offset, let timezone):
-                DeterministicHasher.hash("weekly:\(offset):\(timezone.identifier)")
-
-            case .monthly(let offset, let timezone):
-                DeterministicHasher.hash("monthly:\(offset):\(timezone.identifier)")
-
-            case .once(let date, let offset, let timezone):
-                DeterministicHasher.hash(
-                    "once:\(date.timeIntervalSince1970):\(offset):\(timezone.identifier)"
-                )
-            }
-
-        hasher.combine(deterministicHash)
+        // Standard per-case combine — Swift's Hasher already produces good
+        // distribution and is the correct tool for Hashable conformance.
+        // (Cross-process stability is NOT a goal of Hashable; use a separate
+        // explicit function when a stable routing key is needed.)
+        switch self {
+        case .cron(let expression, let offset, let timezone):
+            hasher.combine(0)
+            hasher.combine(expression)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        case .interval(let duration, let offset, let timezone):
+            hasher.combine(1)
+            hasher.combine(duration.components.seconds)
+            hasher.combine(duration.components.attoseconds)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        case .daily(let offset, let timezone):
+            hasher.combine(2)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        case .weekly(let offset, let timezone):
+            hasher.combine(3)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        case .monthly(let offset, let timezone):
+            hasher.combine(4)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        case .once(let date, let offset, let timezone):
+            hasher.combine(5)
+            hasher.combine(date.timeIntervalSince1970)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        case .yearly(let offset, let timezone):
+            hasher.combine(6)
+            hasher.combine(offset)
+            hasher.combine(timezone.identifier)
+        }
     }
 
     /// Check if this schedule type supports partition offsets
     public var supportsPartitionOffset: Bool { true }
+}
+
+// MARK: - Ergonomic schedule factories
+
+extension SchedulePattern {
+
+    // MARK: Daily
+
+    /// Fires every day at the specified hour and minute.
+    ///
+    /// ```swift
+    /// .daily(hour: 9, minute: 30)    // 09:30 UTC every day
+    /// .daily(hour: 0, timezone: .init(identifier: "America/New_York")!)
+    /// ```
+    public static func daily(
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let offset = minute == 0 ? "PT\(hour)H" : "PT\(hour)H\(minute)M"
+        return .daily(offset: offset, timezone: timezone)
+    }
+
+    // MARK: Weekly
+
+    /// Fires once per week on the specified day at the specified hour and minute.
+    ///
+    /// ```swift
+    /// .weekly(on: .monday, hour: 9)             // Monday 09:00 UTC
+    /// .weekly(on: .friday, hour: 17, minute: 30) // Friday 17:30 UTC
+    /// ```
+    public static func weekly(
+        on day: Weekday,
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let d = day.rawValue  // matches the internal P{n}D dayIndex encoding
+        let offset = minute == 0 ? "P\(d)DT\(hour)H" : "P\(d)DT\(hour)H\(minute)M"
+        return .weekly(offset: offset, timezone: timezone)
+    }
+
+    // MARK: Monthly
+
+    /// Fires once per month on the specified day-of-month at the specified hour and minute.
+    ///
+    /// `day` is 1-indexed (1 = first of month, 28 = 28th of month).
+    ///
+    /// ```swift
+    /// .monthly(day: 1, hour: 0)          // 1st of each month at midnight UTC
+    /// .monthly(day: 15, hour: 10, minute: 30) // 15th of each month at 10:30 UTC
+    /// ```
+    public static func monthly(
+        day: Int,
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let d = day - 1  // convert 1-indexed day to 0-indexed P{n}D offset
+        let offset = minute == 0 ? "P\(d)DT\(hour)H" : "P\(d)DT\(hour)H\(minute)M"
+        return .monthly(offset: offset, timezone: timezone)
+    }
+
+    // MARK: Yearly
+
+    /// Fires once per year on the specified month and day at the specified time.
+    ///
+    /// Using the `Month` enum prevents off-by-one mistakes (no `month: 0` or
+    /// `month: 13`) and makes the intent self-documenting at the call site.
+    ///
+    /// ```swift
+    /// .yearly(month: .january,  day: 1,  hour: 0)         // New Year's Day midnight
+    /// .yearly(month: .march,    day: 15, hour: 10, minute: 30)  // March 15th 10:30
+    /// .yearly(month: .december, day: 25, hour: 8, timezone: nyTZ) // Christmas 8 AM NY
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - month: The calendar month (`.january` – `.december`).
+    ///   - day:   Day of month (1–31).
+    public static func yearly(
+        month: Month,
+        day: Int,
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let m = month.rawValue - 1  // Month.rawValue is 1-indexed; P{m}M is 0-indexed
+        let d = day - 1  // day is 1-indexed; P{d}D is 0-indexed
+        let offset = minute == 0 ? "P\(m)M\(d)DT\(hour)H" : "P\(m)M\(d)DT\(hour)H\(minute)M"
+        return .yearly(offset: offset, timezone: timezone)
+    }
 }
