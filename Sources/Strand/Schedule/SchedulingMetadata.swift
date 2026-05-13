@@ -41,6 +41,10 @@ public struct SchedulingMetadata: Codable, Sendable {
     /// Human-readable name of the schedule.
     public let scheduledBy: String?
 
+    /// UUID of the backfill that triggered this task. `nil` for regularly-scheduled
+    /// or manually-enqueued tasks.
+    public let backfillId: UUID?
+
     /// Metadata format version.
     public let version: Int
 
@@ -50,6 +54,7 @@ public struct SchedulingMetadata: Codable, Sendable {
         scheduleOffset: String? = nil,
         scheduleId: String? = nil,
         scheduledBy: String? = nil,
+        backfillId: UUID? = nil,
         version: Int = 1
     ) {
         self.executionTime = executionTime
@@ -57,6 +62,7 @@ public struct SchedulingMetadata: Codable, Sendable {
         self.scheduleOffset = scheduleOffset
         self.scheduleId = scheduleId
         self.scheduledBy = scheduledBy
+        self.backfillId = backfillId
         self.version = version
     }
 }

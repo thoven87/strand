@@ -365,6 +365,31 @@ public struct ScheduleCalculator {
         try nextRunTime(for: schedule, after: createdAt, timezone: timezone)
     }
 
+    /// Counts the number of schedule slots in `range` (start **inclusive**, end exclusive).
+    ///
+    /// The start is made inclusive by searching from `lowerBound - 1 s` so a slot
+    /// that falls exactly on the range boundary is counted. This matches Temporal’s
+    /// backfill semantics where `StartTime` is adjusted by -1 ms before evaluation.
+    ///
+    /// Capped at `cap` (default 100 000) to bound O(n) iteration for large ranges.
+    public static func countSlots(
+        for schedule: SchedulePattern,
+        in range: Range<Date>,
+        cap: Int = 100_000
+    ) -> Int {
+        var count = 0
+        var cursor = range.lowerBound.addingTimeInterval(-1)
+        while count < cap {
+            guard
+                let next = try? nextRunTime(for: schedule, after: cursor, timezone: schedule.timezone),
+                next < range.upperBound
+            else { break }
+            count += 1
+            cursor = next
+        }
+        return count
+    }
+
     // MARK: - Validation and Utilities
 
     /// Validate that a schedule configuration is valid

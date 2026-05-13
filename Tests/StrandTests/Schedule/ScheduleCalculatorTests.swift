@@ -320,4 +320,180 @@ struct ScheduleCalculatorTests {
         #expect(offsetPartitionTime != partitionTime)
         #expect(offsetPartitionTime < partitionTime)  // Should be one day earlier
     }
+
+    // MARK: - countSlots
+
+    @Test("countSlots returns 0 for an empty range")
+    func countSlotsEmptyRange() {
+        let now = Date()
+        let count = ScheduleCalculator.countSlots(
+            for: .interval(.hours(1)),
+            in: now..<now
+        )
+        #expect(count == 0)
+    }
+
+    @Test("countSlots counts hourly slots across a 24-hour window")
+    func countSlotsHourly24h() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let start = cal.date(from: DateComponents(year: 2024, month: 6, day: 1, hour: 0))!
+        let end = cal.date(from: DateComponents(year: 2024, month: 6, day: 2, hour: 0))!
+        let count = ScheduleCalculator.countSlots(
+            for: .interval(.hours(1)),
+            in: start..<end
+        )
+        // 24 whole hours, start inclusive: 00:00, 01:00 … 23:00 = 24 slots
+        #expect(count == 24)
+    }
+
+    @Test("countSlots counts daily cron slots across a week")
+    func countSlotsDailyOneWeek() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let start = cal.date(from: DateComponents(year: 2024, month: 6, day: 1))!
+        let end = cal.date(from: DateComponents(year: 2024, month: 6, day: 8))!  // 7 days
+        let count = ScheduleCalculator.countSlots(
+            for: .cron("0 9 * * *", timezone: TimeZone(identifier: "UTC")!),
+            in: start..<end
+        )
+        #expect(count == 7)  // 7 × 09:00 UTC
+    }
+
+    @Test("countSlots respects cap parameter")
+    func countSlotsRespectsCap() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        // One year of hourly = 8760 slots; cap at 100
+        let start = cal.date(from: DateComponents(year: 2024, month: 1, day: 1))!
+        let end = cal.date(from: DateComponents(year: 2025, month: 1, day: 1))!
+        let count = ScheduleCalculator.countSlots(
+            for: .interval(.hours(1)),
+            in: start..<end,
+            cap: 100
+        )
+        #expect(count == 100)
+    }
+
+    // MARK: - DST transition tests for N-day intervals
+    //
+    // N-day intervals must fire at the same wall-clock time regardless of DST transitions.
+    // Raw UTC-second arithmetic (seconds + N×86400) drifts by one hour:
+    //
+    //   Fall-back  (Nov 3, 2024 US): 7-day UTC gap = 25 h → naive next = 23:00 EST  (wrong)
+    //   Spring-forward (Mar 9, 2025 US): 7-day UTC gap = 23 h → naive next = 01:00 EDT (wrong)
+    //
+    // calendar.date(byAdding: .day, …) advances by calendar days in the timezone so
+    // the wall-clock time stays stable across both transitions.
+
+    /// Convenience: build a `Date` at midnight on `year-month-day` in `timeZone`.
+    private func midnight(
+        year: Int,
+        month: Int,
+        day: Int,
+        timeZone: TimeZone
+    ) -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        return cal.date(
+            from: DateComponents(
+                year: year,
+                month: month,
+                day: day,
+                hour: 0,
+                minute: 0,
+                second: 0
+            )
+        )!
+    }
+
+    @Test("7-day interval: fall-back (2024-11-03 America/New_York) fires at local midnight, not 23:00")
+    func intervalSevenDayFallBack() throws {
+        let tz = TimeZone(identifier: "America/New_York")!
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+
+        // Fire from Sunday Oct 27 00:00 EDT (UTC-4) = Oct 27 04:00 UTC.
+        let oct27 = midnight(year: 2024, month: 10, day: 27, timeZone: tz)
+
+        let pattern = SchedulePattern.interval(.seconds(86400 * 7), timezone: tz)
+        let next = try #require(try pattern.nextRunTime(after: oct27))
+
+        // Expected: Nov 3 00:00 EST (UTC-5) = Nov 3 05:00 UTC.
+        // Raw arithmetic would give Nov 3 04:00 UTC = Nov 2 23:00 EST (one hour early).
+        let nov3 = midnight(year: 2024, month: 11, day: 3, timeZone: tz)
+        #expect(next == nov3)
+
+        // Verify in components so the failure message is human-readable.
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute], from: next)
+        #expect(c.year == 2024)
+        #expect(c.month == 11)
+        #expect(c.day == 3)
+        #expect(c.hour == 0)
+        #expect(c.minute == 0)
+    }
+
+    @Test("7-day interval: spring-forward (2025-03-09 America/New_York) fires at local midnight, not 01:00")
+    func intervalSevenDaySpringForward() throws {
+        let tz = TimeZone(identifier: "America/New_York")!
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+
+        // Fire from Sunday Mar 2 00:00 EST (UTC-5) = Mar 2 05:00 UTC.
+        let mar2 = midnight(year: 2025, month: 3, day: 2, timeZone: tz)
+
+        let pattern = SchedulePattern.interval(.seconds(86400 * 7), timezone: tz)
+        let next = try #require(try pattern.nextRunTime(after: mar2))
+
+        // Expected: Mar 9 00:00 EDT (UTC-4) = Mar 9 04:00 UTC.
+        // Raw arithmetic would give Mar 9 05:00 UTC = Mar 9 01:00 EDT (one hour late).
+        let mar9 = midnight(year: 2025, month: 3, day: 9, timeZone: tz)
+        #expect(next == mar9)
+
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute], from: next)
+        #expect(c.year == 2025)
+        #expect(c.month == 3)
+        #expect(c.day == 9)
+        #expect(c.hour == 0)
+        #expect(c.minute == 0)
+    }
+
+    @Test("1-day interval: fall-back regression — stays at local midnight after fix")
+    func intervalOneDayFallBack() throws {
+        let tz = TimeZone(identifier: "America/New_York")!
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+
+        let nov2 = midnight(year: 2024, month: 11, day: 2, timeZone: tz)
+        let pattern = SchedulePattern.interval(.seconds(86400), timezone: tz)
+        let next = try #require(try pattern.nextRunTime(after: nov2))
+
+        let nov3 = midnight(year: 2024, month: 11, day: 3, timeZone: tz)
+        #expect(next == nov3)
+
+        // Nov 3 midnight EST = 05:00 UTC, not 04:00 UTC (which would be Nov 2 23:00 EST).
+        let c = cal.dateComponents([.day, .hour], from: next)
+        #expect(c.day == 3)
+        #expect(c.hour == 0)
+    }
+
+    @Test("14-day interval: two-week cadence stays at local midnight across DST")
+    func intervalFourteenDayAcrossDST() throws {
+        let tz = TimeZone(identifier: "America/New_York")!
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+
+        // Oct 26, 2024 (two weeks before Nov 9 — safely past the Nov 3 fall-back)
+        let oct26 = midnight(year: 2024, month: 10, day: 26, timeZone: tz)
+        let pattern = SchedulePattern.interval(.seconds(86400 * 14), timezone: tz)
+        let next = try #require(try pattern.nextRunTime(after: oct26))
+
+        // Nov 9 00:00 EST (UTC-5) = Nov 9 05:00 UTC.
+        let nov9 = midnight(year: 2024, month: 11, day: 9, timeZone: tz)
+        #expect(next == nov9)
+
+        let c = cal.dateComponents([.day, .hour], from: next)
+        #expect(c.day == 9)
+        #expect(c.hour == 0)
+    }
 }

@@ -31,21 +31,21 @@ package struct ScheduleRow: Sendable {
 
 /// A schedule summary row returned by ``ScheduleQueries/listSchedules``.
 package struct ScheduleSummaryRow: Sendable {
-    let id: UUID
-    let queue: String
-    let name: String
-    let taskName: String
-    let patternBuffer: ByteBuffer
-    let isActive: Bool
-    let startsAt: Date?
-    let endsAt: Date?
-    let nextRunAt: Date?
-    let lastRunAt: Date?
-    let lastTaskID: UUID?
-    let runCount: Int
-    let accuracy: ScheduleAccuracy
-    let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
-    let createdAt: Date
+    package let id: UUID
+    package let queue: String
+    package let name: String
+    package let taskName: String
+    package let patternBuffer: ByteBuffer
+    package let isActive: Bool
+    package let startsAt: Date?
+    package let endsAt: Date?
+    package let nextRunAt: Date?
+    package let lastRunAt: Date?
+    package let lastTaskID: UUID?
+    package let runCount: Int
+    package let accuracy: ScheduleAccuracy
+    package let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
+    package let createdAt: Date
 }
 
 /// A task row fired by a specific schedule, returned by ``ScheduleQueries/listScheduleRuns``.
@@ -55,6 +55,39 @@ package struct ScheduleRunRow: Sendable {
     package let attempt: Int
     package let createdAt: Date
     package let completedAt: Date?
+}
+
+/// Full schedule row returned by ``ScheduleQueries/getSchedule(on:namespaceID:id:logger:)``.
+///
+/// Carries every column: the display fields shared with ``ScheduleSummaryRow``
+/// **plus** the payload buffers (`params`, `headers`, `retry_strategy`,
+/// `cancellation`) needed for backfill and run-for-partition operations.
+///
+/// ``ScheduleSummaryRow`` still exists for **list queries** — loading payload
+/// buffers for up to 200 rows just to render names and timestamps would be
+/// wasteful. Single-ID lookups have no such concern, so they always fetch
+/// everything in one query rather than requiring a second round-trip.
+package struct ScheduleFullRow: Sendable {
+    package let id: UUID
+    package let queue: String
+    package let name: String
+    package let taskName: String
+    package let patternBuffer: ByteBuffer
+    package let isActive: Bool
+    package let startsAt: Date?
+    package let endsAt: Date?
+    package let nextRunAt: Date?
+    package let lastRunAt: Date?
+    package let lastTaskID: UUID?
+    package let runCount: Int
+    package let accuracy: ScheduleAccuracy
+    package let kind: TaskKind
+    package let createdAt: Date
+    package let paramsBuffer: ByteBuffer
+    package let headersBuffer: ByteBuffer?
+    package let retryStrategyBuffer: ByteBuffer?
+    package let maxAttempts: Int?
+    package let cancellationBuffer: ByteBuffer?
 }
 
 // MARK: - Queries
@@ -370,18 +403,24 @@ package enum ScheduleQueries {
         )
     }
 
-    /// Fetches a single schedule by primary key.  Returns `nil` when not found.
+    /// Fetches a single schedule by primary key.
+    ///
+    /// Returns `nil` when not found. Returns a ``ScheduleFullRow`` containing
+    /// both the display fields (same as list queries) and the payload buffers
+    /// needed for backfill and run-for-partition operations — one query covers
+    /// all callers instead of requiring a separate `getScheduleDetail` call.
     package static func getSchedule(
         on client: PostgresClient,
         namespaceID: String,
         id: UUID,
         logger: Logger
-    ) async throws -> ScheduleSummaryRow? {
+    ) async throws -> ScheduleFullRow? {
         let stream = try await client.query(
             """
             SELECT id, queue, name, task_name, pattern, is_active,
                    starts_at, ends_at, next_run_at, last_run_at, last_task_id,
-                   run_count, accuracy, kind, created_at
+                   run_count, accuracy, kind, created_at,
+                   params, headers, retry_strategy, max_attempts, cancellation
             FROM strand.schedules
             WHERE namespace_id = \(namespaceID)
               AND id           = \(id)
@@ -391,7 +430,7 @@ package enum ScheduleQueries {
         )
         guard let row = try await stream.first(where: { _ in true }) else { return nil }
         var col = row.makeIterator()
-        return ScheduleSummaryRow(
+        return ScheduleFullRow(
             id: try col.next()!.decode(UUID.self, context: .default),
             queue: try col.next()!.decode(String.self, context: .default),
             name: try col.next()!.decode(String.self, context: .default),
@@ -406,7 +445,12 @@ package enum ScheduleQueries {
             runCount: try col.next()!.decode(Int.self, context: .default),
             accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
             kind: try col.next()!.decode(TaskKind.self, context: .default),
-            createdAt: try col.next()!.decode(Date.self, context: .default)
+            createdAt: try col.next()!.decode(Date.self, context: .default),
+            paramsBuffer: try col.next()!.decode(ByteBuffer.self, context: .default),
+            headersBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default),
+            retryStrategyBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default),
+            maxAttempts: try col.next()!.decode(Int?.self, context: .default),
+            cancellationBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default)
         )
     }
 

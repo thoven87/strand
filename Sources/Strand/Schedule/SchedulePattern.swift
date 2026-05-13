@@ -68,14 +68,28 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
                 nextHour.second = 0
                 guard let boundaryTime = calendar.date(from: nextHour) else { return nil }
                 return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
-            } else if seconds == 86400 {  // 1 day
-                let components = calendar.dateComponents([.year, .month, .day], from: date)
-                var nextDay = components
-                nextDay.day = (components.day ?? 0) + 1
-                nextDay.hour = 0
-                nextDay.minute = 0
-                nextDay.second = 0
-                guard let boundaryTime = calendar.date(from: nextDay) else { return nil }
+            } else if seconds > 0 && seconds % 86400 == 0 {
+                // N whole-day intervals (1 day, 7 days, 14 days, …).
+                //
+                // calendar.date(byAdding: .day, value: N, to: startOfDay) resolves the
+                // correct UTC instant for “same wall-clock time N calendar days later” in
+                // the schedule’s timezone, correctly handling DST transitions:
+                //   • Fall-back  (e.g. Nov 3 US): a 7-day gap spans 25 h in UTC, yet
+                //     the next fire time stays at 00:00 local.
+                //   • Spring-forward (e.g. Mar 9 US): a 7-day gap spans 23 h in UTC,
+                //     yet the next fire time stays at 00:00 local.
+                //
+                // No epsilon needed: startOfDay ≤ date, so startOfDay + N days > date
+                // for any N ≥ 1.
+                let nDays = Int(seconds / 86400)
+                let startOfCurrentDay = calendar.startOfDay(for: date)
+                guard
+                    let boundaryTime = calendar.date(
+                        byAdding: .day,
+                        value: nDays,
+                        to: startOfCurrentDay
+                    )
+                else { return nil }
                 return scheduleOffset.apply(to: boundaryTime, calendar: calendar)
             } else {
                 // All non-standard intervals snap to epoch-aligned boundaries.

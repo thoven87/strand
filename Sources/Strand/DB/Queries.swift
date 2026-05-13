@@ -163,6 +163,7 @@ enum Queries {
         fairnessWeight: Float = 1.0,
         kind: TaskKind = .workflow,
         parentTaskID: UUID? = nil,
+        backfillID: UUID? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
         try await client.withTransaction(logger: logger) { conn in
@@ -176,14 +177,14 @@ enum Queries {
                     (namespace_id, id, queue, name, params, headers, scheduling_metadata,
                      retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds,
                      cancellation, idempotency_key, priority, fairness_key, fairness_weight,
-                     state, kind, parent_task_id, deadline_at)
+                     state, kind, parent_task_id, deadline_at, backfill_id)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
                         \(headersBuffer), \(schedulingMetadata),
                         \(retryStrategyBuffer), \(maxAttempts),
                         \(timeoutSeconds), \(heartbeatTimeoutSeconds),
                         \(cancellationBuffer), \(idempotencyKey), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
-                        \(kind), \(parentTaskID), \(deadlineAt))
+                        \(kind), \(parentTaskID), \(deadlineAt), \(backfillID))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
                 """,
                 logger: logger
@@ -2060,7 +2061,7 @@ private func retryDelay(strategy buf: ByteBuffer?, attempt: Int) -> TimeInterval
     return Swift.min(initial * pow(s.multiplier, Double(Swift.max(attempt - 1, 0))), cap)
 }
 
-private struct QueryError: Error, CustomStringConvertible {
+struct QueryError: Error, CustomStringConvertible {
     let description: String
     init(_ msg: String) { self.description = msg }
 }

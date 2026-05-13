@@ -210,18 +210,31 @@ public struct StrandScheduler: Service {
             // 1. Fire anything that is already due.
             do { try await fireSchedules() } catch {
                 client.logger.info(
-                    "scheduler fire error: \(String(reflecting: error))"
+                    "scheduler fire error:",
+                    metadata: [
+                        "error": " \(String(reflecting: error))"
+                    ]
                 )
             }
 
-            // 2. Find the next scheduled fire time across all active schedules.
+            // 2. Process pending backfill slots.
+            do { try await processBackfills() } catch {
+                client.logger.error(
+                    "backfill processing error:",
+                    metadata: [
+                        "error": " \(String(reflecting: error))"
+                    ]
+                )
+            }
+
+            // 3. Find the next scheduled fire time across all active schedules.
             let nextFireAt = try? await ScheduleQueries.nextScheduledFireTime(
                 on: client.postgres,
                 namespaceID: client.namespaceID,
                 logger: client.logger
             )
 
-            // 3. Sleep until next fire (but never longer than sleepCap so newly-added
+            // 4. Sleep until next fire (but never longer than sleepCap so newly-added
             //    schedules are detected promptly).
             let sleepFor: Duration
             let now = Date.now
@@ -249,6 +262,148 @@ public struct StrandScheduler: Service {
         }
     }
 
+    // MARK: - Backfill processing
+
+    /// Drives all RUNNING backfills: for each backfill, counts in-flight tasks,
+    /// computes how many new slots can be fired (concurrency - active), and
+    /// enqueues them. Advances the cursor and marks backfills complete when the
+    /// range is exhausted.
+    ///
+    /// This runs in the scheduler's poll loop — zero worker task-queue slots
+    /// are consumed for orchestration. The actual workflow/activity executions
+    /// use worker slots as normal.
+    private func processBackfills(now: Date = .now) async throws {
+        let backfills = try await BackfillQueries.listRunning(
+            on: client.postgres,
+            namespaceID: client.namespaceID,
+            logger: client.logger
+        )
+        guard !backfills.isEmpty else { return }
+
+        for backfill in backfills {
+            do {
+                try await processBackfill(backfill, now: now)
+            } catch {
+                client.logger.error(
+                    "backfill error",
+                    metadata: [
+                        "backfill_id": .stringConvertible(backfill.id),
+                        "error": " \(String(reflecting: error))",
+                    ]
+                )
+            }
+        }
+    }
+
+    private func processBackfill(_ backfill: BackfillQueries.BackfillRow, now: Date) async throws {
+        let logger = client.logger
+        let postgres = client.postgres
+
+        // How many slots from this backfill are currently in-flight?
+        let active = try await BackfillQueries.countActiveTasks(
+            on: postgres,
+            backfillID: backfill.id,
+            namespaceID: backfill.namespaceID,
+            logger: logger
+        )
+        let slots = backfill.concurrency - active
+        guard slots > 0 else { return }
+
+        // Decode the stored SchedulePattern to compute next slot times.
+        let pattern = try JSON.decode(SchedulePattern.self, from: backfill.schedulePatternBuffer)
+
+        var cursor = backfill.nextSlotTime
+        var fired = 0
+
+        while fired < slots {
+            // Compute the next slot strictly after the cursor.
+            guard
+                let slotAt = try ScheduleCalculator.nextRunTime(
+                    for: pattern,
+                    after: cursor,
+                    timezone: pattern.timezone
+                ),
+                slotAt < backfill.rangeEnd
+            else {
+                // Range exhausted — mark the backfill complete.
+                try await BackfillQueries.markCompleted(
+                    on: postgres,
+                    backfillID: backfill.id,
+                    namespaceID: backfill.namespaceID,
+                    logger: logger
+                )
+                logger.debug(
+                    "backfill '\(backfill.id)' completed — \(backfill.completedSlots + fired) slots fired"
+                )
+                return
+            }
+
+            // Compute scheduling metadata (same structure as StrandScheduler.fire).
+            var partitionTime: Date? = nil
+            if let times = try? ScheduleCalculator.calculateExecutionTimes(
+                for: pattern,
+                executingAt: slotAt,
+                timezone: pattern.timezone
+            ) {
+                partitionTime = times.scheduledTime
+            }
+            let schedulingMeta = SchedulingMetadata(
+                executionTime: now,
+                partitionTime: partitionTime ?? slotAt,
+                scheduleOffset: pattern.partitionOffset,
+                backfillId: backfill.id
+            )
+
+            // When allowOverwrite=false, use a key that matches what StrandScheduler.fire()
+            // would produce for the same slot so slots already run by the schedule (or a
+            // previous backfill for the same schedule) are deduplicated via ON CONFLICT.
+            // Standalone backfills (no scheduleId) use a backfill-scoped key to prevent
+            // double-firing within the same backfill on retries.
+            let idKey: String?
+            if backfill.allowOverwrite {
+                idKey = nil  // no dedup — always create a fresh task
+            } else if let scheduleId = backfill.scheduleId {
+                idKey = "$schedule:\(scheduleId):\(slotAt.timeIntervalSince1970)"
+            } else {
+                idKey = "$backfill:\(backfill.id):\(slotAt.timeIntervalSince1970)"
+            }
+
+            _ = try await Queries.enqueueTask(
+                on: postgres,
+                namespaceID: backfill.namespaceID,
+                queue: backfill.queue,
+                taskName: backfill.taskName,
+                paramsBuffer: backfill.paramsBuffer,
+                headersBuffer: backfill.headersBuffer,
+                schedulingMetadata: schedulingMeta,
+                retryStrategyBuffer: backfill.retryStrategyBuffer,
+                maxAttempts: backfill.maxAttempts,
+                cancellationBuffer: nil,
+                idempotencyKey: idKey,
+                kind: backfill.taskKind,
+                backfillID: backfill.id,
+                logger: logger
+            )
+
+            cursor = slotAt
+            fired += 1
+        }
+
+        if fired > 0 {
+            try await BackfillQueries.advanceCursor(
+                on: postgres,
+                backfillID: backfill.id,
+                namespaceID: backfill.namespaceID,
+                nextSlotTime: cursor,
+                firedCount: fired,
+                logger: logger
+            )
+            logger.debug(
+                "backfill '\(backfill.id)': fired \(fired) slots, cursor=\(cursor.ISO8601Format())"
+            )
+        }
+    }
+
     private func fireSchedules(now: Date = .now) async throws {
         let rows = try await ScheduleQueries.pollDueSchedules(
             on: client.postgres,
@@ -269,7 +424,11 @@ public struct StrandScheduler: Service {
                         try await self.fire(row, now: now)
                     } catch {
                         self.client.logger.error(
-                            "failed to fire schedule '\(row.name)': \(String(reflecting: error))"
+                            "failed to fire schedule",
+                            metadata: [
+                                "schedule_name": .stringConvertible(row.name),
+                                "error": " \(String(reflecting: error))",
+                            ]
                         )
                     }
                 }

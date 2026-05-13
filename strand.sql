@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     -- claimTasks skips tasks past this deadline so workers never start doomed work.
     deadline_at  TIMESTAMPTZ,
     result       BYTEA,                  -- JSON-encoded success payload
+    backfill_id  UUID,                  -- set when fired by StrandScheduler.processBackfills; FK added below
 
     CONSTRAINT strand_tasks_pkey            PRIMARY KEY (id),
     -- FK to strand.queues: tasks are always in a registered queue.
@@ -345,6 +346,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
 
 -- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS heartbeat_details BYTEA;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS heartbeat_timeout_seconds INTEGER;
+-- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS backfill_id UUID REFERENCES strand.backfills(id) ON DELETE SET NULL;
+-- ALTER TABLE strand.backfills ADD COLUMN IF NOT EXISTS schedule_id UUID REFERENCES strand.schedules(id) ON DELETE SET NULL;
 
 -- Migration for existing databases:
 -- ALTER TABLE strand.events DROP CONSTRAINT strand_events_pkey;
@@ -517,6 +520,58 @@ CREATE TABLE IF NOT EXISTS strand.schedules (
 CREATE INDEX IF NOT EXISTS strand_schedules_due_idx
     ON strand.schedules (namespace_id, next_run_at)
     WHERE is_active = TRUE AND next_run_at IS NOT NULL;
+
+-- ───────────────────────────────────────────────────────────────────────────────
+-- Backfills — retroactive scheduled execution over a historical time range.
+--
+-- One row per backfill request. `StrandScheduler.processBackfills()` polls
+-- RUNNING rows each cycle and enqueues up to `concurrency` slots at a time.
+-- Each enqueued task carries `backfill_id` so the dashboard can list all
+-- tasks that belong to a given backfill.
+-- ───────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS strand.backfills (
+    id               UUID        NOT NULL,
+    namespace_id     TEXT        NOT NULL REFERENCES strand.namespaces(id),
+    queue            TEXT        NOT NULL,
+    task_name        TEXT        NOT NULL,
+    task_kind        TEXT        NOT NULL DEFAULT 'WORKFLOW',
+    params           BYTEA       NOT NULL,
+    headers          BYTEA,
+    retry_strategy   BYTEA,
+    max_attempts     INTEGER,
+    schedule_pattern BYTEA       NOT NULL,   -- JSON-encoded SchedulePattern
+    range_start      TIMESTAMPTZ NOT NULL,   -- inclusive
+    range_end        TIMESTAMPTZ NOT NULL,   -- exclusive
+    concurrency      INTEGER     NOT NULL DEFAULT 1,
+    allow_overwrite  BOOLEAN     NOT NULL DEFAULT false,
+    description      TEXT,
+    schedule_id      UUID        REFERENCES strand.schedules(id) ON DELETE SET NULL,
+    status           TEXT        NOT NULL DEFAULT 'RUNNING',
+    next_slot_time   TIMESTAMPTZ NOT NULL,   -- cursor: next slot to fire
+    total_slots      INTEGER     NOT NULL DEFAULT 0,
+    completed_slots  INTEGER     NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at     TIMESTAMPTZ,
+    CONSTRAINT strand_backfills_pkey   PRIMARY KEY (id),
+    CONSTRAINT strand_backfills_kind   CHECK (task_kind IN ('WORKFLOW', 'ACTIVITY')),
+    CONSTRAINT strand_backfills_status CHECK (status IN ('RUNNING', 'HALTED', 'COMPLETED', 'FAILED')),
+    CONSTRAINT strand_backfills_conc   CHECK (concurrency >= 1)
+);
+
+-- StrandScheduler polls this index each cycle.
+CREATE INDEX IF NOT EXISTS strand_backfills_running_idx
+    ON strand.backfills (namespace_id, status)
+    WHERE status = 'RUNNING';
+
+-- Now that strand.backfills exists, add the FK from strand.tasks.
+ALTER TABLE strand.tasks
+    ADD CONSTRAINT strand_tasks_backfill_fk
+    FOREIGN KEY (backfill_id) REFERENCES strand.backfills(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS strand_tasks_backfill_idx
+    ON strand.tasks (backfill_id)
+    WHERE backfill_id IS NOT NULL;
 
 -- ───────────────────────────────────────────────────────────────────────────────
 -- Workers — ephemeral runtime heartbeat table.

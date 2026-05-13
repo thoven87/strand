@@ -68,6 +68,18 @@ export interface UpcomingSlot {
     slot: string; // ISO 8601 UTC datetime
 }
 
+export const runSchedulePartition = (
+    namespace: string,
+    scheduleId: string,
+    body: { partitionTime: string; allowOverwrite?: boolean },
+): Promise<{ taskId: string; runId: string }> =>
+    api
+        .post<{
+            taskId: string;
+            runId: string;
+        }>(`/api/${namespace}/schedules/${encodeURIComponent(scheduleId)}/run`, body)
+        .then((r) => r.data);
+
 export const getScheduleUpcoming = (
     namespace: string,
     id: string,

@@ -201,7 +201,7 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
 
     /// UTC Gregorian calendar used as the default for date arithmetic.
     /// Avoids silently inheriting the server's system timezone/locale from
-    /// `Calendar.current` when no explicit calendar is provided by the caller.
+    /// `Calendar(identifier: .gregorian)` when no explicit calendar is provided by the caller.
     @usableFromInline static let utcGregorian: Calendar = {
         var c = Calendar(identifier: .gregorian)
         c.timeZone = TimeZone(identifier: "UTC")!

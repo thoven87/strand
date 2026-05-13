@@ -1,7 +1,8 @@
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams, useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Trash2 } from "lucide-react";
+import { ArrowLeft, Trash2, RotateCcw } from "lucide-react";
 import {
     getSchedule,
     getScheduleRuns,
@@ -17,6 +18,55 @@ import { qk } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/ui/badge";
 import { RelativeTime } from "@/components/RelativeTime";
+import {
+    createBackfill,
+    getBackfills,
+    haltBackfill,
+    resumeBackfill,
+    type BackfillResponse,
+} from "@/api/backfills";
+import { runSchedulePartition } from "@/api/schedules";
+import { Play } from "lucide-react";
+
+// ── ISO 8601 helpers ──────────────────────────────────────────────────────────
+
+/** Placeholder / format hint for a given schedule pattern type.
+ *  Schedule Pattern: hourly → YYYY-MM-DDTHH, daily → YYYY-MM-DD, etc. */
+function isoPlaceholderFor(patternType: string): string {
+    switch (patternType.toLocaleLowerCase()) {
+        case "daily":
+        case "weekly":
+            return "2026-04-29";
+        case "monthly":
+            return "2026-05";
+        case "yearly":
+            return "2025";
+        default:
+            return "2026-05-12T15"; // interval / cron
+    }
+}
+
+/** Expands a partial ISO 8601 string to a full UTC ISO string that Date can parse.
+ *  "2025"          → "2025-01-01T00:00:00Z"
+ *  "2026-05"       → "2026-05-01T00:00:00Z"
+ *  "2026-04-29"    → "2026-04-29T00:00:00Z"
+ *  "2026-05-12T15" → "2026-05-12T15:00:00Z"
+ */
+function expandPartialISO(v: string): string {
+    const s = v.trim();
+    if (/^\d{4}$/.test(s)) return `${s}-01-01T00:00:00Z`;
+    if (/^\d{4}-\d{2}$/.test(s)) return `${s}-01T00:00:00Z`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return `${s}T00:00:00Z`;
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(s)) return `${s}:00:00Z`;
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(s)) return `${s}:00Z`;
+    return s.includes("Z") || s.includes("+") ? s : `${s}Z`;
+}
+
+function parsePartialISO(v: string): Date | null {
+    if (!v.trim()) return null;
+    const d = new Date(expandPartialISO(v));
+    return isNaN(d.getTime()) ? null : d;
+}
 
 const TYPE_LABEL: Record<string, string> = {
     cron: "Cron",
@@ -63,6 +113,442 @@ function OptionalTime({ iso }: { iso: string | null }) {
             </span>
             <RelativeTime iso={iso} />
         </span>
+    );
+}
+
+// ── BackfillDialog ────────────────────────────────────────────────────────────
+
+function BackfillDialog({
+    open,
+    onClose,
+    namespace,
+    scheduleId,
+    patternType,
+    onCreated,
+}: {
+    open: boolean;
+    onClose: () => void;
+    namespace: string;
+    scheduleId: string;
+    patternType: string;
+    onCreated: () => void;
+}) {
+    const [rangeStart, setRangeStart] = useState("");
+    const [rangeEnd, setRangeEnd] = useState("");
+    const [concurrency, setConcurrency] = useState(1);
+    const [allowOverwrite, setAllowOverwrite] = useState(false);
+    const [description, setDescription] = useState("");
+    const [error, setError] = useState<string | null>(null);
+    const ph = isoPlaceholderFor(patternType);
+
+    const mutation = useMutation({
+        mutationFn: () => {
+            const start = parsePartialISO(rangeStart);
+            const end = parsePartialISO(rangeEnd);
+            if (!start) {
+                setError("Invalid start — use ISO 8601 e.g. " + ph);
+                return Promise.reject();
+            }
+            if (!end) {
+                setError("Invalid end — use ISO 8601 e.g. " + ph);
+                return Promise.reject();
+            }
+            if (end <= start) {
+                setError("End must be after start");
+                return Promise.reject();
+            }
+            setError(null);
+            return createBackfill(namespace, scheduleId, {
+                rangeStart: start.toISOString(),
+                rangeEnd: end.toISOString(),
+                concurrency,
+                allowOverwrite,
+                description: description || undefined,
+            });
+        },
+        onSuccess: () => {
+            onClose();
+            onCreated();
+        },
+        onError: (e: unknown) => {
+            if (error) return; // already set inline
+            setError(
+                e instanceof Error ? e.message : "Failed to create backfill",
+            );
+        },
+    });
+
+    if (!open) return null;
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className="bg-card border border-border rounded-lg p-6 w-full max-w-md shadow-xl space-y-4">
+                <div>
+                    <h2 className="text-base font-semibold">Create Backfill</h2>
+                    <p className="text-xs text-muted-foreground mt-1">
+                        Retroactively execute this schedule for a historical
+                        range. The scheduler drives slots — no worker
+                        concurrency consumed for orchestration.
+                    </p>
+                </div>
+
+                {/* Start */}
+                <div className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                        Start (inclusive)
+                    </label>
+                    <input
+                        autoFocus
+                        type="text"
+                        placeholder={ph}
+                        value={rangeStart}
+                        onChange={(e) => setRangeStart(e.target.value)}
+                        className="w-full rounded border border-border bg-secondary/20 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/40"
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                        ISO 8601 — e.g. {ph}
+                    </p>
+                </div>
+
+                {/* End */}
+                <div className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                        End (exclusive)
+                    </label>
+                    <input
+                        type="text"
+                        placeholder={ph}
+                        value={rangeEnd}
+                        onChange={(e) => setRangeEnd(e.target.value)}
+                        className="w-full rounded border border-border bg-secondary/20 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/40"
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                        ISO 8601 — e.g. {ph}
+                    </p>
+                </div>
+
+                {/* Concurrency */}
+                <div className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                        Concurrency
+                    </label>
+                    <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={concurrency}
+                        onChange={(e) =>
+                            setConcurrency(
+                                Math.max(1, parseInt(e.target.value) || 1),
+                            )
+                        }
+                        className="w-full rounded border border-border bg-secondary/20 px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                        Max simultaneous slots. Does not affect normal scheduled
+                        executions.
+                    </p>
+                </div>
+
+                {/* Description */}
+                <div className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                        Description
+                    </label>
+                    <input
+                        type="text"
+                        placeholder="Why is this backfill being created?"
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                        className="w-full rounded border border-border bg-secondary/20 px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                    />
+                </div>
+
+                <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                        type="checkbox"
+                        checked={allowOverwrite}
+                        onChange={(e) => setAllowOverwrite(e.target.checked)}
+                        className="rounded"
+                    />
+                    <span className="text-xs text-muted-foreground">
+                        Allow overwrite — re-run slots that already completed
+                    </span>
+                </label>
+
+                {error && (
+                    <p className="text-xs text-red-400 bg-red-500/10 rounded px-3 py-2">
+                        {error}
+                    </p>
+                )}
+
+                <div className="flex justify-end gap-2 pt-1">
+                    <Button variant="outline" size="sm" onClick={onClose}>
+                        Cancel
+                    </Button>
+                    <Button
+                        size="sm"
+                        onClick={() => mutation.mutate()}
+                        disabled={
+                            !rangeStart.trim() ||
+                            !rangeEnd.trim() ||
+                            mutation.isPending
+                        }
+                    >
+                        {mutation.isPending ? "Creating…" : "Create backfill"}
+                    </Button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// ── RunDialog — fire a single partition slot ──────────────────────────────────
+
+function RunDialog({
+    open,
+    onClose,
+    namespace,
+    scheduleId,
+    patternType,
+    onSuccess,
+}: {
+    open: boolean;
+    onClose: () => void;
+    namespace: string;
+    scheduleId: string;
+    patternType: string;
+    onSuccess: (taskId: string) => void;
+}) {
+    const [partitionTime, setPartitionTime] = useState("");
+    const [allowOverwrite, setAllowOverwrite] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const ph = isoPlaceholderFor(patternType);
+
+    const mutation = useMutation({
+        mutationFn: () => {
+            const pt = parsePartialISO(partitionTime);
+            if (!pt) {
+                setError("Invalid partition time — use ISO 8601 e.g. " + ph);
+                return Promise.reject();
+            }
+            setError(null);
+            return runSchedulePartition(namespace, scheduleId, {
+                partitionTime: pt.toISOString(),
+                allowOverwrite,
+            });
+        },
+        onSuccess: (data) => {
+            onClose();
+            onSuccess(data.taskId);
+        },
+        onError: (e: unknown) => {
+            if (error) return;
+            setError(e instanceof Error ? e.message : "Failed to trigger run");
+        },
+    });
+
+    if (!open) return null;
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className="bg-card border border-border rounded-lg p-6 w-full max-w-md shadow-xl space-y-4">
+                <div>
+                    <h2 className="text-base font-semibold">
+                        Run for partition
+                    </h2>
+                    <p className="text-xs text-muted-foreground mt-1">
+                        Fire a single execution for a specific historical
+                        partition. Uses the scheduler’s idempotency key —
+                        re-running an already-completed slot is blocked unless
+                        overwrite is enabled.
+                    </p>
+                </div>
+
+                <div className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                        Partition time
+                    </label>
+                    <input
+                        autoFocus
+                        type="text"
+                        placeholder={ph}
+                        value={partitionTime}
+                        onChange={(e) => setPartitionTime(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter") mutation.mutate();
+                        }}
+                        className="w-full rounded border border-border bg-secondary/20 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/40"
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                        ISO 8601 — e.g. {ph}
+                    </p>
+                </div>
+
+                <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                        type="checkbox"
+                        checked={allowOverwrite}
+                        onChange={(e) => setAllowOverwrite(e.target.checked)}
+                        className="rounded"
+                    />
+                    <span className="text-xs text-muted-foreground">
+                        Allow overwrite — re-run even if this partition already
+                        completed
+                    </span>
+                </label>
+
+                {error && (
+                    <p className="text-xs text-red-400 bg-red-500/10 rounded px-3 py-2">
+                        {error}
+                    </p>
+                )}
+
+                <div className="flex justify-end gap-2 pt-1">
+                    <Button variant="outline" size="sm" onClick={onClose}>
+                        Cancel
+                    </Button>
+                    <Button
+                        size="sm"
+                        onClick={() => mutation.mutate()}
+                        disabled={!partitionTime.trim() || mutation.isPending}
+                    >
+                        {mutation.isPending ? "Running…" : "Run"}
+                    </Button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function BackfillList({
+    namespace,
+    scheduleId,
+}: {
+    namespace: string;
+    scheduleId: string;
+}) {
+    const qc = useQueryClient();
+    const { data: backfills = [] } = useQuery({
+        queryKey: ["backfills", namespace, scheduleId],
+        queryFn: () => getBackfills(namespace, scheduleId),
+        refetchInterval: 5_000,
+    });
+
+    const haltMut = useMutation({
+        mutationFn: (id: string) => haltBackfill(namespace, id),
+        onSuccess: () =>
+            void qc.invalidateQueries({
+                queryKey: ["backfills", namespace, scheduleId],
+            }),
+    });
+    const resumeMut = useMutation({
+        mutationFn: (id: string) => resumeBackfill(namespace, id),
+        onSuccess: () =>
+            void qc.invalidateQueries({
+                queryKey: ["backfills", namespace, scheduleId],
+            }),
+    });
+
+    if (backfills.length === 0)
+        return (
+            <p className="text-xs text-muted-foreground italic">
+                No backfills yet.
+            </p>
+        );
+
+    return (
+        <div className="space-y-2">
+            {backfills.map((b: BackfillResponse) => {
+                const pct =
+                    b.totalSlots > 0
+                        ? Math.round((b.completedSlots / b.totalSlots) * 100)
+                        : 0;
+                const statusColor =
+                    b.status === "COMPLETED"
+                        ? "text-green-400"
+                        : b.status === "FAILED"
+                          ? "text-red-400"
+                          : b.status === "HALTED"
+                            ? "text-amber-400"
+                            : "text-blue-400";
+                return (
+                    <div
+                        key={b.id}
+                        className="rounded-lg border border-border/40 bg-secondary/10 px-4 py-3 space-y-2"
+                    >
+                        <div className="flex items-start justify-between gap-2">
+                            <div className="space-y-0.5 min-w-0">
+                                <p className="text-xs font-mono text-muted-foreground truncate">
+                                    {b.id}
+                                </p>
+                                {b.description && (
+                                    <p className="text-xs text-foreground/70">
+                                        {b.description}
+                                    </p>
+                                )}
+                                <p className="text-[10px] text-muted-foreground">
+                                    {new Date(b.rangeStart)
+                                        .toISOString()
+                                        .slice(0, 16)}{" "}
+                                    →{" "}
+                                    {new Date(b.rangeEnd)
+                                        .toISOString()
+                                        .slice(0, 16)}
+                                    {" · "}concurrency {b.concurrency}
+                                    {b.allowOverwrite && " · overwrite"}
+                                </p>
+                            </div>
+                            <span
+                                className={`text-xs font-medium shrink-0 ${statusColor}`}
+                            >
+                                {b.status}
+                            </span>
+                        </div>
+
+                        {/* Progress bar */}
+                        {b.totalSlots > 0 && (
+                            <div className="space-y-1">
+                                <div className="h-1.5 rounded-full bg-secondary/40 overflow-hidden">
+                                    <div
+                                        className="h-full rounded-full bg-blue-500 transition-all"
+                                        style={{ width: `${pct}%` }}
+                                    />
+                                </div>
+                                <p className="text-[10px] text-muted-foreground">
+                                    {b.completedSlots} / {b.totalSlots} slots (
+                                    {pct}%)
+                                </p>
+                            </div>
+                        )}
+
+                        {/* Actions */}
+                        <div className="flex gap-1.5">
+                            {b.status === "RUNNING" && (
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => haltMut.mutate(b.id)}
+                                    disabled={haltMut.isPending}
+                                    className="h-6 text-[10px] px-2"
+                                >
+                                    Halt
+                                </Button>
+                            )}
+                            {b.status === "HALTED" && (
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => resumeMut.mutate(b.id)}
+                                    disabled={resumeMut.isPending}
+                                    className="h-6 text-[10px] px-2"
+                                >
+                                    Resume
+                                </Button>
+                            )}
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
     );
 }
 
@@ -135,6 +621,9 @@ export function ScheduleDetailPage() {
         },
     });
 
+    const [backfillOpen, setBackfillOpen] = useState(false);
+    const [runOpen, setRunOpen] = useState(false);
+
     return (
         <div className="px-6 py-5">
             {/* Back link */}
@@ -200,6 +689,20 @@ export function ScheduleDetailPage() {
                                     Resume
                                 </Button>
                             )}
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => setRunOpen(true)}
+                            >
+                                <Play size={13} /> Run
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => setBackfillOpen(true)}
+                            >
+                                <RotateCcw size={13} /> Backfill
+                            </Button>
                             <Button
                                 variant="destructive"
                                 size="sm"
@@ -300,6 +803,17 @@ export function ScheduleDetailPage() {
                         </section>
                     )}
 
+                    {/* Backfills */}
+                    <section className="rounded-lg border border-border bg-card/40 p-4">
+                        <h2 className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
+                            Backfills
+                        </h2>
+                        <BackfillList
+                            namespace={namespace}
+                            scheduleId={scheduleId}
+                        />
+                    </section>
+
                     {/* Recent Runs */}
                     <section className="rounded-lg border border-border bg-card/40 overflow-hidden">
                         <div className="px-4 py-3 border-b border-border/50">
@@ -385,6 +899,32 @@ export function ScheduleDetailPage() {
                     </section>
                 </div>
             )}
+
+            <RunDialog
+                open={runOpen}
+                onClose={() => setRunOpen(false)}
+                namespace={namespace}
+                scheduleId={scheduleId}
+                patternType={schedule?.patternType ?? "cron"}
+                onSuccess={(taskId) =>
+                    void navigate({
+                        to: "/$namespace/tasks/$taskId",
+                        params: { namespace, taskId },
+                    })
+                }
+            />
+            <BackfillDialog
+                open={backfillOpen}
+                onClose={() => setBackfillOpen(false)}
+                namespace={namespace}
+                scheduleId={scheduleId}
+                patternType={schedule?.patternType ?? "cron"}
+                onCreated={() =>
+                    void qc.invalidateQueries({
+                        queryKey: ["backfills", namespace, scheduleId],
+                    })
+                }
+            />
         </div>
     );
 }

@@ -116,6 +116,11 @@ extension UpcomingSlotResponse: ResponseCodable {}
 
 // MARK: - Routes
 
+private struct RunScheduleBody: Decodable {
+    let partitionTime: Date
+    let allowOverwrite: Bool?
+}
+
 struct ScheduleRoutes {
     let client: StrandClient
 
@@ -236,6 +241,25 @@ struct ScheduleRoutes {
                 cursor = next
             }
             return slots
+        }
+
+        // POST /api/:namespace/schedules/:id/run
+        // Fire a single execution for a specific partition time.
+        // Uses the scheduler's idempotency key format so re-running an already-completed
+        // slot is blocked via ON CONFLICT — unless allowOverwrite is true.
+        router.post("schedules/:id/run") { req, ctx -> RunScheduleResponse in
+            let scheduleID = try ctx.parameters.require("id", as: UUID.self)
+            let body = try await req.decode(as: RunScheduleBody.self, context: ctx)
+            let result = try await self.client.runScheduleSlot(
+                scheduleID: scheduleID,
+                partitionTime: body.partitionTime,
+                allowOverwrite: body.allowOverwrite ?? false,
+                namespaceID: ctx.namespaceID
+            )
+            return RunScheduleResponse(
+                taskId: result.taskID,
+                runId:  result.runID
+            )
         }
 
         // DELETE /api/:namespace/schedules/:id

@@ -62,7 +62,7 @@ struct PartitionOffsetCoreTests {
     @Test("Apply duration to date with calendar arithmetic")
     func testDurationApplicationWithCalendar() async throws {
         let baseDate = try #require(
-            Calendar.current.date(
+            Calendar(identifier: .gregorian).date(
                 from: DateComponents(
                     timeZone: TimeZone(identifier: "UTC"),
                     year: 2024,
@@ -77,7 +77,7 @@ struct PartitionOffsetCoreTests {
         // Test adding duration
         let duration = ISO8601Duration(days: 15, hours: 6, minutes: 30)
 
-        var calendar = Calendar.current
+        var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
 
         let resultDate = duration.apply(to: baseDate, calendar: calendar)
@@ -101,7 +101,7 @@ struct PartitionOffsetCoreTests {
     @Test("Subtract duration from date with calendar arithmetic")
     func testDurationSubtractionWithCalendar() async throws {
         let baseDate = try #require(
-            Calendar.current.date(
+            Calendar(identifier: .gregorian).date(
                 from: DateComponents(
                     timeZone: TimeZone(identifier: "UTC"),
                     year: 2024,
@@ -116,7 +116,7 @@ struct PartitionOffsetCoreTests {
         // Test subtracting duration
         let duration = ISO8601Duration(days: 1, hours: 2)
 
-        var calendar = Calendar.current
+        var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
 
         let resultDate = duration.subtract(from: baseDate, calendar: calendar)
@@ -295,7 +295,7 @@ struct PartitionOffsetCoreTests {
 
         // Execution time: 2025-07-29T02:00 (when the workflow actually runs)
         let executionTime = try #require(
-            Calendar.current.date(
+            Calendar(identifier: .gregorian).date(
                 from: DateComponents(
                     timeZone: TimeZone(identifier: "UTC"),
                     year: 2025,
@@ -309,7 +309,7 @@ struct PartitionOffsetCoreTests {
 
         // Data partition time should be: 2025-07-29T01:00 (the data period being processed)
         let expectedPartitionTime = try #require(
-            Calendar.current.date(
+            Calendar(identifier: .gregorian).date(
                 from: DateComponents(
                     timeZone: TimeZone(identifier: "UTC"),
                     year: 2025,
@@ -322,7 +322,7 @@ struct PartitionOffsetCoreTests {
         )
 
         // Apply the offset: execution time - PT1H = partition time
-        let partitionTime = config.offset.subtract(from: executionTime, calendar: Calendar.current)
+        let partitionTime = config.offset.subtract(from: executionTime, calendar: Calendar(identifier: .gregorian))
 
         #expect(partitionTime == expectedPartitionTime)
     }
