@@ -289,6 +289,12 @@ extension DailyRunCountResponse: ResponseCodable {}
 
 extension SimpleResponse: ResponseCodable {}
 
+struct RunScheduleResponse: Codable, Sendable {
+    let taskId: UUID
+    let runId: UUID
+}
+extension RunScheduleResponse: ResponseCodable {}
+
 struct EnqueueResultResponse: Codable, Sendable {
     let taskID: UUID
     let runID: UUID

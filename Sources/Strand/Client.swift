@@ -1090,6 +1090,9 @@ public struct StrandClient: Sendable {
     }
 
     /// Fetches a single schedule by ID.  Returns `nil` when not found.
+    ///
+    /// The returned `ScheduleSummary` is built from ``ScheduleFullRow``, which
+    /// is ever needed.
     public func getSchedule(
         id: UUID,
         queue: String? = nil,
@@ -1124,6 +1127,57 @@ public struct StrandClient: Sendable {
             kind: row.kind,
             createdAt: row.createdAt
         )
+    }
+
+    /// Enqueues a single execution for a specific schedule slot ("run for partition").
+    ///
+    /// Uses the same idempotency key format as `StrandScheduler.fire()` so a slot
+    /// already executed by the regular schedule is blocked via `ON CONFLICT` unless
+    /// `allowOverwrite` is `true`.
+    @discardableResult
+    public func runScheduleSlot(
+        scheduleID: UUID,
+        partitionTime: Date,
+        allowOverwrite: Bool = false,
+        namespaceID overrideNS: String? = nil
+    ) async throws -> (taskID: UUID, runID: UUID) {
+        let ns = overrideNS ?? namespaceID
+        guard
+            let schedule = try await ScheduleQueries.getSchedule(
+                on: postgres,
+                namespaceID: ns,
+                id: scheduleID,
+                logger: logger
+            )
+        else {
+            throw StrandError.database(underlying: QueryError("schedule '\(scheduleID)' not found"))
+        }
+        let idempotencyKey: String? =
+            allowOverwrite
+            ? nil
+            : "$schedule:\(scheduleID):\(partitionTime.timeIntervalSince1970)"
+        let meta = SchedulingMetadata(
+            executionTime: Date(),
+            partitionTime: partitionTime,
+            scheduleId: scheduleID.uuidString,
+            scheduledBy: schedule.name
+        )
+        let enqueued = try await Queries.enqueueTask(
+            on: postgres,
+            namespaceID: ns,
+            queue: schedule.queue,
+            taskName: schedule.taskName,
+            paramsBuffer: schedule.paramsBuffer,
+            headersBuffer: schedule.headersBuffer,
+            schedulingMetadata: meta,
+            retryStrategyBuffer: schedule.retryStrategyBuffer,
+            maxAttempts: schedule.maxAttempts,
+            cancellationBuffer: schedule.cancellationBuffer,
+            idempotencyKey: idempotencyKey,
+            kind: schedule.kind,
+            logger: logger
+        )
+        return (taskID: enqueued.taskID, runID: enqueued.runID)
     }
 
     /// Lists schedules for `queue` (or all queues when `queue` is `nil`).
@@ -1170,6 +1224,111 @@ public struct StrandClient: Sendable {
                 createdAt: row.createdAt
             )
         }
+    }
+
+    // MARK: - Backfill
+
+    /// Creates a backfill that retroactively executes `workflowType` for every
+    /// schedule slot between `range.lowerBound` (inclusive) and `range.upperBound`
+    /// (exclusive).
+    ///
+    /// The `StrandScheduler` drives execution: it enqueues up to
+    /// `options.concurrency` slots per poll cycle without occupying worker
+    /// task-queue slots for orchestration.
+    @discardableResult
+    public func createBackfill<W: Workflow>(
+        _ workflowType: W.Type,
+        input: W.Input,
+        schedule: SchedulePattern,
+        range: Range<Date>,
+        queue overrideQueue: String? = nil,
+        scheduleId: UUID? = nil,
+        options: BackfillOptions = .init()
+    ) async throws -> BackfillHandle where W.Input: Codable & Sendable {
+        let q = overrideQueue ?? queueName
+        let paramsBuffer = try JSON.encode(input)
+        let patternBuffer = try JSON.encode(schedule)
+        let id = UUID.v7()
+        // Subtract 1 s so the start is inclusive: nextRunTime finds the slot AT
+        // lowerBound when it coincides with a schedule boundary
+        // (-1 ms adjustment on BackfillRequest.StartTime).
+        let firstSlot =
+            try ScheduleCalculator.nextRunTime(
+                for: schedule,
+                after: range.lowerBound.addingTimeInterval(-1),
+                timezone: schedule.timezone
+            ) ?? range.lowerBound
+        let totalSlots = ScheduleCalculator.countSlots(for: schedule, in: range)
+        try await BackfillQueries.createBackfill(
+            on: postgres,
+            id: id,
+            namespaceID: namespaceID,
+            queue: q,
+            taskName: W.workflowName,
+            taskKind: .workflow,
+            paramsBuffer: paramsBuffer,
+            headersBuffer: nil,
+            retryStrategyBuffer: nil,
+            maxAttempts: nil,
+            schedulePatternBuffer: patternBuffer,
+            rangeStart: range.lowerBound,
+            rangeEnd: range.upperBound,
+            concurrency: options.concurrency,
+            allowOverwrite: options.allowOverwrite,
+            description: options.description,
+            scheduleId: scheduleId,
+            nextSlotTime: firstSlot,
+            totalSlots: totalSlots,
+            logger: logger
+        )
+        return BackfillHandle(id: id, postgres: postgres, namespaceID: namespaceID, logger: logger)
+    }
+
+    /// Creates a backfill for a standalone activity.
+    @discardableResult
+    public func createBackfill<A: ActivityDefinition>(
+        _ activityType: A.Type,
+        input: A.Input,
+        schedule: SchedulePattern,
+        range: Range<Date>,
+        queue overrideQueue: String? = nil,
+        scheduleId: UUID? = nil,
+        options: BackfillOptions = .init()
+    ) async throws -> BackfillHandle where A.Input: Codable & Sendable {
+        let q = overrideQueue ?? queueName
+        let paramsBuffer = try JSON.encode(input)
+        let patternBuffer = try JSON.encode(schedule)
+        let id = UUID.v7()
+        let firstSlot =
+            try ScheduleCalculator.nextRunTime(
+                for: schedule,
+                after: range.lowerBound.addingTimeInterval(-1),
+                timezone: schedule.timezone
+            ) ?? range.lowerBound
+        let totalSlots = ScheduleCalculator.countSlots(for: schedule, in: range)
+        try await BackfillQueries.createBackfill(
+            on: postgres,
+            id: id,
+            namespaceID: namespaceID,
+            queue: q,
+            taskName: A.name,
+            taskKind: .activity,
+            paramsBuffer: paramsBuffer,
+            headersBuffer: nil,
+            retryStrategyBuffer: nil,
+            maxAttempts: nil,
+            schedulePatternBuffer: patternBuffer,
+            rangeStart: range.lowerBound,
+            rangeEnd: range.upperBound,
+            concurrency: options.concurrency,
+            allowOverwrite: options.allowOverwrite,
+            description: options.description,
+            scheduleId: scheduleId,
+            nextSlotTime: firstSlot,
+            totalSlots: totalSlots,
+            logger: logger
+        )
+        return BackfillHandle(id: id, postgres: postgres, namespaceID: namespaceID, logger: logger)
     }
 
     // MARK: - Cleanup

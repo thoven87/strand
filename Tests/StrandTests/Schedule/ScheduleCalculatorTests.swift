@@ -321,6 +321,60 @@ struct ScheduleCalculatorTests {
         #expect(offsetPartitionTime < partitionTime)  // Should be one day earlier
     }
 
+    // MARK: - countSlots
+
+    @Test("countSlots returns 0 for an empty range")
+    func countSlotsEmptyRange() {
+        let now = Date()
+        let count = ScheduleCalculator.countSlots(
+            for: .interval(.hours(1)),
+            in: now..<now
+        )
+        #expect(count == 0)
+    }
+
+    @Test("countSlots counts hourly slots across a 24-hour window")
+    func countSlotsHourly24h() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let start = cal.date(from: DateComponents(year: 2024, month: 6, day: 1, hour: 0))!
+        let end = cal.date(from: DateComponents(year: 2024, month: 6, day: 2, hour: 0))!
+        let count = ScheduleCalculator.countSlots(
+            for: .interval(.hours(1)),
+            in: start..<end
+        )
+        // 24 whole hours, start inclusive: 00:00, 01:00 … 23:00 = 24 slots
+        #expect(count == 24)
+    }
+
+    @Test("countSlots counts daily cron slots across a week")
+    func countSlotsDailyOneWeek() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let start = cal.date(from: DateComponents(year: 2024, month: 6, day: 1))!
+        let end = cal.date(from: DateComponents(year: 2024, month: 6, day: 8))!  // 7 days
+        let count = ScheduleCalculator.countSlots(
+            for: .cron("0 9 * * *", timezone: TimeZone(identifier: "UTC")!),
+            in: start..<end
+        )
+        #expect(count == 7)  // 7 × 09:00 UTC
+    }
+
+    @Test("countSlots respects cap parameter")
+    func countSlotsRespectsCap() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        // One year of hourly = 8760 slots; cap at 100
+        let start = cal.date(from: DateComponents(year: 2024, month: 1, day: 1))!
+        let end = cal.date(from: DateComponents(year: 2025, month: 1, day: 1))!
+        let count = ScheduleCalculator.countSlots(
+            for: .interval(.hours(1)),
+            in: start..<end,
+            cap: 100
+        )
+        #expect(count == 100)
+    }
+
     // MARK: - DST transition tests for N-day intervals
     //
     // N-day intervals must fire at the same wall-clock time regardless of DST transitions.
