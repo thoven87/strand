@@ -11,11 +11,11 @@ public import Foundation
 
 // MARK: - StrandVoid
 
-/// A `Codable`, `Sendable` unit type used as the `Output` of an ``ActivityDefinition``
+/// A `Codable`, `Sendable` unit type used as the `Output` of an ``Activity``
 /// that performs a side effect and returns no meaningful value.
 ///
 /// ```swift
-/// struct SendEmailActivity: ActivityDefinition {
+/// struct SendEmailActivity: Activity {
 ///     func run(input: EmailInput, context: ActivityContext) async throws -> StrandVoid {
 ///         try await smtp.send(to: input.address, body: input.body)
 ///         return .done
@@ -150,6 +150,28 @@ public struct ActivityContext: Sendable {
     /// at zero cost without an extra DB column or init parameter.
     public var queuedAt: Date { activityID.v7CreatedAt ?? Date() }
 
+    /// Scheduling metadata injected by ``StrandScheduler`` when this activity was
+    /// triggered directly by a schedule (`.activity(...)` declaration). `nil` when
+    /// the activity was enqueued via ``StrandClient/enqueueActivity(_:input:options:)``
+    /// or spawned as a child of a workflow.
+    ///
+    /// Use `partitionTime` as the canonical anchor for what data period this
+    /// execution covers — it is stable across retries and backfill re-runs:
+    ///
+    /// ```swift
+    /// func run(input: Input, context: ActivityContext) async throws -> StrandVoid {
+    ///     guard let meta = context.schedulingMetadata else {
+    ///         // Directly enqueued — use queuedAt or input-supplied date
+    ///         return try await processDay(input.date)
+    ///     }
+    ///     // Scheduled execution: partitionTime = data interval start (stable across retries)
+    ///     // executionTime        = when the scheduler actually fired (wall-clock)
+    ///     let day = meta.partitionTime ?? meta.executionTime
+    ///     return try await processDay(day)
+    /// }
+    /// ```
+    public let schedulingMetadata: SchedulingMetadata?
+
     // Package-internal: the parent workflow's task UUID (for parent_task_id FK).
     package let parentWorkflowID: UUID?
 
@@ -165,6 +187,7 @@ public struct ActivityContext: Sendable {
         queueName: String,
         attempt: Int,
         logger: Logger,
+        schedulingMetadata: SchedulingMetadata? = nil,
         parentWorkflowID: UUID?,
         heartbeatDetailsBuffer: ByteBuffer? = nil,
         heartbeatImpl: @escaping @Sendable (ByteBuffer?) async throws -> Void = { _ in }  // default no-op
@@ -174,6 +197,7 @@ public struct ActivityContext: Sendable {
         self.queueName = queueName
         self.attempt = attempt
         self.logger = logger
+        self.schedulingMetadata = schedulingMetadata
         self.parentWorkflowID = parentWorkflowID
         self._heartbeatDetailsBuffer = heartbeatDetailsBuffer
         self._heartbeatImpl = heartbeatImpl
@@ -234,57 +258,17 @@ public struct ActivityContext: Sendable {
 
 // MARK: - Activity
 
-/// A self-contained, independently retryable unit of work.
-///
-/// Closure-based standalone activity for use with `StrandClient.enqueue(_:params:)`
-/// and `StrandClient.runActivity(_:params:)`. For worker-registered activities that
-/// hold dependencies, use ``ActivityDefinition`` instead.
-///
-/// ```swift
-/// let chargeCard = Activity<ChargeInput, ChargeResult>(name: "charge-card") { input, _ in
-///     ChargeResult(paymentID: try await stripe.charge(input.amount))
-/// }
-/// // Fire-and-forget from the client:
-/// let enq = try await client.enqueue(chargeCard, params: ChargeInput(amount: 99.99))
-/// ```
-public struct Activity<P: Codable & Sendable, R: Codable & Sendable>: Sendable {
-
-    public let name: String
-    public let queue: String?
-    public let defaultMaxAttempts: Int?
-
-    /// Package-internal: the typed handler.
-    package let handler: @Sendable (P, ActivityContext) async throws -> R
-
-    /// Package-internal: the execution kind stored in strand.tasks.kind.
-    package let executionKind: TaskKind = .activity
-
-    public init(
-        name: String,
-        queue: String? = nil,
-        maxAttempts: Int? = nil,
-        run handler: @escaping @Sendable (P, ActivityContext) async throws -> R
-    ) {
-        self.name = name
-        self.queue = queue
-        self.defaultMaxAttempts = maxAttempts
-        self.handler = handler
-    }
-}
-
-// MARK: - ActivityDefinition
-
 /// A dependency-injected, independently-retried unit of I/O.
 ///
 /// Activities hold their dependencies as stored properties and are registered
 /// on ``StrandWorker`` via `activities:` or `activityContainers:`. The worker
 /// claims, executes, and retries them independently.
 ///
-/// `ActivityDefinition` automatically satisfies ``ActivityBox``, so instances
+/// `Activity` automatically satisfies ``ActivityBox``, so instances
 /// can be passed directly in the `activities:` array without any wrapper.
 ///
 /// ```swift
-/// struct ChargeCardActivity: ActivityDefinition {
+/// struct ChargeCardActivity: Activity {
 ///     typealias Input  = ChargeInput
 ///     typealias Output = ChargeResult
 ///
@@ -295,7 +279,7 @@ public struct Activity<P: Codable & Sendable, R: Codable & Sendable>: Sendable {
 ///     }
 /// }
 /// ```
-public protocol ActivityDefinition: ActivityBox {
+public protocol Activity: ActivityBox {
     associatedtype Input: Codable & Sendable
     associatedtype Output: Codable & Sendable
     /// The typed error this activity can throw.
@@ -304,7 +288,7 @@ public protocol ActivityDefinition: ActivityBox {
     /// `WorkflowContext.runActivity` — no `ActivityError` wrapper, no `.cause` cast.
     ///
     /// ```swift
-    /// struct AddBankAccountActivity: ActivityDefinition {
+    /// struct AddBankAccountActivity: Activity {
     ///     typealias Failure = BankAccountError   // BankAccountError: Codable
     ///     func run(input: Input, context: ActivityContext) async throws(BankAccountError) -> Output {
     ///         throw .invalidDetails
@@ -342,7 +326,7 @@ public protocol ActivityDefinition: ActivityBox {
     func run(input: Input, context: ActivityContext) async throws -> Output
 }
 
-extension ActivityDefinition {
+extension Activity {
     public static var name: String { String(describing: Self.self) }
     public static var defaultMaxAttempts: Int? { nil }
     public static var defaultTimeout: Duration? { nil }
@@ -354,8 +338,8 @@ extension ActivityDefinition {
 }
 
 // Internal _makeToken() and _run() entry point.
-// Every ActivityDefinition gets these for free — no manual implementation needed.
-extension ActivityDefinition {
+// Every Activity gets these for free — no manual implementation needed.
+extension Activity {
 
     public func _makeToken() -> _ActivityToken {
         _ActivityToken(
@@ -431,6 +415,7 @@ extension ActivityDefinition {
             queueName: exec.queue,
             attempt: claimed.attempt,
             logger: exec.logger,
+            schedulingMetadata: claimed.schedulingMetadata,
             parentWorkflowID: claimed.parentWorkflowID,
             heartbeatDetailsBuffer: claimed.heartbeatDetails,
             heartbeatImpl: { details in

@@ -1,6 +1,6 @@
 import Strand
 
-struct SendEmailActivity: ActivityDefinition {
+struct SendEmailActivity: Activity {
     struct Input: Codable, Sendable {
         let to: String
         let subject: String

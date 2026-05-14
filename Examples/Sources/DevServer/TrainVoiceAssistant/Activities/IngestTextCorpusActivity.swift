@@ -1,6 +1,6 @@
 import Strand
 
-struct IngestTextCorpusActivity: ActivityDefinition {
+struct IngestTextCorpusActivity: Activity {
     struct Input: Codable, Sendable {
         let country: String
         let partition: Int

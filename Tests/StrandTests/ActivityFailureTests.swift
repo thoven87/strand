@@ -27,7 +27,7 @@ import Foundation
 
 /// An activity that unconditionally throws on every attempt.
 /// Used to exercise the FAILED activity fast-path without waiting for retries.
-private struct AlwaysFailingActivity: ActivityDefinition {
+private struct AlwaysFailingActivity: Activity {
     typealias Input = String
     typealias Output = String
     typealias Failure = AlwaysFailingError

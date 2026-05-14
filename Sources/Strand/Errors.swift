@@ -178,7 +178,7 @@ public protocol NonRetryableError: Error {}
 
 // MARK: - Internal failure signals
 
-/// Pre-encoded activity failure reason thrown from `ActivityDefinition._run`.
+/// Pre-encoded activity failure reason thrown from `Activity._run`.
 /// Carries the JSON BYTEA that should be stored verbatim in `strand.runs.failure_reason`.
 /// `StrandWorker.runTask` catches this to bypass re-encoding in `FailureReason`.
 struct _TypedActivityFailure: Error, CustomStringConvertible {

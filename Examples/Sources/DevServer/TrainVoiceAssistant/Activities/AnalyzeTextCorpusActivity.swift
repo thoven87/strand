@@ -1,6 +1,6 @@
 import Strand
 
-struct AnalyzeTextCorpusActivity: ActivityDefinition {
+struct AnalyzeTextCorpusActivity: Activity {
     struct Input: Codable, Sendable {
         let country: String
         let variant: Int

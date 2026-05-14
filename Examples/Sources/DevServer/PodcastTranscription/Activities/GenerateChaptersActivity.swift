@@ -1,7 +1,7 @@
 import Strand
 
 /// Simulates an LLM pass over the full transcript to extract chapter markers.
-struct GenerateChaptersActivity: ActivityDefinition {
+struct GenerateChaptersActivity: Activity {
     typealias Input = ChapterInput
     typealias Output = ChaptersResult
 

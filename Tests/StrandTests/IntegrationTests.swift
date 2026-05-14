@@ -180,7 +180,7 @@ private struct SignalledWorkflow: Workflow {
 // A simple activity plus the workflow that calls it.
 // Used by: activityExecution test.
 
-private struct ReverseActivity: ActivityDefinition {
+private struct ReverseActivity: Activity {
     typealias Input = String
     typealias Output = String
 
@@ -205,7 +205,7 @@ private struct ActivityWorkflow: Workflow {
 // The workflow passes `maxAttempts: 3` so the activity is retried.
 // Used by: activityRetryOnFailure test.
 
-private struct FlakyActivity: ActivityDefinition {
+private struct FlakyActivity: Activity {
     typealias Input = String
     typealias Output = String
     typealias Failure = DeliberateFailure
@@ -676,7 +676,7 @@ struct LeaseExpiryTests {
 
 // MARK: - Standalone activity dispatch
 
-private struct StandaloneGreetActivity: ActivityDefinition {
+private struct StandaloneGreetActivity: Activity {
     typealias Input = String
     typealias Output = String
     func run(input: String, context: ActivityContext) async throws -> String {
@@ -772,7 +772,7 @@ struct StandaloneActivityTests {
 
 // MARK: - Parallel activities (Phase 2 executor)
 
-private struct DoubleActivity: ActivityDefinition {
+private struct DoubleActivity: Activity {
     typealias Input = String
     typealias Output = String
 
@@ -784,7 +784,7 @@ private struct DoubleActivity: ActivityDefinition {
     }
 }
 
-private struct TripleActivity: ActivityDefinition {
+private struct TripleActivity: Activity {
     typealias Input = String
     typealias Output = String
 

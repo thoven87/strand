@@ -4,7 +4,7 @@ import Strand
 /// Simulates fetching a podcast audio file from a CDN.
 /// Returns the episode ID and the number of ~15-minute segments the
 /// workflow will fan out to (capped at 8 so dev runs stay snappy).
-struct DownloadEpisodeActivity: ActivityDefinition {
+struct DownloadEpisodeActivity: Activity {
     struct Input: Codable, Sendable {
         let showName: String
         let episodeTitle: String

@@ -3,7 +3,7 @@ import Strand
 
 /// Calls the HN Firebase REST API and returns the top-N story IDs.
 /// No browser or Puppeteer required — the HN API returns JSON directly.
-struct FetchTopStoriesActivity: ActivityDefinition {
+struct FetchTopStoriesActivity: Activity {
     struct Input: Codable, Sendable { let count: Int }
     typealias Output = [Int]
 

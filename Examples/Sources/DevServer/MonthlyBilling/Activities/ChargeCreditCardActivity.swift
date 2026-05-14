@@ -1,6 +1,6 @@
 import Strand
 
-struct ChargeCreditCardActivity: ActivityDefinition {
+struct ChargeCreditCardActivity: Activity {
     struct Input: Codable, Sendable {
         let invoiceID: String
         let amount: Double

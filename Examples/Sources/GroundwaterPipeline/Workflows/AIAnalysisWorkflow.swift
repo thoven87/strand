@@ -102,7 +102,7 @@ struct FetchStatsOutput: Codable, Sendable {
     let latestMsmt: String?
 }
 
-struct FetchCountyStatsActivity: ActivityDefinition {
+struct FetchCountyStatsActivity: Activity {
     typealias Input = FetchStatsInput
     typealias Output = FetchStatsOutput
 

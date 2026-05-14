@@ -4,7 +4,7 @@ import Strand
 /// Queries `cnra.groundwater_measurements` for distinct county names.
 /// Used by StatsWorkflow to drive fan-out — the county list is data-driven,
 /// not hardcoded, so it adapts to whatever counties appear in the ingested data.
-struct DiscoverCountiesActivity: ActivityDefinition {
+struct DiscoverCountiesActivity: Activity {
     typealias Input = String  // jobID
     typealias Output = [String]
 

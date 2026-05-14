@@ -14,7 +14,7 @@ struct ReadSensorsInput: Codable, Sendable {
 
 /// Simulates reading all sensors in a room.
 /// The server room (roomId == "server-room") has a temperature spike on cycle 3.
-struct ReadSensorsActivity: ActivityDefinition {
+struct ReadSensorsActivity: Activity {
     typealias Input = ReadSensorsInput
     typealias Output = [SensorReading]
     static let name = "iot.read-sensors"
@@ -60,7 +60,7 @@ struct AlertInput: Codable, Sendable {
 
 /// Handles a sensor threshold breach — in production this would page on-call,
 /// trigger HVAC adjustments, etc. Here it logs the alert clearly.
-struct SendAlertActivity: ActivityDefinition {
+struct SendAlertActivity: Activity {
     typealias Input = AlertInput
     typealias Output = String  // alert description
     static let name = "iot.send-alert"

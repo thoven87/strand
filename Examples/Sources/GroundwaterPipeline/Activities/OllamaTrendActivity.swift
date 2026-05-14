@@ -12,7 +12,7 @@ import Foundation
 ///
 /// Uses `format: "json"` to get structured output instead of tool calling —
 /// faster and more reliable for simple classification tasks.
-struct OllamaTrendActivity: ActivityDefinition {
+struct OllamaTrendActivity: Activity {
     typealias Input = OllamaTrendInput
     typealias Output = OllamaTrendOutput
 

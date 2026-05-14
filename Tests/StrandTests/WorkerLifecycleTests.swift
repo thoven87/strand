@@ -41,7 +41,7 @@ private struct WltEchoWorkflow: Workflow {
 //
 // Used by: expiredLeaseRetriedByNewWorker.
 
-private struct WltHungActivity: ActivityDefinition {
+private struct WltHungActivity: Activity {
     typealias Input = String
     typealias Output = String
 
@@ -64,7 +64,7 @@ private struct WltHungActivity: ActivityDefinition {
 //
 // Used by: cancelWorkflowCascadesToChildren.
 
-private struct WltSlowActivity: ActivityDefinition {
+private struct WltSlowActivity: Activity {
     typealias Input = StrandVoid
     typealias Output = StrandVoid
 

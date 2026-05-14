@@ -1,6 +1,6 @@
 import Strand
 
-struct GenerateVoiceModelActivity: ActivityDefinition {
+struct GenerateVoiceModelActivity: Activity {
     struct Input: Codable, Sendable {
         let country: String
         let analysisPaths: [String]

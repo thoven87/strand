@@ -76,61 +76,9 @@ public struct StrandClient: Sendable {
         )
     }
 
-    // MARK: - Activity enqueue / run
+    // MARK: - Activity (standalone Activity dispatch)
 
-    /// Enqueues an ``Activity`` as a standalone unit of work — no workflow required.
-    ///
-    /// The activity runs independently with `kind = 'ACTIVITY'` so the dashboard can
-    /// distinguish leaf executions from orchestrators.
-    ///
-    /// ```swift
-    /// // Fire-and-forget:
-    /// let enq = try await client.enqueue(chargeCard, params: ChargeInput(amount: 99.99))
-    /// // Wait for the result later:
-    /// let result: ChargeResult = try await client.awaitTaskResult(id: enq.taskID)
-    /// ```
-    @discardableResult
-    public func enqueue<P: Codable & Sendable, R: Codable & Sendable>(
-        _ activity: Activity<P, R>,
-        params: P,
-        options: ActivityOptions = .init()
-    ) async throws -> EnqueueResult {
-        try await _enqueue(
-            queue: options.queue ?? activity.queue ?? queueName,
-            taskName: activity.name,
-            params: params,
-            maxAttempts: options.maxAttempts ?? activity.defaultMaxAttempts
-                ?? self.options.defaultMaxAttempts,
-            retryStrategy: options.retryStrategy ?? self.options.defaultRetryStrategy,
-            cancellation: options.cancellation,
-            headers: options.headers,
-            idempotencyKey: options.idempotencyKey,
-            priority: options.priority,
-            delayUntil: options.delayUntil,
-            maxDuration: options.maxDuration,
-            heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
-            fairnessKey: options.fairnessKey,
-            fairnessWeight: options.fairnessWeight,
-            kind: .activity,
-            parentTaskID: nil
-        )
-    }
-
-    /// Enqueues an ``Activity`` and polls until it completes, returning the decoded result.
-    ///
-    /// Equivalent to a standalone activity call from outside a workflow handler.
-    public func runActivity<P: Codable & Sendable, R: Decodable & Sendable>(
-        _ activity: Activity<P, R>,
-        params: P,
-        options: ActivityOptions = .init()
-    ) async throws -> R {
-        let enq = try await enqueue(activity, params: params, options: options)
-        return try await awaitTaskResult(id: enq.taskID)
-    }
-
-    // MARK: - Standalone ActivityDefinition dispatch
-
-    /// Enqueues an ``ActivityDefinition`` as a standalone unit of work without a
+    /// Enqueues an ``Activity`` as a standalone unit of work without a
     /// parent workflow. The activity is claimed and executed by any worker that has
     /// it registered in its `activities:` array.
     ///
@@ -146,7 +94,7 @@ public struct StrandClient: Sendable {
     ///                                   taskID: enq.taskID, client: client)
     /// ```
     @discardableResult
-    public func enqueueActivity<A: ActivityDefinition>(
+    public func enqueueActivity<A: Activity>(
         _ type: A.Type,
         input: A.Input,
         options: ActivityOptions = .init()
@@ -172,7 +120,7 @@ public struct StrandClient: Sendable {
         )
     }
 
-    /// Enqueues an ``ActivityDefinition`` and polls until it completes, returning
+    /// Enqueues an ``Activity`` and polls until it completes, returning
     /// the decoded result. The worker must have this activity registered.
     ///
     /// ```swift
@@ -183,7 +131,7 @@ public struct StrandClient: Sendable {
     ///     options: .init(maxAttempts: 3, priority: .high)
     /// )
     /// ```
-    public func runActivity<A: ActivityDefinition>(
+    public func runActivity<A: Activity>(
         _ type: A.Type,
         input: A.Input,
         options: ActivityOptions = .init()
@@ -852,12 +800,12 @@ public struct StrandClient: Sendable {
         )
     }
 
-    /// Schedules an ``ActivityDefinition``-conforming activity on a recurring pattern.
+    /// Schedules an ``Activity``-conforming activity on a recurring pattern.
     ///
     /// The activity fires directly — no wrapping workflow is created.
     /// Buffering / lifecycle semantics are identical to the workflow overload.
     @discardableResult
-    public func schedule<A: ActivityDefinition>(
+    public func schedule<A: Activity>(
         name: String,
         pattern: SchedulePattern,
         activityType: A.Type,
@@ -873,34 +821,6 @@ public struct StrandClient: Sendable {
             taskName: A.name,
             params: input,
             queue: queue,
-            startsAt: startsAt,
-            endsAt: endsAt,
-            kind: .activity,
-            options: options
-        )
-    }
-
-    /// Schedules an ``Activity`` instance on a recurring pattern.
-    ///
-    /// The activity fires directly — no wrapping workflow is created.
-    /// Buffering / lifecycle semantics are identical to the workflow overload.
-    @discardableResult
-    public func schedule<P: Codable & Sendable, R: Codable & Sendable>(
-        name scheduleName: String,
-        pattern: SchedulePattern,
-        _ activity: Activity<P, R>,
-        params: P,
-        queue: String? = nil,
-        startsAt: Date? = nil,
-        endsAt: Date? = nil,
-        options: ScheduleOptions = .init()
-    ) async throws -> UUID {
-        try await _schedule(
-            name: scheduleName,
-            pattern: pattern,
-            taskName: activity.name,
-            params: params,
-            queue: queue ?? activity.queue,
             startsAt: startsAt,
             endsAt: endsAt,
             kind: .activity,
@@ -1304,7 +1224,7 @@ public struct StrandClient: Sendable {
 
     /// Creates a backfill for a standalone activity.
     @discardableResult
-    public func createBackfill<A: ActivityDefinition>(
+    public func createBackfill<A: Activity>(
         _ activityType: A.Type,
         input: A.Input,
         schedule: SchedulePattern,
