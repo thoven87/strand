@@ -626,7 +626,7 @@ enum Queries {
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
                    c.wake_event, c.event_payload,
                    t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
-                   t.scheduling_metadata, c.available_at, c.heartbeat_details
+                   t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,

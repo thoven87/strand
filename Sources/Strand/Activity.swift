@@ -173,7 +173,32 @@ public struct ActivityContext: Sendable {
     public let schedulingMetadata: SchedulingMetadata?
 
     // Package-internal: the parent workflow's task UUID (for parent_task_id FK).
-    package let parentWorkflowID: UUID?
+    public let parentWorkflowID: UUID?
+
+    /// The namespace this activity is executing in.
+    public let namespace: String
+    /// The UUID of the current run attempt (`strand.runs.id`).
+    /// Each retry gets a new `runID`; `activityID` stays the same across retries.
+    ///
+    /// For regular activities this is the exact `strand.runs.id` primary key — safe
+    /// to query, log, or use as a correlation token.
+    ///
+    /// For local activities this is a freshly generated UUID that is **not** backed
+    /// by a database row. It changes on every activation (including replays), so it
+    /// must not be used for deduplication or DB lookups.
+    public let runID: UUID
+    /// Per-attempt execution cap. `nil` defers to the worker's claim timeout.
+    public let timeout: Duration?
+    /// Heartbeat window. When set, a missed heartbeat re-queues the activity after
+    /// this duration rather than waiting the full `timeout`. `nil` = worker default.
+    public let heartbeatTimeout: Duration?
+    /// Maximum execution attempts configured for this activity. `nil` = worker default.
+    public let maxAttempts: Int?
+    /// Key-value metadata forwarded from the enqueue call site.
+    public let headers: [String: String]
+    /// Absolute deadline across all retry attempts. `nil` = no total budget.
+    /// Use `deadlineAt.map { $0.timeIntervalSince(.now) }` to compute remaining budget.
+    public let deadlineAt: Date?
 
     // Package-internal: heartbeat details from the previous attempt.
     private let _heartbeatDetailsBuffer: ByteBuffer?
@@ -187,8 +212,15 @@ public struct ActivityContext: Sendable {
         queueName: String,
         attempt: Int,
         logger: Logger,
+        namespace: String,
+        runID: UUID,
         schedulingMetadata: SchedulingMetadata? = nil,
         parentWorkflowID: UUID?,
+        timeout: Duration? = nil,
+        heartbeatTimeout: Duration? = nil,
+        maxAttempts: Int? = nil,
+        headers: [String: String] = [:],
+        deadlineAt: Date? = nil,
         heartbeatDetailsBuffer: ByteBuffer? = nil,
         heartbeatImpl: @escaping @Sendable (ByteBuffer?) async throws -> Void = { _ in }  // default no-op
     ) {
@@ -197,8 +229,15 @@ public struct ActivityContext: Sendable {
         self.queueName = queueName
         self.attempt = attempt
         self.logger = logger
+        self.namespace = namespace
+        self.runID = runID
         self.schedulingMetadata = schedulingMetadata
         self.parentWorkflowID = parentWorkflowID
+        self.timeout = timeout
+        self.heartbeatTimeout = heartbeatTimeout
+        self.maxAttempts = maxAttempts
+        self.headers = headers
+        self.deadlineAt = deadlineAt
         self._heartbeatDetailsBuffer = heartbeatDetailsBuffer
         self._heartbeatImpl = heartbeatImpl
     }
@@ -368,6 +407,8 @@ extension Activity {
             queueName: exec.queue,
             attempt: 1,
             logger: exec.logger,
+            namespace: exec.namespace,
+            runID: UUID.v7(),  // ephemeral — not backed by a strand.runs row
             parentWorkflowID: parentWorkflowID,
             heartbeatImpl: { _ in }  // no-op: local activities run synchronously in the activation
         )
@@ -415,8 +456,15 @@ extension Activity {
             queueName: exec.queue,
             attempt: claimed.attempt,
             logger: exec.logger,
+            namespace: exec.namespace,
+            runID: claimed.runID,
             schedulingMetadata: claimed.schedulingMetadata,
             parentWorkflowID: claimed.parentWorkflowID,
+            timeout: claimed.timeoutSeconds.map { .seconds($0) },
+            heartbeatTimeout: claimed.heartbeatTimeoutSeconds.map { .seconds($0) },
+            maxAttempts: claimed.maxAttempts,
+            headers: claimed.headers,
+            deadlineAt: claimed.deadlineAt,
             heartbeatDetailsBuffer: claimed.heartbeatDetails,
             heartbeatImpl: { details in
                 // Extend the Postgres lease to signal that the activity is still alive.

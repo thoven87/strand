@@ -732,7 +732,7 @@ public struct StrandWorker: Service {
         // a new task type doesn't spin-loop on workers that haven't updated yet.
         guard let reg = _registry.lookup(claimed.taskName) else {
             let delay = unknownTaskDelay(seed: claimed.runID.uuidString)
-            let wakeAt = Date.now.addingTimeInterval(Double(delay.components.seconds))
+            let wakeAt = Date.now.addingDuration(delay)
             do {
                 try await Queries.scheduleRun(
                     on: postgres,

@@ -59,3 +59,23 @@ extension Duration {
         }
     }
 }
+
+// MARK: - Date + Duration arithmetic
+
+extension Date {
+    /// Returns a new `Date` by adding the given `Duration` to this date.
+    ///
+    /// Mirrors Foundation's `addingTimeInterval(_:)` but accepts `Duration`
+    /// directly, keeping the attoseconds-to-seconds conversion in one place.
+    /// Commonly used to compute absolute deadlines from a relative budget:
+    /// ```swift
+    /// // Anchored to the stable activation timestamp — safe across replays.
+    /// let deadline = activationTime.addingDuration(options.maxDuration)
+    ///
+    /// // Anchored to wall-clock now — correct for external enqueue calls.
+    /// let deadline = Date.now.addingDuration(options.maxDuration)
+    /// ```
+    package func addingDuration(_ duration: Duration) -> Date {
+        addingTimeInterval(duration.timeInterval)
+    }
+}

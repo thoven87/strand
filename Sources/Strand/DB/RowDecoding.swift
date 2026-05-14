@@ -63,6 +63,10 @@ struct ClaimedTask: Sendable {
     /// Exposed to the activity handler via `ActivityContext.heartbeatDetails(as:)`.
     let heartbeatDetails: ByteBuffer?
 
+    /// The absolute deadline for this task (`strand.tasks.deadline_at`). `nil` means no total budget.
+    /// Used by activities to compute remaining budget: `deadlineAt.map { $0.timeIntervalSince(.now) }`.
+    let deadlineAt: Date?
+
     /// `true` when this attempt is the last one allowed.
     ///
     /// Used to decide whether a thrown error should mark the OTel span `ERROR`.
@@ -76,10 +80,10 @@ struct ClaimedTask: Sendable {
 
 extension ClaimedTask {
     /// Decode from the column order returned by the claim CTE:
-    /// run_id, task_id, attempt, version, task_name, params,
+    /// Columns: run_id, task_id, attempt, version, task_name, params,
     /// retry_strategy, max_attempts, headers, wake_event, event_payload,
     /// parent_task_id, kind, timeout_seconds, heartbeat_timeout_seconds,
-    /// scheduling_metadata, available_at, heartbeat_details
+    /// scheduling_metadata, available_at, heartbeat_details, deadline_at
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -108,6 +112,7 @@ extension ClaimedTask {
         schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
         availableAt = try col.next()!.decode(Date.self, context: .default)
         heartbeatDetails = try col.next()!.decode(ByteBuffer?.self, context: .default)
+        deadlineAt = try col.next()!.decode(Date?.self, context: .default)
     }
 }
 

@@ -183,6 +183,7 @@ public struct StrandClient: Sendable {
         // Use the caller-supplied ID when provided; otherwise delegate to the workflow
         // type's own ID generator (overridable per type via WorkflowRegistrable).
         let resolvedID = options.id ?? W.generateWorkflowID()
+        let workflowDeadlineAt: Date? = options.maxDuration.map { Date.now.addingDuration($0) }
 
         let row = try await Queries.enqueueTask(
             on: postgres,
@@ -197,6 +198,7 @@ public struct StrandClient: Sendable {
             idempotencyKey: resolvedID,  // always set — enables client.workflow(id:) lookup
             priority: options.priority,
             scheduledAt: options.delayUntil,
+            deadlineAt: workflowDeadlineAt,
             fairnessKey: options.fairnessKey,
             fairnessWeight: options.fairnessWeight,
             kind: .workflow,
@@ -333,12 +335,7 @@ public struct StrandClient: Sendable {
         kind: TaskKind = .workflow,
         parentTaskID: UUID? = nil
     ) async throws -> EnqueueResult {
-        let deadlineAt: Date? = maxDuration.map {
-            Date.now.addingTimeInterval(
-                Double($0.components.seconds)
-                    + Double($0.components.attoseconds) / 1_000_000_000_000_000_000
-            )
-        }
+        let deadlineAt: Date? = maxDuration.map { Date.now.addingDuration($0) }
         // Producer span: wraps the DB insert so that the context injected into
         // task headers IS this span's context. The worker's consumer span then
         // addLink-s back here, completing the producer → consumer trace link.

@@ -315,6 +315,24 @@ public struct WorkflowOptions: Sendable {
     /// A key with weight `5.0` is dispatched approximately 5× more often than a key with `1.0`.
     /// Only meaningful when `fairnessKey` is set.
     public var fairnessWeight: Double
+    /// Maximum total wall-clock duration from when the workflow is first enqueued until
+    /// it permanently completes, across **all** retries and `continueAsNew` transitions.
+    ///
+    /// When this deadline is reached, `failRun` refuses to schedule another retry
+    /// regardless of remaining `maxAttempts`. The task is immediately marked `FAILED`
+    /// and workers skip claiming it once the deadline has elapsed.
+    ///
+    /// `nil` = no total budget; only `maxAttempts` limits the workflow.
+    ///
+    /// ```swift
+    /// // Subscription workflow must complete within 10 minutes:
+    /// try await client.startWorkflow(
+    ///     SubscriptionWorkflow.self,
+    ///     options: WorkflowOptions(id: "sub-\(customerID)", maxDuration: .seconds(600)),
+    ///     input: customer
+    /// )
+    /// ```
+    public var maxDuration: Duration?
 
     public init(
         id: String? = nil,
@@ -325,7 +343,8 @@ public struct WorkflowOptions: Sendable {
         retryStrategy: RetryStrategy? = nil,
         headers: [String: String] = [:],
         fairnessKey: String? = nil,
-        fairnessWeight: Double = 1.0
+        fairnessWeight: Double = 1.0,
+        maxDuration: Duration? = nil
     ) {
         self.id = id
         self.queue = queue
@@ -336,6 +355,7 @@ public struct WorkflowOptions: Sendable {
         self.headers = headers
         self.fairnessKey = fairnessKey
         self.fairnessWeight = max(fairnessWeight, 0.001)
+        self.maxDuration = maxDuration
     }
 }
 
@@ -360,6 +380,10 @@ public struct ChildWorkflowOptions: Sendable {
     public var retryStrategy: RetryStrategy?
     /// Earliest time this child workflow may be claimed. `nil` = immediately.
     public var delayUntil: Date?
+    /// Maximum total wall-clock duration for this child workflow across all retries
+    /// and `continueAsNew` transitions. `nil` = no total budget.
+    /// Equivalent to ``WorkflowOptions/maxDuration`` for top-level workflows.
+    public var maxDuration: Duration?
 
     public init(
         queue: String? = nil,
@@ -369,7 +393,8 @@ public struct ChildWorkflowOptions: Sendable {
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
         retryStrategy: RetryStrategy? = nil,
-        delayUntil: Date? = nil
+        delayUntil: Date? = nil,
+        maxDuration: Duration? = nil
     ) {
         self.queue = queue
         self.priority = priority
@@ -379,5 +404,6 @@ public struct ChildWorkflowOptions: Sendable {
         self.fairnessWeight = max(fairnessWeight, 0.001)
         self.retryStrategy = retryStrategy
         self.delayUntil = delayUntil
+        self.maxDuration = maxDuration
     }
 }
