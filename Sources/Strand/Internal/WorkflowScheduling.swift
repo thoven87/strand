@@ -273,13 +273,7 @@ extension WorkflowRegistration {
                             scheduledAt: options.delayUntil,
                             timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
                             heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
-                            deadlineAt: options.maxDuration.map {
-                                Date.now.addingTimeInterval(
-                                    Double($0.components.seconds)
-                                        + Double($0.components.attoseconds)
-                                        / 1_000_000_000_000_000_000
-                                )
-                            },
+                            deadlineAt: options.maxDuration.map { activation.activationTime.addingDuration($0) },
                             fairnessKey: options.fairnessKey,
                             fairnessWeight: options.fairnessWeight,
                             kind: .activity
@@ -453,7 +447,8 @@ extension WorkflowRegistration {
                     let childFairnessKey,
                     let childFairnessWeight,
                     let childRetryStrategy,
-                    let childScheduledAt
+                    let childScheduledAt,
+                    let childDeadlineAt
                 ):
                     let targetQueue = childQueue ?? exec.queue
                     pendingChildren.append(
@@ -472,7 +467,7 @@ extension WorkflowRegistration {
                             scheduledAt: childScheduledAt,
                             timeoutSeconds: nil,
                             heartbeatTimeoutSeconds: nil,
-                            deadlineAt: nil,
+                            deadlineAt: childDeadlineAt,
                             fairnessKey: childFairnessKey,
                             fairnessWeight: childFairnessWeight,
                             kind: .workflow

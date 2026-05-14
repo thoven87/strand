@@ -48,6 +48,35 @@ struct ConditionResultSentinel: Codable {
     }
 }
 
+// MARK: - WorkflowRandomNumberGenerator
+
+/// A deterministic, replay-safe random number generator for use inside workflow handlers.
+///
+/// Each call to `next()` consumes one checkpoint slot. On the first activation the value is
+/// generated with `SystemRandomNumberGenerator` and stored as a checkpoint. On every subsequent
+/// replay the stored checkpoint value is returned — the same sequence is produced regardless of
+/// how many times the workflow replays.
+///
+/// Obtain an instance via ``WorkflowContext/randomNumberGenerator``:
+/// ```swift
+/// var rng = context.randomNumberGenerator
+/// let jitter = Int.random(in: 0...500, using: &rng)   // stable across replays
+/// let pick   = items.randomElement(using: &rng)!       // same pick on replay
+/// ```
+///
+/// - Important: Store the generator in a `var` — `next()` is `mutating`.
+public struct WorkflowRandomNumberGenerator: RandomNumberGenerator {
+    private let _next: @Sendable () -> UInt64
+
+    init(_ next: @escaping @Sendable () -> UInt64) {
+        self._next = next
+    }
+
+    public mutating func next() -> UInt64 {
+        _next()
+    }
+}
+
 // MARK: - _WorkflowActivation
 
 /// Holds all mutable per-activation state for a single workflow execution attempt.
@@ -317,6 +346,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```
     public var schedulingMetadata: SchedulingMetadata? { _impl.schedulingMetadata }
 
+    /// The queue this workflow is executing on.
+    public var queueName: String { _impl.queueName }
+
+    /// The namespace this workflow is executing in.
+    public var namespace: String { _impl.namespace }
+
+    /// The registered workflow type name (e.g. `"FulfillOrderWorkflow"`).
+    public var workflowName: String { _impl.taskName }
+
+    /// Key-value metadata forwarded from the enqueue call site.
+    /// Read-only; set at enqueue time via ``WorkflowOptions/headers``.
+    public var headers: [String: String] { _impl.headers }
+
     // MARK: - runActivity
 
     /// Schedules an activity and suspends until it completes, then returns the decoded result.
@@ -496,6 +538,36 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         try _checkpoint(label: "random") { Double.random(in: range) }
     }
 
+    /// A deterministic, replay-safe random number generator.
+    ///
+    /// Each call to `next()` on the returned generator consumes one checkpoint slot —
+    /// the same approach used by ``uuid()`` and ``random(in:)``. On replay the stored
+    /// checkpoint value is returned so the sequence is always identical.
+    ///
+    /// ```swift
+    /// var rng = context.randomNumberGenerator
+    /// let jitter  = Int.random(in: 0...500, using: &rng)
+    /// let shuffle = myArray.shuffled(using: &rng)
+    /// ```
+    ///
+    /// - Important: Assign to a `var` — `RandomNumberGenerator.next()` is `mutating`.
+    public var randomNumberGenerator: WorkflowRandomNumberGenerator {
+        WorkflowRandomNumberGenerator { [_impl] in
+            let seqNum = _impl.nextSeqNum()
+            if let cached = _impl.checkpointCache[seqNum],
+                let value = try? JSON.decode(UInt64.self, from: cached)
+            {
+                return value
+            }
+            let value = UInt64.random(in: .min ... .max)
+            // UInt64 is always Codable — force-unwrap is safe here.
+            let buf = try! JSON.encode(value)
+            _impl.checkpointCache[seqNum] = buf
+            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: "rng", value: buf))
+            return value
+        }
+    }
+
     // MARK: - sleep
 
     /// Suspends the workflow for at least `duration` before continuing.
@@ -510,10 +582,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         async throws
     {
         _impl.lastCallSite = (fileID, line)
-        let seconds =
-            Double(duration.components.seconds)
-            + Double(duration.components.attoseconds) / 1_000_000_000_000_000_000
-        try await sleep(until: Date.now.addingTimeInterval(seconds), fileID: fileID, line: line)
+        try await sleep(until: Date.now.addingDuration(duration), fileID: fileID, line: line)
     }
 
     /// Suspends the workflow until at least `wakeAt` before continuing.
@@ -612,12 +681,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Slow path: event not yet received — emit command and suspend ─────────────────
-        let timeoutAt: Date? = timeout.map { dur in
-            Date.now.addingTimeInterval(
-                Double(dur.components.seconds)
-                    + Double(dur.components.attoseconds) / 1_000_000_000_000_000_000
-            )
-        }
+        let timeoutAt: Date? = timeout.map { Date.now.addingDuration($0) }
 
         _impl.executor.emit(
             .awaitEvent(
@@ -806,10 +870,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             let ts = (try? JSON.decode(Double.self, from: cached)) ?? 0
             wakeAt = Date(timeIntervalSince1970: ts)
         } else {
-            let seconds =
-                Double(timeout.components.seconds)
-                + Double(timeout.components.attoseconds) / 1_000_000_000_000_000_000
-            wakeAt = Date.now.addingTimeInterval(seconds)
+            wakeAt = Date.now.addingDuration(timeout)
             let buf = try JSON.encode(wakeAt.timeIntervalSince1970)
             _impl.checkpointCache[seqNum] = buf
             _impl.executor.emit(
@@ -1044,6 +1105,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Note: options.headers forwarding intentionally omitted from the command —
         // the worker injects parent context headers when enqueuing the child task.
 
+        let childDeadlineAt: Date? = options.maxDuration.map { _impl.activationTime.addingDuration($0) }
         _impl.executor.emit(
             .scheduleChildWorkflow(
                 name: CW.workflowName,
@@ -1056,7 +1118,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 fairnessKey: options.fairnessKey,
                 fairnessWeight: options.fairnessWeight,
                 retryStrategy: options.retryStrategy,
-                scheduledAt: options.delayUntil
+                scheduledAt: options.delayUntil,
+                deadlineAt: childDeadlineAt
             )
         )
 

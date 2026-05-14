@@ -93,7 +93,8 @@ enum WorkflowCommand: Sendable {
         fairnessKey: String?,  // nil = no per-tenant isolation
         fairnessWeight: Double,  // 1.0 = default weight
         retryStrategy: RetryStrategy?,  // nil = worker default
-        scheduledAt: Date?  // nil = immediately
+        scheduledAt: Date?,  // nil = immediately
+        deadlineAt: Date?  // nil = no total execution budget
     )
 }
 
