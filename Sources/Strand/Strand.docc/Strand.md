@@ -48,6 +48,7 @@ struct OrderWorkflow: Workflow {
 - <doc:Scheduling>
 - <doc:SignalsAndEvents>
 - <doc:RetryStrategies>
+- <doc:VersioningGuide>
 - <doc:TestingWorkflows>
 
 ### Recipes

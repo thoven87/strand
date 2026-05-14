@@ -10,10 +10,12 @@ struct QueueRoutes {
 
     func register(on router: some RouterMethods<StrandRequestContext>) {
 
-        router.get("queues") { _, ctx -> [QueueResponse] in
+        router.get("queues") { req, ctx -> [QueueResponse] in
+            let rootOnly = req.uri.queryParameters.get("rootOnly").map { $0 == "true" } ?? false
             let rows = try await ManagementQueries.listQueueStats(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,
+                rootOnly: rootOnly,
                 logger: self.client.logger
             )
             return rows.map(QueueResponse.init)
@@ -25,13 +27,15 @@ struct QueueRoutes {
             return SimpleResponse(message: "created", id: body.name)
         }
 
-        router.get("queues/:queue") { _, ctx -> QueueResponse in
+        router.get("queues/:queue") { req, ctx -> QueueResponse in
             let queue = try ctx.parameters.require("queue")
+            let rootOnly = req.uri.queryParameters.get("rootOnly").map { $0 == "true" } ?? false
             guard
                 let row = try await ManagementQueries.queueStats(
                     on: self.postgres,
                     namespaceID: ctx.namespaceID,
                     queue: queue,
+                    rootOnly: rootOnly,
                     logger: self.client.logger
                 )
             else {

@@ -76,7 +76,7 @@ public struct EnqueueOptions: Sendable {
     /// Relative throughput weight for this fairness key. Default `1.0`.
     /// A key with weight `5.0` is dispatched approximately 5× more often than a key with `1.0`.
     /// Only meaningful when multiple keys share the same queue and priority level.
-    public var fairnessWeight: Float
+    public var fairnessWeight: Double
 
     public init(
         queue: String? = nil,
@@ -89,7 +89,7 @@ public struct EnqueueOptions: Sendable {
         delayUntil: Date? = nil,
         maxDuration: Duration? = nil,
         fairnessKey: String? = nil,
-        fairnessWeight: Float = 1.0
+        fairnessWeight: Double = 1.0
     ) {
         self.queue = queue
         self.maxAttempts = maxAttempts
@@ -373,29 +373,50 @@ public struct AwaitEventOptions: Sendable {
 
 /// Options controlling how a failed or cancelled task is retried.
 public struct RetryOptions: Codable, Sendable {
-    /// Which tasks to include in the retry.
+    /// Determines which descendant tasks are reset alongside the selected task.
     ///
-    /// In Strand all three modes produce the same execution behaviour: the
-    /// workflow is re-enqueued and its checkpoint-replay mechanism naturally
-    /// skips already-completed activities. The mode is preserved in the
-    /// request for API compatibility and future use.
+    /// When you retry a workflow, child activities that previously ran are stored in
+    /// `task_completions`. On replay, the workflow would normally fast-path those
+    /// results — returning the old success *or* old failure without re-executing
+    /// the activity. The mode controls which children have their `task_completions`
+    /// entry deleted and a fresh PENDING run created, forcing re-execution.
+    ///
+    /// Activities that are NOT reset replay their cached result instantly.
     public enum Mode: String, Codable, Sendable {
-        /// Re-enqueue every task in the workflow (default).
-        case all
-        /// Re-enqueue only tasks that are in a failed or cancelled state.
+        /// Reset only FAILED and CANCELLED descendants.
+        ///
+        /// The right default for most retries: re-run what failed, skip what
+        /// already succeeded. Completed activities replay from cache; only
+        /// failed/cancelled ones are given fresh PENDING runs.
         case failedOnly = "failed_only"
-        /// Re-enqueue failed tasks plus any downstream tasks that depend on them.
+
+        /// Reset FAILED/CANCELLED descendants **and** any descendant created at
+        /// or after the earliest failure point, even if it completed successfully.
+        ///
+        /// Use this when a failed task may have produced bad side-effects that
+        /// contaminate later activities, making their “completed” results
+        /// unreliable and worth discarding.
         case failedAndDependents = "failed_and_dependents"
+
+        /// Reset **every** descendant regardless of state.
+        ///
+        /// Every child activity re-runs from scratch — no results are replayed
+        /// from cache. Use this when you cannot trust any previously-completed
+        /// result and want a full fresh execution.
+        case all
     }
 
     public var mode: Mode
     /// When `true`, resets the attempt counter to 1 and clears stored failure
     /// reasons — a clean slate with the original `max_attempts` budget intact.
+    /// Also propagates to descendant tasks: their attempt counters are reset to 1
+    /// rather than bumped.
+    ///
     /// When `false` (default), the attempt counter continues from where it
     /// left off and `max_attempts` is bumped by one to allow the next attempt.
     public var resetHistory: Bool
 
-    public init(mode: Mode = .all, resetHistory: Bool = false) {
+    public init(mode: Mode = .failedOnly, resetHistory: Bool = false) {
         self.mode = mode
         self.resetHistory = resetHistory
     }

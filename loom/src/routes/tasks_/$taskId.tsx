@@ -900,9 +900,6 @@ export function TaskDetailPage() {
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
     const [signalDialogOpen, setSignalDialogOpen] = useState(false);
     const [triggerOpen, setTriggerOpen] = useState(false);
-    const [triggerMode, setTriggerMode] = useState<"template" | "exact">(
-        "template",
-    );
 
     const signalMutation = useMutation({
         mutationFn: ({ name, payload }: { name: string; payload?: string }) =>
@@ -1149,32 +1146,15 @@ export function TaskDetailPage() {
                         </Button>
                     )}
                     {isWorkflow && (
-                        <div className="flex">
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => {
-                                    setTriggerMode("template");
-                                    setTriggerOpen(true);
-                                }}
-                                className="gap-1.5 rounded-r-none border-r-0"
-                            >
-                                <Zap size={12} />
-                                Run Again
-                            </Button>
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => {
-                                    setTriggerMode("exact");
-                                    setTriggerOpen(true);
-                                }}
-                                className="rounded-l-none px-2"
-                                title="Replay with exact input from this run"
-                            >
-                                ↺
-                            </Button>
-                        </div>
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setTriggerOpen(true)}
+                            className="gap-1.5"
+                        >
+                            <Zap size={12} />
+                            Run Again
+                        </Button>
                     )}
                 </div>
             </div>
@@ -1459,11 +1439,7 @@ export function TaskDetailPage() {
                 namespace={namespace}
                 initialWorkflowName={task.name}
                 initialQueue={task.queue}
-                initialInput={
-                    triggerMode === "exact"
-                        ? (task.params ?? "{}")
-                        : paramsTemplate(task.params)
-                }
+                initialInput={paramsTemplate(task.params)}
             />
         </div>
     );

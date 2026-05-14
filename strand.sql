@@ -17,6 +17,46 @@
 
 CREATE SCHEMA IF NOT EXISTS strand;
 
+-- pgcrypto: required by strand.gen_uuid_v7() for gen_random_bytes().
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- UUIDv7 generator (PostgreSQL < 18 compatibility shim)
+--
+-- PostgreSQL 18 shipped a built-in gen_uuid_v7(). This function provides the
+-- same semantics for PostgreSQL 15–17 using pgcrypto's gen_random_bytes().
+--
+-- RFC 9562 layout:
+--   bits  0-47  unix_ts_ms   48-bit millisecond timestamp (big-endian)
+--   bits 48-51  ver          0b0111 (version 7)
+--   bits 52-63  rand_a       12 random bits
+--   bits 64-65  var          0b10   (RFC 4122 variant)
+--   bits 66-127 rand_b       62 random bits
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION strand.gen_uuid_v7()
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    unix_ms BIGINT;
+    rand_b  BYTEA;
+BEGIN
+    unix_ms := (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT;
+    rand_b  := gen_random_bytes(10);
+    RETURN encode(
+        -- bytes 0-5: 48-bit millisecond timestamp
+        substring(int8send(unix_ms) FROM 3)
+        -- bytes 6-7: version nibble 7 (0x7) || 12 random bits
+        || set_byte(substring(rand_b FROM 1 FOR 2), 0,
+                    (get_byte(rand_b, 0) & 15) | 112)
+        -- bytes 8-15: variant 10xxxxxx || 62 random bits
+        || set_byte(substring(rand_b FROM 3 FOR 8), 0,
+                    (get_byte(rand_b, 2) & 63) | 128),
+        'hex')::UUID;
+END;
+$$;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Namespaces — top-level isolation boundary.
 --
@@ -433,7 +473,7 @@ CREATE TABLE IF NOT EXISTS strand.workflow_state (
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS strand.workflow_signals (
-    id           UUID        NOT NULL DEFAULT gen_random_uuid(),
+    id           UUID        NOT NULL DEFAULT strand.gen_uuid_v7(),
     seq          BIGSERIAL   NOT NULL,   -- monotonic total order, unaffected by transaction commit ordering
     namespace_id TEXT        NOT NULL DEFAULT 'default',
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,

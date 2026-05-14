@@ -81,7 +81,7 @@ public struct ActivityOptions: Sendable {
 
     /// Relative throughput weight for this fairness key. Default `1.0`.
     /// A key with weight `5.0` is dispatched ~5× more often than `1.0`.
-    public var fairnessWeight: Float
+    public var fairnessWeight: Double
 
     /// Key-value metadata forwarded with the activity task (e.g. trace IDs).
     public var headers: [String: String]
@@ -104,7 +104,7 @@ public struct ActivityOptions: Sendable {
         priority: TaskPriority = .normal,
         delayUntil: Date? = nil,
         fairnessKey: String? = nil,
-        fairnessWeight: Float = 1.0,
+        fairnessWeight: Double = 1.0,
         headers: [String: String] = [:],
         idempotencyKey: String? = nil,
         cancellation: CancellationPolicy? = nil

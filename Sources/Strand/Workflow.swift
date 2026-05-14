@@ -314,7 +314,7 @@ public struct WorkflowOptions: Sendable {
     /// Relative throughput weight for this fairness key. Default `1.0`.
     /// A key with weight `5.0` is dispatched approximately 5× more often than a key with `1.0`.
     /// Only meaningful when `fairnessKey` is set.
-    public var fairnessWeight: Float
+    public var fairnessWeight: Double
 
     public init(
         id: String? = nil,
@@ -325,7 +325,7 @@ public struct WorkflowOptions: Sendable {
         retryStrategy: RetryStrategy? = nil,
         headers: [String: String] = [:],
         fairnessKey: String? = nil,
-        fairnessWeight: Float = 1.0
+        fairnessWeight: Double = 1.0
     ) {
         self.id = id
         self.queue = queue
@@ -355,7 +355,7 @@ public struct ChildWorkflowOptions: Sendable {
     /// Fairness group key for this child workflow. See ``WorkflowOptions/fairnessKey``.
     public var fairnessKey: String?
     /// Relative throughput weight for this child's fairness key. Default `1.0`.
-    public var fairnessWeight: Float
+    public var fairnessWeight: Double
     /// Retry policy on failure. `nil` inherits the worker default.
     public var retryStrategy: RetryStrategy?
     /// Earliest time this child workflow may be claimed. `nil` = immediately.
@@ -367,7 +367,7 @@ public struct ChildWorkflowOptions: Sendable {
         maxAttempts: Int? = nil,
         headers: [String: String] = [:],
         fairnessKey: String? = nil,
-        fairnessWeight: Float = 1.0,
+        fairnessWeight: Double = 1.0,
         retryStrategy: RetryStrategy? = nil,
         delayUntil: Date? = nil
     ) {

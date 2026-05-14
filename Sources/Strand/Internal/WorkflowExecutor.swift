@@ -91,7 +91,7 @@ enum WorkflowCommand: Sendable {
         priority: TaskPriority,  // .normal when unspecified
         maxAttempts: Int?,  // nil = worker default
         fairnessKey: String?,  // nil = no per-tenant isolation
-        fairnessWeight: Float,  // 1.0 = default weight
+        fairnessWeight: Double,  // 1.0 = default weight
         retryStrategy: RetryStrategy?,  // nil = worker default
         scheduledAt: Date?  // nil = immediately
     )

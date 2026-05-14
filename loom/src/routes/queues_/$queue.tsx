@@ -13,14 +13,80 @@ import { Button } from "@/components/ui/button";
 import { CalendarClock, ArrowLeft, Pause, Play } from "lucide-react";
 import type { Queue, TaskState, TaskSummary } from "@/api/types";
 
-const STATES = [
-    "PENDING",
-    "RUNNING",
-    "SLEEPING",
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-];
+// State config mirrors runs.tsx — label, stats key, accent colour
+const STATE_CONFIG = [
+    {
+        state: "RUNNING",
+        key: "running" as const,
+        accent: "bg-yellow-500/20 text-yellow-300",
+    },
+    {
+        state: "PENDING",
+        key: "pending" as const,
+        accent: "bg-blue-500/15   text-blue-400",
+    },
+    {
+        state: "SLEEPING",
+        key: "sleeping" as const,
+        accent: "bg-slate-500/20  text-slate-300",
+    },
+    {
+        state: "WAITING",
+        key: "waiting" as const,
+        accent: "bg-violet-500/20 text-violet-300",
+    },
+    {
+        state: "COMPLETED",
+        key: "completed" as const,
+        accent: "bg-green-500/15  text-green-400",
+    },
+    {
+        state: "FAILED",
+        key: "failed" as const,
+        accent: "bg-red-500/20    text-red-400",
+    },
+    {
+        state: "CANCELLED",
+        key: "cancelled" as const,
+        accent: "bg-slate-500/15  text-slate-400",
+    },
+] as const;
+
+function StatePill({
+    label,
+    count,
+    active,
+    accent,
+    onClick,
+}: {
+    label: string;
+    count: number;
+    active: boolean;
+    accent: string;
+    onClick: () => void;
+}) {
+    return (
+        <button
+            onClick={onClick}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                active
+                    ? "bg-secondary text-foreground"
+                    : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"
+            }`}
+        >
+            {label.charAt(0) + label.slice(1).toLowerCase()}
+            {count > 0 && (
+                <span
+                    className={`rounded px-1 py-px text-[10px] font-mono leading-none ${
+                        active ? "bg-white/10 text-foreground" : accent
+                    }`}
+                >
+                    {count >= 1000 ? `${Math.floor(count / 1000)}k` : count}
+                </span>
+            )}
+        </button>
+    );
+}
 
 function QueueBar({ stats }: { stats: Queue["stats"] }) {
     const total =
@@ -40,47 +106,23 @@ function QueueBar({ stats }: { stats: Queue["stats"] }) {
         { count: stats.running, cls: "bg-yellow-400" },
         { count: stats.pending, cls: "bg-blue-400" },
         { count: stats.sleeping, cls: "bg-indigo-400" },
+        { count: stats.waiting, cls: "bg-violet-400" },
         { count: stats.failed, cls: "bg-red-400" },
         { count: stats.cancelled, cls: "bg-orange-400" },
         { count: stats.completed, cls: "bg-green-400" },
     ].filter((s) => s.count > 0);
 
-    const items = [
-        { label: "Running", count: stats.running, dot: "bg-yellow-400" },
-        { label: "Pending", count: stats.pending, dot: "bg-blue-400" },
-        { label: "Sleeping", count: stats.sleeping, dot: "bg-indigo-400" },
-        { label: "Failed", count: stats.failed, dot: "bg-red-400" },
-        { label: "Cancelled", count: stats.cancelled, dot: "bg-orange-400" },
-        { label: "Completed", count: stats.completed, dot: "bg-green-400" },
-    ].filter((i) => i.count > 0);
-
+    // Legend is intentionally omitted — the StatePill filter bar below shows
+    // the same counts and doubles as the click-to-filter control.
     return (
-        <div className="space-y-2">
-            <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                {segments.map((seg, i) => (
-                    <div
-                        key={i}
-                        className={`${seg.cls} opacity-80`}
-                        style={{ width: `${(seg.count / total) * 100}%` }}
-                    />
-                ))}
-            </div>
-            <div className="flex flex-wrap gap-x-4 gap-y-0.5">
-                {items.map((item) => (
-                    <span
-                        key={item.label}
-                        className="flex items-center gap-1.5 text-xs text-muted-foreground"
-                    >
-                        <span
-                            className={`size-1.5 rounded-full ${item.dot} opacity-80`}
-                        />
-                        {item.label}:{" "}
-                        <strong className="text-foreground font-medium">
-                            {item.count.toLocaleString()}
-                        </strong>
-                    </span>
-                ))}
-            </div>
+        <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            {segments.map((seg, i) => (
+                <div
+                    key={i}
+                    className={`${seg.cls} opacity-80`}
+                    style={{ width: `${(seg.count / total) * 100}%` }}
+                />
+            ))}
         </div>
     );
 }
@@ -98,9 +140,11 @@ export function QueueDetailPage() {
     const [history, setHistory] = useState<string[]>([]);
 
     // ── Queue detail (stats + paused) ───────────────────────────────────────
+    // Queue detail always shows root tasks only — child activities are spawned
+    // automatically by workflows and are not the primary concern of this view.
     const { data: queueData } = useQuery({
         queryKey: qk.queues.detail(namespace, queue),
-        queryFn: () => getQueue(namespace, queue),
+        queryFn: () => getQueue(namespace, queue, { rootOnly: true }),
         refetchInterval: 5_000,
     });
 
@@ -128,6 +172,7 @@ export function QueueDetailPage() {
                 state: stateFilter,
                 cursor,
                 limit: 50,
+                rootOnly: true,
             }),
         refetchInterval: (query) => {
             const items = query.state.data?.items as
@@ -219,38 +264,37 @@ export function QueueDetailPage() {
                 </div>
             )}
 
-            {/* State filter tabs */}
-            <div className="flex gap-1.5 mb-4 flex-wrap">
-                <button
+            {/* Filter bar: state pills with live counts from queueData.stats */}
+            <div className="flex gap-1.5 mb-4 flex-wrap items-center">
+                {/* All */}
+                <StatePill
+                    label="All"
+                    count={0}
+                    active={stateFilter === undefined}
+                    accent=""
                     onClick={() => {
                         setStateFilter(undefined);
                         setCursor(undefined);
                         setHistory([]);
                     }}
-                    className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-                        stateFilter === undefined
-                            ? "bg-secondary text-secondary-foreground"
-                            : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"
-                    }`}
-                >
-                    All
-                </button>
-                {STATES.map((s) => (
-                    <button
-                        key={s}
+                />
+
+                {/* Per-state pills with counts from queueData.stats */}
+                {STATE_CONFIG.map(({ state, key, accent }) => (
+                    <StatePill
+                        key={state}
+                        label={state}
+                        count={queueData?.stats[key] ?? 0}
+                        active={stateFilter === state}
+                        accent={accent}
                         onClick={() => {
-                            setStateFilter(s);
+                            setStateFilter(
+                                stateFilter === state ? undefined : state,
+                            );
                             setCursor(undefined);
                             setHistory([]);
                         }}
-                        className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-                            stateFilter === s
-                                ? "bg-secondary text-secondary-foreground"
-                                : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"
-                        }`}
-                    >
-                        {s.charAt(0) + s.slice(1).toLowerCase()}
-                    </button>
+                    />
                 ))}
             </div>
 

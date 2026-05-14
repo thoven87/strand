@@ -381,7 +381,7 @@ public struct StrandClient: Sendable {
         maxDuration: Duration? = nil,
         heartbeatTimeoutSeconds: Int? = nil,
         fairnessKey: String? = nil,
-        fairnessWeight: Float = 1.0,
+        fairnessWeight: Double = 1.0,
         kind: TaskKind = .workflow,
         parentTaskID: UUID? = nil
     ) async throws -> EnqueueResult {
@@ -574,7 +574,25 @@ public struct StrandClient: Sendable {
                 createdAt: Date.now
             )
         default:
-            // FAILED, CANCELLED, or any other terminal state — same task, next attempt.
+            // FAILED, CANCELLED, or any other terminal state.
+            //
+            // Step 1: reset descendant tasks based on the retry mode.
+            //   - failedOnly           -> descendants in FAILED/CANCELLED state
+            //   - failedAndDependents  -> above + temporally later descendants
+            //   - all                  -> every descendant regardless of state
+            // Deletes their task_completions rows and creates fresh PENDING runs so
+            // the parent's next activation re-runs them instead of replaying cached
+            // failures. Safe no-op when the selected task has no descendants
+            // (e.g. a plain activity).
+            try await Queries.resetChildTasks(
+                on: postgres,
+                rootTaskID: taskID,
+                namespaceID: ns,
+                mode: options.mode,
+                resetHistory: options.resetHistory,
+                logger: logger
+            )
+            // Step 2: retry the root task itself.
             let (runID, attempt) = try await Queries.retryTask(
                 on: postgres,
                 namespaceID: ns,

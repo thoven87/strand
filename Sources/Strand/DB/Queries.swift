@@ -160,7 +160,7 @@ enum Queries {
         heartbeatTimeoutSeconds: Int? = nil,
         deadlineAt: Date? = nil,
         fairnessKey: String? = nil,
-        fairnessWeight: Float = 1.0,
+        fairnessWeight: Double = 1.0,
         kind: TaskKind = .workflow,
         parentTaskID: UUID? = nil,
         backfillID: UUID? = nil,
@@ -265,7 +265,7 @@ enum Queries {
         let heartbeatTimeoutSeconds: Int?
         let deadlineAt: Date?
         let fairnessKey: String?
-        let fairnessWeight: Float
+        let fairnessWeight: Double
         let kind: TaskKind  // .activity or .workflow
     }
 
@@ -1714,6 +1714,75 @@ enum Queries {
 
     // MARK: - continueAsNew for child workflows
 
+    /// Deletes transient workflow artefacts for `taskID` so a fresh activation
+    /// starts from a clean state.
+    ///
+    /// Called inside an existing transaction by
+    /// ``retryTask(on:namespaceID:taskID:resetHistory:logger:)`` when
+    /// `resetHistory` is `true`. All retry modes operate on FAILED or CANCELLED
+    /// tasks, which have no outstanding `event_waits` by construction, so this
+    /// function never needs to touch that table.
+    ///
+    /// ``continueChildWorkflowAsNew(on:namespaceID:taskID:currentRunID:currentVersion:newInput:newRunID:logger:)``
+    /// performs the same deletions inline as named CTE arms (plus `event_waits`,
+    /// which is required for a still-RUNNING task) to keep that operation a
+    /// **single round-trip**. If you add a table here, mirror it there.
+    ///
+    /// - Parameter clearHistory: Pass `true` when the caller wants a full
+    ///   clean-slate reset. Deletes `workflow_history` so `nextHistorySeq`
+    ///   resets to 1 and `WORKFLOW_STARTED` is re-emitted on the new activation.
+    ///   Pass `false` for `continueAsNew`-style resets that intentionally
+    ///   preserve the accumulated history across continuation cycles.
+    static func clearWorkflowArtefacts(
+        on conn: PostgresConnection,
+        taskID: UUID,
+        namespaceID: String,
+        clearHistory: Bool,
+        logger: Logger
+    ) async throws {
+        // Checkpoints — isolated from the new run by run_id in SELECT, but the
+        // old rows still appear in the Loom dashboard for the old failed run.
+        try await conn.query(
+            "DELETE FROM strand.checkpoints WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)",
+            logger: logger
+        )
+        // Workflow state — keyed by task_id only; without this delete the fresh
+        // _activate path restores stale signal-mutated fields (isPaused=true etc.)
+        // instead of starting from W().
+        try await conn.query(
+            "DELETE FROM strand.workflow_state WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)",
+            logger: logger
+        )
+        // Pending signals — stale signals queued before the failure must not
+        // replay against the fresh W() state of the reset run.
+        try await conn.query(
+            "DELETE FROM strand.workflow_signals WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)",
+            logger: logger
+        )
+        if clearHistory {
+            // nextHistorySeq() uses MAX(seq); without this delete the new activation
+            // inherits the old sequence number and isFirstActivation stays false
+            // (WORKFLOW_STARTED is never re-emitted on the reset run).
+            try await conn.query(
+                "DELETE FROM strand.workflow_history WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)",
+                logger: logger
+            )
+            // Delete all terminal run records so the Runs panel shows a clean
+            // slate. The newly-inserted PENDING run (created by retryTask before
+            // this call) has state = 'PENDING' and is NOT matched by this DELETE.
+            // PostgreSQL CTE isolation guarantees the same for resetChildTasks.
+            try await conn.query(
+                """
+                DELETE FROM strand.runs
+                WHERE  task_id      = \(taskID)
+                  AND  namespace_id = \(namespaceID)
+                  AND  state NOT IN ('PENDING', 'RUNNING', 'SLEEPING', 'WAITING')
+                """,
+                logger: logger
+            )
+        }
+    }
+
     /// Resets a **child** workflow for continuation-as-new without signalling its parent.
     ///
     /// When `context.continueAsNew(input:)` is called inside a child workflow
@@ -1735,6 +1804,7 @@ enum Queries {
     /// The entire operation is one atomic CTE. If the CAS check
     /// (`state = RUNNING AND version = currentVersion`) fails (race / duplicate),
     /// all CTEs are no-ops — safe under concurrent execution.
+    ///
     static func continueChildWorkflowAsNew(
         on client: PostgresClient,
         namespaceID: String,
@@ -1764,6 +1834,10 @@ enum Queries {
                   AND namespace_id = \(namespaceID)
                 RETURNING id, queue, priority, fairness_key, fairness_weight, kind
             ),
+            -- These DELETE arms mirror clearWorkflowArtefacts(clearHistory: false)
+            -- plus del_event_waits (required here; FAILED tasks never have waits).
+            -- Both are inlined to keep this a single round-trip.
+            -- If you add a table to clearWorkflowArtefacts, add a matching arm here.
             del_checkpoints AS (
                 DELETE FROM strand.checkpoints
                 WHERE task_id      = (SELECT task_id FROM complete_run)
@@ -1800,6 +1874,171 @@ enum Queries {
             """,
             logger: logger
         )
+    }
+
+    // MARK: - resetChildTasks
+
+    /// Resets descendant tasks of `rootTaskID` to PENDING based on the retry mode,
+    /// then notifies workers on affected queues.
+    ///
+    /// Called from ``StrandClient/requeueTask(id:options:namespaceID:)`` **before**
+    /// ``retryTask(on:namespaceID:taskID:resetHistory:logger:)`` so the parent
+    /// workflow's next activation finds fresh child slots instead of replaying old
+    /// results from `task_completions`.
+    ///
+    /// | Mode                    | Descendants reset                                |
+    /// |-------------------------|--------------------------------------------------|
+    /// | `.failedOnly`           | FAILED and CANCELLED only                        |
+    /// | `.failedAndDependents`  | FAILED/CANCELLED + any created at or after the   |
+    /// |                         | earliest failure (even if they succeeded)         |
+    /// | `.all`                  | Every descendant regardless of state             |
+    ///
+    /// For each selected descendant the function:
+    /// 1. Deletes its `task_completions` row — the parent must not fast-path these
+    ///    on its next activation.
+    /// 2. Updates `strand.tasks` to PENDING (bumps or resets `attempt` based on
+    ///    `resetHistory`).
+    /// 3. Inserts a fresh PENDING run.
+    ///
+    /// Returns immediately when there are no descendants — safe to call for plain
+    /// activity tasks.
+    ///
+    /// Run IDs are generated by `strand.gen_uuid_v7()` inside the CTE, keeping the
+    /// entire operation a single round-trip while still producing time-ordered UUIDs.
+    static func resetChildTasks(
+        on client: PostgresClient,
+        rootTaskID: UUID,
+        namespaceID: String,
+        mode: RetryOptions.Mode,
+        resetHistory: Bool,
+        logger: Logger
+    ) async throws {
+        try await client.withTransaction(logger: logger) { conn in
+            try await resetChildTasks(
+                on: conn,
+                rootTaskID: rootTaskID,
+                namespaceID: namespaceID,
+                mode: mode,
+                resetHistory: resetHistory,
+                logger: logger
+            )
+        }
+    }
+
+    static func resetChildTasks(
+        on conn: PostgresConnection,
+        rootTaskID: UUID,
+        namespaceID: String,
+        mode: RetryOptions.Mode,
+        resetHistory: Bool,
+        logger: Logger
+    ) async throws {
+        let modeRaw = mode.rawValue
+        let stream = try await conn.query(
+            """
+            WITH RECURSIVE
+            all_desc AS (
+                -- Direct children of rootTaskID
+                SELECT id, state, queue, priority, fairness_key, fairness_weight,
+                       attempt, max_attempts, kind, parent_task_id, created_at
+                FROM   strand.tasks
+                WHERE  parent_task_id = \(rootTaskID)
+                  AND  namespace_id   = \(namespaceID)
+                UNION ALL
+                -- Grandchildren and deeper
+                SELECT t.id, t.state, t.queue, t.priority, t.fairness_key, t.fairness_weight,
+                       t.attempt, t.max_attempts, t.kind, t.parent_task_id, t.created_at
+                FROM   strand.tasks t
+                JOIN   all_desc d ON t.parent_task_id = d.id
+            ),
+            -- Earliest point of failure; NULL when there are no failures.
+            earliest_fail_at AS (
+                SELECT MIN(created_at) AS t
+                FROM   all_desc
+                WHERE  state IN ('FAILED', 'CANCELLED')
+            ),
+            -- Which descendants to reset:
+            --   'all'                   -> every descendant
+            --   'failed_only'           -> FAILED / CANCELLED only
+            --   'failed_and_dependents' -> FAILED / CANCELLED + any that were
+            --                             created at or after the earliest failure
+            to_reset AS (
+                SELECT * FROM all_desc
+                WHERE  \(modeRaw) = 'all'
+                    OR state IN ('FAILED', 'CANCELLED')
+                    OR (    \(modeRaw) = 'failed_and_dependents'
+                        AND created_at >= COALESCE(
+                                (SELECT t FROM earliest_fail_at),
+                                'infinity'::timestamptz))
+            ),
+            -- 1. Remove old completion records so the parent workflow does not
+            --    fast-path these children via task_completions on its next activation.
+            del_completions AS (
+                DELETE FROM strand.task_completions
+                WHERE  task_id      IN (SELECT id FROM to_reset)
+                  AND  namespace_id  = \(namespaceID)
+            ),
+            -- 2. Advance the task state and attempt counter.
+            upd_tasks AS (
+                UPDATE strand.tasks t
+                SET    state        = 'PENDING',
+                       attempt      = CASE WHEN \(resetHistory) THEN 1
+                                          ELSE t.attempt + 1
+                                     END,
+                       max_attempts = CASE WHEN \(resetHistory) THEN t.max_attempts
+                                          ELSE GREATEST(
+                                                  COALESCE(t.max_attempts, t.attempt + 1),
+                                                  t.attempt + 1)
+                                     END
+                FROM   to_reset tr
+                WHERE  t.id = tr.id
+            ),
+            -- 3. One fresh PENDING run per reset task.
+            --    strand.gen_uuid_v7() produces time-ordered UUIDs without a
+            --    separate Swift round-trip (requires pgcrypto).
+            new_runs AS (
+                INSERT INTO strand.runs
+                    (namespace_id, id, task_id, queue, attempt, state,
+                     available_at, priority, fairness_key, fairness_weight,
+                     kind, parent_task_id)
+                SELECT \(namespaceID),
+                       strand.gen_uuid_v7(),
+                       tr.id,
+                       tr.queue,
+                       CASE WHEN \(resetHistory) THEN 1 ELSE tr.attempt + 1 END,
+                       'PENDING',
+                       NOW(),
+                       tr.priority,
+                       tr.fairness_key,
+                       tr.fairness_weight,
+                       tr.kind,
+                       tr.parent_task_id
+                FROM   to_reset tr
+                RETURNING queue
+            ),
+            -- 4. When resetting history, remove all terminal run records for
+            --    the selected child tasks so their Runs panels also show a
+            --    clean slate. PostgreSQL CTE snapshot isolation ensures the
+            --    newly-inserted PENDING rows (from new_runs above) are not
+            --    visible to this DELETE — they did not exist at statement start.
+            del_old_runs AS (
+                DELETE FROM strand.runs
+                WHERE  task_id      IN (SELECT id FROM to_reset)
+                  AND  namespace_id  = \(namespaceID)
+                  AND  state        NOT IN ('PENDING', 'RUNNING', 'SLEEPING', 'WAITING')
+                  AND  \(resetHistory)
+            )
+            SELECT DISTINCT queue FROM new_runs
+            """,
+            logger: logger
+        )
+        var notified: Set<String> = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            let queue = try col.next()!.decode(String.self, context: .default)
+            guard notified.insert(queue).inserted else { continue }
+            try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+        }
     }
 
     // MARK: - Retry
@@ -1876,13 +2115,22 @@ enum Queries {
                 logger: logger
             )
             if resetHistory {
-                // Clear failure_reason on all prior FAILED/CANCELLED runs for a clean slate.
+                // Clear failure_reason on prior runs so the dashboard shows a clean slate.
                 try await conn.query(
                     """
                     UPDATE strand.runs
                     SET failure_reason = NULL
                     WHERE task_id = \(taskID) AND state IN (\(TaskState.failed), \(TaskState.cancelled))
                     """,
+                    logger: logger
+                )
+                // Delete checkpoints, workflow state, pending signals, and history.
+                // clearHistory=true so nextHistorySeq resets to 1 on the new activation.
+                try await clearWorkflowArtefacts(
+                    on: conn,
+                    taskID: taskID,
+                    namespaceID: namespaceID,
+                    clearHistory: true,
                     logger: logger
                 )
             }
@@ -1938,7 +2186,7 @@ enum Queries {
             let cancellation = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let priority = try col.next()!.decode(TaskPriority.self, context: .default)
             let fairnessKey = try col.next()!.decode(String?.self, context: .default)
-            let fairnessWeight = try col.next()!.decode(Float.self, context: .default)
+            let fairnessWeight = try col.next()!.decode(Double.self, context: .default)
             let kind = try col.next()!.decode(TaskKind.self, context: .default)
 
             let newTaskID = UUID.v7()
