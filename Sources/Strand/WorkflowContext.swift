@@ -948,6 +948,29 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// }
     /// ```
     ///
+    /// ## Determinism constraint
+    ///
+    /// `version(changeID:)` consumes a **sequence number** from the same monotonic
+    /// counter as `runActivity`, `sleep`, and `waitForEvent`. It must be called at the
+    /// **same unconditional position** in the control flow on every activation of this
+    /// workflow instance. Placing it inside a branch whose condition can change between
+    /// activations (e.g. a signal-mutated flag) shifts all downstream sequence numbers
+    /// and corrupts checkpoint replay.
+    ///
+    /// ```swift
+    /// // ✗ WRONG — only reached when isPaused is true; downstream seqNums shift.
+    /// if isPaused {
+    ///     let _ = try context.version(changeID: "v2-feature")
+    /// }
+    ///
+    /// // ✓ CORRECT — always reached; return value drives the branch.
+    /// let useV2 = try context.version(changeID: "v2-feature")
+    /// if isPaused && useV2 { ... }
+    /// ```
+    ///
+    /// For a full deployment guide — including `markVersion`, multi-step migrations,
+    /// and strategy selection — see <doc:VersioningGuide>.
+    ///
     /// - Parameter changeID: A stable, unique string identifying this code change point.
     ///   Use a descriptive name like `"v2-add-notification"` — it must never be reused
     ///   for a different change in the same workflow.

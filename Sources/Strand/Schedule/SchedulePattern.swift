@@ -466,7 +466,142 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
 extension SchedulePattern {
 
-    // MARK: Daily
+    // MARK: - Private helpers
+
+    /// Maps a ``Weekday`` to its standard cron day-of-week number.
+    /// Cron convention: Sun=0, Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6.
+    private static func cronDay(_ day: Weekday) -> Int {
+        switch day {
+        case .sunday: return 0
+        case .monday: return 1
+        case .tuesday: return 2
+        case .wednesday: return 3
+        case .thursday: return 4
+        case .friday: return 5
+        case .saturday: return 6
+        }
+    }
+
+    // MARK: - Weekdays (Mon–Fri)
+
+    /// Fires every weekday (Monday through Friday) at the specified hour and minute.
+    ///
+    /// ```swift
+    /// .weekdays(hour: 9)                    // 09:00 UTC every weekday
+    /// .weekdays(hour: 9, timezone: nyTZ)    // 09:00 Eastern every weekday
+    /// ```
+    public static func weekdays(
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        .cron("\(minute) \(hour) * * 1-5", timezone: timezone)
+    }
+
+    /// Fires every weekday (Monday through Friday) at each of the specified hours.
+    ///
+    /// ```swift
+    /// .weekdays(hours: 9, 16)                  // 09:00 and 16:00 UTC every weekday
+    /// .weekdays(hours: 8, 12, 17, minute: 30)  // 08:30, 12:30, 17:30 every weekday
+    /// ```
+    public static func weekdays(
+        hours: Int...,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let h = hours.sorted().map { String($0) }.joined(separator: ",")
+        return .cron("\(minute) \(h) * * 1-5", timezone: timezone)
+    }
+
+    // MARK: - Specific weekday selection
+
+    /// Fires on the selected weekdays at the specified hour and minute.
+    ///
+    /// ```swift
+    /// .onDays(.monday, .wednesday, .friday, hour: 9)      // MWF at 09:00 UTC
+    /// .onDays(.tuesday, .thursday, hour: 8, minute: 30)   // TuTh at 08:30
+    /// ```
+    public static func onDays(
+        _ days: Weekday...,
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let d = days.map { cronDay($0) }.sorted().map { String($0) }.joined(separator: ",")
+        return .cron("\(minute) \(hour) * * \(d)", timezone: timezone)
+    }
+
+    /// Fires on the selected weekdays at each of the specified hours.
+    ///
+    /// ```swift
+    /// .onDays(.monday, .wednesday, .friday, hours: 8, 14)
+    /// // 08:00 and 14:00 on Mon, Wed, Fri
+    /// ```
+    public static func onDays(
+        _ days: Weekday...,
+        hours: Int...,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let d = days.map { cronDay($0) }.sorted().map { String($0) }.joined(separator: ",")
+        let h = hours.sorted().map { String($0) }.joined(separator: ",")
+        return .cron("\(minute) \(h) * * \(d)", timezone: timezone)
+    }
+
+    // MARK: - Multiple hours per day
+
+    /// Fires every day at each of the specified hours.
+    ///
+    /// ```swift
+    /// .onHours(8, 12, 17)              // 08:00, 12:00, 17:00 UTC every day
+    /// .onHours(9, 14, minute: 30)      // 09:30 and 14:30 UTC every day
+    /// ```
+    public static func onHours(
+        _ hours: Int...,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let h = hours.sorted().map { String($0) }.joined(separator: ",")
+        return .cron("\(minute) \(h) * * *", timezone: timezone)
+    }
+
+    // MARK: - Specific dates of the month
+
+    /// Fires on the specified day-of-month values at the given hour and minute.
+    ///
+    /// Days are 1-indexed.
+    ///
+    /// ```swift
+    /// .onDates(1, 15, hour: 9)         // 1st and 15th of each month at 09:00 UTC
+    /// .onDates(1, 8, 15, 22, hour: 0)  // weekly-ish: every 7 days at midnight
+    /// ```
+    public static func onDates(
+        _ dates: Int...,
+        hour: Int,
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let d = dates.sorted().map { String($0) }.joined(separator: ",")
+        return .cron("\(minute) \(hour) \(d) * *", timezone: timezone)
+    }
+
+    // MARK: - Sub-hourly (multiple minutes)
+
+    /// Fires at specific minutes past every hour.
+    ///
+    /// ```swift
+    /// .onMinutes(0, 15, 30, 45)   // every 15 minutes
+    /// .onMinutes(0, 30)           // every 30 minutes
+    /// ```
+    public static func onMinutes(
+        _ minutes: Int...,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        let m = minutes.sorted().map { String($0) }.joined(separator: ",")
+        return .cron("\(m) * * * *", timezone: timezone)
+    }
+
+    // MARK: - Daily
 
     /// Fires every day at the specified hour and minute.
     ///

@@ -497,3 +497,232 @@ struct ScheduleCalculatorTests {
         #expect(c.hour == 0)
     }
 }
+
+// MARK: - Typed constructor tests
+//
+// Reference week: 2024-03-11 (Mon) – 2024-03-17 (Sun) UTC.
+// Foundation Gregorian weekday numbers: Sun=1 Mon=2 Tue=3 Wed=4 Thu=5 Fri=6 Sat=7.
+//
+// Epoch-second anchors used by sub-hourly tests (UTC Jan 1 1970):
+//   00:00 =     0 s   00:07 =   420 s   00:15 =   900 s
+//   00:30 = 1 800 s   00:47 = 2 820 s   01:00 = 3 600 s
+//   10:00 = 36 000 s  18:00 = 64 800 s
+
+@Suite("Typed pattern constructors")
+struct TypedPatternConstructorTests {
+
+    // Shared UTC calendar used in every test.
+    private var utc: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        return c
+    }
+
+    /// Build a UTC Date at the given date and time.
+    private func date(
+        _ year: Int,
+        _ month: Int,
+        _ day: Int,
+        hour: Int = 0,
+        minute: Int = 0
+    ) -> Date {
+        utc.date(
+            from: DateComponents(
+                year: year,
+                month: month,
+                day: day,
+                hour: hour,
+                minute: minute,
+                second: 0
+            )
+        )!
+    }
+
+    // MARK: weekdays(hour:)
+
+    @Test(".weekdays(hour:) skips Saturday and Sunday to next Monday")
+    func weekdaysSkipsWeekend() throws {
+        let p = SchedulePattern.weekdays(hour: 9)
+        // Saturday 2024-03-16 08:00 UTC — next slot is Monday 09:00
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 16, hour: 8)))
+        let c = utc.dateComponents([.weekday, .hour, .minute], from: next)
+        #expect(c.weekday == 2)  // Monday
+        #expect(c.hour == 9)
+        #expect(c.minute == 0)
+    }
+
+    @Test(".weekdays(hour:) fires same day when still before the hour")
+    func weekdaysSameDayBeforeHour() throws {
+        let p = SchedulePattern.weekdays(hour: 9)
+        // Monday 2024-03-11 08:00 UTC — still before 09:00
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 11, hour: 8)))
+        let c = utc.dateComponents([.year, .month, .day, .hour], from: next)
+        #expect(c.year == 2024 && c.month == 3 && c.day == 11)
+        #expect(c.hour == 9)
+    }
+
+    @Test(".weekdays(hour:) advances to next weekday when hour is past")
+    func weekdaysNextDayAfterHour() throws {
+        let p = SchedulePattern.weekdays(hour: 9)
+        // Monday 2024-03-11 10:00 UTC — past 09:00, next is Tuesday
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 11, hour: 10)))
+        let c = utc.dateComponents([.day, .weekday, .hour], from: next)
+        #expect(c.day == 12)  // Tuesday the 12th
+        #expect(c.weekday == 3)  // Tuesday
+        #expect(c.hour == 9)
+    }
+
+    @Test(".weekdays(hour:) skips Sunday to Monday")
+    func weekdaysSkipsSunday() throws {
+        let p = SchedulePattern.weekdays(hour: 9)
+        // Sunday 2024-03-17 12:00 UTC
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 17, hour: 12)))
+        let c = utc.dateComponents([.weekday, .hour], from: next)
+        #expect(c.weekday == 2)  // Monday
+        #expect(c.hour == 9)
+    }
+
+    // MARK: weekdays(hours:)
+
+    @Test(".weekdays(hours:) picks the later-hour slot on the same day")
+    func weekdaysMultiHourSameDay() throws {
+        let p = SchedulePattern.weekdays(hours: 9, 16)
+        // Monday 10:00 — 09:00 is past, next is 16:00 same day
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 11, hour: 10)))
+        let c = utc.dateComponents([.day, .hour], from: next)
+        #expect(c.day == 11)  // same Monday
+        #expect(c.hour == 16)
+    }
+
+    @Test(".weekdays(hours:) rolls to the first listed hour on the next weekday")
+    func weekdaysMultiHourRollover() throws {
+        let p = SchedulePattern.weekdays(hours: 9, 16)
+        // Monday 17:00 — both hours past, next is Tuesday 09:00
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 11, hour: 17)))
+        let c = utc.dateComponents([.weekday, .hour], from: next)
+        #expect(c.weekday == 3)  // Tuesday
+        #expect(c.hour == 9)
+    }
+
+    // MARK: onDays(Weekday..., hour:)
+
+    @Test(".onDays fires on the next selected weekday, skipping unselected ones")
+    func onDaysNextSelectedDay() throws {
+        // From Tuesday, next selected day is Wednesday
+        let p = SchedulePattern.onDays(.monday, .wednesday, .friday, hour: 9)
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 12, hour: 10)))  // Tue 10:00
+        let c = utc.dateComponents([.weekday, .hour], from: next)
+        #expect(c.weekday == 4)  // Wednesday
+        #expect(c.hour == 9)
+    }
+
+    @Test(".onDays wraps to next week when all selected days in current week are past")
+    func onDaysWeekWrap() throws {
+        // Friday 10:00 — Fri is last selected day, next selection is Monday next week
+        let p = SchedulePattern.onDays(.monday, .wednesday, .friday, hour: 9)
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 15, hour: 10)))  // Fri 10:00
+        let c = utc.dateComponents([.weekday, .hour], from: next)
+        #expect(c.weekday == 2)  // Monday
+        #expect(c.hour == 9)
+    }
+
+    // MARK: onDays(Weekday..., hours:)
+
+    @Test(".onDays with multiple hours picks the correct remaining hour on the same day")
+    func onDaysMultiHourSameDay() throws {
+        // Monday 09:00 — 08:00 is past, next is 14:00 same day
+        let p = SchedulePattern.onDays(.monday, .wednesday, .friday, hours: 8, 14)
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 11, hour: 9)))
+        let c = utc.dateComponents([.day, .hour], from: next)
+        #expect(c.day == 11)  // same Monday
+        #expect(c.hour == 14)
+    }
+
+    @Test(".onDays with multiple hours rolls to first hour on the next selected day")
+    func onDaysMultiHourRollover() throws {
+        // Monday 15:00 — both 08:00 and 14:00 past; next is Wednesday 08:00
+        let p = SchedulePattern.onDays(.monday, .wednesday, .friday, hours: 8, 14)
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 11, hour: 15)))
+        let c = utc.dateComponents([.weekday, .hour], from: next)
+        #expect(c.weekday == 4)  // Wednesday
+        #expect(c.hour == 8)
+    }
+
+    // MARK: onHours
+
+    @Test(".onHours fires at the next listed hour within the same day")
+    func onHoursNextHour() throws {
+        let p = SchedulePattern.onHours(8, 12, 17)
+        // 10:00 UTC epoch day 0 (= 36 000 s); next is 12:00
+        let next = try #require(try p.nextRunTime(after: Date(timeIntervalSince1970: 36_000)))
+        let c = utc.dateComponents([.hour, .minute], from: next)
+        #expect(c.hour == 12)
+        #expect(c.minute == 0)
+    }
+
+    @Test(".onHours wraps to the first listed hour the next day after the last slot")
+    func onHoursWrapNextDay() throws {
+        let p = SchedulePattern.onHours(8, 12, 17)
+        // 18:00 UTC epoch day 0 (= 64 800 s); next is 08:00 on day 1
+        let next = try #require(try p.nextRunTime(after: Date(timeIntervalSince1970: 64_800)))
+        let c = utc.dateComponents([.hour, .minute], from: next)
+        #expect(c.hour == 8)
+        #expect(c.minute == 0)
+        #expect(next.timeIntervalSince1970 >= 86_400)  // must be day 1 or later
+    }
+
+    // MARK: onDates
+
+    @Test(".onDates fires on the next listed date within the same month")
+    func onDatesNextDate() throws {
+        let p = SchedulePattern.onDates(1, 15, hour: 9)
+        // 3rd of March — next listed date is the 15th
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 3, hour: 8)))
+        let c = utc.dateComponents([.day, .hour], from: next)
+        #expect(c.day == 15)
+        #expect(c.hour == 9)
+    }
+
+    @Test(".onDates wraps to the first listed date in the next month when all are past")
+    func onDatesNextMonth() throws {
+        let p = SchedulePattern.onDates(1, 15, hour: 9)
+        // 20th of March — both 1st and 15th are past; next is April 1st
+        let next = try #require(try p.nextRunTime(after: date(2024, 3, 20, hour: 8)))
+        let c = utc.dateComponents([.month, .day, .hour], from: next)
+        #expect(c.month == 4)  // April
+        #expect(c.day == 1)
+        #expect(c.hour == 9)
+    }
+
+    // MARK: onMinutes
+
+    @Test(".onMinutes fires at the next listed minute within the current hour")
+    func onMinutesNextMinute() throws {
+        let p = SchedulePattern.onMinutes(0, 15, 30, 45)
+        // 00:07:00 UTC (= 420 s) — next listed minute is 00:15
+        let next = try #require(try p.nextRunTime(after: Date(timeIntervalSince1970: 420)))
+        let c = utc.dateComponents([.hour, .minute], from: next)
+        #expect(c.hour == 0)
+        #expect(c.minute == 15)
+    }
+
+    @Test(".onMinutes rolls to the top of the next hour when past all listed minutes")
+    func onMinutesWrapToNextHour() throws {
+        let p = SchedulePattern.onMinutes(0, 15, 30, 45)
+        // 00:47:00 UTC (= 2 820 s) — past :45, next is 01:00
+        let next = try #require(try p.nextRunTime(after: Date(timeIntervalSince1970: 2_820)))
+        let c = utc.dateComponents([.hour, .minute], from: next)
+        #expect(c.hour == 1)
+        #expect(c.minute == 0)
+    }
+
+    @Test(".onMinutes picks the correct minute in a 30-minute schedule")
+    func onMinutesThirtyMin() throws {
+        let p = SchedulePattern.onMinutes(0, 30)
+        // 00:15:00 UTC (= 900 s) — next is 00:30
+        let next = try #require(try p.nextRunTime(after: Date(timeIntervalSince1970: 900)))
+        let c = utc.dateComponents([.hour, .minute], from: next)
+        #expect(c.hour == 0)
+        #expect(c.minute == 30)
+    }
+}

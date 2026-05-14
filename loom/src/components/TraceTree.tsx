@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { cn, fmtDuration } from "@/lib/utils";
 import { TimeBrush } from "@/components/TimeBrush";
+import { JsonView } from "@/components/JsonView";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -1620,15 +1621,9 @@ export function TraceTree({
                                                 {isDetailLoading ? (
                                                     <JsonSkeleton />
                                                 ) : spanDetail?.input ? (
-                                                    <pre className="bg-secondary/30 border border-border/40 rounded p-2 text-[10px] font-mono text-foreground/80 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed select-text transition-opacity duration-150">
-                                                        {JSON.stringify(
-                                                            JSON.parse(
-                                                                spanDetail.input,
-                                                            ),
-                                                            null,
-                                                            2,
-                                                        )}
-                                                    </pre>
+                                                    <JsonView
+                                                        value={spanDetail.input}
+                                                    />
                                                 ) : (
                                                     <p className="text-[10px] text-muted-foreground/50 italic">
                                                         —
@@ -1644,15 +1639,11 @@ export function TraceTree({
                                                 {isDetailLoading ? (
                                                     <JsonSkeleton />
                                                 ) : spanDetail?.output ? (
-                                                    <pre className="bg-secondary/30 border border-border/40 rounded p-2 text-[10px] font-mono text-foreground/80 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed select-text transition-opacity duration-150">
-                                                        {JSON.stringify(
-                                                            JSON.parse(
-                                                                spanDetail.output,
-                                                            ),
-                                                            null,
-                                                            2,
-                                                        )}
-                                                    </pre>
+                                                    <JsonView
+                                                        value={
+                                                            spanDetail.output
+                                                        }
+                                                    />
                                                 ) : (
                                                     <p className="text-[10px] text-muted-foreground/50 italic">
                                                         —

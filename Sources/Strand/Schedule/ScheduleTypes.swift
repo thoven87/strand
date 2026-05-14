@@ -76,7 +76,7 @@ public struct ScheduleOptions: Sendable {
     public var accuracy: ScheduleAccuracy
 
     public init(
-        maxAttempts: Int? = nil,
+        maxAttempts: Int? = 25,
         retryStrategy: RetryStrategy? = nil,
         cancellation: CancellationPolicy? = nil,
         headers: [String: String] = [:],

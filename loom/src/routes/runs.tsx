@@ -251,8 +251,9 @@ export function RunsPage() {
 
     // ── Data fetching ──────────────────────────────────────────────────────
     const { data: queues = [] } = useQuery({
-        queryKey: qk.queues.list(namespace),
-        queryFn: () => getQueues(namespace),
+        queryKey: [...qk.queues.list(namespace), rootOnly],
+        queryFn: () =>
+            getQueues(namespace, { rootOnly: rootOnly || undefined }),
         refetchInterval: 10_000,
     });
 
@@ -380,22 +381,6 @@ export function RunsPage() {
                     ))}
                 </div>
 
-                {/* Root only toggle */}
-                <button
-                    onClick={() => {
-                        setRootOnly((v) => !v);
-                        setCursor(undefined);
-                    }}
-                    className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
-                        rootOnly
-                            ? "bg-brand/15 text-brand border-brand/30"
-                            : "border-border text-muted-foreground hover:text-foreground"
-                    }`}
-                    title="Hide child activities spawned by workflows"
-                >
-                    Root only
-                </button>
-
                 <div className="h-4 w-px bg-border/50 hidden sm:block" />
 
                 {/* "All states" pill */}
@@ -421,6 +406,22 @@ export function RunsPage() {
                         }
                     />
                 ))}
+
+                {/* Root only toggle — lives next to state filters, not kind filters */}
+                <button
+                    onClick={() => {
+                        setRootOnly((v) => !v);
+                        setCursor(undefined);
+                    }}
+                    className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs font-medium transition-colors ${
+                        rootOnly
+                            ? "bg-brand/15 text-brand border-brand/30"
+                            : "border-border text-muted-foreground hover:text-foreground"
+                    }`}
+                    title="Hide child activities spawned by workflows"
+                >
+                    Root only
+                </button>
 
                 {/* Clear-all indicator */}
                 {hasActiveFilters && (

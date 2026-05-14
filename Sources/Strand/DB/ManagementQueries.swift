@@ -258,6 +258,7 @@ package enum ManagementQueries {
     package static func listQueueStats(
         on client: PostgresClient,
         namespaceID: String,
+        rootOnly: Bool = false,
         logger: Logger
     ) async throws -> [QueueStatsRow] {
         let stream = try await client.query(
@@ -274,7 +275,11 @@ package enum ManagementQueries {
               COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')  AS cancelled,
               q.is_paused
             FROM strand.queues q
-            LEFT JOIN strand.tasks t ON t.queue = q.name AND t.namespace_id = q.namespace_id
+            -- When rootOnly=true, only join root tasks (parent_task_id IS NULL)
+            -- so the stats bar counts the same population as the task list.
+            LEFT JOIN strand.tasks t ON t.queue = q.name
+                                    AND t.namespace_id = q.namespace_id
+                                    AND (NOT \(rootOnly) OR t.parent_task_id IS NULL)
             WHERE q.namespace_id = \(namespaceID)
             GROUP BY q.name, q.created_at, q.is_paused
             ORDER BY q.name
@@ -291,6 +296,7 @@ package enum ManagementQueries {
         on client: PostgresClient,
         namespaceID: String,
         queue: String,
+        rootOnly: Bool = false,
         logger: Logger
     ) async throws -> QueueStatsRow? {
         let stream = try await client.query(
@@ -307,7 +313,11 @@ package enum ManagementQueries {
               COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')  AS cancelled,
               q.is_paused
             FROM strand.queues q
-            LEFT JOIN strand.tasks t ON t.queue = q.name AND t.namespace_id = q.namespace_id
+            -- When rootOnly=true, only join root tasks (parent_task_id IS NULL)
+            -- so the stats bar counts the same population as the task list.
+            LEFT JOIN strand.tasks t ON t.queue = q.name
+                                    AND t.namespace_id = q.namespace_id
+                                    AND (NOT \(rootOnly) OR t.parent_task_id IS NULL)
             WHERE q.name = \(queue) AND q.namespace_id = \(namespaceID)
             GROUP BY q.name, q.created_at, q.is_paused
             """,

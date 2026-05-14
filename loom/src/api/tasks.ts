@@ -12,7 +12,12 @@ import type { TraceSpan } from "@/components/TraceTree";
 export const getTasks = (
     namespace: string,
     queue: string,
-    opts: { state?: string; cursor?: string; limit?: number } = {},
+    opts: {
+        state?: string;
+        cursor?: string;
+        limit?: number;
+        rootOnly?: boolean;
+    } = {},
 ) =>
     api
         .get<CursorPage<TaskSummary>>(
