@@ -48,7 +48,7 @@ jobs:
                     POSTGRES_USER: "strand"
                     POSTGRES_PASSWORD: "strand"
                     POSTGRES_HOST_AUTH_METHOD: ${{ matrix.postgres-auth }}
-                    POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.postgres-auth }}
+                    POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.postgres-auth }} --set max_connections=500
         steps:
             - name: Checkout
               uses: actions/checkout@v4
