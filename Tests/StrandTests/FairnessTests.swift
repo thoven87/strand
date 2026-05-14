@@ -80,9 +80,9 @@ private final class CompletionLog: Sendable {
 /// Records which `tenantKey` completed each slot and optionally fires a
 /// `TestExpectation` when a specific key is seen.
 ///
-/// Must be defined at file scope so `ActivityDefinition.name` (the Swift type
+/// Must be defined at file scope so `Activity.name` (the Swift type
 /// name) is stable — the registry looks up handlers by this string.
-private struct TenantSlotActivity: ActivityDefinition {
+private struct TenantSlotActivity: Activity {
     struct Input: Codable, Sendable { let tenantKey: String }
     typealias Output = StrandVoid
 

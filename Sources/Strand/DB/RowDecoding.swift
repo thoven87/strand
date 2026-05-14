@@ -95,7 +95,7 @@ extension ClaimedTask {
         eventPayloadBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
 
         // Decode typed fields from headers once here.
-        // All downstream consumers (WorkflowRegistration, ActivityDefinition._run, etc.)
+        // All downstream consumers (WorkflowRegistration, Activity._run, etc.)
         // read from these typed fields instead of re-parsing the raw buffer.
         let h: [String: String] =
             headersBuffer.flatMap { try? JSON.decode([String: String].self, from: $0) } ?? [:]

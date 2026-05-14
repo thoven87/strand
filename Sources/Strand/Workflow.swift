@@ -64,7 +64,7 @@ extension WorkflowRegistrable {
 /// A durable workflow orchestrator implemented as a value-type struct.
 ///
 /// The handler **must be deterministic**: no I/O, no `Date.now`, no `UUID()`.
-/// All I/O belongs in ``ActivityDefinition`` implementations.
+/// All I/O belongs in ``Activity`` implementations.
 ///
 /// ```swift
 /// struct OrderWorkflow: Workflow {
@@ -242,14 +242,14 @@ extension WorkflowSignalDefinition {
 
 /// Marker protocol that enables activity instances in the `activities:` array.
 ///
-/// Every type conforming to ``ActivityDefinition`` automatically satisfies this
+/// Every type conforming to ``Activity`` automatically satisfies this
 /// protocol. You never need to implement it manually.
 public protocol ActivityBox: Sendable {
     /// The registered activity name — shown in logs and the dashboard.
     var activityName: String { get }
 
     /// Infrastructure used by ``StrandWorker``. Do not call or implement manually;
-    /// a default is provided via `extension ActivityDefinition`.
+    /// a default is provided via `extension Activity`.
     func _makeToken() -> _ActivityToken
 }
 

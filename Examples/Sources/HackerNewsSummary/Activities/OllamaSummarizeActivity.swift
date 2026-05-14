@@ -4,7 +4,7 @@ import Strand
 /// Sends an HN story to a locally running Ollama instance and returns a
 /// 2–3 sentence summary.  Requires `ollama serve` to be running and a
 /// model (e.g. `qwen3:latest`) to be pulled.
-struct OllamaSummarizeActivity: ActivityDefinition {
+struct OllamaSummarizeActivity: Activity {
     struct Input: Codable, Sendable {
         let title: String
         let content: String  // url or self-post text, truncated to 1500 chars

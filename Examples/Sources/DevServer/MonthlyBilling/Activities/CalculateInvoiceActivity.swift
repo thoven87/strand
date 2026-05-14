@@ -6,7 +6,7 @@ import FoundationEssentials
 import Foundation
 #endif
 
-struct CalculateInvoiceActivity: ActivityDefinition {
+struct CalculateInvoiceActivity: Activity {
     struct Input: Codable, Sendable {
         let userID: Int
     }

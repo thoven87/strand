@@ -85,12 +85,12 @@ public struct StrandSchedule: Sendable {
         }
     }
 
-    // MARK: ActivityDefinition
+    // MARK: Activity
 
     /// Declares a recurring activity schedule.
     ///
     /// The activity fires directly — no wrapping workflow is created.
-    public static func activity<A: ActivityDefinition>(
+    public static func activity<A: Activity>(
         _ name: String,
         pattern: SchedulePattern,
         activityType: A.Type,

@@ -3,7 +3,7 @@ import Strand
 /// Simulates running speech-to-text on one ~15-minute audio segment.
 /// Multiple instances of this activity run in parallel — they form the wide
 /// part of the diamond fan-out.
-struct TranscribeSegmentActivity: ActivityDefinition {
+struct TranscribeSegmentActivity: Activity {
     typealias Input = SegmentInput
     typealias Output = SegmentTranscript
 

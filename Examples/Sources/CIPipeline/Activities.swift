@@ -9,7 +9,7 @@ import Foundation
 
 // ── Stage 1: Checkout ──────────────────────────────────────────────────────
 
-struct CheckoutActivity: ActivityDefinition {
+struct CheckoutActivity: Activity {
     typealias Input = PipelineInput
     typealias Output = StageResult
     static let name = "ci.checkout"
@@ -29,7 +29,7 @@ struct CheckoutActivity: ActivityDefinition {
 
 // ── Stage 2a: Lint ─────────────────────────────────────────────────────────
 
-struct LintActivity: ActivityDefinition {
+struct LintActivity: Activity {
     typealias Input = PipelineInput
     typealias Output = StageResult
     static let name = "ci.lint"
@@ -55,7 +55,7 @@ struct LintActivity: ActivityDefinition {
 // Kill the process during the retry window and restart: Strand will resume
 // from exactly this stage.
 
-struct UnitTestActivity: ActivityDefinition {
+struct UnitTestActivity: Activity {
     typealias Input = PipelineInput
     typealias Output = StageResult
     static let name = "ci.unit-tests"
@@ -82,7 +82,7 @@ struct UnitTestActivity: ActivityDefinition {
 
 // ── Stage 2c: Security scan ────────────────────────────────────────────────
 
-struct SecurityScanActivity: ActivityDefinition {
+struct SecurityScanActivity: Activity {
     typealias Input = PipelineInput
     typealias Output = StageResult
     static let name = "ci.security-scan"
@@ -102,7 +102,7 @@ struct SecurityScanActivity: ActivityDefinition {
 
 // ── Stage 3: Build ─────────────────────────────────────────────────────────
 
-struct BuildActivity: ActivityDefinition {
+struct BuildActivity: Activity {
     typealias Input = PipelineInput
     typealias Output = StageResult
     static let name = "ci.build"
@@ -122,7 +122,7 @@ struct BuildActivity: ActivityDefinition {
 
 // ── Stage 5: Deploy ────────────────────────────────────────────────────────
 
-struct DeployActivity: ActivityDefinition {
+struct DeployActivity: Activity {
     typealias Input = PipelineInput
     typealias Output = StageResult
     static let name = "ci.deploy"

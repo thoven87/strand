@@ -1,6 +1,6 @@
 import Strand
 
-struct GeneratePDFActivity: ActivityDefinition {
+struct GeneratePDFActivity: Activity {
     struct Input: Codable, Sendable {
         let invoiceID: String
         let chargeID: String

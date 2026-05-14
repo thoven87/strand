@@ -40,7 +40,7 @@ private final class HeartbeatObserver: @unchecked Sendable {
 /// On attempt 1: fails after processing `failAfter` items, leaving the last
 /// heartbeat at `failAfter`.
 /// On attempt 2: resumes from `heartbeatDetails`, processes remaining items.
-private struct ProgressActivity: ActivityDefinition {
+private struct ProgressActivity: Activity {
     typealias Input = ProgressInput
     typealias Output = Int  // total items processed
 
@@ -85,7 +85,7 @@ private struct HeartbeatTestError: Error, Codable, Sendable {
 
 /// Wraps ProgressActivity and calls liveness-only `heartbeat()` (no details)
 /// between items to verify it does NOT overwrite stored progress.
-private struct LivenessHeartbeatActivity: ActivityDefinition {
+private struct LivenessHeartbeatActivity: Activity {
     typealias Input = ProgressInput
     typealias Output = Int
 

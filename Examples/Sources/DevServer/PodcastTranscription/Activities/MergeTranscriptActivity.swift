@@ -2,7 +2,7 @@ import Strand
 
 /// Joins all parallel segment transcripts into one document.
 /// This is the bottom point of the diamond — N parallel results converge here.
-struct MergeTranscriptActivity: ActivityDefinition {
+struct MergeTranscriptActivity: Activity {
     typealias Input = MergeInput
     typealias Output = FullTranscript
 

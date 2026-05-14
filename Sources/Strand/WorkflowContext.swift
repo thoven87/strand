@@ -325,12 +325,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// re-executing the activity or touching the DB (beyond a fast checkpoint lookup).
     ///
     /// - Parameters:
-    ///   - type: The `ActivityDefinition` conforming type to schedule.
+    ///   - type: The `Activity` conforming type to schedule.
     ///   - input: Encoded and forwarded to the activity handler.
     ///   - options: Routing, retry, and timeout overrides. Inherits from workflow defaults if omitted.
     /// - Throws: `A.Failure` directly when the activity failed with a typed failure (if declared).
     ///           `ActivityError` when the activity reached a terminal error state (all retries exhausted or cancelled).
-    public func runActivity<A: ActivityDefinition>(
+    public func runActivity<A: Activity>(
         _ type: A.Type,
         input: A.Input,
         options: ActivityOptions = .init(),
@@ -414,7 +414,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```swift
     /// let result = try await context.runActivity(SendEmailActivity.self)
     /// ```
-    public func runActivity<A: ActivityDefinition>(
+    public func runActivity<A: Activity>(
         _ type: A.Type,
         options: ActivityOptions = .init(),
         fileID: String = #fileID,
@@ -891,10 +891,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```
     ///
     /// - Parameters:
-    ///   - type: The `ActivityDefinition` conforming type to execute.
+    ///   - type: The `Activity` conforming type to execute.
     ///   - input: Forwarded verbatim to the activity handler.
     ///   - options: Execution options (reserved for future use).
-    public func runLocalActivity<A: ActivityDefinition>(
+    public func runLocalActivity<A: Activity>(
         _ type: A.Type,
         input: A.Input,
         options: LocalActivityOptions = .init()
@@ -921,7 +921,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     }
 
     /// Convenience overload for activities with no input (`StrandVoid`).
-    public func runLocalActivity<A: ActivityDefinition>(
+    public func runLocalActivity<A: Activity>(
         _ type: A.Type,
         options: LocalActivityOptions = .init()
     ) async throws -> A.Output where A.Input == StrandVoid {

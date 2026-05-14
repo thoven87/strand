@@ -33,7 +33,7 @@ import ServiceLifecycle
 
 // ── Activity: does the actual I/O ───────────────────────────────────────────
 
-struct SendEmailActivity: ActivityDefinition {
+struct SendEmailActivity: Activity {
     typealias Input  = EmailInput
     typealias Output = EmailResult
 

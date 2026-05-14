@@ -990,7 +990,7 @@ public struct StrandWorker: Service {
                 taskLogger.error("continue-as-new failed", metadata: .forError(error))
             }
         } catch let typed as _TypedActivityFailure {
-            // Pre-encoded failure reason from ActivityDefinition._run — use verbatim.
+            // Pre-encoded failure reason from Activity._run — use verbatim.
             await failAndRecord(
                 reasonBuffer: typed.reasonBuffer,
                 claimed: claimed,

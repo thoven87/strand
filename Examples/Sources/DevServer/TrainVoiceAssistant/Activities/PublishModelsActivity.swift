@@ -1,6 +1,6 @@
 import Strand
 
-struct PublishModelsActivity: ActivityDefinition {
+struct PublishModelsActivity: Activity {
     typealias Input = PublishInput
     typealias Output = PublishResult
 

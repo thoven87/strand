@@ -169,7 +169,7 @@ private struct SimpleWorkflow: Workflow {
     }
 }
 
-private struct SimpleActivity: ActivityDefinition {
+private struct SimpleActivity: Activity {
     typealias Input = String
     typealias Output = String
     var onRan: (@Sendable () -> Void)?

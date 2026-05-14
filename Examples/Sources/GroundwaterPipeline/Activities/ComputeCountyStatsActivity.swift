@@ -16,7 +16,7 @@ import Foundation
 ///   Positive → water table is deeper (declining)
 ///   Negative → water table is shallower (recovering)
 ///   Near zero → stable
-struct ComputeCountyStatsActivity: ActivityDefinition {
+struct ComputeCountyStatsActivity: Activity {
     typealias Input = ComputeStatsInput
     typealias Output = ComputeStatsOutput
 

@@ -76,7 +76,7 @@ public struct StrandService: Service {
         /// (e.g. a database client or API key). Implement `ActivityContainerProtocol`
         /// to bundle related activities and inject shared resources once.
         public var activityContainers: [any ActivityContainerProtocol]
-        /// Individual activity instances. Any `ActivityDefinition` satisfies
+        /// Individual activity instances. Any `Activity` satisfies
         /// `ActivityBox` automatically; use this for standalone activities.
         public var activities: [any ActivityBox]
         public var workflowConcurrency: Int

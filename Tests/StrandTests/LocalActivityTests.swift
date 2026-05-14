@@ -13,7 +13,7 @@ import Foundation
 
 // MARK: - Activity fixtures
 
-private struct UppercaseActivity: ActivityDefinition {
+private struct UppercaseActivity: Activity {
     typealias Input = String
     typealias Output = String
     func run(input: String, context: ActivityContext) async throws -> String {
@@ -21,7 +21,7 @@ private struct UppercaseActivity: ActivityDefinition {
     }
 }
 
-private struct AddOneActivity: ActivityDefinition {
+private struct AddOneActivity: Activity {
     typealias Input = Int
     typealias Output = Int
     func run(input: Int, context: ActivityContext) async throws -> Int {
@@ -29,7 +29,7 @@ private struct AddOneActivity: ActivityDefinition {
     }
 }
 
-private struct FailingLocalActivity: ActivityDefinition {
+private struct FailingLocalActivity: Activity {
     typealias Input = String
     typealias Output = String
     typealias Failure = LocalError
@@ -75,7 +75,7 @@ private struct MixedWorkflow: Workflow {
 }
 
 // Simple regular activity used by MixedWorkflow.
-private struct ReverseLocalActivity: ActivityDefinition {
+private struct ReverseLocalActivity: Activity {
     typealias Input = String
     typealias Output = String
     var onRan: (@Sendable () -> Void)?

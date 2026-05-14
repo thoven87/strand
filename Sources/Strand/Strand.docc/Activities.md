@@ -5,11 +5,11 @@ calls, and database writes live.
 
 ## Protocol-based definition
 
-Implement ``ActivityDefinition`` to define a dependency-injected, independently
+Implement ``Activity`` to define a dependency-injected, independently
 retried unit of work:
 
 ```swift
-struct FetchWeatherActivity: ActivityDefinition {
+struct FetchWeatherActivity: Activity {
     typealias Input  = WeatherInput
     typealias Output = WeatherResult
 
@@ -91,7 +91,7 @@ before the StartToClose deadline would fire.
 Set defaults on the activity type itself to avoid repeating options at every call-site:
 
 ```swift
-struct FetchWeatherActivity: ActivityDefinition {
+struct FetchWeatherActivity: Activity {
     static var defaultMaxAttempts: Int? { 5 }
     static var defaultTimeout: Duration? { .seconds(10) }
     // ...
@@ -125,7 +125,7 @@ returns that value so the activity can resume mid-stream instead of restarting
 from the beginning:
 
 ```swift
-struct IngestFileActivity: ActivityDefinition {
+struct IngestFileActivity: Activity {
     typealias Input  = FileInput
     typealias Output = StrandVoid
 
@@ -173,7 +173,7 @@ Use ``StrandVoid`` as the `Output` type when the activity performs a side effect
 and returns no meaningful value:
 
 ```swift
-struct SendEmailActivity: ActivityDefinition {
+struct SendEmailActivity: Activity {
     typealias Input  = EmailInput
     typealias Output = StrandVoid
 

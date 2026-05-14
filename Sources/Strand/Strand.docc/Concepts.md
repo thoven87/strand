@@ -9,7 +9,7 @@ is the orchestration logic. It calls `context.runActivity(...)` to dispatch leaf
 units of work, and `context.sleep(for:)` / `context.waitForEvent(...)` to
 suspend until external events arrive.
 
-An **activity** is a Swift struct that conforms to ``ActivityDefinition`` and
+An **activity** is a Swift struct that conforms to ``Activity`` and
 performs I/O: database queries, HTTP calls, file operations. Activities are the
 only place where side effects should live.
 

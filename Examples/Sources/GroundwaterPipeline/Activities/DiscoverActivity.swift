@@ -9,7 +9,7 @@ import Foundation
 
 /// Queries the CKAN datastore API to get the exact row count without downloading
 /// any data, then creates the pipeline_runs record for progress tracking.
-struct DiscoverActivity: ActivityDefinition {
+struct DiscoverActivity: Activity {
     typealias Input = DiscoverInput
     typealias Output = DiscoverOutput
 

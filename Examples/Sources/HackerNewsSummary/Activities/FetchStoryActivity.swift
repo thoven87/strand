@@ -2,7 +2,7 @@ import Foundation
 import Strand
 
 /// Fetches a single HN story from the Firebase REST API.
-struct FetchStoryActivity: ActivityDefinition {
+struct FetchStoryActivity: Activity {
     struct Input: Codable, Sendable { let storyID: Int }
     typealias Output = HNStory
 

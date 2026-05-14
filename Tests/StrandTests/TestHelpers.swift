@@ -45,7 +45,7 @@ final class AtomicInt: @unchecked Sendable {
 /// no fixed delay and no 2-second backoff window.
 ///
 /// ```swift
-/// private struct MyActivity: ActivityDefinition {
+/// private struct MyActivity: Activity {
 ///     let done: TestExpectation
 ///     func run(input: String, context: ActivityContext) async throws -> String {
 ///         defer { done.trigger() }

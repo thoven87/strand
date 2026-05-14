@@ -21,7 +21,7 @@ import Foundation
 ///   single UNNEST transaction, balancing round-trips against memory usage.
 /// - **Idempotent progress tracking**: `cnra.chunk_progress` uses ON CONFLICT so
 ///   a retried activity updates the existing row rather than inserting a duplicate.
-struct DownloadAndInsertActivity: ActivityDefinition {
+struct DownloadAndInsertActivity: Activity {
     typealias Input = IngestChunkInput
     typealias Output = IngestChunkOutput
 
