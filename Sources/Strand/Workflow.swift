@@ -248,26 +248,23 @@ public struct EventPredicate<Target>: Sendable {
 
     /// Serializes the predicate to a JSONB-compatible nested JSON byte array.
     ///
-    /// `["order", "id"]` + value `"abc-123"` → `{"order": {"id": "abc-123"}}`
+    /// `["order", "id"]` + value `"abc-123"` → `{"order":{"id":"abc-123"}}`
+    ///
+    /// Built from inside out using the already-encoded `valueBytes` — no
+    /// `JSONSerialization` round-trip needed, works with `FoundationEssentials`.
     func toJSONBytes() throws -> [UInt8] {
-        // Wrap value bytes in `[…]` so JSONSerialization can parse any scalar
-        // JSON type (string, number, bool) not just objects/arrays.
-        let wrapped = [UInt8(ascii: "[")] + valueBytes + [UInt8(ascii: "]")]
-        guard
-            let parsed = try? JSONSerialization.jsonObject(with: Data(wrapped)) as? [Any],
-            let valueAny = parsed.first
-        else {
-            throw EventPredicateError.invalidValue
+        guard !pathComponents.isEmpty else { throw EventPredicateError.invalidValue }
+        // JSON.encode(String) produces a quoted key, e.g. "order" → `"order"`.
+        // Wrap one level at a time from the innermost component outward.
+        var result = valueBytes
+        for component in pathComponents.reversed() {
+            guard let keyBuf = try? JSON.encode(component) else {
+                throw EventPredicateError.invalidValue
+            }
+            result = [UInt8(ascii: "{")] + Array(keyBuf.readableBytesView)
+                + [UInt8(ascii: ":")] + result + [UInt8(ascii: "}")]
         }
-        let nested = Self.buildNested(pathComponents, value: valueAny)
-        let data = try JSONSerialization.data(withJSONObject: nested)
-        return Array(data)
-    }
-
-    private static func buildNested(_ path: [String], value: Any) -> [String: Any] {
-        guard !path.isEmpty else { return [:] }
-        if path.count == 1 { return [path[0]: value] }
-        return [path[0]: buildNested(Array(path.dropFirst()), value: value)]
+        return result
     }
 }
 
