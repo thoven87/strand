@@ -958,6 +958,10 @@ public struct StrandWorker: Service {
                 } else {
                     // ── Root workflow ─────────────────────────────────────────────────
                     // No parent is tracking this task_id, so a fresh task is fine.
+                    // Propagate first_task_id so the full continueAsNew chain is
+                    // navigable: if this task was itself a continuation, carry the
+                    // original chain root forward; otherwise this task IS the root.
+                    let firstTaskID = claimed.firstTaskID ?? claimed.taskID
                     _ = try await Queries.enqueueTask(
                         on: postgres,
                         namespaceID: signal.namespaceID,
@@ -975,8 +979,12 @@ public struct StrandWorker: Service {
                         fairnessWeight: 1.0,
                         kind: .workflow,
                         parentTaskID: nil,
+                        firstTaskID: firstTaskID,
                         logger: logger
                     )
+                    // completeRun transitions strand.tasks.state → COMPLETED and sets
+                    // completed_at. We immediately overwrite to CONTINUED_AS_NEW so the
+                    // old task is distinguishable from a naturally-completed workflow.
                     try await Queries.completeRun(
                         on: postgres,
                         namespaceID: signal.namespaceID,
@@ -984,6 +992,19 @@ public struct StrandWorker: Service {
                         version: claimed.version,
                         resultBuffer: nil,
                         logger: logger
+                    )
+                    // Override the task state set by completeRun.
+                    // This is a separate statement — there is no race: the old run is
+                    // COMPLETED after completeRun and can never be claimed again, so
+                    // no worker can concurrently transition it to a different state.
+                    try await postgres.query(
+                        """
+                        UPDATE strand.tasks
+                        SET state = \(TaskState.continuedAsNew)
+                        WHERE id           = \(claimed.taskID)
+                          AND namespace_id = \(signal.namespaceID)
+                        """,
+                        logger: taskLogger
                     )
                 }
             } catch {

@@ -1,5 +1,6 @@
 package import NIOCore
 import NIOFoundationCompat
+import PostgresNIO
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -92,5 +93,55 @@ package enum JSON {
     ) throws(StrandError) -> T? {
         guard let buffer, buffer.readableBytes > 0 else { return nil }
         return try decode(type, from: buffer)
+    }
+}
+
+// MARK: - RawJSONB
+
+/// A `PostgresCodable` that binds and reads a JSONB column using the text
+/// wire format (OID 3802) rather than binary.
+///
+/// ```swift
+/// // Write — bind a ByteBuffer directly as JSONB:
+/// conn.query("INSERT INTO t (payload) VALUES (\(RawJSONB(payloadBuffer)))")
+/// conn.query("SELECT … WHERE payload @> \(RawJSONB(payloadBuffer))")
+///
+/// // Read — decode a JSONB column as a ByteBuffer, no SQL ::text cast:
+/// let raw = try col.next()!.decode(RawJSONB?.self, context: .default)
+/// let buf: ByteBuffer? = raw.map(\.buffer)
+/// ```
+struct RawJSONB: PostgresNonThrowingEncodable, PostgresDecodable, Sendable {
+    static var psqlType: PostgresDataType { .jsonb }
+    static var psqlFormat: PostgresFormat { .text }
+
+    private(set) var buffer: ByteBuffer
+
+    init(_ buffer: ByteBuffer) {
+        self.buffer = buffer
+    }
+
+    // MARK: Encode (write side)
+
+    func encode(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<some PostgresJSONEncoder>
+    ) {
+        var buf = buffer
+        byteBuffer.writeBuffer(&buf)
+    }
+
+    // MARK: Decode (read side)
+    //
+    // PostgresNIO requests text format for this column because psqlFormat == .text.
+    // PostgreSQL sends the JSON string with no binary prefix, so we get clean bytes.
+
+    init(
+        from buffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<some PostgresJSONDecoder>
+    ) throws {
+        // readSlice shares the underlying storage (copy-on-write) — no copy.
+        self.buffer = buffer.readSlice(length: buffer.readableBytes) ?? ByteBuffer()
     }
 }

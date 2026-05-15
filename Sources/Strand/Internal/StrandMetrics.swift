@@ -46,6 +46,25 @@ public enum StrandMetrics {
     /// Workflow called `context.continueAsNew(input:)` — old run completed, new task enqueued.
     /// **Dimensions**: `task_name`, `queue`
     public static let tasksContinuedAsNew = "strand.tasks.continued_as_new"
+
+    // MARK: - Pruner
+
+    /// Number of terminal tasks deleted in a pruner cycle.
+    /// Includes COMPLETED, CONTINUED_AS_NEW, FAILED, and CANCELLED tasks
+    /// that have aged past the namespace retention window.
+    /// **Dimensions**: `namespace`
+    public static let prunerTasksDeleted = "strand.pruner.tasks_deleted"
+
+    /// Number of events deleted in a pruner cycle.
+    /// `strand.events` rows have no FK to tasks and are pruned independently.
+    /// **Dimensions**: `namespace`
+    public static let prunerEventsDeleted = "strand.pruner.events_deleted"
+
+    /// Number of monthly partitions dropped in a partition management cycle.
+    /// A non-zero value means at least one whole month of `strand.runs` or
+    /// `strand.task_logs` data was instantly reclaimed without a vacuum.
+    /// **Dimensions**: `namespace`
+    public static let prunerPartitionsDropped = "strand.pruner.partitions_dropped"
 }
 
 // MARK: - LISTEN/NOTIFY channel names

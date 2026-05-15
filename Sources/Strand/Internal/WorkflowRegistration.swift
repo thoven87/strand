@@ -157,7 +157,6 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         let checkpointRows = try await Queries.getCheckpointStates(
             on: exec.postgres,
             taskID: claimed.taskID,
-            runID: claimed.runID,
             logger: exec.logger
         )
         var checkpointCache: [Int: ByteBuffer] = [:]
@@ -356,7 +355,6 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             let freshCheckpoints = try await Queries.getCheckpointStates(
                 on: exec.postgres,
                 taskID: claimed.taskID,
-                runID: claimed.runID,
                 logger: exec.logger
             )
             for row in freshCheckpoints where activation.cachedCheckpoint(for: row.seqNum) == nil {

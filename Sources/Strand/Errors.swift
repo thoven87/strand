@@ -53,34 +53,7 @@ public enum StrandError: Error, LocalizedError, Sendable {
     }
 }
 
-// MARK: - EventWaitTimeoutError
 
-/// Thrown by ``WorkflowContext/waitForEvent(_:as:timeout:)`` when the timeout
-/// elapses before the named event arrives.
-///
-/// Catch this type specifically in your workflow handler — do **not** catch the
-/// broader ``StrandError`` enum, which contains framework-internal variants
-/// that must propagate to the runtime:
-///
-/// ```swift
-/// do {
-///     let payload = try await context.waitForEvent(
-///         "order.shipped", as: ShipmentInfo.self, timeout: .seconds(300)
-///     )
-///     return .success(payload)
-/// } catch is EventWaitTimeoutError {
-///     // No one shipped within 5 minutes — escalate
-///     return .timedOut
-/// }
-/// ```
-public struct EventWaitTimeoutError: Error, Sendable {
-    /// The name of the event that was being waited for.
-    public let eventName: String
-
-    public var localizedDescription: String {
-        "Timed out waiting for event \"\(eventName)\""
-    }
-}
 
 /// Internal sentinel errors used to signal clean lifecycle transitions.
 /// Never surfaced to user code.

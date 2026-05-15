@@ -275,6 +275,8 @@ package enum WorkflowStateQueries {
         case workflowFailed = "WORKFLOW_FAILED"
         case signalReceived = "SIGNAL_RECEIVED"
         case activityScheduled = "ACTIVITY_SCHEDULED"
+        case activityCompleted = "ACTIVITY_COMPLETED"
+        case activityFailed = "ACTIVITY_FAILED"
         case timerStarted = "TIMER_STARTED"
         case timerFired = "TIMER_FIRED"
         case conditionWaiting = "CONDITION_WAITING"

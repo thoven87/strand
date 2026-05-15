@@ -22,11 +22,15 @@ import type { StrandEvent } from "@/api/types";
 /** Returns the first ~60 visible characters of a JSON string, without newlines. */
 function payloadPreview(raw: string | null): string | null {
     if (!raw) return null;
+    // Strip JSONB binary wire-format version byte (0x01) defensively.
+    // The backend now uses RawJSONB (text format) so this byte should never
+    // appear, but guard against version skew or cached responses.
+    const clean = raw.charCodeAt(0) === 1 ? raw.slice(1) : raw;
     try {
-        const pretty = JSON.stringify(JSON.parse(raw));
+        const pretty = JSON.stringify(JSON.parse(clean));
         return pretty.length > 72 ? pretty.slice(0, 69) + "…" : pretty;
     } catch {
-        return raw.length > 72 ? raw.slice(0, 69) + "…" : raw;
+        return clean.length > 72 ? clean.slice(0, 69) + "…" : clean;
     }
 }
 

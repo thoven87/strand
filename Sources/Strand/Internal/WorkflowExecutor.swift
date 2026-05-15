@@ -33,7 +33,12 @@ enum WorkflowCommand: Sendable {
     case startTimer(wakeAt: Date, seqNum: Int)
 
     /// Register a named-event wait and suspend until the event arrives.
-    case awaitEvent(eventName: String, seqNum: Int, timeoutAt: Date?)
+    ///
+    /// `predicate` is a JSONB-serialized equality filter (e.g. `{"approvalId": "abc-123"}`).
+    /// `nil` means match any payload — used by the auto-scoped typed API.
+    /// Non-nil predicates are stored in `strand.event_waits.predicate` and evaluated
+    /// by Postgres at emission time via `incoming_payload @> predicate`.
+    case awaitEvent(eventName: String, seqNum: Int, timeoutAt: Date?, predicate: ByteBuffer?)
 
     /// Persist a computed value as a checkpoint (uuid/random result or activity fast-path).
     /// Non-suspending — the handler continues immediately after emitting this.
@@ -63,6 +68,13 @@ enum WorkflowCommand: Sendable {
     /// Always carries `seqNum` (the deadline checkpoint slot) so `applyScheduleCommands`
     /// can atomically write the `ConditionResultSentinel` and `CONDITION_TIMED_OUT`.
     case conditionTimedOut(seqNum: Int)
+
+    /// Records that an activity result (success or failure) was delivered to the handler.
+    /// Non-suspending — processed by the step-2 loop to write an `ACTIVITY_COMPLETED` or
+    /// `ACTIVITY_FAILED` history event. For successful completions the accompanying
+    /// `.writeCheckpoint` ensures replays return via fast-path-1 without re-emitting.
+    /// For failures, an `ActivityFailedSentinel` checkpoint guards the same invariant.
+    case activityCompleted(name: String, seqNum: Int, failed: Bool)
 
     /// Records that a child workflow result was delivered to the handler.
     /// Non-suspending — processed by the step-2 loop to write a `CHILD_WORKFLOW_COMPLETED`
@@ -107,8 +119,6 @@ enum WorkflowCommand: Sendable {
 /// parked on `CheckedContinuation`s here. On re-activation the worker calls the
 /// Resume API (`resumeActivity`, `resumeAllTimers`, etc.) to deliver real results,
 /// then calls `drain()` to continue the handler from where it paused.
-///
-/// **Why `@unchecked Sendable`**
 ///
 /// All access occurs on the drain loop caller's thread. Never share this object
 /// across concurrent tasks or call `drain()` from two threads at once.

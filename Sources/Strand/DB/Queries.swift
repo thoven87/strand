@@ -163,6 +163,7 @@ enum Queries {
         fairnessWeight: Double = 1.0,
         kind: TaskKind = .workflow,
         parentTaskID: UUID? = nil,
+        firstTaskID: UUID? = nil,
         backfillID: UUID? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
@@ -177,14 +178,14 @@ enum Queries {
                     (namespace_id, id, queue, name, params, headers, scheduling_metadata,
                      retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds,
                      cancellation, idempotency_key, priority, fairness_key, fairness_weight,
-                     state, kind, parent_task_id, deadline_at, backfill_id)
+                     state, kind, parent_task_id, first_task_id, deadline_at, backfill_id)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
                         \(headersBuffer), \(schedulingMetadata),
                         \(retryStrategyBuffer), \(maxAttempts),
                         \(timeoutSeconds), \(heartbeatTimeoutSeconds),
                         \(cancellationBuffer), \(idempotencyKey), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
-                        \(kind), \(parentTaskID), \(deadlineAt), \(backfillID))
+                        \(kind), \(parentTaskID), \(firstTaskID), \(deadlineAt), \(backfillID))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
                 """,
                 logger: logger
@@ -626,7 +627,8 @@ enum Queries {
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
                    c.wake_event, c.event_payload,
                    t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
-                   t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at
+                   t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at,
+                   t.first_task_id
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
@@ -1177,14 +1179,18 @@ enum Queries {
 
     // MARK: - Checkpoints
 
-    /// Bulk-loads all checkpoints for `taskID` written by `runID`.
+    /// Loads all checkpoint rows for a workflow task regardless of which run wrote them.
     ///
-    /// Keyed by `seq_num` (integer primary key) rather than name. Callers use the
-    /// returned `seqNum` to reconstruct the deterministic step counter cache.
+    /// The `run_id` filter was removed: `strand.checkpoints` has PRIMARY KEY
+    /// `(task_id, seq_num)`, so there is at most one row per seq_num per task.
+    /// The `setCheckpointState` upsert already uses an attempt-number guard so
+    /// only the highest-attempt run's value survives for each seq_num. Loading
+    /// all checkpoints for the task (not just the current run) means crash recovery
+    /// correctly reconstructs deterministic values (uuid(), random()) even when
+    /// `failRun` has created a new run_id for a workflow retry.
     static func getCheckpointStates(
         on client: PostgresClient,
         taskID: UUID,
-        runID: UUID,
         logger: Logger
     ) async throws -> [CheckpointRow] {
         let stream = try await client.query(
@@ -1192,8 +1198,7 @@ enum Queries {
             SELECT seq_num, name, state
             FROM strand.checkpoints
             WHERE task_id = \(taskID)
-              AND run_id  = \(runID)
-            ORDER BY created_at
+            ORDER BY seq_num
             """,
             logger: logger
         )
@@ -1353,8 +1358,9 @@ enum Queries {
             )
             if let row = try await evtStream.first(where: { _ in true }) {
                 var col = row.makeIterator()
-                if let payload = try col.next()!.decode(ByteBuffer?.self, context: .default) {
-                    return .payload(payload)
+                // RawJSONB decodes JSONB in text wire format — no 0x01 binary prefix.
+                if let raw = try col.next()!.decode(RawJSONB?.self, context: .default) {
+                    return .payload(raw.buffer)
                 }
             }
             let timeoutAt: Date? = timeoutSeconds.map { Date.now.addingTimeInterval(Double($0)) }
@@ -1499,13 +1505,20 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.events (id, namespace_id, queue, name, payload)
-                VALUES (\(emissionID), \(namespaceID), \(queue), \(eventName), \(payloadBuffer))
+                VALUES (\(emissionID), \(namespaceID), \(queue), \(eventName), \(RawJSONB(payloadBuffer)))
                 """,
                 logger: logger
             )
-            // namespace_id filter is essential for tenant isolation.
+
+            // payload is JSONB; RawJSONB sends payloadBuffer with JSONB OID directly.
             let waitsStream = try await conn.query(
-                "SELECT task_id, run_id FROM strand.event_waits WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND event_name = \(eventName)",
+                """
+                SELECT task_id, run_id FROM strand.event_waits
+                WHERE namespace_id = \(namespaceID)
+                  AND queue        = \(queue)
+                  AND event_name   = \(eventName)
+                  AND \(RawJSONB(payloadBuffer)) @> predicate
+                """,
                 logger: logger
             )
             var waits: [(taskID: UUID, runID: UUID)] = []
@@ -1543,8 +1556,16 @@ enum Queries {
                     logger: logger
                 )
             }
+            // Delete only the waiters that were actually woken (predicate matched).
+            // Non-matching waiters remain registered for a future event that satisfies them.
             try await conn.query(
-                "DELETE FROM strand.event_waits WHERE namespace_id = \(namespaceID) AND queue = \(queue) AND event_name = \(eventName)",
+                """
+                DELETE FROM strand.event_waits
+                WHERE namespace_id = \(namespaceID)
+                  AND queue        = \(queue)
+                  AND event_name   = \(eventName)
+                  AND \(RawJSONB(payloadBuffer)) @> predicate
+                """,
                 logger: logger
             )
             if !waits.isEmpty {

@@ -137,19 +137,55 @@ private struct TimeoutEventWorkflow: Workflow {
         context: WorkflowContext<Self>,
         input: TimeoutEventInput
     ) async throws -> String {
-        do {
-            return try await context.waitForEvent(
-                input.eventName,
-                as: String.self,
-                timeout: .seconds(1)
-            )
-        } catch is EventWaitTimeoutError {
+        if let result = try await context.waitForEvent(
+            input.eventName,
+            as: String.self,
+            timeout: .seconds(1)
+        ) {
+            return result
+        } else {
             return "timed-out"
         }
     }
 }
 
-// ── 7. Signalled ────────────────────────────────────────────────────────────
+// ── 7. Nested-predicate event ──────────────────────────────────────────────
+// Exercises waitForEvent(matching:) with a 3-level keypath predicate.
+// Two concurrent workflows share the same event name but different city values;
+// each must only wake when the emitted payload matches its own predicate.
+// Used by: nestedPredicateRouting test.
+
+private struct CityPayload: Codable, Sendable, Equatable {
+    struct Order: Codable, Sendable, Equatable {
+        struct Address: Codable, Sendable, Equatable {
+            let city: String
+        }
+        let address: Address
+    }
+    let order: Order
+}
+
+private struct CityEvent: WorkflowEvent {
+    typealias Payload = CityPayload
+}
+
+private struct NestedPredicateWorkflow: Workflow {
+    typealias Input = String   // city this instance is waiting for
+    typealias Output = String  // city that actually arrived in the payload
+
+    mutating func run(
+        context: WorkflowContext<Self>,
+        input: String
+    ) async throws -> String {
+        let payload = try await context.waitForEvent(
+            CityEvent.self,
+            matching: \.order.address.city == input
+        )
+        return payload.order.address.city
+    }
+}
+
+// ── 8. Signalled ────────────────────────────────────────────────────────────
 // Stores signal receipt as optional workflow state so it survives between
 // activations. The `Bool?` (rather than `Bool`) decodes cleanly from the
 // initial empty-object `{}` that the worker synthesises on the first
@@ -452,6 +488,57 @@ struct EventTests {
 
             let result = try await handle.result(timeout: .seconds(10))
             #expect(result == EventPayload(msg: "from-test"))
+        }
+    }
+
+    @Test("waitForEvent matching: routes by nested payload predicate — 3-level keypath")
+    func nestedPredicateRouting() async throws {
+        try await withTestEnvironment { client in
+            let workerTask = startWorker(
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [NestedPredicateWorkflow.self]
+            )
+            defer { workerTask.cancel() }
+
+            // Two concurrent instances each waiting for a different city.
+            let handleNYC = try await client.startWorkflow(
+                NestedPredicateWorkflow.self, options: .init(), input: "NYC"
+            )
+            let handleLDN = try await client.startWorkflow(
+                NestedPredicateWorkflow.self, options: .init(), input: "London"
+            )
+
+            // Wait until both have registered their event_wait (state = WAITING).
+            let deadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < deadline {
+                let s1 = try await handleNYC.snapshot()
+                let s2 = try await handleLDN.snapshot()
+                if s1?.state == .waiting && s2?.state == .waiting { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+
+            // Emit London — the NYC workflow must NOT wake (predicate mismatch).
+            try await client.emit(
+                CityEvent.self,
+                payload: .init(order: .init(address: .init(city: "London")))
+            )
+            try await Task.sleep(for: .milliseconds(400))
+
+            let snapNYC = try await handleNYC.snapshot()
+            #expect(snapNYC?.state == .waiting, "NYC workflow should not wake on London event")
+
+            // Emit NYC — only the NYC workflow should wake.
+            try await client.emit(
+                CityEvent.self,
+                payload: .init(order: .init(address: .init(city: "NYC")))
+            )
+
+            let resultLDN = try await handleLDN.result(timeout: .seconds(10))
+            let resultNYC = try await handleNYC.result(timeout: .seconds(10))
+            #expect(resultLDN == "London")
+            #expect(resultNYC == "NYC")
         }
     }
 

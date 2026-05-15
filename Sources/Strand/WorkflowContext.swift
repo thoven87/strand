@@ -34,6 +34,20 @@ struct SleepCompletedSentinel: Codable {
     }
 }
 
+/// Checkpoint sentinel stored when an activity terminates with FAILED or CANCELLED.
+/// On fresh-path replay, detecting this sentinel in the checkpoint cache causes
+/// `runActivity` to re-throw the stored error without emitting `.activityCompleted`,
+/// ensuring the `ACTIVITY_FAILED` history event is written exactly once regardless of
+/// how many re-activations follow.
+struct ActivityFailedSentinel: Codable {
+    let failed: Bool
+    init() { self.failed = true }
+    private enum CodingKeys: String, CodingKey { case failed = "$activityFailed" }
+    static func detect(in buffer: ByteBuffer) -> Bool {
+        (try? JSON.decode(ActivityFailedSentinel.self, from: buffer))?.failed == true
+    }
+}
+
 /// Checkpoint sentinel written when a `condition(timeout:)` call resolves (either
 /// predicate satisfied or deadline elapsed). Overrides the deadline checkpoint so
 /// replay can return the result immediately without re-evaluating the predicate.
@@ -384,12 +398,37 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // ── Fast path 1: checkpoint cache (result persisted in a prior activation) ──────
         if let cached = _impl.checkpointCache[seqNum] {
+            // An ActivityFailedSentinel means the activity failed or was cancelled.
+            // Re-throw the stored error without emitting any command — exactly-once guard
+            // that prevents ACTIVITY_FAILED from being written more than once on replay.
+            if ActivityFailedSentinel.detect(in: cached) {
+                if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
+                    if let buf = nonSuccess.failureReason,
+                        let af = ActivityFailure.decode(from: buf),
+                        let typedErr = af.decode(A.Failure.self)
+                    {
+                        throw typedErr
+                    }
+                    let cause = nonSuccess.failureReason.flatMap { ActivityFailure.decode(from: $0) }
+                    let retryState: ActivityRetryState =
+                        nonSuccess.state == .cancelled ? .cancelled : .maximumAttemptsReached
+                    throw ActivityError(activityName: A.name, retryState: retryState, cause: cause)
+                }
+                // Fallback: failure reason not available (edge case in crash recovery).
+                throw ActivityError(activityName: A.name, retryState: .maximumAttemptsReached, cause: nil)
+            }
             return try JSON.decode(A.Output.self, from: cached)
         }
 
         // ── Fast path 2a: activity terminated with FAILED or CANCELLED in a prior activation ───
         if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
             _impl.lastCallSite = (fileID, line)
+            // Write a failure sentinel so the next fresh-path replay hits fast path 1 and
+            // does not re-emit .activityCompleted — exactly-once ACTIVITY_FAILED history write.
+            if let sentinel = try? JSON.encode(ActivityFailedSentinel()) {
+                _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: sentinel))
+            }
+            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
             // Attempt to decode the original typed Failure value from the stored payload.
             // Falls back to ActivityError when Failure = Never or payload is absent.
             if let buf = nonSuccess.failureReason,
@@ -412,6 +451,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             _impl.checkpointCache[seqNum] = preloaded
             // Emit a checkpoint write so the worker persists this result after drain.
             _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: preloaded))
+            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
             return try JSON.decode(A.Output.self, from: preloaded)
         }
 
@@ -437,9 +477,21 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 (cont: CheckedContinuation<ByteBuffer, Error>) in
                 _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
             }
+            // Continuation resumed — activity completed in this activation.
+            // Write a checkpoint so fresh-path replays use fast path 1 without needing
+            // task_completions. Emit .activityCompleted for the ACTIVITY_COMPLETED history event.
+            _impl.checkpointCache[seqNum] = resultBuffer
+            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: resultBuffer))
+            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
             return try JSON.decode(A.Output.self, from: resultBuffer)
         } catch let signal as _ActivityFailureSignal {
-            // Re-activation delivered a typed failure signal — try to decode A.Failure.
+            // Re-activation delivered a typed failure signal.
+            // Write a failure sentinel so fresh-path replays hit fast path 1 (exactly-once guard).
+            if let sentinel = try? JSON.encode(ActivityFailedSentinel()) {
+                _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: sentinel))
+            }
+            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
+            // Try to decode A.Failure from the stored payload.
             if let buf = signal.failureReason,
                 let af = ActivityFailure.decode(from: buf),
                 let typedErr = af.decode(A.Failure.self)
@@ -636,20 +688,80 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// Suspends the workflow until an event named `name` is emitted, then returns its payload.
     ///
     /// On replay, the payload is returned instantly from the checkpoint cache.
-    /// If `timeout` is set and elapses before the event arrives, throws `StrandError.timeout`.
+    ///
+    /// ## Filtering by payload content
+    ///
+    /// Supply `matching:` to only wake on events whose payload contains specific fields.
+    /// Filtering happens **before** any workflow is resumed (Postgres evaluates
+    /// `incoming_payload @> predicate` at emission time via a GIN index). Non-matching
+    /// emissions leave the wait registered for the next event.
+    ///
+    /// ```swift
+    /// // Wake only when an event arrives with the right approvalId:
+    /// let approval = try await context.waitForEvent(
+    ///     "agent.approval.response",
+    ///     as: ApprovalPayload.self,
+    ///     matching: \.approvalId == input.approvalId
+    /// )
+    ///
+    /// // With a timeout — returns nil when the deadline elapses:
+    /// if let approval = try await context.waitForEvent(
+    ///     "order.approved",
+    ///     as: ApprovalPayload.self,
+    ///     timeout: .seconds(300)
+    /// ) {
+    ///     // received
+    /// } else {
+    ///     // timed out — normal control flow, not an error
+    /// }
+    /// ```
     ///
     /// - Parameters:
-    ///   - name: The event name to wait for (matched against `emitEvent` calls or
-    ///     `client.emitEvent` calls from outside the workflow).
+    ///   - name: The event name to wait for.
     ///   - type: Expected payload type. Must match what the emitter encodes.
-    ///   - timeout: Optional maximum wait duration. `nil` = wait forever.
+    ///   - matching: Optional equality predicate on the payload. `nil` = match any payload.
     public func waitForEvent<T: Codable & Sendable>(
         _ name: String,
         as type: T.Type,
-        timeout: Duration? = nil,
+        matching predicate: EventPredicate<T>? = nil,
         fileID: String = #fileID,
         line: Int = #line
     ) async throws -> T {
+        // No timeout — nil is structurally impossible; force-unwrap is safe.
+        try await _waitForEvent(name, as: type, matching: predicate, timeout: nil, fileID: fileID, line: line)!
+    }
+
+    /// Suspends the workflow until an event named `name` is emitted, or until
+    /// `timeout` elapses — whichever comes first.
+    ///
+    /// Returns the decoded payload when the event arrives, or `nil` when the
+    /// deadline elapses. A timeout is normal control flow, not an error.
+    ///
+    /// - Parameters:
+    ///   - name: The event name to wait for.
+    ///   - type: Expected payload type. Must match what the emitter encodes.
+    ///   - matching: Optional equality predicate on the payload. `nil` = match any payload.
+    ///   - timeout: Maximum duration to wait. When elapsed, returns `nil`.
+    public func waitForEvent<T: Codable & Sendable>(
+        _ name: String,
+        as type: T.Type,
+        matching predicate: EventPredicate<T>? = nil,
+        timeout: Duration,
+        fileID: String = #fileID,
+        line: Int = #line
+    ) async throws -> T? {
+        try await _waitForEvent(name, as: type, matching: predicate, timeout: timeout, fileID: fileID, line: line)
+    }
+
+    // Shared implementation — public overloads above provide the right return type.
+    private func _waitForEvent<T: Codable & Sendable>(
+        _ name: String,
+        as type: T.Type,
+        matching predicate: EventPredicate<T>?,
+        timeout: Duration?,
+        fileID: String,
+        line: Int
+    ) async throws -> T? {
         _impl.lastCallSite = (fileID, line)
         let seqNum = _impl.nextSeqNum()
 
@@ -658,7 +770,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Checkpoint cache — either the payload or a timeout sentinel from a prior activation.
         if let cached = _impl.checkpointCache[seqNum] {
             if TimeoutSentinel.detect(in: cached) {
-                throw EventWaitTimeoutError(eventName: name)
+                return nil
             }
             return try JSON.decode(T.self, from: cached)
         }
@@ -676,18 +788,22 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 // Woken by timeout — applyScheduleCommands writes the sentinel checkpoint
                 // and EVENT_WAIT_TIMED_OUT history row atomically via writeEventWaitTimedOut.
                 _impl.executor.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
-                throw EventWaitTimeoutError(eventName: name)
+                return nil
             }
         }
 
-        // ── Slow path: event not yet received — emit command and suspend ─────────────────
+        // ── Slow path: event not yet received — emit command and suspend ──────────
+        let predicateBuf: ByteBuffer? = try predicate.flatMap { p in
+            ByteBuffer(bytes: try p.toJSONBytes())
+        }
         let timeoutAt: Date? = timeout.map { Date.now.addingDuration($0) }
 
         _impl.executor.emit(
             .awaitEvent(
-                eventName: name,  // raw name — no prefix
+                eventName: name,
                 seqNum: seqNum,
-                timeoutAt: timeoutAt
+                timeoutAt: timeoutAt,
+                predicate: predicateBuf   // nil → DB stores '{}', matches any payload
             )
         )
 
@@ -703,7 +819,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         } catch let err as StrandError {
             if case .timeout = err {
                 _impl.executor.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
-                throw EventWaitTimeoutError(eventName: name)
+                return nil
             }
             throw err
         }
@@ -711,15 +827,11 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Write a checkpoint and record EVENT_RECEIVED so that:
         // (a) crash-recovery fresh activations fast-path through this seqNum, and
         // (b) the trace view shows a complete WAIT span duration.
-        // This mirrors what the re-activation fast-path does when wakeEvent == name;
-        // the slow path (cached-Task continuation resume) must do the same so both
-        // paths leave identical marks in strand.checkpoints and workflow_history.
         _impl.checkpointCache[seqNum] = resultBuffer
         _impl.executor.emit(
             .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: resultBuffer)
         )
         _impl.executor.emit(.eventReceived(eventName: name))
-
         return try JSON.decode(T.self, from: resultBuffer)
     }
 
@@ -731,31 +843,37 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// the queue, this call is a no-op.
     ///
     /// - Parameters:
-    /// Typed `WorkflowEvent` overload — the compiler enforces that the event
-    /// name and payload type match between emitter and waiter.
+    /// Typed `WorkflowEvent` overload.
+    ///
+    /// Waits for an event named `E.name` and optionally filters by payload content.
+    /// Use `matching:` to ensure only events with specific field values wake this
+    /// workflow instance — filtering happens before any workflow is resumed.
     ///
     /// ```swift
-    /// try await context.waitForEvent(OrderShippedEvent.self)
+    /// // Broadcast — any emission of this event type wakes the workflow:
+    /// let signal = try await context.waitForEvent(SystemShutdownEvent.self)
+    ///
+    /// // Instance-scoped via predicate — only matching payloads wake this workflow:
+    /// let approval = try await context.waitForEvent(
+    ///     OrderApprovedEvent.self,
+    ///     matching: \.orderId == input.orderId
+    /// )
     /// ```
+    /// Typed overload — no timeout. Waits forever until the event arrives.
     public func waitForEvent<E: WorkflowEvent>(
         _ eventType: E.Type,
-        timeout: Duration? = nil
+        matching predicate: EventPredicate<E.Payload>? = nil
     ) async throws -> E.Payload {
-        try await waitForEvent(E.name, as: E.Payload.self, timeout: timeout)
+        try await waitForEvent(E.name, as: E.Payload.self, matching: predicate)
     }
 
-    /// Typed `WorkflowEvent` overload for emitting — derives the event name from
-    /// the event type so the compiler catches mismatches at the call site.
-    ///
-    /// ```swift
-    /// try await context.emitEvent(OrderShippedEvent.self,
-    ///     payload: TrackingInfo(number: "1Z999"))
-    /// ```
-    public func emitEvent<E: WorkflowEvent>(
+    /// Typed overload — with timeout. Returns `nil` when the deadline elapses.
+    public func waitForEvent<E: WorkflowEvent>(
         _ eventType: E.Type,
-        payload: E.Payload
-    ) throws {
-        try emitEvent(E.name, payload: payload)
+        matching predicate: EventPredicate<E.Payload>? = nil,
+        timeout: Duration
+    ) async throws -> E.Payload? {
+        try await waitForEvent(E.name, as: E.Payload.self, matching: predicate, timeout: timeout)
     }
 
     /// Emits a named event on this workflow's queue.

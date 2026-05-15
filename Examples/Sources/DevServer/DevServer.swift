@@ -525,11 +525,14 @@ private func seedOnePodcast(client: StrandClient, logger: Logger) async {
             logger: logger
         )
 
+        let pruner = StrandPruner(postgres: postgres, logger: logger)
+
         app.addServices(observability)  // OTel must be first so spans are emitted correctly
         app.addServices(postgres)
         app.addServices(notifier)  // one LISTEN connection, fans out to workers + listener
         app.addServices(ordersWorker)
         app.addServices(reportsWorker)
+        app.addServices(pruner)  // prunes all namespaces, reads retention_days from DB
         app.addServices(metricsListener)  // receives strand_metrics broadcasts→ updates cache
         app.addServices(metricsLoop)  // broadcasts live counts every 5 s
 

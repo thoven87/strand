@@ -196,7 +196,7 @@ extension EventRow {
         var col = row.makeIterator()
         id = try col.next()!.decode(UUID.self, context: .default)
         name = try col.next()!.decode(String.self, context: .default)
-        payloadBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
+        payloadBuffer = try col.next()!.decode(RawJSONB?.self, context: .default).map(\.buffer)
         createdAt = try col.next()!.decode(Date.self, context: .default)
         queue = try col.next()!.decode(String.self, context: .default)
         // triggered_tasks is a json_agg result; uniqueness enforced by the
@@ -948,6 +948,96 @@ package enum ManagementQueries {
         return h > 0 ? "\(days)d \(h)h" : "\(days)d"
     }
 
+    // MARK: - Retention helpers
+
+    /// Returns all namespace IDs from `strand.namespaces`, ordered alphabetically.
+    /// Used by the pruner when `namespaceID` is `nil` (prune all namespaces).
+    /// Connection overload — SQL lives here.
+    package static func allNamespaceIDs(
+        on conn: PostgresConnection,
+        logger: Logger
+    ) async throws -> [String] {
+        let stream = try await conn.query(
+            "SELECT id FROM strand.namespaces ORDER BY id",
+            logger: logger
+        )
+        var ids: [String] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            if let id = try? col.next()?.decode(String.self, context: .default) {
+                ids.append(id)
+            }
+        }
+        return ids
+    }
+
+    package static func allNamespaceIDs(
+        on client: PostgresClient,
+        logger: Logger
+    ) async throws -> [String] {
+        try await client.withConnection { conn in
+            try await allNamespaceIDs(on: conn, logger: logger)
+        }
+    }
+
+    /// Minimum `retention_days` across all namespaces, falling back to 30.
+    ///
+    /// Used for partition-drop cutoff calculations in multi-namespace mode:
+    /// partitions are shared across all namespaces, so the most conservative
+    /// (shortest) retention window must be respected — a partition cannot be
+    /// dropped if any namespace still needs data from it.
+    /// Connection overload — SQL lives here.
+    package static func minimumRetentionDays(
+        on conn: PostgresConnection,
+        logger: Logger
+    ) async throws -> Int {
+        let stream = try await conn.query(
+            "SELECT COALESCE(MIN(retention_days), 30) FROM strand.namespaces",
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else { return 30 }
+        var col = row.makeIterator()
+        return (try? col.next()?.decode(Int.self, context: .default)) ?? 30
+    }
+
+    package static func minimumRetentionDays(
+        on client: PostgresClient,
+        logger: Logger
+    ) async throws -> Int {
+        try await client.withConnection { conn in
+            try await minimumRetentionDays(on: conn, logger: logger)
+        }
+    }
+
+    /// Returns `retention_days` for a single namespace, falling back to 30
+    /// if the row is missing. Used per-namespace in `tryPrune` and in
+    /// `tryManagePartitions` when a specific namespace is configured.
+    /// Connection overload — SQL lives here.
+    package static func retentionDays(
+        namespaceID: String,
+        on conn: PostgresConnection,
+        logger: Logger
+    ) async throws -> Int {
+        let stream = try await conn.query(
+            "SELECT retention_days FROM strand.namespaces WHERE id = \(namespaceID)",
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else { return 30 }
+        var col = row.makeIterator()
+        return (try? col.next()?.decode(Int.self, context: .default)) ?? 30
+    }
+
+    /// Client overload — one-liner that delegates to the connection overload.
+    package static func retentionDays(
+        namespaceID: String,
+        on client: PostgresClient,
+        logger: Logger
+    ) async throws -> Int {
+        try await client.withConnection { conn in
+            try await retentionDays(namespaceID: namespaceID, on: conn, logger: logger)
+        }
+    }
+
     // MARK: - Cleanup
 
     /// Deletes terminal tasks older than `ageSeconds` and their associated
@@ -983,14 +1073,45 @@ package enum ManagementQueries {
             -- Each state clause uses its own terminal timestamp so the
             -- partial indexes (strand_tasks_completed_at_idx, etc.) can be
             -- used instead of scanning the full table.
+            --
+            -- IMPORTANT — parent-task guard:
+            -- Never prune a child task (parent_task_id IS NOT NULL) while its
+            -- parent workflow is still alive. Doing so would delete the child's
+            -- task_completions row, which is the durable result store used by
+            -- crash-recovery (_activate → loadCompletedChildActivities). Without
+            -- that row, a post-crash replay would re-execute already-completed
+            -- activities, causing duplicate side effects.
+            --
+            -- A child task is safe to prune when:
+            --   (a) it has no parent (root task), OR
+            --   (b) its parent no longer exists (was already pruned), OR
+            --   (c) its parent is itself terminal — i.e. the whole workflow tree
+            --       is done and the parent will be pruned in the same or a
+            --       subsequent cycle.
             WITH to_delete AS (
-                SELECT id FROM strand.tasks
+                SELECT id FROM strand.tasks t
                 WHERE namespace_id = \(namespaceID)
                   AND (\(queue)::text IS NULL OR queue = \(queue))
                   AND (
-                        (state = 'COMPLETED' AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
-                     OR (state = 'CANCELLED' AND cancelled_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
-                     OR (state = 'FAILED'    AND created_at   < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                        (state = 'COMPLETED'        AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = 'CONTINUED_AS_NEW'  AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = 'CANCELLED'         AND cancelled_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = 'FAILED'            AND created_at   < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                  )
+                  AND (
+                      -- Root task — safe to prune independently.
+                      t.parent_task_id IS NULL
+                      -- Parent no longer exists (was already pruned) — orphan cleanup.
+                      OR NOT EXISTS (
+                          SELECT 1 FROM strand.tasks parent
+                          WHERE parent.id = t.parent_task_id
+                      )
+                      -- Parent is itself terminal — whole tree is done.
+                      OR EXISTS (
+                          SELECT 1 FROM strand.tasks parent
+                          WHERE parent.id = t.parent_task_id
+                            AND parent.state IN ('COMPLETED', 'CONTINUED_AS_NEW', 'FAILED', 'CANCELLED')
+                      )
                   )
                 LIMIT \(limit)
                 FOR UPDATE SKIP LOCKED
@@ -1027,14 +1148,81 @@ package enum ManagementQueries {
         guard let row = try await stream.first(where: { _ in true }) else { return 0 }
         var col = row.makeIterator()
         let count = try col.next()!.decode(Int.self, context: .default)
-        logger.info(
-            "cleanup removed \(count) terminal tasks",
-            metadata: [
-                "strand.namespace": .string(namespaceID),
-                "strand.queue": .string(queue ?? "*"),
-                "strand.count": .stringConvertible(count),
-            ]
+        if count > 0 {
+            logger.debug(
+                "cleanup removed \(count) terminal tasks",
+                metadata: [
+                    "strand.namespace": .string(namespaceID),
+                    "strand.queue": .string(queue ?? "*"),
+                    "strand.count": .stringConvertible(count),
+                ]
+            )
+        }
+        return count
+    }
+
+    /// Deletes events from `strand.events` older than `ageSeconds`.
+    ///
+    /// Events are append-only and have no FK to tasks, so they are never
+    /// cascade-deleted by ``cleanupTasks``. Without explicit pruning they
+    /// accumulate indefinitely.
+    ///
+    /// Deleting an event sets `emission_id` to NULL on any `strand.event_triggers`
+    /// rows that reference it (via `ON DELETE SET NULL`). Those event_trigger
+    /// rows are eventually cleaned up by ``cleanupTasks`` when their tasks are
+    /// pruned.
+    ///
+    /// Returns the number of events deleted.
+    package static func cleanupEvents(
+        on client: PostgresClient,
+        namespaceID: String,
+        ageSeconds: Int?,
+        limit: Int,
+        logger: Logger
+    ) async throws -> Int {
+        let effectiveAgeSeconds: Int
+        if let explicit = ageSeconds {
+            effectiveAgeSeconds = explicit
+        } else {
+            let nsStream = try await client.query(
+                "SELECT retention_days FROM strand.namespaces WHERE id = \(namespaceID)",
+                logger: logger
+            )
+            var days = 30
+            if let nsRow = try await nsStream.first(where: { _ in true }) {
+                var col = nsRow.makeIterator()
+                days = (try? col.next()?.decode(Int.self, context: .default)) ?? 30
+            }
+            effectiveAgeSeconds = days * 24 * 3600
+        }
+
+        let stream = try await client.query(
+            """
+            WITH to_delete AS (
+                SELECT id FROM strand.events
+                WHERE namespace_id = \(namespaceID)
+                  AND created_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second'
+                ORDER BY created_at ASC
+                LIMIT \(limit)
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM strand.events
+            WHERE id IN (SELECT id FROM to_delete)
+            RETURNING id
+            """,
+            logger: logger
         )
+        var count = 0
+        for try await _ in stream { count += 1 }
+        if count > 0 {
+            logger.debug(
+                "cleanup removed \(count) events",
+                metadata: [
+                    "strand.namespace": .string(namespaceID),
+                    "strand.count": .stringConvertible(count),
+                ]
+            )
+        }
         return count
     }
 }

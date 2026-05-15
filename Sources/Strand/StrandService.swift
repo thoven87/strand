@@ -40,9 +40,17 @@ public struct StrandService: Service {
     public struct Options: Sendable {
         /// One entry per logical worker. At least one queue is required.
         public var queues: [QueueConfig]
-        /// Automatic task pruning. `nil` disables the pruner.
-        /// Use `StrandPrunerOptions()` for defaults; all five fields are
-        /// available (`interval`, `maxAge`, `limit`, `queue`, `advisoryLockKey`).
+        /// Automatic task pruning. Enabled by default with ``StrandPrunerOptions``
+        /// defaults: 30-second DELETE cycle (same as River's `JobCleanerIntervalDefault`),
+        /// 12-hour partition management, row limit of 10,000 per cycle, and
+        /// retention read per-namespace from `strand.namespaces.retention_days`
+        /// (default: 30 days). All registered namespaces are pruned each cycle.
+        ///
+        /// Only one instance in the cluster runs each cycle — leader election
+        /// is via `pg_try_advisory_lock`, so running a pruner on every node is safe.
+        ///
+        /// Set to `nil` to disable pruning entirely (useful in test environments
+        /// or when running a dedicated pruner process).
         public var pruner: StrandPrunerOptions?
         /// Scheduler options. `nil` disables the scheduler.
         /// Add schedules with ``StrandService/addSchedule(_:)``.
@@ -52,7 +60,7 @@ public struct StrandService: Service {
 
         public init(
             queues: [QueueConfig],
-            pruner: StrandPrunerOptions? = nil,
+            pruner: StrandPrunerOptions? = .init(),
             scheduler: SchedulerConfig? = nil,
             logger: Logger = Logger(label: "dev.strand")
         ) {
@@ -277,11 +285,12 @@ public struct StrandService: Service {
             )
         }
 
-        // ── 4. Pruner (optional) ────────────────────────────────────────────────
+        // ── 4. Pruner (optional) ────────────────────────────────────────────
+        // namespaceID: nil — prune every namespace in strand.namespaces each
+        // cycle, respecting each namespace's own retention_days setting.
         let pruner: StrandPruner? = options.pruner.map { opts in
             StrandPruner(
                 postgres: postgres,
-                namespaceID: firstQueue.namespace,
                 options: opts,
                 logger: logger
             )
