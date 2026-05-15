@@ -58,6 +58,132 @@ END;
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Monthly partition helpers
+--
+-- strand.runs and strand.workflow_history are partitioned by created_at
+-- (PARTITION BY RANGE). StrandPruner manages the lifecycle:
+--   • create_range_partition — idempotent; called at startup and every 12 h.
+--   • list_partitions_before — finds old partitions to detach and drop.
+--
+-- Naming convention: strand.<table>_<YYYYMM>  e.g. strand.runs_202601
+--
+-- IMPORTANT (Hatchet production lesson): Postgres autovacuum does NOT run
+-- ANALYZE on partitioned parent tables — only on their child partitions. Without
+-- periodic manual ANALYZE on strand.runs and strand.workflow_history the query
+-- planner uses wrong row estimates (up to 6 000 000× off in production), causing
+-- sequential scans on the claim path. StrandPruner.analyzeParentTables() calls
+-- ANALYZE on both parents every 12 h.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- create_range_partition(base_table, month_start, fill_factor)
+-- Creates a child table strand.<base_table>_<YYYYMM> covering one calendar month.
+-- Returns TRUE if the partition was newly created, FALSE if it already existed.
+CREATE OR REPLACE FUNCTION strand.create_range_partition(
+    base_table  TEXT,
+    month_start DATE,
+    fill_factor INTEGER DEFAULT 80
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $$
+DECLARE
+    suffix  TEXT := to_char(date_trunc('month', month_start), 'YYYYMM');
+    p_name  TEXT := base_table || '_' || suffix;   -- e.g. 'runs_202601'
+    p_from  TEXT := to_char(date_trunc('month', month_start), 'YYYY-MM-DD');
+    p_to    TEXT := to_char(date_trunc('month', month_start)
+                            + INTERVAL '1 month', 'YYYY-MM-DD');
+BEGIN
+    -- Idempotent: exit immediately if the partition already exists.
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'strand' AND c.relname = p_name
+    ) THEN
+        RETURN FALSE;
+    END IF;
+
+    -- Create the child table attached to the parent's partition set.
+    EXECUTE format(
+        'CREATE TABLE strand.%I PARTITION OF strand.%I
+         FOR VALUES FROM (%L::TIMESTAMPTZ) TO (%L::TIMESTAMPTZ)',
+        p_name, base_table, p_from, p_to
+    );
+
+    -- Mirror the storage/vacuum settings of the parent table.
+    EXECUTE format(
+        $fmt$ALTER TABLE strand.%I SET (
+            fillfactor                      = %s,
+            autovacuum_vacuum_scale_factor  = 0.05,
+            autovacuum_vacuum_threshold     = 50,
+            autovacuum_analyze_scale_factor = 0.02,
+            autovacuum_analyze_threshold    = 50,
+            autovacuum_vacuum_cost_delay    = 2,
+            autovacuum_vacuum_cost_limit    = 2000
+        )$fmt$,
+        p_name, fill_factor
+    );
+
+    RETURN TRUE;
+END;
+$$;
+
+-- drop_partition(base_table, partition_name)
+-- Drops a partition that has already been detached (or drops it with plain
+-- DETACH when CONCURRENTLY is not required).
+-- Using format('%I') guarantees safe identifier quoting on the SQL side so
+-- Swift callers do not need to build raw DDL strings.
+--
+-- NOTE: DETACH PARTITION CONCURRENTLY cannot run inside any PL/pgSQL block
+-- (Postgres bans it in transaction contexts). Swift therefore calls DETACH via
+-- a raw connection using PostgresQuery(unsafeSQL:) where the identifier values
+-- are sourced exclusively from strand.list_partitions_before — a pg_inherits
+-- system-catalog query, not from user input — so the raw-string approach is safe.
+CREATE OR REPLACE FUNCTION strand.drop_partition(
+    base_table     TEXT,
+    partition_name TEXT
+) RETURNS VOID
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- Plain DETACH (no CONCURRENTLY) — safe inside a function / transaction.
+    -- Use this in dev environments or when lock contention is not a concern.
+    -- Production callers should DETACH CONCURRENTLY first (from app code),
+    -- then call this function to DROP the now-detached table.
+    EXECUTE format('DROP TABLE IF EXISTS strand.%I', partition_name);
+END;
+$$;
+
+-- list_partitions_before(base_table, cutoff_date)
+-- Returns the names (without schema) of partitions for base_table whose
+-- calendar month is strictly before cutoff_date.
+-- Uses the naming convention <table>_<YYYYMM> inside the strand schema.
+CREATE OR REPLACE FUNCTION strand.list_partitions_before(
+    base_table  TEXT,
+    cutoff_date DATE
+) RETURNS TABLE (partition_name TEXT)
+LANGUAGE plpgsql AS $$
+DECLARE
+    parent_oid OID;
+BEGIN
+    SELECT c.oid INTO parent_oid
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'strand' AND c.relname = base_table;
+
+    IF parent_oid IS NULL THEN RETURN; END IF;
+
+    RETURN QUERY
+    SELECT c.relname::TEXT
+    FROM   pg_inherits i
+    JOIN   pg_class c     ON c.oid = i.inhrelid
+    JOIN   pg_namespace n ON n.oid = c.relnamespace
+    WHERE  i.inhparent = parent_oid
+      AND  n.nspname   = 'strand'
+      -- Match naming convention: <base_table>_<YYYYMM>
+      AND  c.relname ~ ('^' || base_table || '_\d{6}$')
+      -- The YYYYMM suffix encodes the month; compare to cutoff
+      AND  to_date(substring(c.relname FROM '\d{6}$'), 'YYYYMM') < cutoff_date;
+END;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Namespaces — top-level isolation boundary.
 --
 -- Provides hard data isolation between tenants. Every execution table carries
@@ -123,6 +249,9 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     --   'WORKFLOW'  — top-level orchestrator, enqueued directly by the client
     --   'ACTIVITY'  — leaf unit of work, spawned by a workflow via runActivity
     parent_task_id  UUID,  -- NULL for root; set when spawned by runActivity / runChildWorkflow
+    -- First task in a continueAsNew chain. NULL for the chain's first task and for all
+    -- child tasks. Set only on root workflows spawned by context.continueAsNew().
+    first_task_id   UUID,
 
     -- Lifecycle
     state        TEXT        NOT NULL DEFAULT 'PENDING',
@@ -148,7 +277,8 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     CONSTRAINT strand_tasks_idempotency_key UNIQUE (namespace_id, queue, idempotency_key),
     CONSTRAINT strand_tasks_kind            CHECK (kind IN ('WORKFLOW', 'ACTIVITY')),
     CONSTRAINT strand_tasks_state           CHECK (state IN (
-        'PENDING', 'RUNNING', 'SLEEPING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED'
+        'PENDING', 'RUNNING', 'SLEEPING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED',
+        'CONTINUED_AS_NEW'
     ))
 );
 
@@ -163,7 +293,7 @@ CREATE INDEX IF NOT EXISTS strand_tasks_ns_kind_idx
 -- Most-recent-first task list (new API sort order)
 CREATE INDEX IF NOT EXISTS strand_tasks_ns_id_desc_idx
     ON strand.tasks (namespace_id, queue, id DESC)
-    WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
+    WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'CONTINUED_AS_NEW');
 
 -- Parent-child lineage: "show all activities spawned by this workflow"
 CREATE INDEX IF NOT EXISTS strand_tasks_parent_idx
@@ -187,6 +317,14 @@ CREATE INDEX IF NOT EXISTS strand_tasks_deadline_idx
 CREATE INDEX IF NOT EXISTS strand_tasks_completed_at_idx
     ON strand.tasks (namespace_id, queue, completed_at DESC)
     WHERE state = 'COMPLETED' AND completed_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS strand_tasks_continued_as_new_idx
+    ON strand.tasks (namespace_id, queue, completed_at DESC)
+    WHERE state = 'CONTINUED_AS_NEW' AND completed_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS strand_tasks_first_task_idx
+    ON strand.tasks (first_task_id)
+    WHERE first_task_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS strand_tasks_cancelled_at_idx
     ON strand.tasks (namespace_id, queue, cancelled_at DESC)
@@ -221,10 +359,21 @@ ALTER TABLE strand.tasks SET (
 -- High churn: rows transition through states frequently.
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- strand.runs is partitioned RANGE by created_at (monthly buckets).
+--
+-- The PRIMARY KEY is (id, created_at) — Postgres requires the partition key
+-- to be part of every unique constraint on a partitioned table.
+-- A separate non-unique index on id alone (strand_runs_id_idx) keeps
+-- point-lookups fast when only the UUID is known (completeRun, failRun, etc.).
+--
+-- FK note: strand.event_waits formerly had run_id REFERENCES strand.runs(id)
+-- ON DELETE CASCADE. That FK cannot reference a non-PK column on a partitioned
+-- table, so it is declared as a plain column (no FK). Application code and the
+-- cascade-drop via partition DROP TABLE maintain the invariant in practice.
 CREATE TABLE IF NOT EXISTS strand.runs (
     id           UUID    NOT NULL,
     namespace_id TEXT    NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
-    task_id      UUID    NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    task_id      UUID    NOT NULL,   -- logical FK to strand.tasks(id); no DB constraint (see above)
     queue        TEXT    NOT NULL,   -- denormalised for fast claim query
     attempt      INTEGER NOT NULL,
 
@@ -260,12 +409,19 @@ CREATE TABLE IF NOT EXISTS strand.runs (
     finished_at TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT strand_runs_pkey  PRIMARY KEY (id),
+    -- Composite PK includes created_at (the partition key).
+    CONSTRAINT strand_runs_pkey  PRIMARY KEY (id, created_at),
     CONSTRAINT strand_runs_kind  CHECK (kind IN ('WORKFLOW', 'ACTIVITY')),
     CONSTRAINT strand_runs_state CHECK (state IN (
         'PENDING', 'RUNNING', 'SLEEPING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED'
     ))
-);
+) PARTITION BY RANGE (created_at);
+
+-- Fast UUID point-lookup when created_at is not known.
+-- Queries like completeRun / failRun use WHERE id = $runID; Postgres scans
+-- the active partition indexes (typically 2-3 monthly partitions).
+CREATE INDEX IF NOT EXISTS strand_runs_id_idx
+    ON strand.runs (id);
 
 -- strand.runs is the highest-churn table: attempt, state, lease_expires_at,
 -- started_at and finished_at all change on every execution. fillfactor = 80
@@ -308,7 +464,7 @@ CREATE INDEX IF NOT EXISTS strand_runs_lease_idx
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS strand.checkpoints (
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     seq_num      INTEGER     NOT NULL,                  -- global activation counter;
     name         TEXT,                                  -- optional human-readable label for debugging only
@@ -330,10 +486,14 @@ CREATE INDEX IF NOT EXISTS strand_checkpoints_ns_idx
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS strand.events (
     id           UUID        NOT NULL,  -- UUIDv7, always generated by Swift via UUID.v7()
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     queue        TEXT        NOT NULL,
     name         TEXT        NOT NULL,
-    payload      BYTEA,
+    -- JSONB: the only table in Strand that stores payload as JSONB rather than BYTEA.
+    -- Justified exception: strand.events is content-routable (waitForEvent predicates
+    -- use `payload @> predicate` at emission time), making JSONB the honest type.
+    -- All other payload columns remain BYTEA per the project convention.
+    payload      JSONB,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT strand_events_pkey PRIMARY KEY (id)
 );
@@ -342,13 +502,19 @@ CREATE TABLE IF NOT EXISTS strand.events (
 -- and the events page list (ordered newest first per name).
 CREATE INDEX IF NOT EXISTS strand_events_name_idx
     ON strand.events (namespace_id, queue, name, created_at DESC);
+-- GIN index enabling efficient `payload @> predicate` containment checks at
+-- event emission time. Sparse: only non-trivial payloads (not empty object)
+-- are indexed — most events have real content.
+CREATE INDEX IF NOT EXISTS strand_events_payload_gin
+    ON strand.events USING GIN (payload)
+    WHERE payload IS NOT NULL AND payload <> '{}';
 
 -- One row per (event emission → task woken) pair.
 -- emission_id links back to the specific strand.events row that caused this wake.
 -- Pruned automatically via ON DELETE CASCADE when the task is deleted by StrandPruner.
 CREATE TABLE IF NOT EXISTS strand.event_triggers (
     id           UUID        NOT NULL,  -- UUIDv7, always generated by Swift via UUID.v7()
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     queue        TEXT        NOT NULL,
     event_name   TEXT        NOT NULL,
     emission_id  UUID        REFERENCES strand.events(id) ON DELETE SET NULL,
@@ -404,9 +570,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS strand.event_waits (
-    namespace_id  TEXT        NOT NULL DEFAULT 'default',
+    namespace_id  TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
     task_id       UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
-    run_id        UUID        NOT NULL REFERENCES strand.runs(id) ON DELETE CASCADE,
+    run_id        UUID        NOT NULL,   -- logical FK to strand.runs(id); no DB constraint (partitioned table)
     queue         TEXT        NOT NULL,
     seq_num       INTEGER     NOT NULL,
     -- Named-event waits (context.waitForEvent): event_name is non-null, child_task_id is null.
@@ -415,6 +581,12 @@ CREATE TABLE IF NOT EXISTS strand.event_waits (
     event_name    TEXT,
     child_task_id UUID        REFERENCES strand.tasks(id) ON DELETE CASCADE,
     timeout_at    TIMESTAMPTZ,
+    -- Equality filter stored as JSONB. At emission, Postgres evaluates
+    -- `incoming_payload @> predicate` via GIN index — only matching waiters are woken.
+    -- '{}' (empty object) matches any payload and is the default for un-predicated waits
+    -- (auto-scoped typed events, string-based waitForEvent). A non-trivial predicate
+    -- like {"approvalId": "abc-123"} filters to matching payloads only.
+    predicate     JSONB NOT NULL DEFAULT '{}',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT strand_event_waits_pkey PRIMARY KEY (run_id, seq_num)
 );
@@ -422,6 +594,13 @@ CREATE TABLE IF NOT EXISTS strand.event_waits (
 -- Wake-up lookup by named event (waitForEvent path).
 CREATE INDEX IF NOT EXISTS strand_event_waits_event_idx
     ON strand.event_waits (namespace_id, queue, event_name);
+
+-- GIN index on predicate for efficient @> containment lookups at emission time.
+-- Sparse: only non-trivial predicates ({} excluded) benefit from GIN. Rows with
+-- the default '{}' are matched unconditionally by exact event_name lookup.
+CREATE INDEX IF NOT EXISTS strand_event_waits_predicate_gin
+    ON strand.event_waits USING GIN (predicate)
+    WHERE predicate <> '{}';
 
 -- Wake-up lookup by child task ID (runActivity / runChildWorkflow completion path).
 CREATE INDEX IF NOT EXISTS strand_event_waits_child_task_idx
@@ -436,7 +615,7 @@ CREATE INDEX IF NOT EXISTS strand_event_waits_child_task_idx
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS strand.task_completions (
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     state        TEXT        NOT NULL,   -- 'COMPLETED' | 'FAILED' | 'CANCELLED'
     result       BYTEA,
@@ -456,7 +635,7 @@ CREATE INDEX IF NOT EXISTS strand_task_completions_ns_idx
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS strand.workflow_state (
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     state        BYTEA       NOT NULL,  -- JSON-encoded @Workflow struct
     state_seq    BIGINT      NOT NULL DEFAULT 0,  -- monotonic; updated each activation
@@ -475,7 +654,7 @@ CREATE TABLE IF NOT EXISTS strand.workflow_state (
 CREATE TABLE IF NOT EXISTS strand.workflow_signals (
     id           UUID        NOT NULL DEFAULT strand.gen_uuid_v7(),
     seq          BIGSERIAL   NOT NULL,   -- monotonic total order, unaffected by transaction commit ordering
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     signal_name  TEXT        NOT NULL,
     payload      BYTEA,
@@ -490,6 +669,32 @@ CREATE INDEX IF NOT EXISTS strand_workflow_signals_inbox_idx
     ON strand.workflow_signals (namespace_id, task_id, seq ASC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Task logs — structured per-task log lines emitted by context.log(…).
+--
+-- Partitioned RANGE by created_at (monthly). No ON CONFLICT — log writes are
+-- fire-and-forget. No FK to strand.tasks — partition DROP TABLE handles cleanup
+-- automatically when StrandPruner drops expired months.
+--
+-- Powers the Loom "Logs" tab on the task detail page.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strand.task_logs (
+    id           UUID        NOT NULL DEFAULT strand.gen_uuid_v7(),
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id),
+    task_id      UUID        NOT NULL,   -- logical FK to strand.tasks(id); no DB constraint (partitioned)
+    run_id       UUID        NOT NULL,   -- which run/attempt produced this entry
+    level        TEXT        NOT NULL DEFAULT 'INFO',
+    message      TEXT        NOT NULL,
+    metadata     BYTEA,                  -- optional JSON key-value pairs
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_task_logs_pkey  PRIMARY KEY (id, created_at),
+    CONSTRAINT strand_task_logs_level CHECK (level IN ('DEBUG', 'INFO', 'WARN', 'ERROR'))
+) PARTITION BY RANGE (created_at);
+
+-- Task-scoped log scan (Loom Logs tab, newest-first).
+CREATE INDEX IF NOT EXISTS strand_task_logs_task_idx
+    ON strand.task_logs (namespace_id, task_id, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Workflow history — append-only event log per workflow execution.
 --
 -- Every significant decision (activity scheduled, activity completed, signal
@@ -497,8 +702,18 @@ CREATE INDEX IF NOT EXISTS strand_workflow_signals_inbox_idx
 -- Used by the UI timeline and future workflow-reset functionality.
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- strand.workflow_history is append-only and intentionally NOT partitioned.
+--
+-- Reason: batchAppendHistory uses ON CONFLICT (task_id, seq) DO NOTHING for
+-- idempotency. Postgres requires that the ON CONFLICT target be a unique
+-- constraint, and unique constraints on partitioned tables must include the
+-- partition key. Adding created_at to the PK would break the ON CONFLICT
+-- clause and allow duplicate (task_id, seq) rows in different partitions.
+-- The table is append-only (no UPDATEs), so bloat accumulation is much lower
+-- than strand.runs. Retention is handled by StrandPruner via DELETE cascaded
+-- from strand.tasks (ON DELETE CASCADE FK is preserved).
 CREATE TABLE IF NOT EXISTS strand.workflow_history (
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     seq          BIGINT      NOT NULL,  -- 1-based monotonic per workflow
     event_type   TEXT        NOT NULL,  -- 'WORKFLOW_STARTED' | 'ACTIVITY_SCHEDULED' |
@@ -514,7 +729,24 @@ CREATE TABLE IF NOT EXISTS strand.workflow_history (
 CREATE INDEX IF NOT EXISTS strand_workflow_history_ns_idx
     ON strand.workflow_history (namespace_id, task_id, seq ASC);
 
-
+-- Storage / autovacuum tuning for workflow_history.
+--
+-- No fillfactor: this table is append-only (no UPDATEs). HOT update savings
+-- only apply when the same row is updated in-place; reserving free space on
+-- heap pages would just waste storage without reducing index churn.
+--
+-- Autovacuum is tuned aggressively because dead tuples arrive in bursts:
+-- when StrandPruner CASCADE-DELETEs an old task, all its history rows die at
+-- once. The default scale_factor=0.2 would let those dead tuples sit until
+-- 20% of the table is dead; 0.05 triggers cleanup after each meaningful prune
+-- cycle instead.
+ALTER TABLE strand.workflow_history SET (
+    autovacuum_vacuum_scale_factor  = 0.05,
+    autovacuum_analyze_scale_factor = 0.05,
+    autovacuum_vacuum_threshold     = 50,
+    autovacuum_analyze_threshold    = 50,
+    autovacuum_vacuum_cost_delay    = 2
+);
 
 -- ────────────────────────────────────────────────────────────────────────────────────
 -- Schedules — cron/interval/one-shot task triggers.
@@ -630,7 +862,7 @@ CREATE INDEX IF NOT EXISTS strand_tasks_backfill_idx
 
 CREATE UNLOGGED TABLE IF NOT EXISTS strand.workers (
     id           TEXT        NOT NULL,    -- "<hostname>:<pid>"
-    namespace_id TEXT        NOT NULL DEFAULT 'default',
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
     queue        TEXT        NOT NULL,
     concurrency  INTEGER     NOT NULL,    -- configured workflowConcurrency + activityConcurrency
     running      INTEGER     NOT NULL DEFAULT 0,   -- currently executing tasks
@@ -677,3 +909,33 @@ BEGIN
     RETURN (plan -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Initial monthly partitions (fresh install)
+--
+-- Create partitions for the current month and the next two months so the
+-- schema is immediately usable. StrandPruner.ensurePartitions() maintains
+-- this lead time at runtime (called at startup and every 12 h).
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$
+DECLARE
+    i INTEGER;
+BEGIN
+    FOR i IN 0..2 LOOP
+        PERFORM strand.create_range_partition(
+            'runs',
+            date_trunc('month', NOW() + (i || ' months')::INTERVAL)::DATE
+        );
+        PERFORM strand.create_range_partition(
+            'task_logs',
+            date_trunc('month', NOW() + (i || ' months')::INTERVAL)::DATE
+        );
+    END LOOP;
+END;
+$$;
+
+-- Seed parent-table statistics for the query planner.
+-- Autovacuum never ANALYZEs partitioned parents — must be run manually
+-- (and by StrandPruner.analyzeParentTables every 12 h).
+ANALYZE strand.runs;
+ANALYZE strand.task_logs;

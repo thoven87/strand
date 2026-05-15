@@ -137,13 +137,13 @@ private struct TimeoutEventWorkflow: Workflow {
         context: WorkflowContext<Self>,
         input: TimeoutEventInput
     ) async throws -> String {
-        do {
-            return try await context.waitForEvent(
-                input.eventName,
-                as: String.self,
-                timeout: .seconds(1)
-            )
-        } catch is EventWaitTimeoutError {
+        if let result = try await context.waitForEvent(
+            input.eventName,
+            as: String.self,
+            timeout: .seconds(1)
+        ) {
+            return result
+        } else {
             return "timed-out"
         }
     }

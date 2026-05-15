@@ -67,6 +67,10 @@ struct ClaimedTask: Sendable {
     /// Used by activities to compute remaining budget: `deadlineAt.map { $0.timeIntervalSince(.now) }`.
     let deadlineAt: Date?
 
+    /// First task in the `continueAsNew` chain this task belongs to.
+    /// `nil` for the first task in a chain, for child tasks, and for activities.
+    let firstTaskID: UUID?
+
     /// `true` when this attempt is the last one allowed.
     ///
     /// Used to decide whether a thrown error should mark the OTel span `ERROR`.
@@ -80,10 +84,11 @@ struct ClaimedTask: Sendable {
 
 extension ClaimedTask {
     /// Decode from the column order returned by the claim CTE:
-    /// Columns: run_id, task_id, attempt, version, task_name, params,
+    /// run_id, task_id, attempt, version, task_name, params,
     /// retry_strategy, max_attempts, headers, wake_event, event_payload,
     /// parent_task_id, kind, timeout_seconds, heartbeat_timeout_seconds,
-    /// scheduling_metadata, available_at, heartbeat_details, deadline_at
+    /// scheduling_metadata, available_at, heartbeat_details, deadline_at,
+    /// first_task_id
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -113,6 +118,7 @@ extension ClaimedTask {
         availableAt = try col.next()!.decode(Date.self, context: .default)
         heartbeatDetails = try col.next()!.decode(ByteBuffer?.self, context: .default)
         deadlineAt = try col.next()!.decode(Date?.self, context: .default)
+        firstTaskID = try col.next()!.decode(UUID?.self, context: .default)
     }
 }
 

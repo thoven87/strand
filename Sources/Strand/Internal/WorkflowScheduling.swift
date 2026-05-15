@@ -132,6 +132,15 @@ extension WorkflowRegistration {
                     logger: exec.logger
                 )
                 historySeq += 1
+            case .activityCompleted(let name, let seqNum, let failed):
+                // Record activity completion or failure. runActivity emits this command
+                // exactly once; for successes the accompanying .writeCheckpoint ensures
+                // replays return from fast-path-1 without re-emitting; for failures an
+                // ActivityFailedSentinel checkpoint guards the same invariant.
+                try await record(
+                    failed ? .activityFailed : .activityCompleted,
+                    try? JSON.encode(WorkflowStateQueries.ActivityScheduledData(activity: name, seqNum: seqNum))
+                )
             case .childWorkflowCompleted(let name, let seqNum):
                 // Record child workflow completion. runChildWorkflow emits this command
                 // exactly once; the accompanying checkpoint ensures replays return from
@@ -218,7 +227,7 @@ extension WorkflowRegistration {
             case .scheduleActivity, .startTimer, .awaitEvent, .scheduleChildWorkflow:
                 return true
             case .writeCheckpoint, .timerFired, .eventReceived, .eventWaitTimedOut,
-                .conditionMet, .conditionTimedOut, .emitEvent, .childWorkflowCompleted:
+                .conditionMet, .conditionTimedOut, .emitEvent, .activityCompleted, .childWorkflowCompleted:
                 return false
             }
         }
@@ -325,7 +334,7 @@ extension WorkflowRegistration {
                         logger: exec.logger
                     )
 
-                case .awaitEvent(let eventName, let seqNum, let timeoutAt):
+                case .awaitEvent(let eventName, let seqNum, let timeoutAt, let predicate):
                     // Atomic check-or-wait: prevents the lost-wakeup race where the
                     // event fires between drain() returning and this transaction committing.
                     //
@@ -340,6 +349,11 @@ extension WorkflowRegistration {
                     let taskID = claimed.taskID
                     let runID = claimed.runID
                     let queueName = exec.queue
+                    // Wrap predicate as RawJSONB — same approach as emitEvent.
+                    // nil predicate uses '{}' (matches any payload); non-nil uses the
+                    // serialized predicate bytes.
+                    let predicateRaw = RawJSONB(predicate ?? ByteBuffer(string: "{}"))
+
                     try await exec.postgres.withTransaction(logger: exec.logger) { conn in
                         // Always register the event_wait so emitEvent can find this run later.
                         // namespace_id is required for tenant isolation — never rely on the
@@ -347,10 +361,12 @@ extension WorkflowRegistration {
                         try await conn.query(
                             """
                             INSERT INTO strand.event_waits
-                                (namespace_id, task_id, run_id, queue, seq_num, event_name, timeout_at)
-                            VALUES (\(exec.namespace), \(taskID), \(runID), \(queueName), \(seqNum), \(eventName), \(timeoutAt))
+                                (namespace_id, task_id, run_id, queue, seq_num, event_name, timeout_at, predicate)
+                            VALUES (\(exec.namespace), \(taskID), \(runID), \(queueName), \(seqNum), \(eventName), \(timeoutAt), \(predicateRaw))
                             ON CONFLICT (run_id, seq_num) DO UPDATE
-                                SET event_name = EXCLUDED.event_name, timeout_at = EXCLUDED.timeout_at
+                                SET event_name = EXCLUDED.event_name,
+                                    timeout_at  = EXCLUDED.timeout_at,
+                                    predicate   = EXCLUDED.predicate
                             """,
                             logger: exec.logger
                         )
@@ -364,6 +380,7 @@ extension WorkflowRegistration {
                             WHERE namespace_id = \(exec.namespace)
                               AND queue = \(queueName)
                               AND name  = \(eventName)
+                              AND payload @> \(predicateRaw)
                             ORDER BY created_at DESC
                             LIMIT 1
                             """,
@@ -374,9 +391,9 @@ extension WorkflowRegistration {
                             var col = evtRow.makeIterator()
                             let emissionID = try col.next()!.decode(UUID.self, context: .default)
                             let existingPayload = try col.next()!.decode(
-                                ByteBuffer?.self,
+                                RawJSONB?.self,
                                 context: .default
-                            )
+                            ).map(\.buffer)
                             // Transition to PENDING with the event payload so the next
                             // activation's waitForEvent fast-path (wakeEvent == name) fires.
                             try await conn.query(
@@ -483,7 +500,7 @@ extension WorkflowRegistration {
                     )
 
                 case .writeCheckpoint, .timerFired, .eventReceived, .eventWaitTimedOut,
-                    .conditionMet, .conditionTimedOut, .childWorkflowCompleted:
+                    .conditionMet, .conditionTimedOut, .activityCompleted, .childWorkflowCompleted:
                     break  // processed in step-2 (non-suspending, not enqueued as child tasks)
                 }
             }

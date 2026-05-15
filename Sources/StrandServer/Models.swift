@@ -201,7 +201,18 @@ struct EventResponse: Codable, Sendable {
     init(from row: EventRow) {
         id = row.id.uuidString.lowercased()
         name = row.name
-        payload = row.payloadBuffer.map { String(buffer: $0) }
+        // Strip the JSONB binary wire-format version byte (0x01) if present.
+        // PostgreSQL prepends this byte in binary protocol mode; reading with
+        // RawJSONB (text format) prevents it entirely, but we strip here too
+        // as a server-layer guarantee — callers never see the prefix.
+        payload = row.payloadBuffer.map { buf in
+            var b = buf
+            if b.readableBytes > 0,
+               b.getBytes(at: b.readerIndex, length: 1) == [0x01] {
+                b.moveReaderIndex(forwardBy: 1)
+            }
+            return String(buffer: b)
+        }
         createdAt = row.createdAt
         queue = row.queue
         triggeredTasks = row.triggeredTasks.map {

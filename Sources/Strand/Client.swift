@@ -430,15 +430,13 @@ public struct StrandClient: Sendable {
         )
     }
 
-    /// Typed overload — derives the event name from the ``WorkflowEvent`` type.
-    ///
-    /// The compiler enforces that the payload type matches what the workflow
-    /// declared in its ``WorkflowEvent`` conformance.
+    /// Emits a typed event by name. Any workflow waiting for `E.name` whose
+    /// `matching:` predicate is satisfied by this payload will be woken.
     ///
     /// ```swift
-    /// try await client.emit(OrderShippedEvent.self,
-    ///     payload: TrackingInfo(number: "1Z999"),
-    ///     queue: "orders")
+    /// // From an HTTP handler — routing is done by the waiter's predicate:
+    /// try await client.emit(OrderApprovedEvent.self,
+    ///     payload: ApprovalPayload(orderId: "abc-123", approved: true))
     /// ```
     public func emit<E: WorkflowEvent>(
         _ eventType: E.Type,

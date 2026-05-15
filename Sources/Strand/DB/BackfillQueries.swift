@@ -186,12 +186,39 @@ package enum BackfillQueries {
         namespaceID: String,
         logger: Logger
     ) async throws {
+        // Atomically in one round-trip:
+        //   1. Mark the backfill HALTED (guard: only if currently RUNNING).
+        //   2. Cancel any PENDING tasks that were enqueued for this backfill
+        //      but have not yet been claimed by a worker. These slots will
+        //      never run, so leaving them PENDING would orphan them.
+        //   3. Cancel their PENDING/SLEEPING runs.
+        //
+        // RUNNING tasks are intentionally left alone — they have already
+        // started work and should be allowed to complete.
         try await client.query(
             """
-            UPDATE strand.backfills
-            SET status = \(BackfillStatus.halted)
-            WHERE id = \(backfillID) AND namespace_id = \(namespaceID)
-              AND status = \(BackfillStatus.running)
+            WITH halted AS (
+                UPDATE strand.backfills
+                SET status = \(BackfillStatus.halted)
+                WHERE id            = \(backfillID)
+                  AND namespace_id  = \(namespaceID)
+                  AND status        = \(BackfillStatus.running)
+                RETURNING id
+            ),
+            cancelled_tasks AS (
+                UPDATE strand.tasks
+                SET state        = \(TaskState.cancelled),
+                    cancelled_at = NOW()
+                WHERE backfill_id = (SELECT id FROM halted)
+                  AND namespace_id = \(namespaceID)
+                  AND state       = \(TaskState.pending)
+                RETURNING id
+            )
+            UPDATE strand.runs
+            SET state = \(TaskState.cancelled)
+            WHERE task_id      IN (SELECT id FROM cancelled_tasks)
+              AND namespace_id  = \(namespaceID)
+              AND state        IN (\(TaskState.pending), \(TaskState.sleeping))
             """,
             logger: logger
         )

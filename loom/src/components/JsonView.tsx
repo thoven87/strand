@@ -83,7 +83,8 @@ export function JsonView({ value, label, className }: Props) {
 
     function handleCopy() {
         if (!value) return;
-        navigator.clipboard.writeText(value).then(() => {
+        const toCopy = value.charCodeAt(0) === 1 ? value.slice(1) : value;
+        navigator.clipboard.writeText(toCopy).then(() => {
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
         });
@@ -97,9 +98,11 @@ export function JsonView({ value, label, className }: Props) {
         );
     }
 
-    let pretty = value;
+    // Strip JSONB binary wire-format version byte (0x01) defensively.
+    const sanitized = value.charCodeAt(0) === 1 ? value.slice(1) : value;
+    let pretty = sanitized;
     try {
-        pretty = JSON.stringify(JSON.parse(value), null, 2);
+        pretty = JSON.stringify(JSON.parse(sanitized), null, 2);
     } catch {
         /* not JSON — display as-is */
     }

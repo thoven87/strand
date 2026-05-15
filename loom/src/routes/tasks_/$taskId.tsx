@@ -190,6 +190,8 @@ function taskDurationMs(
 
 function eventColour(type: string): string {
     if (type.startsWith("WORKFLOW_")) return "bg-blue-400";
+    if (type === "ACTIVITY_COMPLETED") return "bg-green-400";
+    if (type === "ACTIVITY_FAILED") return "bg-red-400";
     if (type.startsWith("ACTIVITY_")) return "bg-yellow-400";
     if (type.startsWith("SIGNAL_")) return "bg-purple-400";
     if (type.startsWith("CHILD_")) return "bg-cyan-400";

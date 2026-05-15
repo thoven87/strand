@@ -52,7 +52,13 @@ public struct BackfillHandle: Sendable {
         self.logger = logger
     }
 
-    /// Stop enqueueing new slots. In-flight tasks continue to completion.
+    /// Stop enqueueing new slots and cancel any PENDING (not-yet-started)
+    /// slots that were already enqueued.
+    ///
+    /// Tasks that are currently RUNNING are left to complete — they have
+    /// already started work. Only slots that have not yet been claimed by a
+    /// worker (state = PENDING) are cancelled, preventing them from being
+    /// picked up after the halt.
     public func halt() async throws {
         try await BackfillQueries.halt(
             on: postgres,

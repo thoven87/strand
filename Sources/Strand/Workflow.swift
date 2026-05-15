@@ -152,28 +152,39 @@ extension Workflow {
 
 /// A named, typed event that a workflow can wait for and a client can emit.
 ///
-/// Define an event as a concrete type so the compiler enforces that both sides
-/// agree on the name and payload type. A typo or payload mismatch becomes a
-/// compile error instead of a silent runtime failure.
+/// ## Instance-scoped delivery
+///
+/// The typed `waitForEvent` and `emit(to:)` APIs are **instance-scoped**: the
+/// event name is automatically suffixed with the target workflow's task UUID,
+/// so a single `OrderApprovedEvent` emission reaches exactly one waiting
+/// workflow instance rather than broadcasting to all.
 ///
 /// ```swift
 /// // 1. Define the event once:
-/// struct OrderShippedEvent: WorkflowEvent {
-///     typealias Payload = TrackingInfo
-///     static let name   = "order.shipped"
+/// struct OrderApprovedEvent: WorkflowEvent {
+///     typealias Payload = ApprovalPayload
+///     static let name   = "order.approved"  // human-readable, no ID needed
 /// }
 ///
-/// // 2. Wait for it in the workflow:
-/// let tracking = try await context.waitForEvent(OrderShippedEvent.self)
+/// ```swift
+/// // 2. Wait in the workflow, filtering by a payload field:
+/// let approval = try await context.waitForEvent(
+///     OrderApprovedEvent.self,
+///     matching: \.orderId == input.orderId   // only wake when orderId matches
+/// )
 ///
-/// // 3. Emit it from the client:
-/// try await client.emit(OrderShippedEvent.self,
-///     payload: TrackingInfo(number: "1Z999"),
-///     to: orderHandle)
+/// // 3. Emit from an HTTP handler — routing is done by the waiter's predicate:
+/// try await client.emit(OrderApprovedEvent.self,
+///     payload: ApprovalPayload(orderId: "abc-123", approved: true))
 /// ```
 ///
-/// For dynamic event names (e.g. per-order topics) the string API remains:
-/// `context.waitForEvent("order.shipped:\(orderID)", as: TrackingInfo.self)`
+/// ## Broadcast (no predicate)
+///
+/// Omit `matching:` to wake every workflow waiting for this event type:
+/// ```swift
+/// let signal = try await context.waitForEvent(SystemShutdownEvent.self)
+/// try await client.emit(SystemShutdownEvent.self, payload: ShutdownPayload())
+/// ```
 public protocol WorkflowEvent: Sendable {
     /// The event payload. Must be `Codable` and `Sendable`.
     associatedtype Payload: Codable & Sendable
@@ -185,6 +196,113 @@ public protocol WorkflowEvent: Sendable {
 
 extension WorkflowEvent {
     public static var name: String { String(describing: Self.self) }
+}
+
+// MARK: - EventPredicate
+
+/// A serializable equality predicate for payload-based event routing.
+///
+/// Created via the `==` operator on a `KeyPath` of the event's `Payload` type.
+/// The predicate is stored as JSONB in `strand.event_waits` and evaluated by
+/// Postgres at emission time using the `@>` containment operator — only the
+/// workflows whose predicate is a subset of the incoming event payload are woken.
+/// Filtering happens **before** any workflow is resumed.
+///
+/// ```swift
+/// // Flat field:
+/// \.approvalId == input.approvalId     // stores {"approvalId": "abc-123"}
+///
+/// // Nested field:
+/// \.order.id == input.orderID          // stores {"order": {"id": "abc-123"}}
+/// ```
+///
+/// - Note: The property name is extracted from Swift's KeyPath description string
+///   (`String(describing:)`). This is reliable for stored properties in current
+///   Swift (5.9+). Computed properties or very deep nesting may require using
+///   ``EventPredicate/init(path:equals:)`` with an explicit dot-path string.
+public struct EventPredicate<Target>: Sendable {
+    /// Dot-separated path components, e.g. `["order", "id"]`.
+    let pathComponents: [String]
+    /// JSON-encoded bytes of the expected value (e.g. `"\"abc-123\""` for a String).
+    let valueBytes: [UInt8]
+
+    /// Creates a predicate with an explicit dot-path string.
+    ///
+    /// Use this when `String(describing: keyPath)` doesn't produce the expected
+    /// field name, for example with computed properties or protocol requirements.
+    ///
+    /// ```swift
+    /// EventPredicate<MyPayload>(path: "order.merchantID", equals: input.merchantID)
+    /// ```
+    public init<V: Codable & Sendable>(path: String, equals value: V) {
+        self.pathComponents = path.components(separatedBy: ".")
+            .filter { !$0.isEmpty }
+        self.valueBytes = (try? JSON.encode(value))
+            .map { Array($0.readableBytesView) } ?? []
+    }
+
+    internal init(pathComponents: [String], valueBytes: [UInt8]) {
+        self.pathComponents = pathComponents
+        self.valueBytes = valueBytes
+    }
+
+    /// Serializes the predicate to a JSONB-compatible nested JSON byte array.
+    ///
+    /// `["order", "id"]` + value `"abc-123"` → `{"order": {"id": "abc-123"}}`
+    func toJSONBytes() throws -> [UInt8] {
+        // Wrap value bytes in `[…]` so JSONSerialization can parse any scalar
+        // JSON type (string, number, bool) not just objects/arrays.
+        let wrapped = [UInt8(ascii: "[")] + valueBytes + [UInt8(ascii: "]")]
+        guard
+            let parsed = try? JSONSerialization.jsonObject(with: Data(wrapped)) as? [Any],
+            let valueAny = parsed.first
+        else {
+            throw EventPredicateError.invalidValue
+        }
+        let nested = Self.buildNested(pathComponents, value: valueAny)
+        let data = try JSONSerialization.data(withJSONObject: nested)
+        return Array(data)
+    }
+
+    private static func buildNested(_ path: [String], value: Any) -> [String: Any] {
+        guard !path.isEmpty else { return [:] }
+        if path.count == 1 { return [path[0]: value] }
+        return [path[0]: buildNested(Array(path.dropFirst()), value: value)]
+    }
+}
+
+/// Errors thrown during EventPredicate serialization.
+public enum EventPredicateError: Error {
+    case invalidValue
+}
+
+/// Creates a payload-equality predicate from a `KeyPath` and a concrete value.
+///
+/// The property path is extracted from Swift's KeyPath description string.
+/// Both flat (`\.approvalId`) and shallow-nested (`\.order.id`) paths work
+/// reliably in Swift 5.9+.
+///
+/// ```swift
+/// let approval = try await context.waitForEvent(
+///     "agent.approval.response",
+///     as: ApprovalPayload.self,
+///     matching: \.approvalId == input.approvalId
+/// )
+/// ```
+public func == <Root, Value: Codable & Sendable>(
+    lhs: KeyPath<Root, Value>,
+    rhs: Value
+) -> EventPredicate<Root> {
+    // String(describing: \Foo.bar.baz) → "\Foo.bar.baz" in Swift 5.9+
+    // Drop the first component ("\TypeName") to get the property path.
+    let raw = String(describing: lhs)
+    var parts = raw.components(separatedBy: ".")
+    if let first = parts.first, first.hasPrefix("\\") {
+        parts = Array(parts.dropFirst())
+    }
+    let components = parts.filter { !$0.isEmpty }
+    let bytes = (try? JSON.encode(rhs)).map { Array($0.readableBytesView) } ?? []
+    return EventPredicate(pathComponents: components, valueBytes: bytes)
 }
 
 // MARK: - WorkflowSignalDefinition
