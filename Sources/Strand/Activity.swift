@@ -1,6 +1,7 @@
 public import Logging  // Logger in ActivityContext.logger is public API
 package import NIOCore  // ByteBuffer is part of the package-internal interface (_heartbeatImpl signature, init heartbeatDetailsBuffer)
 import PostgresNIO  // PostgresClient captured in heartbeatImpl closure; internal to _run()
+import Synchronization  // Mutex<Bool> for _ActivityCancellationFlag
 import Tracing
 
 #if canImport(FoundationEssentials)
@@ -127,6 +128,22 @@ public struct ActivityOptions: Sendable {
 
 // MARK: - ActivityContext
 
+// MARK: - Cancellation flag
+
+/// Shared mutable cancellation flag passed between `ActivityContext` and
+/// the heartbeat closure inside `Activity._run`.
+///
+/// Using a reference type (class) lets both the struct and the closure refer
+/// to the same storage without copying. `@unchecked Sendable` is safe here:
+/// the `Mutex` provides the required thread safety.
+package final class _ActivityCancellationFlag: @unchecked Sendable {
+    private let _flag: Mutex<Bool> = Mutex(false)
+    package var isCancelled: Bool { _flag.withLock { $0 } }
+    package func markCancelled() { _flag.withLock { $0 = true } }
+}
+
+// MARK: - ActivityContext
+
 /// Minimal execution context passed into every Activity handler.
 ///
 /// Unlike `WorkflowContext`, `ActivityContext` carries no orchestration
@@ -206,6 +223,37 @@ public struct ActivityContext: Sendable {
     // Package-internal: heartbeat implementation — accepts optional progress details.
     package let _heartbeatImpl: @Sendable (ByteBuffer?) async throws -> Void
 
+    // Shared cancellation flag — set by the heartbeat closure when extendClaim
+    // returns no rows (the run is no longer RUNNING).
+    private let _cancellationFlag: _ActivityCancellationFlag
+
+    /// `true` when this activity has been externally cancelled via
+    /// ``StrandClient/cancelTask(_:)`` or parent-workflow cancellation.
+    ///
+    /// Updated at each ``heartbeat()`` call — the heartbeat detects
+    /// cancellation by trying to extend the lease in Postgres. Without
+    /// regular heartbeating this property may lag behind the database state.
+    ///
+    /// Also returns `true` when Swift’s cooperative task cancellation is active
+    /// (e.g. the worker is shutting down or the 2× claim-window deadline fired).
+    ///
+    /// ```swift
+    /// func run(input: BatchInput, context: ActivityContext) async throws -> BatchResult {
+    ///     var results: [ItemResult] = []
+    ///     for (i, item) in input.items.enumerated() {
+    ///         if context.isCancelled { break }      // clean early exit
+    ///         if i.isMultiple(of: 50) {
+    ///             try await context.heartbeat()      // refreshes isCancelled, throws if cancelled
+    ///         }
+    ///         results.append(try process(item))
+    ///     }
+    ///     return BatchResult(results: results, partial: context.isCancelled)
+    /// }
+    /// ```
+    public var isCancelled: Bool {
+        Task.isCancelled || _cancellationFlag.isCancelled
+    }
+
     package init(
         activityID: UUID,
         activityName: String,
@@ -222,6 +270,7 @@ public struct ActivityContext: Sendable {
         headers: [String: String] = [:],
         deadlineAt: Date? = nil,
         heartbeatDetailsBuffer: ByteBuffer? = nil,
+        cancellationFlag: _ActivityCancellationFlag = _ActivityCancellationFlag(),
         heartbeatImpl: @escaping @Sendable (ByteBuffer?) async throws -> Void = { _ in }  // default no-op
     ) {
         self.activityID = activityID
@@ -239,6 +288,7 @@ public struct ActivityContext: Sendable {
         self.headers = headers
         self.deadlineAt = deadlineAt
         self._heartbeatDetailsBuffer = heartbeatDetailsBuffer
+        self._cancellationFlag = cancellationFlag
         self._heartbeatImpl = heartbeatImpl
     }
 
@@ -450,6 +500,10 @@ extension Activity {
         }
         let heartbeatLogger = exec.logger
 
+        // Create the cancellation flag before the context so the heartbeat
+        // closure and ActivityContext.isCancelled share the same reference.
+        let cancellationFlag = _ActivityCancellationFlag()
+
         let ctx = ActivityContext(
             activityID: claimed.taskID,
             activityName: claimed.taskName,
@@ -466,22 +520,32 @@ extension Activity {
             headers: claimed.headers,
             deadlineAt: claimed.deadlineAt,
             heartbeatDetailsBuffer: claimed.heartbeatDetails,
+            cancellationFlag: cancellationFlag,
             heartbeatImpl: { details in
-                // Extend the Postgres lease to signal that the activity is still alive.
-                // When `details` is non-nil, persists the heartbeat progress checkpoint
-                // so the next retry attempt can resume exactly where it left off.
-                try await Queries.extendClaim(
-                    on: postgres,
-                    namespaceID: namespace,
-                    runID: runID,
-                    extendBySeconds: heartbeatExtendSecs,
-                    heartbeatDetails: details,
-                    logger: heartbeatLogger
-                )
-                // Also renew the in-process fatal deadline so a long-running
-                // activity that regularly heartbeats is never killed by the 2×
-                // claimTimeout guard.
-                fatalDeadline?.renew()
+                do {
+                    // Extend the Postgres lease to signal that the activity is still alive.
+                    // When `details` is non-nil, persists the heartbeat progress checkpoint
+                    // so the next retry attempt can resume exactly where it left off.
+                    try await Queries.extendClaim(
+                        on: postgres,
+                        namespaceID: namespace,
+                        runID: runID,
+                        extendBySeconds: heartbeatExtendSecs,
+                        heartbeatDetails: details,
+                        logger: heartbeatLogger
+                    )
+                    // Also renew the in-process fatal deadline so a long-running
+                    // activity that regularly heartbeats is never killed by the 2×
+                    // claimTimeout guard.
+                    fatalDeadline?.renew()
+                } catch is InternalError {
+                    // extendClaim found no RUNNING row — the run was cancelled
+                    // externally. Set the flag so context.isCancelled returns true
+                    // immediately, then throw CancellationError (Swift’s standard
+                    // cancellation type) rather than leaking InternalError.
+                    cancellationFlag.markCancelled()
+                    throw CancellationError()
+                }
             }
         )
         // Worker.runTask already opens a .consumer span (with the workflow activation

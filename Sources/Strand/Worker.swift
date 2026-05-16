@@ -1099,7 +1099,14 @@ final class Registry: Sendable {
 /// Thrown by the 2× deadline poller (Task 2 inside `runTask`) when the
 /// fatal deadline expires. Propagates out of the `withThrowingTaskGroup`,
 /// cancels the execution task, and is caught as a general failure.
-private struct ClaimTimeoutError: Error {}
+/// Thrown by the 2× deadline poller when the fatal deadline fires.
+/// `package` so `WorkflowRegistration.resumeActivation` can reference `failureName`
+/// directly rather than comparing against a bare string literal.
+package struct ClaimTimeoutError: Error {
+    /// The value stored in `FailureReason.name` when this error is recorded.
+    /// Derived from the type so a rename automatically updates the stored string.
+    package static let failureName: String = String(describing: Self.self)
+}
 
 // MARK: - FailureReason
 

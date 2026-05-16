@@ -72,6 +72,8 @@ public enum ActivityRetryState: String, Sendable, CustomStringConvertible {
     case maximumAttemptsReached
     /// The activity was cancelled — either by the workflow, or because the worker shut down.
     case cancelled
+    /// The activity exceeded its per-attempt `timeout` or total-budget `maxDuration`.
+    case timedOut
 
     public var description: String { rawValue }
 }

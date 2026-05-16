@@ -24,6 +24,12 @@ struct TaskRoutes {
         let payload: String?  // optional JSON string; forwarded as raw bytes
     }
 
+    private struct UpdateBody: Decodable {
+        let name: String  // @WorkflowUpdate handler name, e.g. "setPriority"
+        let payload: String?  // optional JSON string (nil for void-input updates)
+        let timeout: Double?  // seconds to wait for result; default 10
+    }
+
     func register(on router: some RouterMethods<StrandRequestContext>) {
 
         // GET /api/:namespace/task-definitions
@@ -214,6 +220,11 @@ struct TaskRoutes {
         }
 
         // GET /api/:namespace/queues/:queue/tasks/:taskID/history
+        // Reads from strand.workflow_history — the granular event-by-event log that
+        // feeds the ActivityTimeline (History tab). strand.trace_spans is used for
+        // the Trace tab (waterfall) but cannot serve the History tab because each
+        // span row collapses the full lifecycle into one record with a single
+        // event_type field, losing the individual SCHEDULED/COMPLETED boundaries.
         router.get("queues/:queue/tasks/:taskID/history") { _, ctx -> [HistoryEventResponse] in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
             let rows = try await WorkflowStateQueries.listHistory(
@@ -236,6 +247,72 @@ struct TaskRoutes {
                 namespaceID: ctx.namespaceID
             )
             return SimpleResponse(message: "signal sent", id: taskID.uuidString)
+        }
+
+        // POST /api/:namespace/queues/:queue/tasks/:taskID/update
+        // Dispatches a @WorkflowUpdate handler and long-polls for the result.
+        // Body: { name: String, payload: String?, timeout: Double? }
+        // Returns UpdateResultResponse — correlationID is always present so callers
+        // can re-poll strand.workflow_updates independently on timeout.
+        router.post("queues/:queue/tasks/:taskID/update") { req, ctx -> UpdateResultResponse in
+            let taskID = try ctx.parameters.require("taskID", as: UUID.self)
+            let body = try await req.decode(as: UpdateBody.self, context: ctx)
+            let correlationID = UUID().uuidString
+            let payloadBuf: ByteBuffer? = body.payload.map { ByteBuffer(string: $0) }
+
+            try await self.client._sendUpdateSignal(
+                updateName: body.name,
+                correlationID: correlationID,
+                payload: payloadBuf,
+                toWorkflowTaskID: taskID,
+                namespaceID: ctx.namespaceID
+            )
+
+            // Long-poll with exponential back-off (50 ms → 500 ms) until the
+            // handler result appears in strand.workflow_updates or deadline hits.
+            let deadline = Date(timeIntervalSinceNow: body.timeout ?? 10.0)
+            var delayMs = 50.0
+            while Date() < deadline {
+                if let found = try await WorkflowStateQueries.findUpdateResult(
+                    on: self.postgres,
+                    namespaceID: ctx.namespaceID,
+                    correlationID: correlationID,
+                    logger: self.client.logger
+                ) {
+                    return UpdateResultResponse(
+                        correlationID: correlationID,
+                        result: found.result.map { String(buffer: $0) },
+                        error: found.error,
+                        timedOut: false
+                    )
+                }
+                let remainingMs = deadline.timeIntervalSinceNow * 1_000
+                guard remainingMs > 0 else { break }
+                let sleepMs = min(delayMs, remainingMs)
+                try await Task.sleep(nanoseconds: UInt64(sleepMs * 1_000_000))
+                delayMs = min(delayMs * 2, 500)
+            }
+
+            return UpdateResultResponse(
+                correlationID: correlationID,
+                result: nil,
+                error: nil,
+                timedOut: true
+            )
+        }
+
+        // GET /api/:namespace/queues/:queue/tasks/:taskID/version-markers
+        // Returns the version markers for a workflow task (empty array for activities or tasks
+        // that have never called context.version(changeID:)).
+        router.get("queues/:queue/tasks/:taskID/version-markers") { _, ctx -> [VersionMarkerResponse] in
+            let taskID = try ctx.parameters.require("taskID", as: UUID.self)
+            let rows = try await WorkflowStateQueries.listVersionMarkers(
+                on: self.postgres,
+                namespaceID: ctx.namespaceID,
+                taskID: taskID,
+                logger: self.client.logger
+            )
+            return rows.map(VersionMarkerResponse.init(from:))
         }
 
         // GET /api/:namespace/queues/:queue/tasks/:taskID/state
@@ -261,171 +338,81 @@ struct TaskRoutes {
         // GET /api/:namespace/tasks/:taskID/trace
         router.get("tasks/:taskID/trace") { _, ctx -> [TraceSpanResponse] in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
-            let rows = try await ManagementQueries.traceTask(
+            let spanRows = try await TraceSpanQueries.getTraceSpans(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,
                 rootTaskID: taskID,
                 logger: self.client.logger
             )
-            guard let root = rows.first(where: { $0.depth == 0 }) else {
+            guard !spanRows.isEmpty else {
                 throw HTTPError(.notFound, message: "Task not found")
             }
-            // Derive WAIT / SLEEP / SIGNAL / EMIT spans from workflow_history
-            // for every workflow-kind task in the tree.
-            let workflowIDs = rows.filter { $0.kind == .workflow }.map { $0.id }
-            let historySpans = try await ManagementQueries.executionHistorySpansForTrace(
-                on: self.postgres,
-                namespaceID: ctx.namespaceID,
-                workflowTaskIDs: workflowIDs,
-                logger: self.client.logger
-            )
-            return Self.buildTrace(rows: rows, historySpans: historySpans, rootCreatedAt: root.createdAt)
+            return Self.buildTraceFromSpans(spanRows)
         }
     }
 
-    // MARK: - Trace helpers
+    // MARK: - Trace helpers (OLAP path)
 
-    private static func buildTrace(
-        rows: [TraceSpanRow],
-        historySpans: [ManagementQueries.ExecutionHistorySpanRow],
-        rootCreatedAt: Date
+    /// Build a `[TraceSpanResponse]` tree from flat `strand.trace_spans` rows.
+    /// One index scan replaces the old recursive CTE + history query path.
+    private static func buildTraceFromSpans(
+        _ spans: [TraceSpanQueries.SpanRow]
     ) -> [TraceSpanResponse] {
+        guard
+            let rootSpan = spans.first(where: { $0.parentID == nil || $0.parentID == $0.id })
+                ?? spans.first
+        else { return [] }
+        let rootCreatedAt = rootSpan.queuedAt
         let now = Date()
-        var childrenByParent: [UUID: [TraceSpanRow]] = [:]
-        for row in rows {
-            if let parentID = row.parentTaskID {
-                childrenByParent[parentID, default: []].append(row)
+
+        // Build parent → children map keyed by parentID string.
+        var childrenByParentID: [String: [TraceSpanQueries.SpanRow]] = [:]
+        for span in spans {
+            if let pid = span.parentID, pid != span.id {
+                childrenByParentID[pid, default: []].append(span)
             }
         }
-        // Group execution history spans by parent workflow task ID.
-        var historyByTask: [UUID: [ManagementQueries.ExecutionHistorySpanRow]] = [:]
-        for s in historySpans {
-            historyByTask[s.workflowTaskID, default: []].append(s)
-        }
-        let roots = rows.filter { $0.depth == 0 }
-        return roots.map {
-            buildSpan(
-                $0,
-                childrenByParent: childrenByParent,
-                historyByTask: historyByTask,
-                rootCreatedAt: rootCreatedAt,
-                now: now
+
+        func buildSpanFromOLAP(_ span: TraceSpanQueries.SpanRow) -> TraceSpanResponse {
+            // startMs: offset from the root's enqueue time (same baseline as old buildSpan).
+            // durationMs: total wall-clock from enqueue to finish — mirrors the old
+            //   `row.createdAt` baseline so the bar covers queue-wait + execution.
+            // queuedMs: time from enqueue until a worker first claimed it.
+            let startMs = max(0.0, span.queuedAt.timeIntervalSince(rootCreatedAt) * 1000)
+            let endDate = span.finishedAt ?? now
+            let durationMs = max(0.0, endDate.timeIntervalSince(span.queuedAt) * 1000)
+            let queuedMs = span.startedAt.map { max(0.0, $0.timeIntervalSince(span.queuedAt) * 1000) }
+
+            let kind: WorkflowSpanKind = WorkflowSpanKind(rawValue: span.kind) ?? .activity
+            let state: WorkflowSpanState = WorkflowSpanState(rawValue: span.state) ?? .waiting
+
+            let kids = (childrenByParentID[span.id] ?? [])
+                .sorted { $0.queuedAt < $1.queuedAt }
+                .map { buildSpanFromOLAP($0) }
+
+            return TraceSpanResponse(
+                id: span.id,
+                name: span.name,
+                kind: kind,
+                state: state,
+                startMs: startMs,
+                durationMs: durationMs,
+                queuedMs: queuedMs,
+                attempt: span.attempt,
+                maxAttempts: span.maxAttempts,
+                errorMessage: span.error,
+                workerID: span.workerID,
+                createdAt: span.queuedAt,
+                startedAt: span.startedAt,
+                completedAt: span.finishedAt,
+                taskId: span.taskID,
+                children: kids,
+                emissionId: nil,
+                eventPayload: nil
             )
         }
+
+        return [buildSpanFromOLAP(rootSpan)]
     }
 
-    private static func buildSpan(
-        _ row: TraceSpanRow,
-        childrenByParent: [UUID: [TraceSpanRow]],
-        historyByTask: [UUID: [ManagementQueries.ExecutionHistorySpanRow]],
-        rootCreatedAt: Date,
-        now: Date
-    ) -> TraceSpanResponse {
-        let startMs = max(0.0, row.createdAt.timeIntervalSince(rootCreatedAt) * 1000)
-        let endDate = row.finishedAt ?? now
-        let durationMs = max(0.0, endDate.timeIntervalSince(row.createdAt) * 1000)
-        let queuedMs = row.startedAt.map { max(0.0, $0.timeIntervalSince(row.createdAt) * 1000) }
-
-        let childRows = (childrenByParent[row.id] ?? []).sorted { $0.createdAt < $1.createdAt }
-        var children: [TraceSpanResponse] = childRows.map {
-            buildSpan(
-                $0,
-                childrenByParent: childrenByParent,
-                historyByTask: historyByTask,
-                rootCreatedAt: rootCreatedAt,
-                now: now
-            )
-        }
-
-        // Inject execution history spans (WAIT / SLEEP / SIGNAL / EMIT) for workflow nodes.
-        if row.kind == .workflow {
-            let histSpans = (historyByTask[row.id] ?? []).map {
-                buildHistorySpan(
-                    $0,
-                    rootCreatedAt: rootCreatedAt,
-                    workflowFinishedAt: row.finishedAt,
-                    now: now
-                )
-            }
-            // Merge task children and execution history spans in start-time order.
-            children = (children + histSpans).sorted { $0.startMs < $1.startMs }
-        }
-
-        return TraceSpanResponse(
-            id: row.id.uuidString,
-            name: row.name,
-            kind: WorkflowSpanKind(taskKind: row.kind),
-            state: spanState(from: row.state),
-            startMs: startMs,
-            durationMs: durationMs,
-            queuedMs: queuedMs,
-            attempt: row.attempt,
-            maxAttempts: row.maxAttempts,
-            errorMessage: row.failureBuffer.map { String(buffer: $0) },
-            workerID: row.workerID,
-            createdAt: row.createdAt,
-            startedAt: row.startedAt,
-            completedAt: row.finishedAt,
-            taskId: row.id,
-            children: children,
-            emissionId: nil,
-            eventPayload: nil
-        )
-    }
-
-    /// Builds a `TraceSpanResponse` from an execution history span.
-    ///
-    /// - The span `id` is deterministic: computed from the workflow task UUID and
-    ///   the history sequence number so the UI key is stable across polling intervals.
-    /// - `taskId` is set to the containing workflow's task ID so the trace inspector
-    ///   "View task" button navigates to the workflow detail page.
-    /// - `workflowFinishedAt`: when the parent workflow has completed but a WAIT/SLEEP
-    ///   span has no recorded `endedAt` (e.g. EVENT_RECEIVED was not written for a
-    ///   cached-handler-Task resume), caps the duration at the workflow's finish time
-    ///   rather than the current wall-clock, avoiding multi-hour phantom durations.
-    private static func buildHistorySpan(
-        _ row: ManagementQueries.ExecutionHistorySpanRow,
-        rootCreatedAt: Date,
-        workflowFinishedAt: Date?,
-        now: Date
-    ) -> TraceSpanResponse {
-        let startMs = max(0.0, row.startedAt.timeIntervalSince(rootCreatedAt) * 1000)
-        // Use the recorded end, or fall back to the workflow's finish time (cap for
-        // spans missing their END event), or finally the current wall-clock time.
-        let endDate = row.endedAt ?? workflowFinishedAt ?? now
-        let durationMs = max(0.0, endDate.timeIntervalSince(row.startedAt) * 1000)
-        return TraceSpanResponse(
-            id: "\(row.workflowTaskID.uuidString)-\(row.seqNum)",
-            name: row.name,
-            kind: row.spanKind,
-            state: row.state,
-            startMs: startMs,
-            durationMs: durationMs,
-            queuedMs: nil,
-            attempt: 0,
-            maxAttempts: nil,
-            errorMessage: nil,
-            workerID: nil,
-            createdAt: row.startedAt,
-            startedAt: nil,
-            completedAt: row.endedAt,
-            taskId: row.workflowTaskID,
-            children: [],
-            emissionId: row.emissionID,
-            eventPayload: row.receivedPayload.map { String(buffer: $0) }
-        )
-    }
-
-    private static func spanState(from state: TaskState) -> WorkflowSpanState {
-        switch state {
-        case .pending: return .pending
-        case .running: return .running
-        case .sleeping: return .waiting  // suspended on sleep/child/event
-        case .waiting: return .waiting  // suspended on signal/event
-        case .completed: return .completed
-        case .failed: return .failed
-        case .cancelled: return .cancelled
-        case .continuedAsNew: return .completed  // terminal — workflow continued as new
-        }
-    }
 }

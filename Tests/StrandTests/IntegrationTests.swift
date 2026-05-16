@@ -170,7 +170,7 @@ private struct CityEvent: WorkflowEvent {
 }
 
 private struct NestedPredicateWorkflow: Workflow {
-    typealias Input = String   // city this instance is waiting for
+    typealias Input = String  // city this instance is waiting for
     typealias Output = String  // city that actually arrived in the payload
 
     mutating func run(
@@ -504,10 +504,14 @@ struct EventTests {
 
             // Two concurrent instances each waiting for a different city.
             let handleNYC = try await client.startWorkflow(
-                NestedPredicateWorkflow.self, options: .init(), input: "NYC"
+                NestedPredicateWorkflow.self,
+                options: .init(),
+                input: "NYC"
             )
             let handleLDN = try await client.startWorkflow(
-                NestedPredicateWorkflow.self, options: .init(), input: "London"
+                NestedPredicateWorkflow.self,
+                options: .init(),
+                input: "London"
             )
 
             // Wait until both have registered their event_wait (state = WAITING).

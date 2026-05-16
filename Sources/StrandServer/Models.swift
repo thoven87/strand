@@ -208,7 +208,8 @@ struct EventResponse: Codable, Sendable {
         payload = row.payloadBuffer.map { buf in
             var b = buf
             if b.readableBytes > 0,
-               b.getBytes(at: b.readerIndex, length: 1) == [0x01] {
+                b.getBytes(at: b.readerIndex, length: 1) == [0x01]
+            {
                 b.moveReaderIndex(forwardBy: 1)
             }
             return String(buffer: b)
@@ -326,9 +327,17 @@ struct HistoryEventResponse: Codable, Sendable {
 
     init(from row: WorkflowStateQueries.HistoryEventRow) {
         seq = row.seq
-        eventType = row.eventType.rawValue  // decode from enum — was row.eventType directly
+        eventType = row.eventType.rawValue
         eventData = row.eventData.map { String(buffer: $0) }
         createdAt = row.createdAt
+    }
+
+    /// Init from a `strand.trace_spans` row (OLAP path).
+    init(seq: Int, eventType: String, eventData: String?, createdAt: Date) {
+        self.seq = seq
+        self.eventType = eventType
+        self.eventData = eventData
+        self.createdAt = createdAt
     }
 }
 extension HistoryEventResponse: ResponseCodable {}
@@ -439,3 +448,86 @@ struct TaskMetricsResponse: Codable, Sendable {
     let ratePerSec: Double?
 }
 extension TaskMetricsResponse: ResponseCodable {}
+
+// MARK: - OLAP latency response types
+
+/// Per-task exact latency from `strand.trace_spans` PERCENTILE_CONT query.
+/// Exact values (not DDSketch ±2% approximations) over the selected window.
+struct LatencyTaskResponse: Codable, Sendable {
+    let taskName: String
+    let count: Int
+    let p50Ms: Double?
+    let p95Ms: Double?
+    let p99Ms: Double?
+    let minMs: Double?
+    let maxMs: Double?
+
+    init(from row: OLAPLatencyRow) {
+        taskName = row.taskName
+        count = row.count
+        p50Ms = row.p50Ms
+        p95Ms = row.p95Ms
+        p99Ms = row.p99Ms
+        minMs = row.minMs
+        maxMs = row.maxMs
+    }
+}
+extension LatencyTaskResponse: ResponseCodable {}
+
+/// Time-bucketed p50/p95 for one task, for trend charts.
+struct LatencyBucketResponse: Codable, Sendable {
+    let bucket: Date
+    let taskName: String
+    let count: Int
+    let p50Ms: Double?
+    let p95Ms: Double?
+
+    init(from row: OLAPBucketRow) {
+        bucket = row.bucket
+        taskName = row.taskName
+        count = row.count
+        p50Ms = row.p50Ms
+        p95Ms = row.p95Ms
+    }
+}
+extension LatencyBucketResponse: ResponseCodable {}
+
+/// Response for `GET /api/:namespace/metrics/latency`.
+struct LatencyResponse: Codable, Sendable {
+    /// Per-task exact p50/p95/p99/min/max from OLAP, ordered by execution count desc.
+    let tasks: [LatencyTaskResponse]
+    /// Time-bucketed p50/p95 for trend charts. Granularity: minute (<=1h), hour (>1h).
+    let timeSeries: [LatencyBucketResponse]
+    /// The time window in hours (1, 6, 24, or 168).
+    let windowHours: Int
+}
+extension LatencyResponse: ResponseCodable {}
+
+/// Response for `POST /api/:namespace/queues/:queue/tasks/:taskID/update`.
+/// Server polls `strand.workflow_updates` until the handler result appears or
+/// the timeout elapses, then returns immediately.
+struct UpdateResultResponse: Codable, Sendable {
+    /// The correlation ID used to track this update. Returned even on timeout
+    /// so callers can re-query `strand.workflow_updates` independently.
+    let correlationID: String
+    /// JSON-encoded handler return value. `nil` when `timedOut` is true or the
+    /// handler threw an error.
+    let result: String?
+    /// Non-nil when the handler threw — contains the error description.
+    let error: String?
+    /// `true` when the result was not available within the timeout window.
+    let timedOut: Bool
+}
+extension UpdateResultResponse: ResponseCodable {}
+
+struct VersionMarkerResponse: Codable, Sendable {
+    let changeId: String
+    let value: Bool
+    let markedAt: Date
+    init(from row: WorkflowStateQueries.VersionMarkerRow) {
+        changeId = row.changeID
+        value = row.value
+        markedAt = row.markedAt
+    }
+}
+extension VersionMarkerResponse: ResponseCodable {}

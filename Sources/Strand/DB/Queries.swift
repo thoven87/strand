@@ -217,6 +217,21 @@ enum Queries {
                 )
                 // pg_notify is transactional — delivered only after this transaction commits.
                 try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+                // Write-through to trace_spans — best-effort, never blocks the main flow.
+                try? await TraceSpanQueries.upsertTaskSpan(
+                    on: conn,
+                    id: taskID.uuidString,
+                    namespaceID: namespaceID,
+                    taskID: taskID,
+                    parentID: parentTaskID?.uuidString,
+                    kind: kind == .workflow ? .workflow : .activity,
+                    name: taskName,
+                    state: .waiting,
+                    maxAttempts: maxAttempts,
+                    queuedAt: scheduledAt ?? Date(),
+                    eventType: kind == .workflow ? .workflowStarted : .activityScheduled,
+                    logger: logger
+                )
                 return EnqueueRow(taskID: taskID, runID: runID, attempt: 1, created: true)
             } else {
                 let existStream = try await conn.query(
@@ -415,6 +430,23 @@ enum Queries {
                     runInterp.appendLiteral(")")
                 }
                 try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
+                // Write-through to trace_spans — best-effort, one row per new child.
+                for child in newChildren {
+                    try? await TraceSpanQueries.upsertTaskSpan(
+                        on: conn,
+                        id: child.taskID.uuidString,
+                        namespaceID: namespaceID,
+                        taskID: child.taskID,
+                        parentID: parentTaskID.uuidString,
+                        kind: child.kind == .workflow ? .workflow : .activity,
+                        name: child.taskName,
+                        state: .waiting,
+                        maxAttempts: child.maxAttempts,
+                        queuedAt: child.scheduledAt ?? Date(),
+                        eventType: child.kind == .workflow ? .workflowStarted : .activityScheduled,
+                        logger: logger
+                    )
+                }
             }
 
             // ── 5. Notify workers — one pg_notify per distinct new child queue ────────
@@ -636,6 +668,22 @@ enum Queries {
         )
         var tasks: [ClaimedTask] = []
         for try await row in stream { tasks.append(try ClaimedTask(row: row)) }
+        // Write-through to trace_spans — best-effort RUNNING update per claimed task.
+        // trace_spans.id is TEXT (supports both "<uuid>" and "<uuid>:<seqNum>" formats),
+        // so task IDs must be bound as strings, not UUIDs.
+        for task in tasks {
+            _ = try? await client.query(
+                """
+                UPDATE strand.trace_spans
+                SET state      = \(WorkflowSpanState.running),
+                    started_at = COALESCE(started_at, NOW()),
+                    worker_id  = \(workerID),
+                    attempt    = \(task.attempt)
+                WHERE id = \(task.taskID.uuidString)
+                """,
+                logger: logger
+            )
+        }
         return tasks
     }
 
@@ -654,14 +702,26 @@ enum Queries {
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
             // Fetch task state and ID — FOR UPDATE prevents concurrent completions.
+            // Partition pruning: strand.runs is partitioned monthly by created_at.
+            // Adding a 2-month window lets Postgres skip all older partitions while
+            // still safely covering runs that started just before a month boundary.
             let stateStream = try await conn.query(
-                "SELECT t.state, t.id FROM strand.runs r JOIN strand.tasks t ON t.id = r.task_id WHERE r.id = \(runID) AND r.namespace_id = \(namespaceID) FOR UPDATE",
+                """
+                SELECT t.state, t.id, t.kind
+                FROM   strand.runs r
+                JOIN   strand.tasks t ON t.id = r.task_id
+                WHERE  r.id            = \(runID)
+                  AND  r.namespace_id  = \(namespaceID)
+                  AND  r.created_at   >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
+                FOR UPDATE
+                """,
                 logger: logger
             )
             guard let row = try await stateStream.first(where: { _ in true }) else { return }
             var col = row.makeIterator()
             let taskState = try col.next()!.decode(TaskState.self, context: .default)
             let taskID = try col.next()!.decode(UUID.self, context: .default)
+            let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
             if taskState == .cancelled { throw InternalError.cancelled }
 
             // CAS on version — if another worker already wrote a completion, bail out.
@@ -688,6 +748,19 @@ enum Queries {
                 "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
                 logger: logger
             )
+            // Write-through to trace_spans — best-effort COMPLETED update.
+            let _spanCompleteET: WorkflowStateQueries.HistoryEventType =
+                taskKind == .workflow ? .workflowCompleted : .activityCompleted
+            _ = try? await conn.query(
+                """
+                UPDATE strand.trace_spans
+                SET state       = \(WorkflowSpanState.completed),
+                    finished_at = NOW(),
+                    event_type  = \(_spanCompleteET)
+                WHERE id = \(taskID.uuidString)
+                """,
+                logger: logger
+            )
             try await emitTaskCompletionSignal(
                 conn: conn,
                 namespaceID: namespaceID,
@@ -701,6 +774,7 @@ enum Queries {
 
     private struct _NRFlag: Decodable { let non_retryable: Bool? }
     private struct _ErrorType: Decodable { let name: String? }
+    private struct _FailureMessage: Decodable { let message: String? }
 
     /// Marks a run as failed and schedules a retry if attempts remain.
     static func failRun(
@@ -713,9 +787,12 @@ enum Queries {
         try await client.withTransaction(logger: logger) { conn in
             let infoStream = try await conn.query(
                 """
-                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.queue, t.deadline_at
-                FROM strand.runs r JOIN strand.tasks t ON t.id = r.task_id
-                WHERE r.id = \(runID) FOR UPDATE OF t
+                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.queue, t.deadline_at, t.kind
+                FROM   strand.runs r
+                JOIN   strand.tasks t ON t.id = r.task_id
+                WHERE  r.id           = \(runID)
+                  AND  r.created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
+                FOR UPDATE OF t
                 """,
                 logger: logger
             )
@@ -727,6 +804,7 @@ enum Queries {
             let retryStrategyBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
             _ = try col.next()!.decode(String.self, context: .default)
             let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
+            let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
             // Guard: only fail if this run is still running.
             // If another worker already processed it, bail out silently.
             let failStream = try await conn.query(
@@ -736,6 +814,22 @@ enum Queries {
             guard try await failStream.first(where: { _ in true }) != nil else { return }
             try await conn.query(
                 "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
+                logger: logger
+            )
+            // Write-through to trace_spans — best-effort FAILED update.
+            // If a retry is scheduled, claimTasks will later overwrite this with state='RUNNING'.
+            let _spanError: String? = (try? JSON.decode(_FailureMessage.self, from: reasonBuffer))?.message
+            let _spanFailET: WorkflowStateQueries.HistoryEventType =
+                taskKind == .workflow ? .workflowFailed : .activityFailed
+            _ = try? await conn.query(
+                """
+                UPDATE strand.trace_spans
+                SET state       = \(WorkflowSpanState.failed),
+                    finished_at = NOW(),
+                    error       = \(_spanError),
+                    event_type  = \(_spanFailET)
+                WHERE id        = \(taskID.uuidString)
+                """,
                 logger: logger
             )
 
@@ -1572,6 +1666,40 @@ enum Queries {
                 try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             }
         }
+    }
+
+    // MARK: - Update result polling
+
+    /// Returns the payload of the most-recent `strand.events` row with the given
+    /// `name` in `namespaceID`, or `nil` if no such row exists yet.
+    ///
+    /// Used by `WorkflowHandle.executeUpdate` to poll for update results stored
+    /// as named events in `strand.events`.  Correlation IDs are UUIDs, making the
+    /// event name globally unique, so no queue filter is required.
+    static func findLatestEventPayload(
+        on client: PostgresClient,
+        namespaceID: String,
+        name: String,
+        logger: Logger
+    ) async throws -> ByteBuffer? {
+        let stream = try await client.query(
+            """
+            SELECT payload
+            FROM   strand.events
+            WHERE  namespace_id = \(namespaceID)
+              AND  name         = \(name)
+            ORDER  BY created_at DESC
+            LIMIT  1
+            """,
+            logger: logger
+        )
+        for try await row in stream {
+            var col = row.makeIterator()
+            if let raw = try col.next()!.decode(RawJSONB?.self, context: .default) {
+                return raw.buffer
+            }
+        }
+        return nil
     }
 
     // MARK: - Lease expiry sweep

@@ -61,6 +61,45 @@ export const sendSignal = (
         })
         .then((r) => r.data);
 
+export interface UpdateResult {
+    correlationID: string;
+    result: string | null; // JSON string from the handler, or null
+    error: string | null; // non-null when handler threw
+    timedOut: boolean;
+}
+
+export const sendUpdate = (
+    namespace: string,
+    queue: string,
+    taskId: string,
+    name: string,
+    payload?: string,
+    timeoutSeconds?: number,
+): Promise<UpdateResult> =>
+    api
+        .post<UpdateResult>(
+            `/api/${namespace}/queues/${queue}/tasks/${taskId}/update`,
+            { name, payload: payload ?? null, timeout: timeoutSeconds ?? 10 },
+        )
+        .then((r) => r.data);
+
+export interface VersionMarker {
+    changeId: string;
+    value: boolean;
+    markedAt: string; // ISO 8601
+}
+
+export const getVersionMarkers = (
+    namespace: string,
+    queue: string,
+    taskId: string,
+): Promise<VersionMarker[]> =>
+    api
+        .get<
+            VersionMarker[]
+        >(`/api/${namespace}/queues/${queue}/tasks/${taskId}/version-markers`)
+        .then((r) => r.data);
+
 export interface DailyActivity {
     date: string; // ISO date string
     total: number;

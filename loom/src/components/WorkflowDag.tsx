@@ -44,6 +44,8 @@ function kindBadge(kind: TraceSpan["kind"]): { label: string; fill: string } {
             return { label: "cond", fill: "#94a3b8" };
         case "LOG":
             return { label: "L", fill: "#64748b" };
+        default:
+            return { label: "?", fill: "#64748b" };
     }
 }
 

@@ -33,6 +33,10 @@ struct MetricsResponse: Codable, Sendable {
         let p50WaitMs: Double?
         /// p95 queue-wait time, milliseconds.
         let p95WaitMs: Double?
+        /// Exact minimum execution time in milliseconds from DDSketch.
+        let minMs: Double?
+        /// Exact maximum execution time in milliseconds from DDSketch.
+        let maxMs: Double?
     }
     let completed: Int
     let failed: Int
@@ -277,7 +281,9 @@ struct MetricsRoutes {
                             p95Ms: t.execTime.quantile(0.95),
                             p99Ms: t.execTime.quantile(0.99),
                             p50WaitMs: t.waitTime?.quantile(0.50),
-                            p95WaitMs: t.waitTime?.quantile(0.95)
+                            p95WaitMs: t.waitTime?.quantile(0.95),
+                            minMs: t.execTime.min,
+                            maxMs: t.execTime.max
                         )
                     }
                 } else {
@@ -347,6 +353,53 @@ struct MetricsRoutes {
                 p95WaitMs: wait?.quantile(0.95),
                 ratePerSec: ratePerSec > 0 ? ratePerSec : nil
             )
+        }
+
+        // GET /api/:namespace/metrics/latency
+        // Returns exact OLAP latency percentiles from `strand.trace_spans` via
+        // PERCENTILE_CONT, plus a time-bucketed series for trend charts.
+        // Query parameters:
+        //   hours     – lookback window in hours (1, 6, 24, 168); default 24
+        //   limit     – max task names to return (default 50, capped at 500)
+        //   taskName  – optional filter to a single task definition
+        router.get("metrics/latency") { req, ctx -> LatencyResponse in
+            let ns = ctx.namespaceID
+            let rawHours = req.uri.queryParameters.get("hours").flatMap(Int.init) ?? 24
+            let validHours = [1, 6, 24, 168]
+            let hours = validHours.min(by: { abs($0 - rawHours) < abs($1 - rawHours) }) ?? 24
+            let limit = req.uri.queryParameters.get("limit").flatMap(Int.init) ?? 50
+            let taskName = req.uri.queryParameters.get("taskName")
+
+            do {
+                async let perTaskRows = ManagementQueries.latencyPercentiles(
+                    on: self.postgres,
+                    namespaceID: ns,
+                    hours: hours,
+                    limit: limit,
+                    logger: self.logger
+                )
+                async let bucketRows = ManagementQueries.latencyTimeSeries(
+                    on: self.postgres,
+                    namespaceID: ns,
+                    hours: hours,
+                    taskName: taskName,
+                    logger: self.logger
+                )
+
+                let (tasks, buckets) = try await (perTaskRows, bucketRows)
+
+                return LatencyResponse(
+                    tasks: tasks.map(LatencyTaskResponse.init(from:)),
+                    timeSeries: buckets.map(LatencyBucketResponse.init(from:)),
+                    windowHours: hours
+                )
+            } catch {
+                ctx.logger.error(
+                    "Failed to get metrics",
+                    metadata: ["error": "\(String(reflecting: error))"]
+                )
+                throw HTTPError(.internalServerError, message: "Failed to get metrics: \(error)")
+            }
         }
     }
 }

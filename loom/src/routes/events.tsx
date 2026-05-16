@@ -284,7 +284,7 @@ function EventRow({
                 className="border-b border-border/40 last:border-0 hover:bg-secondary/10 transition-colors cursor-pointer group/row"
                 onClick={() => setExpanded((e) => !e)}
             >
-                {/* Timestamp — first column like Inngest */}
+                {/* Timestamp */}
                 <td className="px-4 py-2.5 whitespace-nowrap">
                     <RelativeTime iso={event.createdAt} />
                 </td>

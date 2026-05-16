@@ -43,6 +43,10 @@ public struct DDSketch: Sendable {
     private(set) var bins: [Int: Int] = [:]
     /// Total number of observations inserted.
     private(set) var count: Int = 0
+    /// Exact minimum value seen. `nil` when the sketch is empty.
+    private(set) var minValue: Double? = nil
+    /// Exact maximum value seen. `nil` when the sketch is empty.
+    private(set) var maxValue: Double? = nil
 
     // MARK: - Mutation
 
@@ -52,6 +56,8 @@ public struct DDSketch: Sendable {
         let bin = Int((log(ms) * Self.invLogGamma).rounded(.up))
         bins[bin, default: 0] += 1
         count += 1
+        minValue = Swift.min(minValue ?? ms, ms)
+        maxValue = Swift.max(maxValue ?? ms, ms)
     }
 
     /// Merge another sketch into this one (in-place).
@@ -60,6 +66,12 @@ public struct DDSketch: Sendable {
             bins[bin, default: 0] += n
         }
         count += other.count
+        if let otherMin = other.minValue {
+            minValue = minValue.map { Swift.min($0, otherMin) } ?? otherMin
+        }
+        if let otherMax = other.maxValue {
+            maxValue = maxValue.map { Swift.max($0, otherMax) } ?? otherMax
+        }
     }
 
     // MARK: - Query
@@ -67,6 +79,9 @@ public struct DDSketch: Sendable {
     /// Estimate the `q`-th quantile (0 … 1), returned in milliseconds.
     ///
     /// Returns `nil` when the sketch is empty.
+    ///
+    /// Special cases: `q == 0.0` returns the exact `minValue`; `q == 1.0`
+    /// returns the exact `maxValue`.
     ///
     /// ## Error guarantee
     ///
@@ -80,6 +95,8 @@ public struct DDSketch: Sendable {
     /// This matches the symmetric `±2 %` guarantee cited in the DDSketch paper.
     public func quantile(_ q: Double) -> Double? {
         guard count > 0, (0...1).contains(q) else { return nil }
+        if q == 0.0 { return minValue }
+        if q == 1.0 { return maxValue }
         let target = Int((q * Double(count)).rounded(.up))
         var accumulated = 0
         for key in bins.keys.sorted() {
@@ -94,6 +111,29 @@ public struct DDSketch: Sendable {
         return nil
     }
 
+    /// Returns the approximate sum of all recorded values (in milliseconds).
+    /// Uses the geometric midpoint of each bucket as the representative value.
+    public func approximateSum() -> Double {
+        bins.reduce(0.0) { acc, pair in
+            let mid = exp2((Double(pair.key) - 0.5) * Self.log2gamma)
+            return acc + mid * Double(pair.value)
+        }
+    }
+
+    /// Returns the approximate mean of all recorded values (in milliseconds).
+    /// Returns `nil` when the sketch is empty.
+    public func approximateMean() -> Double? {
+        count > 0 ? approximateSum() / Double(count) : nil
+    }
+
+    /// Returns all buckets as `(midpoint, count)` pairs, sorted by midpoint ascending.
+    /// The midpoint is the geometric midpoint of the bucket's range.
+    public func toList() -> [(midpoint: Double, count: Int)] {
+        bins.keys.sorted().map { k in
+            (midpoint: exp2((Double(k) - 0.5) * Self.log2gamma), count: bins[k]!)
+        }
+    }
+
     // MARK: - Serialisation
 
     /// A `Codable` representation that fits inside a `pg_notify` payload.
@@ -105,16 +145,25 @@ public struct DDSketch: Sendable {
         public let bins: [String: Int]
         /// Total number of observations.
         public let size: Int
+        /// Exact minimum value seen. `nil` when the sketch is empty (`size == 0`).
+        public let min: Double?
+        /// Exact maximum value seen. `nil` when the sketch is empty (`size == 0`).
+        public let max: Double?
 
         public init(from sketch: DDSketch) {
             bins = Dictionary(uniqueKeysWithValues: sketch.bins.map { ("\($0.key)", $0.value) })
             size = sketch.count
+            min = sketch.minValue
+            max = sketch.maxValue
         }
 
         /// Estimate the `q`-th quantile (ms).  Returns `nil` for an empty sketch.
         /// Uses the geometric midpoint `γ^(k−0.5)` for symmetric ±2 % error.
+        /// `q == 0.0` returns the exact `min`; `q == 1.0` returns the exact `max`.
         public func quantile(_ q: Double) -> Double? {
             guard size > 0, (0...1).contains(q) else { return nil }
+            if q == 0.0 { return min }
+            if q == 1.0 { return max }
             let target = Int((q * Double(size)).rounded(.up))
             let sorted = bins.compactMap { k, v -> (Int, Int)? in
                 Int(k).map { ($0, v) }
@@ -129,6 +178,28 @@ public struct DDSketch: Sendable {
             return nil
         }
 
+        /// Returns the approximate sum of all recorded values (in milliseconds).
+        public func approximateSum() -> Double {
+            bins.reduce(0.0) { acc, pair in
+                guard let k = Int(pair.key) else { return acc }
+                let mid = exp2((Double(k) - 0.5) * DDSketch.log2gamma)
+                return acc + mid * Double(pair.value)
+            }
+        }
+
+        /// Returns the approximate mean (in milliseconds). `nil` when empty.
+        public func approximateMean() -> Double? {
+            size > 0 ? approximateSum() / Double(size) : nil
+        }
+
+        /// Returns all buckets as `(midpoint, count)` pairs, sorted by midpoint ascending.
+        public func toList() -> [(midpoint: Double, count: Int)] {
+            bins.compactMap { k, n -> (Double, Int)? in
+                guard let ki = Int(k) else { return nil }
+                return (exp2((Double(ki) - 0.5) * DDSketch.log2gamma), n)
+            }.sorted { $0.0 < $1.0 }
+        }
+
         /// Merge multiple serialised sketches into one so callers can query
         /// cross-queue quantiles without duplicating the quantile algorithm.
         /// Returns `nil` when the input array is empty.
@@ -136,16 +207,22 @@ public struct DDSketch: Sendable {
             guard !sketches.isEmpty else { return nil }
             var mergedBins: [String: Int] = [:]
             var mergedSize = 0
+            var mergedMin: Double? = nil
+            var mergedMax: Double? = nil
             for s in sketches {
                 for (k, v) in s.bins { mergedBins[k, default: 0] += v }
                 mergedSize += s.size
+                if let m = s.min { mergedMin = mergedMin.map { Swift.min($0, m) } ?? m }
+                if let m = s.max { mergedMax = mergedMax.map { Swift.max($0, m) } ?? m }
             }
-            return Serialized(bins: mergedBins, size: mergedSize)
+            return Serialized(bins: mergedBins, size: mergedSize, min: mergedMin, max: mergedMax)
         }
 
-        private init(bins: [String: Int], size: Int) {
+        private init(bins: [String: Int], size: Int, min: Double?, max: Double?) {
             self.bins = bins
             self.size = size
+            self.min = min
+            self.max = max
         }
     }
 }

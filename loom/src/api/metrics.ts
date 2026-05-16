@@ -20,6 +20,8 @@ export interface TaskTiming {
     p50WaitMs: number | null;
     /** p95 queue-wait time */
     p95WaitMs: number | null;
+    minMs: number | null;
+    maxMs: number | null;
 }
 
 export interface MetricsData {
@@ -57,6 +59,46 @@ export const getTaskMetrics = (
         .get<TaskMetrics>(
             `/api/${namespace}/metrics/task/${encodeURIComponent(taskName)}`,
         )
+        .then((r) => r.data);
+
+export interface LatencyTask {
+    taskName: string;
+    count: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+    p99Ms: number | null;
+    minMs: number | null;
+    maxMs: number | null;
+}
+
+export interface LatencyBucket {
+    bucket: string; // ISO 8601
+    taskName: string;
+    count: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+}
+
+export interface LatencyData {
+    tasks: LatencyTask[];
+    timeSeries: LatencyBucket[];
+    windowHours: number;
+}
+
+export const getLatencyMetrics = (
+    namespace: string,
+    hours: number,
+    limit?: number,
+    taskName?: string,
+): Promise<LatencyData> =>
+    api
+        .get<LatencyData>(`/api/${namespace}/metrics/latency`, {
+            params: {
+                hours,
+                ...(limit !== undefined ? { limit } : {}),
+                ...(taskName ? { taskName } : {}),
+            },
+        })
         .then((r) => r.data);
 
 export const getMetrics = (

@@ -29,7 +29,7 @@ struct RoomMonitorWorkflow: Workflow {
     ///     RoomMonitorWorkflow.UpdateThresholds.self,
     ///     payload: ThresholdUpdate(newThresholds: adjusted, reason: "post-incident"))
     /// ```
-    struct UpdateThresholds: WorkflowSignalDefinition {
+    struct UpdateThresholds: WorkflowSignal {
         typealias W = RoomMonitorWorkflow
         typealias Input = ThresholdUpdate
         static func apply(to w: inout RoomMonitorWorkflow, input: ThresholdUpdate) {
@@ -95,7 +95,7 @@ struct RoomMonitorWorkflow: Workflow {
                     }
 
                 if breached {
-                    _ = try await context.runActivity(
+                    try await context.runActivity(
                         SendAlertActivity.self,
                         input: AlertInput(
                             roomId: input.roomId,

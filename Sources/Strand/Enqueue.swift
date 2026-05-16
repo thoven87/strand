@@ -177,6 +177,7 @@ public enum WorkflowSpanKind: String, Sendable, Codable, CaseIterable {
     case wait = "WAIT"  // ctx.waitForEvent(...)
     case sleep = "SLEEP"  // ctx.sleep(for:)
     case signal = "SIGNAL"  // handleSignal delivery
+    case update = "UPDATE"  // @WorkflowUpdate delivery
     case emit = "EMIT"  // ctx.emitEvent(...)
     case condition = "CONDITION"  // ctx.condition(...) — reserved for future use
 }
@@ -196,6 +197,33 @@ extension WorkflowSpanKind {
     var displayName: String { rawValue.lowercased() }
 }
 
+// MARK: - WorkflowSpanKind PostgresCodable
+
+extension WorkflowSpanKind: PostgresCodable {
+    public static var psqlType: PostgresDataType { .text }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let kind = WorkflowSpanKind(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = kind
+    }
+}
+
 // MARK: - WorkflowSpanState
 
 /// State of a span in the workflow trace view.
@@ -212,6 +240,33 @@ public enum WorkflowSpanState: String, Sendable, Codable {
     case cancelled = "CANCELLED"
     case delayed = "DELAYED"
     case completed = "COMPLETED"
+}
+
+// MARK: - WorkflowSpanState PostgresCodable
+
+extension WorkflowSpanState: PostgresCodable {
+    public static var psqlType: PostgresDataType { .text }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let state = WorkflowSpanState(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = state
+    }
 }
 
 // MARK: - Task result types
@@ -372,6 +427,25 @@ public struct AwaitEventOptions: Sendable {
 // MARK: - RetryOptions
 
 /// Options controlling how a failed or cancelled task is retried.
+// MARK: - Version migration
+
+/// The migration status for a ``WorkflowContext/version(changeID:)`` gate
+/// across all workflows in a namespace.
+///
+/// Returned by ``StrandClient/migrationStatus(changeID:)``.
+public struct MigrationStatus: Sendable {
+    /// The changeID this status describes.
+    public let changeID: String
+    /// Number of in-flight workflows still on the old code path (`value = false`).
+    /// When this reaches zero it is safe to remove the `else` branch.
+    public let pendingCount: Int
+    /// Number of in-flight workflows that have passed the gate on the new path.
+    public let completedCount: Int
+    /// `true` when no in-flight workflow is still on the old path — safe to
+    /// delete the `else` branch in the next deploy.
+    public var isSafeToRemove: Bool { pendingCount == 0 }
+}
+
 public struct RetryOptions: Codable, Sendable {
     /// Determines which descendant tasks are reset alongside the selected task.
     ///

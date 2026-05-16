@@ -14,10 +14,14 @@ package import Foundation
 package struct PendingSignal: Sendable {
     /// Primary key of the `strand.workflow_signals` row.
     let id: UUID
-    /// The registered signal name (matches `@WorkflowSignal.name`).
+    /// The signal or update name. For updates this is the clean handler name
+    /// (e.g. `"setPriority"`); for signals it is the signal name (e.g. `"pause"`).
     let name: String
     /// Caller-supplied payload bytes, or `nil` when the signal carries no data.
     let payload: ByteBuffer?
+    /// Non-nil when this row is an `@WorkflowUpdate` request.
+    /// Nil for regular `@WorkflowSignal` deliveries.
+    let updateCorrelationID: String?
 }
 
 // MARK: - WorkflowStateQueries
@@ -110,7 +114,7 @@ package enum WorkflowStateQueries {
     ) async throws -> [PendingSignal] {
         let stream = try await postgres.query(
             """
-            SELECT id, signal_name, payload
+            SELECT id, signal_name, payload, update_correlation_id
             FROM   strand.workflow_signals
             WHERE  task_id      = \(taskID)
               AND  namespace_id = \(namespaceID)
@@ -125,7 +129,8 @@ package enum WorkflowStateQueries {
                 PendingSignal(
                     id: try col.next()!.decode(UUID.self, context: .default),
                     name: try col.next()!.decode(String.self, context: .default),
-                    payload: try col.next()!.decode(ByteBuffer?.self, context: .default)
+                    payload: try col.next()!.decode(ByteBuffer?.self, context: .default),
+                    updateCorrelationID: try col.next()!.decode(String?.self, context: .default)
                 )
             )
         }
@@ -149,6 +154,58 @@ package enum WorkflowStateQueries {
             "DELETE FROM strand.workflow_signals WHERE id = ANY(\(ids))",
             logger: logger
         )
+    }
+
+    // MARK: - writeUpdateResult / findUpdateResult
+
+    /// Writes a workflow update result (or error) to `strand.workflow_updates`.
+    ///
+    /// Called by the worker after `handleUpdate` returns. ON CONFLICT DO NOTHING
+    /// ensures idempotency on re-activation.
+    package static func writeUpdateResult(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        correlationID: String,
+        result: ByteBuffer?,
+        error: String?,
+        logger: Logger
+    ) async throws {
+        try await postgres.query(
+            """
+            INSERT INTO strand.workflow_updates
+                (namespace_id, task_id, correlation_id, result, error)
+            VALUES (\(namespaceID), \(taskID), \(correlationID), \(result), \(error))
+            ON CONFLICT (namespace_id, correlation_id) DO NOTHING
+            """,
+            logger: logger
+        )
+    }
+
+    /// Polls `strand.workflow_updates` for a result row matching `correlationID`.
+    /// Returns `nil` when no row exists yet (caller should retry).
+    package static func findUpdateResult(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        correlationID: String,
+        logger: Logger
+    ) async throws -> (result: ByteBuffer?, error: String?)? {
+        let stream = try await postgres.query(
+            """
+            SELECT result, error
+            FROM   strand.workflow_updates
+            WHERE  namespace_id   = \(namespaceID)
+              AND  correlation_id = \(correlationID)
+            """,
+            logger: logger
+        )
+        for try await row in stream {
+            var col = row.makeIterator()
+            let result = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let error = try col.next()!.decode(String?.self, context: .default)
+            return (result: result, error: error)
+        }
+        return nil
     }
 
     // MARK: - insertSignal
@@ -274,6 +331,7 @@ package enum WorkflowStateQueries {
         case workflowCompleted = "WORKFLOW_COMPLETED"
         case workflowFailed = "WORKFLOW_FAILED"
         case signalReceived = "SIGNAL_RECEIVED"
+        case updateApplied = "UPDATE_APPLIED"
         case activityScheduled = "ACTIVITY_SCHEDULED"
         case activityCompleted = "ACTIVITY_COMPLETED"
         case activityFailed = "ACTIVITY_FAILED"
@@ -508,11 +566,10 @@ package enum WorkflowStateQueries {
         }
         try await postgres.withTransaction(logger: logger) { conn in
             for e in events {
-                let rawType = e.eventType.rawValue
                 try await conn.query(
                     """
                     INSERT INTO strand.workflow_history (namespace_id, task_id, seq, event_type, event_data)
-                    VALUES (\(namespaceID), \(taskID), \(e.seq), \(rawType), \(e.eventData))
+                    VALUES (\(namespaceID), \(taskID), \(e.seq), \(e.eventType), \(e.eventData))
                     ON CONFLICT (task_id, seq) DO NOTHING
                     """,
                     logger: logger
@@ -520,5 +577,123 @@ package enum WorkflowStateQueries {
             }
         }
     }
+}
 
+// MARK: - Version markers
+
+extension WorkflowStateQueries {
+
+    /// Upserts a version marker for a workflow task.
+    /// Called from applyScheduleCommands (.recordVersionMarker) and StrandClient.markVersion.
+    package static func writeVersionMarker(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        changeID: String,
+        value: Bool,
+        logger: Logger
+    ) async throws {
+        try await postgres.query(
+            """
+            INSERT INTO strand.workflow_version_markers
+                (namespace_id, task_id, change_id, value, marked_at)
+            VALUES (\(namespaceID), \(taskID), \(changeID), \(value), NOW())
+            ON CONFLICT (task_id, change_id)
+            DO UPDATE SET value = EXCLUDED.value, marked_at = NOW()
+            """,
+            logger: logger
+        )
+    }
+
+    package struct VersionMarkerRow: Sendable {
+        package let changeID: String
+        package let value: Bool
+        package let markedAt: Date
+    }
+
+    /// Returns all version markers for a workflow task, ordered by marked_at DESC.
+    package static func listVersionMarkers(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> [VersionMarkerRow] {
+        let stream = try await postgres.query(
+            """
+            SELECT change_id, value, marked_at
+            FROM strand.workflow_version_markers
+            WHERE namespace_id = \(namespaceID)
+              AND task_id = \(taskID)
+            ORDER BY marked_at DESC
+            """,
+            logger: logger
+        )
+        var rows: [VersionMarkerRow] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            let changeID = try col.next()!.decode(String.self, context: .default)
+            let value = try col.next()!.decode(Bool.self, context: .default)
+            let markedAt = try col.next()!.decode(Date.self, context: .default)
+            rows.append(VersionMarkerRow(changeID: changeID, value: value, markedAt: markedAt))
+        }
+        return rows
+    }
+
+    /// Returns the migration status for a version gate across all workflows in a namespace.
+    /// Used by ``StrandClient/migrationStatus(changeID:)`` to tell operators when it is
+    /// safe to remove the old code path guarded by ``WorkflowContext/version(changeID:)``.
+    /// `isSafeToRemove` is `true` when every in-flight workflow has passed the gate
+    /// on the new path (no rows with `value = false` remain).
+    package static func versionMigrationStatus(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        changeID: String,
+        logger: Logger
+    ) async throws -> MigrationStatus {
+        let stream = try await postgres.query(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN value = false THEN 1 ELSE 0 END), 0)::integer AS pending,
+              COALESCE(SUM(CASE WHEN value = true  THEN 1 ELSE 0 END), 0)::integer AS completed
+            FROM strand.workflow_version_markers
+            WHERE namespace_id = \(namespaceID)
+              AND change_id    = \(changeID)
+            """,
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else {
+            return MigrationStatus(changeID: changeID, pendingCount: 0, completedCount: 0)
+        }
+        var col = row.makeIterator()
+        let pending = try col.next()!.decode(Int.self, context: .default)
+        let completed = try col.next()!.decode(Int.self, context: .default)
+        return MigrationStatus(changeID: changeID, pendingCount: pending, completedCount: completed)
+    }
+}
+
+// MARK: - WorkflowStateQueries.HistoryEventType: PostgresCodable
+
+extension WorkflowStateQueries.HistoryEventType: PostgresCodable {
+    package static var psqlType: PostgresDataType { .text }
+    package static var psqlFormat: PostgresFormat { .binary }
+
+    package func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    package init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let evt = WorkflowStateQueries.HistoryEventType(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = evt
+    }
 }

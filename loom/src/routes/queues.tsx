@@ -1,11 +1,27 @@
+import { useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams } from "@tanstack/react-router";
 import { getQueues, pauseQueue, resumeQueue } from "@/api/queues";
+import { getMetrics } from "@/api/metrics";
 import { qk } from "@/lib/queryKeys";
 import { Pause, Play } from "lucide-react";
 import type { Queue } from "@/api/types";
 import { EmptyState } from "@/components/EmptyState";
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Formats a per-second rate as a human-readable string. Mirrors metrics.tsx. */
+function fmtRate(ratePerSec: number | null | undefined): string {
+    if (ratePerSec == null || !isFinite(ratePerSec) || ratePerSec < 0)
+        return "—";
+    const perMin = ratePerSec * 60;
+    if (perMin < 1) return "< 1/min";
+    if (ratePerSec < 1) return `${perMin.toFixed(perMin < 10 ? 1 : 0)}/min`;
+    return `${ratePerSec >= 10 ? ratePerSec.toFixed(0) : ratePerSec.toFixed(1)}/s`;
+}
+
+// ── QueueBar ──────────────────────────────────────────────────────────────────
 
 function QueueBar({ stats }: { stats: Queue["stats"] }) {
     const total =
@@ -74,6 +90,7 @@ export function QueuesPage() {
     usePageTitle("Queues");
     const { namespace } = useParams({ strict: false }) as { namespace: string };
     const qc = useQueryClient();
+
     const {
         data: queues = [],
         isLoading,
@@ -83,6 +100,26 @@ export function QueuesPage() {
         queryFn: () => getQueues(namespace),
         refetchInterval: 10_000,
     });
+
+    // Metrics — per-queue throughput from the broadcast DDSketch cache.
+    const { data: metricsData } = useQuery({
+        queryKey: qk.metrics.get(namespace),
+        queryFn: () => getMetrics(namespace),
+        staleTime: 10_000,
+        refetchInterval: 10_000,
+    });
+
+    // Aggregate ratePerSec across all (taskName, state) rows for each queue.
+    const queueRates = useMemo(() => {
+        if (!metricsData?.taskTimings) return {} as Record<string, number>;
+        const map: Record<string, number> = {};
+        for (const t of metricsData.taskTimings) {
+            if (t.ratePerSec != null && t.ratePerSec > 0) {
+                map[t.queue] = (map[t.queue] ?? 0) + t.ratePerSec;
+            }
+        }
+        return map;
+    }, [metricsData?.taskTimings]);
 
     const pauseMut = useMutation({
         mutationFn: (name: string) => pauseQueue(namespace, name),
@@ -121,7 +158,7 @@ export function QueuesPage() {
                         className="rounded-lg border border-border bg-card/40 hover:border-border/80 hover:bg-card/60 transition-all p-4 group"
                     >
                         <div className="flex items-center justify-between mb-3">
-                            {/* Name + paused badge */}
+                            {/* Name + paused badge + throughput pill */}
                             <div className="flex items-center gap-2">
                                 <Link
                                     to="/$namespace/queues/$queue"
@@ -133,6 +170,11 @@ export function QueuesPage() {
                                 {q.isPaused && (
                                     <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium bg-yellow-500/15 text-yellow-300 border-yellow-500/25">
                                         Paused
+                                    </span>
+                                )}
+                                {(queueRates[q.name] ?? 0) > 0 && (
+                                    <span className="text-[11px] text-muted-foreground bg-secondary/20 rounded px-1.5 py-0.5">
+                                        {fmtRate(queueRates[q.name])}
                                     </span>
                                 )}
                             </div>

@@ -20,8 +20,6 @@ import { WorkflowsPage } from "@/routes/workflows";
 import { MetricsPage } from "@/routes/metrics";
 import { TaskTracePage } from "@/routes/tasks_/$taskId.trace";
 import { NotFound } from "@/routes/not-found";
-import { getStoredNamespace } from "@/lib/namespace";
-
 // ── Root ───────────────────────────────────────────────────────────────────
 
 const rootRoute = createRootRoute({
@@ -33,13 +31,16 @@ const rootRoute = createRootRoute({
     notFoundComponent: NotFound,
 });
 
-// ── Index → /{storedNamespace}/tasks ──────────────────────────────────────
+// ── Index → /default/tasks ──────────────────────────────────────
 
 const indexRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/",
     beforeLoad: () => {
-        throw redirect({ to: `/${getStoredNamespace()}/tasks` as never });
+        throw redirect({
+            to: "/$namespace/tasks",
+            params: { namespace: "default" },
+        });
     },
 });
 
@@ -170,54 +171,7 @@ const metricsRoute = createRoute({
     component: MetricsPage,
 });
 
-// ── Legacy redirects ────────────────────────────────────────────────────────
-// Old flat routes redirect to the namespace-scoped equivalents using the
-// stored namespace so any existing bookmarks keep working.
-
-const legacyTasksRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: "/tasks",
-    beforeLoad: () => {
-        throw redirect({
-            to: `/${getStoredNamespace()}/runs` as never,
-        });
-    },
-});
-
-const legacyQueueRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: "/queues/$queue",
-    beforeLoad: ({ params }) => {
-        throw redirect({
-            to: `/${getStoredNamespace()}/tasks` as never,
-            search: { queue: params.queue } as never,
-        });
-    },
-});
-
-const legacyQueueTasksRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: "/queues/$queue/tasks/$taskId",
-    beforeLoad: ({ params }) => {
-        throw redirect({
-            to: `/${getStoredNamespace()}/tasks/${params.taskId}` as never,
-            search: { queue: params.queue } as never,
-        });
-    },
-});
-
-const legacyQueueEventsRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: "/queues/$queue/events",
-    beforeLoad: ({ params }) => {
-        throw redirect({
-            to: `/${getStoredNamespace()}/events` as never,
-            search: { queue: params.queue } as never,
-        });
-    },
-});
-
-// ── Router ─────────────────────────────────────────────────────────────────
+// ── Router ─────────────────────────────────────────────────────
 
 const routeTree = rootRoute.addChildren([
     indexRoute,
@@ -237,10 +191,6 @@ const routeTree = rootRoute.addChildren([
         workflowsRoute,
         metricsRoute,
     ]),
-    legacyTasksRoute,
-    legacyQueueRoute,
-    legacyQueueTasksRoute,
-    legacyQueueEventsRoute,
 ]);
 
 export const router = createRouter({ routeTree });

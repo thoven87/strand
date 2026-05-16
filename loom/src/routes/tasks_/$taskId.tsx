@@ -12,13 +12,18 @@ import { getEventTriggerForTask } from "@/api/events";
 import { getTaskMetrics, type TaskMetrics } from "@/api/metrics";
 import { RetryDialog } from "@/components/RetryDialog";
 import { SignalDialog } from "@/components/SignalDialog";
+import { UpdateDialog } from "@/components/UpdateDialog";
 import type { RetryOptions } from "@/api/types";
 import { getRuns, getCheckpoints } from "@/api/runs";
 import {
     getWorkflowHistory,
     getWorkflowState,
+    getVersionMarkers,
     sendSignal,
+    sendUpdate,
+    type VersionMarker,
 } from "@/api/workflows";
+
 import { qk } from "@/lib/queryKeys";
 import { StatusBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -193,6 +198,7 @@ function eventColour(type: string): string {
     if (type === "ACTIVITY_COMPLETED") return "bg-green-400";
     if (type === "ACTIVITY_FAILED") return "bg-red-400";
     if (type.startsWith("ACTIVITY_")) return "bg-yellow-400";
+    if (type === "UPDATE_APPLIED") return "bg-violet-400";
     if (type.startsWith("SIGNAL_")) return "bg-purple-400";
     if (type.startsWith("CHILD_")) return "bg-cyan-400";
     if (type.startsWith("TIMER_")) return "bg-green-400";
@@ -202,6 +208,7 @@ function eventColour(type: string): string {
 }
 
 function eventLabel(type: string): string {
+    if (type === "UPDATE_APPLIED") return "Update applied";
     return type
         .replace(/_/g, " ")
         .toLowerCase()
@@ -448,7 +455,7 @@ function ActivityTimeline({
                                     const d = JSON.parse(
                                         evt.eventData ?? "{}",
                                     ) as Record<string, unknown>;
-                                    // seq_num may be a string (new) or a number (legacy completed events)
+                                    // seq_num may be a string or a number depending on the event source
                                     if (typeof d.seq_num === "string")
                                         seqNum = d.seq_num;
                                     else if (typeof d.seq_num === "number")
@@ -756,6 +763,42 @@ function WorkflowStateView({
     return <JsonView label="state" value={data.state} />;
 }
 
+// ── VersionMarkersPanel ──────────────────────────────────────────────────
+
+function VersionMarkersPanel({ markers }: { markers: VersionMarker[] }) {
+    if (markers.length === 0) return null;
+    return (
+        <div className="rounded-lg border border-border bg-card/40 p-4">
+            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-3">
+                Version Gates
+            </h3>
+            <div className="space-y-1">
+                {markers.map((m) => (
+                    <div
+                        key={m.changeId}
+                        className="flex items-center gap-2 text-xs"
+                    >
+                        {/* passed = green ✓, operator-pinned = amber dot */}
+                        <span
+                            className={`w-4 h-4 flex items-center justify-center rounded-full text-[10px] font-bold shrink-0 ${
+                                m.value
+                                    ? "bg-green-500/15 text-green-500"
+                                    : "bg-amber-500/15 text-amber-500"
+                            }`}
+                        >
+                            {m.value ? "✓" : "·"}
+                        </span>
+                        <span className="font-mono text-foreground flex-1">
+                            {m.changeId}
+                        </span>
+                        <RelativeTime iso={m.markedAt} />
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
 // ── Schedule card ────────────────────────────────────────────────────
 
 /**
@@ -897,10 +940,22 @@ export function TaskDetailPage() {
         refetchInterval: 30_000,
     });
 
+    const { data: versionMarkers = [] } = useQuery<VersionMarker[]>({
+        queryKey: [
+            ...qk.tasks.detail(namespace, task?.queue ?? "", taskId),
+            "version-markers",
+        ],
+        queryFn: () => getVersionMarkers(namespace, task!.queue, taskId),
+        enabled: !!task && task.kind === "WORKFLOW" && !isTerminal(task.state),
+        staleTime: 10_000,
+        refetchInterval: 15_000,
+    });
+
     const [runsOpen, setRunsOpen] = useState(false);
     const [stateOpen, setStateOpen] = useState(false);
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
     const [signalDialogOpen, setSignalDialogOpen] = useState(false);
+    const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
     const [triggerOpen, setTriggerOpen] = useState(false);
 
     const signalMutation = useMutation({
@@ -911,6 +966,17 @@ export function TaskDetailPage() {
             qc.invalidateQueries({
                 queryKey: qk.workflows.state(namespace, queue, taskId),
             });
+        },
+    });
+
+    const updateMutation = useMutation({
+        mutationFn: ({ name, payload }: { name: string; payload?: string }) =>
+            sendUpdate(namespace, queue, taskId, name, payload),
+        onSuccess: () => {
+            /* do NOT close dialog here — let UpdateDialog show the result */
+        },
+        onError: () => {
+            /* UpdateDialog will show error from result */
         },
     });
 
@@ -1119,6 +1185,17 @@ export function TaskDetailPage() {
                             onClick={() => setSignalDialogOpen(true)}
                         >
                             <Send size={12} /> Signal
+                        </Button>
+                    )}
+                    {!terminal && isWorkflow && (
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setUpdateDialogOpen(true)}
+                            className="gap-1.5"
+                        >
+                            <Zap size={13} />
+                            Update
                         </Button>
                     )}
                     {!terminal && (
@@ -1386,6 +1463,11 @@ export function TaskDetailPage() {
                 )}
             </div>
 
+            {/* ── Version Gates ───────────────────────────────────────────── */}
+            {isWorkflow && versionMarkers.length > 0 && (
+                <VersionMarkersPanel markers={versionMarkers} />
+            )}
+
             {/* ── Workflow State (collapsible, secondary) ───────────────────── */}
             {isWorkflow && (
                 <div className="rounded-lg border border-border bg-card/40 overflow-hidden">
@@ -1434,6 +1516,18 @@ export function TaskDetailPage() {
                     signalMutation.mutate({ name, payload })
                 }
                 isPending={signalMutation.isPending}
+            />
+            <UpdateDialog
+                open={updateDialogOpen}
+                onClose={() => {
+                    setUpdateDialogOpen(false);
+                    updateMutation.reset();
+                }}
+                onSend={(name, payload) =>
+                    updateMutation.mutate({ name, payload })
+                }
+                isPending={updateMutation.isPending}
+                result={updateMutation.data ?? null}
             />
             <TriggerDialog
                 open={triggerOpen}

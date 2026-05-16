@@ -142,7 +142,8 @@ public struct StrandClient: Sendable {
             options: AwaitTaskResultOptions(timeout: options.timeout)
         )
         guard snap.state == .completed else {
-            throw StrandError.activityFailed(name: A.name, state: snap.state.rawValue)
+            let retryState: ActivityRetryState = snap.state == .cancelled ? .cancelled : .maximumAttemptsReached
+            throw ActivityError(activityName: A.name, retryState: retryState, cause: nil)
         }
         return try snap.decodeResult(as: A.Output.self)
     }
@@ -292,27 +293,6 @@ public struct StrandClient: Sendable {
             initialRunID: runID,
             client: self
         )
-    }
-
-    // MARK: - awaitWorkflowResult (package)
-
-    /// Polls until `taskID` reaches a terminal state and decodes the result as `T`.
-    ///
-    /// Package-internal — called by ``WorkflowHandle`` when callers need a typed result
-    /// without going through the full snapshot API.
-    package func awaitWorkflowResult<T: Decodable & Sendable>(
-        taskID: UUID,
-        as type: T.Type,
-        options: AwaitTaskResultOptions = .init()
-    ) async throws -> T {
-        let snap = try await pollTerminalSnapshot(id: taskID, options: options)
-        guard snap.state == .completed else {
-            throw StrandError.activityFailed(
-                name: taskID.uuidString,
-                state: snap.state.rawValue
-            )
-        }
-        return try snap.decodeResult(as: type)
     }
 
     // MARK: - Internal enqueue helper
@@ -1291,13 +1271,13 @@ public struct StrandClient: Sendable {
 
     // MARK: - Workflow versioning
 
-    /// Forces a specific ``WorkflowContext/version(changeID:)`` checkpoint value for an
+    /// Forces a specific ``WorkflowContext/version(changeID:)`` gate value for an
     /// in-flight workflow, enabling safe code-deployment migrations.
     ///
-    /// When deploying new code with a ``WorkflowContext/version(changeID:)`` guard,
-    /// ALL workflow activations (both new and in-flight) return `true` on their first
-    /// encounter of that `changeID`. Call this method on existing in-flight workflows
-    /// to force them to take the **pre-change** code path on their next activation.
+    /// When deploying new code guarded by ``WorkflowContext/version(changeID:)``, all
+    /// new workflow instances return `true` on their first encounter of that `changeID`.
+    /// Call this method on existing in-flight workflows **before** deploying to force
+    /// them to take the pre-change code path on their next activation.
     ///
     /// ```swift
     /// // Before deploying the updated code, mark in-flight workflows to use the pre-change path:
@@ -1310,95 +1290,52 @@ public struct StrandClient: Sendable {
     ///
     /// - Parameters:
     ///   - changeID: Must match exactly what's passed to ``WorkflowContext/version(changeID:)``.
-    ///   - value: `false` pins the workflow to the pre-change code path; `true` to the post-change
-    ///     path (the default for new executions that haven't encountered this `changeID` yet).
+    ///   - value: `false` pins the workflow to the pre-change code path; `true` to the
+    ///     post-change path (the default for new executions).
     ///   - taskID: The task UUID of the in-flight workflow.
-    ///   - callSiteIndex: Which call site to target when `version(changeID:)` is called
-    ///     multiple times with the same `changeID`. Defaults to `1` (the first call site).
     /// - Returns: The `value` that was written.
-    /// - Throws: ``StrandError/unknownTask(name:)`` when no run is found for `taskID`.
     @discardableResult
     public func markVersion(
         changeID: String,
         value: Bool,
-        taskID: UUID,
-        callSiteIndex: Int = 1
+        taskID: UUID
     ) async throws -> Bool {
-        // With the integer-keyed checkpoint schema, `WorkflowContext.version(changeID:)` stores
-        // checkpoints keyed by seq_num (monotonic activation counter) with `changeID` as the
-        // optional debug label.
-        //
-        // Strategy:
-        //   1. If the version checkpoint was already written (workflow ran past it), look it up
-        //      by name and update it in-place.
-        //   2. If not yet written (workflow is sleeping before the version call), estimate the
-        //      seq_num as (current checkpoint count) + callSiteIndex and INSERT it so the next
-        //      activation finds the desired value in its cache.
-        let stateBuffer = try JSON.encode(value)
-
-        // Resolve the most recent run for this task.
-        let runIDStream = try await postgres.query(
-            """
-            SELECT id FROM strand.runs
-            WHERE task_id = \(taskID)
-              AND namespace_id = \(namespaceID)
-            ORDER BY attempt DESC
-            LIMIT 1
-            """,
-            logger: logger
-        )
-        guard let runRow = try await runIDStream.first(where: { _ in true }) else {
-            throw StrandError.unknownTask(name: taskID.uuidString)
-        }
-        var col = runRow.makeIterator()
-        let runID = try col.next()!.decode(UUID.self, context: .default)
-
-        // Look up an existing checkpoint by debug name + call-site offset.
-        let existingStream = try await postgres.query(
-            """
-            SELECT seq_num FROM strand.checkpoints
-            WHERE task_id = \(taskID)
-              AND run_id  = \(runID)
-              AND name    = \(changeID)
-            ORDER BY seq_num ASC
-            LIMIT 1
-            OFFSET \(callSiteIndex - 1)
-            """,
-            logger: logger
-        )
-
-        let seqNum: Int
-        if let existingRow = try await existingStream.first(where: { _ in true }) {
-            // Checkpoint already written — reuse its seq_num.
-            var seqCol = existingRow.makeIterator()
-            seqNum = try seqCol.next()!.decode(Int.self, context: .default)
-        } else {
-            // Checkpoint not yet written (workflow sleeping before the version call).
-            // Estimate position: (count of already-written checkpoints) + callSiteIndex.
-            let countStream = try await postgres.query(
-                """
-                SELECT COUNT(*) FROM strand.checkpoints
-                WHERE task_id = \(taskID) AND run_id = \(runID)
-                """,
-                logger: logger
-            )
-            var countCol = try await countStream.first(where: { _ in true })!.makeIterator()
-            let count = try countCol.next()!.decode(Int.self, context: .default)
-            seqNum = count + callSiteIndex
-        }
-
-        try await Queries.setCheckpointState(
+        try await WorkflowStateQueries.writeVersionMarker(
             on: postgres,
             namespaceID: namespaceID,
             taskID: taskID,
-            seqNum: seqNum,
-            name: changeID,
-            stateBuffer: stateBuffer,
-            runID: runID,
-            extendClaimBySeconds: nil,
+            changeID: changeID,
+            value: value,
             logger: logger
         )
         return value
+    }
+
+    /// Returns the migration status for a version gate across all in-flight workflows
+    /// in this namespace.
+    ///
+    /// Use this to determine when it is safe to remove the `else` branch of a
+    /// ``WorkflowContext/version(changeID:)`` guard:
+    ///
+    /// ```swift
+    /// let status = try await client.migrationStatus(changeID: "add-fraud-check")
+    /// if status.isSafeToRemove {
+    ///     // Every in-flight workflow has passed the gate on the new path.
+    ///     // Safe to delete the else branch in the next deploy.
+    /// } else {
+    ///     print("\(status.pendingCount) workflows still on the old path")
+    /// }
+    /// ```
+    ///
+    /// - Parameter changeID: Must match exactly what's passed to
+    ///   ``WorkflowContext/version(changeID:)``.
+    public func migrationStatus(changeID: String) async throws -> MigrationStatus {
+        try await WorkflowStateQueries.versionMigrationStatus(
+            on: postgres,
+            namespaceID: namespaceID,
+            changeID: changeID,
+            logger: logger
+        )
     }
 }
 

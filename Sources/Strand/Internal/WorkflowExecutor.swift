@@ -93,6 +93,13 @@ enum WorkflowCommand: Sendable {
     /// is a no-op (idempotent replay safety).
     case emitEvent(name: String, payload: ByteBuffer)
 
+    /// Emitted by `WorkflowContext.version(changeID:)` on first encounter.
+    /// Non-suspending — the handler continues immediately.
+    /// Processed by `applyScheduleCommands` to upsert a row in
+    /// `strand.workflow_version_markers`, which is the primary replay store for
+    /// version gates. Does not consume a sequence number.
+    case recordVersionMarker(changeID: String, value: Bool)
+
     /// Schedule a child workflow and suspend until it completes.
     case scheduleChildWorkflow(
         name: String,
@@ -557,21 +564,21 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
 
     // MARK: - Teardown
 
-    /// Resume all pending continuations with `StrandError.cancelled`.
+    /// Resume all pending continuations with `InternalError.cancelled`.
     ///
     /// **Only call during true teardown** (workflow completion, real failure, worker
     /// shutdown). The normal suspension path does NOT call this — the handler Task
     /// stays alive between activations, parked on its continuations, and the Resume
     /// API delivers real results on re-activation.
     func cancelPending() {
-        for (_, cont) in activityContinuations { cont.resume(throwing: StrandError.cancelled) }
-        for (_, cont) in timerContinuations { cont.resume(throwing: StrandError.cancelled) }
-        for (_, cont) in eventContinuations { cont.resume(throwing: StrandError.cancelled) }
+        for (_, cont) in activityContinuations { cont.resume(throwing: InternalError.cancelled) }
+        for (_, cont) in timerContinuations { cont.resume(throwing: InternalError.cancelled) }
+        for (_, cont) in eventContinuations { cont.resume(throwing: InternalError.cancelled) }
         for (_, entry) in conditionEntries {
-            entry.continuation?.resume(throwing: StrandError.cancelled)
+            entry.continuation?.resume(throwing: InternalError.cancelled)
         }
         for (_, entry) in localActivityEntries {
-            entry.continuation?.resume(throwing: StrandError.cancelled)
+            entry.continuation?.resume(throwing: InternalError.cancelled)
         }
         activityContinuations.removeAll()
         timerContinuations.removeAll()

@@ -579,342 +579,6 @@ package enum ManagementQueries {
         return try EventTriggerRow(row: row)
     }
 
-    /// Represents a real workflow step (WAIT / SLEEP / SIGNAL / EMIT) that is
-    /// stored in the history log rather than as a separate `strand.tasks` row.
-    package struct ExecutionHistorySpanRow: Sendable {
-        /// The workflow task this span belongs to. Used to link the span
-        /// back to the workflow in the trace inspector ("View task" navigation).
-        package let workflowTaskID: UUID
-        package let spanKind: WorkflowSpanKind  // WAIT | SLEEP | SIGNAL | EMIT
-        package let name: String  // event name, signal name, or duration label
-        /// Sequence number from `strand.workflow_history`. Used to compute a
-        /// deterministic span ID so the UI does not flicker on polling re-renders.
-        package let seqNum: Int
-        package let startedAt: Date
-        package let endedAt: Date?  // nil while still suspended / sleeping
-        package let state: WorkflowSpanState
-        package let emissionID: UUID?  // only for WAIT spans: links to strand.events
-        /// Raw JSON payload received when the waitForEvent resolved (nil on timeout or
-        /// if the wait is still open). Sourced from `strand.checkpoints`.
-        package let receivedPayload: ByteBuffer?
-    }
-
-    // ── Parse event_data helpers ──────────────────────────────────────────
-    private static func eventName(from buf: ByteBuffer?) -> String? {
-        guard let b = buf else { return nil }
-        return (try? JSON.decode(WorkflowStateQueries.NamedEventData.self, from: b))?.eventName
-    }
-
-    private static func signalName(from buf: ByteBuffer?) -> String? {
-        guard let b = buf else { return nil }
-        return (try? JSON.decode(WorkflowStateQueries.SignalReceivedData.self, from: b))?.name
-    }
-
-    /// Derives execution history spans from `strand.workflow_history` for all given
-    /// workflow task IDs.
-    ///
-    /// Pairs complementary history events (TIMER_STARTED+TIMER_FIRED,
-    /// EVENT_WAIT_STARTED+EVENT_RECEIVED) into duration spans and promotes
-    /// point-in-time events (SIGNAL_RECEIVED, EVENT_EMITTED) into instant spans.
-    /// For resolved WAIT spans, looks up `emission_id` from `strand.event_triggers`
-    /// so the trace inspector can link back to the specific event that woke the run.
-    package static func executionHistorySpansForTrace(
-        on client: PostgresClient,
-        namespaceID: String,
-        workflowTaskIDs: [UUID],
-        logger: Logger
-    ) async throws -> [ExecutionHistorySpanRow] {
-        guard !workflowTaskIDs.isEmpty else { return [] }
-
-        // ── 1. Fetch relevant history events ────────────────────────────────────
-        let histStream = try await client.query(
-            """
-            SELECT wh.task_id, wh.seq, wh.event_type, wh.event_data, wh.created_at
-            FROM   strand.workflow_history wh
-            WHERE  wh.task_id    = ANY(\(workflowTaskIDs))
-              AND  wh.event_type IN (
-                    'EVENT_WAIT_STARTED', 'EVENT_RECEIVED', 'EVENT_WAIT_TIMED_OUT',
-                    'TIMER_STARTED',      'TIMER_FIRED',
-                    'SIGNAL_RECEIVED',    'EVENT_EMITTED',
-                    'CONDITION_WAITING',  'CONDITION_MET',  'CONDITION_TIMED_OUT'
-                   )
-            ORDER  BY wh.task_id, wh.seq
-            """,
-            logger: logger
-        )
-
-        // Collect events grouped by task_id, preserving seq order.
-        struct HEvt {
-            let seq: Int
-            let eventType: WorkflowStateQueries.HistoryEventType
-            let eventData: ByteBuffer?
-            let createdAt: Date
-        }
-        var byTask: [UUID: [HEvt]] = [:]
-        for try await row in histStream {
-            var col = row.makeIterator()
-            let taskID = try col.next()!.decode(UUID.self, context: .default)
-            let seq = try col.next()!.decode(Int.self, context: .default)
-            let rawType = try col.next()!.decode(String.self, context: .default)
-            let eventData = try col.next()!.decode(ByteBuffer?.self, context: .default)
-            let createdAt = try col.next()!.decode(Date.self, context: .default)
-            guard let eventType = WorkflowStateQueries.HistoryEventType(rawValue: rawType) else { continue }
-            byTask[taskID, default: []].append(
-                HEvt(
-                    seq: seq,
-                    eventType: eventType,
-                    eventData: eventData,
-                    createdAt: createdAt
-                )
-            )
-        }
-
-        // ── 2. Fetch emission IDs for resolved WAIT spans ────────────────────────
-        // Key: (taskID, eventName) → emissionID
-        var emissionMap: [UUID: [String: UUID]] = [:]
-        let etStream = try await client.query(
-            """
-            SELECT et.task_id, et.event_name, et.emission_id
-            FROM   strand.event_triggers et
-            WHERE  et.task_id     = ANY(\(workflowTaskIDs))
-              AND  et.emission_id IS NOT NULL
-            """,
-            logger: logger
-        )
-        for try await row in etStream {
-            var col = row.makeIterator()
-            let taskID = try col.next()!.decode(UUID.self, context: .default)
-            let eventName = try col.next()!.decode(String.self, context: .default)
-            let emissionID = try col.next()!.decode(UUID?.self, context: .default)
-            if let emissionID { emissionMap[taskID, default: [:]][eventName] = emissionID }
-        }
-
-        // ── 3. Fetch waitForEvent checkpoints (received payloads only) ─────────────────
-        // Checkpoints hold the actual event payload for resolved EVENT_RECEIVED spans.
-        // Timed-out waits are now detected exclusively via EVENT_WAIT_TIMED_OUT history rows.
-        var waitPayloads: [UUID: [String: ByteBuffer]] = [:]
-        let wfPrefix = "waitForEvent:"
-        let cpStream = try await client.query(
-            """
-            SELECT DISTINCT ON (r.task_id, c.name)
-                   r.task_id, c.name, c.state
-            FROM   strand.checkpoints c
-            JOIN   strand.runs r ON r.id = c.run_id
-            WHERE  r.task_id = ANY(\(workflowTaskIDs))
-              AND  c.name LIKE 'waitForEvent:%'
-            ORDER  BY r.task_id, c.name, r.attempt DESC
-            """,
-            logger: logger
-        )
-        for try await row in cpStream {
-            var col = row.makeIterator()
-            let taskID = try col.next()!.decode(UUID.self, context: .default)
-            let cpName = try col.next()!.decode(String.self, context: .default)
-            let cpState = try col.next()!.decode(ByteBuffer?.self, context: .default)
-            guard cpName.hasPrefix(wfPrefix), let buf = cpState else { continue }
-            let eName = String(cpName.dropFirst(wfPrefix.count))
-            // Only store actual payloads — TimeoutSentinel rows are no longer needed
-            // here because EVENT_WAIT_TIMED_OUT in workflow_history is the source of truth.
-            if !TimeoutSentinel.detect(in: buf) {
-                waitPayloads[taskID, default: [:]][eName] = buf
-            }
-        }
-
-        // ── 5. Pair events and emit ExecutionHistorySpanRows ─────────────────
-        var results: [ExecutionHistorySpanRow] = []
-
-        for (taskID, events) in byTask {
-            var i = 0
-            while i < events.count {
-                let evt = events[i]
-                switch evt.eventType {
-
-                case .timerStarted:
-                    let durationMs =
-                        evt.eventData
-                        .flatMap { try? JSON.decode(WorkflowStateQueries.TimerStartedData.self, from: $0) }
-                        .map(\.durationMs) ?? 0
-                    let label = ManagementQueries.sleepLabel(durationMs: durationMs)
-                    // Find the next TIMER_FIRED for this task (seq > N).
-                    if let endIdx = events[(i + 1)...].firstIndex(where: { $0.eventType == .timerFired }) {
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .sleep,
-                                name: label,
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: events[endIdx].createdAt,
-                                state: .completed,
-                                emissionID: nil,
-                                receivedPayload: nil
-                            )
-                        )
-                        i = endIdx + 1
-                        continue
-                    } else {
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .sleep,
-                                name: label,
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: nil,
-                                state: .waiting,
-                                emissionID: nil,
-                                receivedPayload: nil
-                            )
-                        )
-                    }
-
-                case .eventWaitStarted:
-                    let eName = eventName(from: evt.eventData) ?? WorkflowSpanKind.wait.displayName
-                    // First: EVENT_RECEIVED — event arrived successfully.
-                    if let endIdx = events[(i + 1)...].firstIndex(where: {
-                        $0.eventType == .eventReceived && eventName(from: $0.eventData) == eName
-                    }) {
-                        let emID = emissionMap[taskID]?[eName]
-                        let receivedPayload = waitPayloads[taskID]?[eName]
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .wait,
-                                name: eName,
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: events[endIdx].createdAt,
-                                state: .completed,
-                                emissionID: emID,
-                                receivedPayload: receivedPayload
-                            )
-                        )
-                        i = endIdx + 1
-                        continue
-                        // EVENT_WAIT_TIMED_OUT — exact end time recorded when the deadline fired.
-                    } else if let endIdx = events[(i + 1)...].firstIndex(where: {
-                        $0.eventType == .eventWaitTimedOut && eventName(from: $0.eventData) == eName
-                    }) {
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .wait,
-                                name: eName,
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: events[endIdx].createdAt,
-                                state: .timedOut,
-                                emissionID: nil,
-                                receivedPayload: nil
-                            )
-                        )
-                        i = endIdx + 1
-                        continue
-                    } else {
-                        // No completion event found — wait is still open.
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .wait,
-                                name: eName,
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: nil,
-                                state: .waiting,
-                                emissionID: nil,
-                                receivedPayload: nil
-                            )
-                        )
-                    }
-
-                case .signalReceived:
-                    let sName = signalName(from: evt.eventData) ?? WorkflowSpanKind.signal.displayName
-                    results.append(
-                        ExecutionHistorySpanRow(
-                            workflowTaskID: taskID,
-                            spanKind: .signal,
-                            name: sName,
-                            seqNum: evt.seq,
-                            startedAt: evt.createdAt,
-                            endedAt: evt.createdAt,
-                            state: .completed,
-                            emissionID: nil,
-                            receivedPayload: nil
-                        )
-                    )
-
-                case .eventEmitted:
-                    let eName = eventName(from: evt.eventData) ?? WorkflowSpanKind.emit.displayName
-                    results.append(
-                        ExecutionHistorySpanRow(
-                            workflowTaskID: taskID,
-                            spanKind: .emit,
-                            name: eName,
-                            seqNum: evt.seq,
-                            startedAt: evt.createdAt,
-                            endedAt: evt.createdAt,
-                            state: .completed,
-                            emissionID: nil,
-                            receivedPayload: nil
-                        )
-                    )
-
-                case .conditionWaiting:
-                    // Look ahead for the completion event, stepping over any intermediate
-                    // CONDITION_WAITING re-parks (predicate still false after a signal).
-                    if let endIdx = events[(i + 1)...].firstIndex(where: {
-                        $0.eventType == .conditionMet || $0.eventType == .conditionTimedOut
-                    }) {
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .condition,
-                                name: "condition",
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: events[endIdx].createdAt,
-                                state: events[endIdx].eventType == .conditionMet ? .completed : .timedOut,
-                                emissionID: nil,
-                                receivedPayload: nil
-                            )
-                        )
-                        i = endIdx + 1
-                        continue
-                    } else {
-                        // No completion found — still waiting or only re-parks remain.
-                        results.append(
-                            ExecutionHistorySpanRow(
-                                workflowTaskID: taskID,
-                                spanKind: .condition,
-                                name: "condition",
-                                seqNum: evt.seq,
-                                startedAt: evt.createdAt,
-                                endedAt: nil,
-                                state: .waiting,
-                                emissionID: nil,
-                                receivedPayload: nil
-                            )
-                        )
-                        // Skip subsequent CONDITION_WAITING entries — they are re-parks of
-                        // the same condition call and do not produce separate spans.
-                        while i + 1 < events.count && events[i + 1].eventType == .conditionWaiting {
-                            i += 1
-                        }
-                    }
-
-                case .conditionMet, .conditionTimedOut:
-                    break  // consumed by the .conditionWaiting look-ahead above
-
-                default:
-                    break
-                }
-                i += 1
-            }
-        }
-
-        return results
-    }
-
     // MARK: - Formatting helpers
 
     /// Formats a timer duration (in milliseconds) as a compact, locale-independent
@@ -1542,27 +1206,6 @@ extension ManagementQueries {
     }
 }
 
-// MARK: - Trace
-
-/// A flattened row returned by the recursive trace CTE.
-/// Callers (StrandServer route handlers) build a tree from the flat list.
-package struct TraceSpanRow: Sendable {
-    package let id: UUID
-    package let name: String
-    package let kind: TaskKind
-    package let state: TaskState
-    package let parentTaskID: UUID?
-    package let createdAt: Date
-    package let attempt: Int
-    package let maxAttempts: Int?
-    package let depth: Int
-    // from latest run (nil when never claimed)
-    package let startedAt: Date?
-    package let finishedAt: Date?
-    package let workerID: String?
-    package let failureBuffer: ByteBuffer?  // failure_reason (raw JSON BYTEA)
-}
-
 extension ManagementQueries {
     /// Returns one `(name, kind)` pair per distinct task name across the
     /// namespace, including child tasks (no parent_task_id filter).
@@ -1600,74 +1243,6 @@ extension ManagementQueries {
 }
 
 extension ManagementQueries {
-    /// Runs a recursive CTE rooted at `rootTaskID` and returns all spans
-    /// in breadth-first order (depth ASC, created_at ASC). Returns an empty
-    /// array when the root task does not exist or belongs to a different namespace.
-    package static func traceTask(
-        on client: PostgresClient,
-        namespaceID: String,
-        rootTaskID: UUID,
-        logger: Logger
-    ) async throws -> [TraceSpanRow] {
-        let stream = try await client.query(
-            """
-            WITH RECURSIVE tree AS (
-              SELECT t.id, t.name, t.kind, t.state, t.parent_task_id,
-                     t.created_at, t.attempt, t.max_attempts,
-                     0 AS depth
-              FROM strand.tasks t
-              WHERE t.namespace_id = \(namespaceID) AND t.id = \(rootTaskID)
-              UNION ALL
-              SELECT t.id, t.name, t.kind, t.state, t.parent_task_id,
-                     t.created_at, t.attempt, t.max_attempts,
-                     tree.depth + 1
-              FROM strand.tasks t
-              JOIN tree ON t.parent_task_id = tree.id
-              WHERE t.namespace_id = \(namespaceID) AND tree.depth < 50
-            ),
-            latest_runs AS (
-              SELECT DISTINCT ON (task_id)
-                task_id, started_at, finished_at, worker_id, failure_reason
-              FROM strand.runs
-              WHERE task_id IN (SELECT id FROM tree)
-              ORDER BY task_id, attempt DESC
-            )
-            SELECT tree.id, tree.name, tree.kind, tree.state, tree.parent_task_id,
-                   tree.created_at, tree.attempt, tree.max_attempts,
-                   tree.depth,
-                   lr.started_at, lr.finished_at, lr.worker_id, lr.failure_reason
-            FROM tree
-            LEFT JOIN latest_runs lr ON lr.task_id = tree.id
-            ORDER BY tree.depth, tree.created_at
-            """,
-            logger: logger
-        )
-        var rows: [TraceSpanRow] = []
-        for try await row in stream {
-            var col = row.makeIterator()
-            rows.append(
-                TraceSpanRow(
-                    id: try col.next()!.decode(UUID.self, context: .default),
-                    name: try col.next()!.decode(String.self, context: .default),
-                    kind: try col.next()!.decode(TaskKind.self, context: .default),
-                    state: try col.next()!.decode(TaskState.self, context: .default),
-                    parentTaskID: try col.next()!.decode(UUID?.self, context: .default),
-                    createdAt: try col.next()!.decode(Date.self, context: .default),
-                    attempt: try col.next()!.decode(Int.self, context: .default),
-                    maxAttempts: try col.next()!.decode(Int?.self, context: .default),
-                    depth: try col.next()!.decode(Int.self, context: .default),
-                    startedAt: try col.next()!.decode(Date?.self, context: .default),
-                    finishedAt: try col.next()!.decode(Date?.self, context: .default),
-                    workerID: try col.next()!.decode(String?.self, context: .default),
-                    failureBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default)
-                )
-            )
-        }
-        return rows
-    }
-}
-
-extension ManagementQueries {
     /// Returns up to `limit` workflows currently suspended in `ctx.waitForEvent(eventName)`
     /// on the given queue, ordered by wait registration time (oldest first).
     /// Used by the dashboard "Waiting for this event" panel.
@@ -1697,6 +1272,220 @@ extension ManagementQueries {
         )
         var rows: [EventWaiterRow] = []
         for try await row in stream { rows.append(try EventWaiterRow(row: row)) }
+        return rows
+    }
+}
+
+// MARK: - OLAP latency types
+
+/// Row from the OLAP latency-percentiles query. All durations in milliseconds.
+package struct OLAPLatencyRow: Sendable {
+    package let taskName: String
+    package let count: Int
+    package let p50Ms: Double?
+    package let p95Ms: Double?
+    package let p99Ms: Double?
+    package let minMs: Double?
+    package let maxMs: Double?
+}
+
+/// One time-bucketed row from the OLAP latency time-series query.
+package struct OLAPBucketRow: Sendable {
+    package let bucket: Date
+    package let taskName: String
+    package let count: Int
+    package let p50Ms: Double?
+    package let p95Ms: Double?
+}
+
+extension ManagementQueries {
+
+    /// Exact p50/p95/p99/min/max latency per task name from `strand.trace_spans`
+    /// using `PERCENTILE_CONT`. Rows are ordered by execution count descending.
+    /// The `hours` parameter controls the lookback window; `limit` caps the number
+    /// of task names returned (default 50, capped at 500).
+    ///
+    /// Backed by `strand_trace_spans_latency_idx` (migration 004).
+    package static func latencyPercentiles(
+        on client: PostgresClient,
+        namespaceID: String,
+        hours: Int,
+        limit: Int = 50,
+        logger: Logger
+    ) async throws -> [OLAPLatencyRow] {
+        let safeLimit = min(max(limit, 1), 500)  // clamp: 1 … 500
+        let cutoff = Date(timeIntervalSinceNow: -Double(hours) * 3600)
+
+        let stream = try await client.query(
+            """
+            SELECT
+              name AS task_name,
+              COUNT(*)::integer AS count,
+              PERCENTILE_CONT(0.50) WITHIN GROUP (
+                ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+              ) AS p50_ms,
+              PERCENTILE_CONT(0.95) WITHIN GROUP (
+                ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+              ) AS p95_ms,
+              PERCENTILE_CONT(0.99) WITHIN GROUP (
+                ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+              ) AS p99_ms,
+              MIN(EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000) AS min_ms,
+              MAX(EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000) AS max_ms
+            FROM strand.trace_spans
+            WHERE namespace_id = \(namespaceID)
+              AND kind IN ('WORKFLOW', 'ACTIVITY')
+              AND state = 'COMPLETED'
+              AND started_at IS NOT NULL
+              AND finished_at IS NOT NULL
+              AND finished_at >= \(cutoff)
+            GROUP BY name
+            ORDER BY count DESC
+            LIMIT \(safeLimit)
+            """,
+            logger: logger
+        )
+        var rows: [OLAPLatencyRow] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            let taskName = try col.next()!.decode(String.self, context: .default)
+            let count = try col.next()!.decode(Int.self, context: .default)
+            let p50 = try col.next()!.decode(Double?.self, context: .default)
+            let p95 = try col.next()!.decode(Double?.self, context: .default)
+            let p99 = try col.next()!.decode(Double?.self, context: .default)
+            let minMs = try col.next()!.decode(Double?.self, context: .default)
+            let maxMs = try col.next()!.decode(Double?.self, context: .default)
+            rows.append(
+                OLAPLatencyRow(
+                    taskName: taskName,
+                    count: count,
+                    p50Ms: p50,
+                    p95Ms: p95,
+                    p99Ms: p99,
+                    minMs: minMs,
+                    maxMs: maxMs
+                )
+            )
+        }
+        return rows
+    }
+
+    /// Time-bucketed p50/p95 latency from `strand.trace_spans`.
+    /// Granularity: minute (`hours <= 1`), hour (`hours > 1`).
+    /// Optional `taskName` filter limits results to a single task definition.
+    ///
+    /// Backed by `strand_trace_spans_latency_idx` (migration 004).
+    package static func latencyTimeSeries(
+        on client: PostgresClient,
+        namespaceID: String,
+        hours: Int,
+        taskName: String?,
+        logger: Logger
+    ) async throws -> [OLAPBucketRow] {
+        let cutoff = Date(timeIntervalSinceNow: -Double(hours) * 3600)
+        let query: PostgresQuery
+        if hours <= 1 {
+            if let taskName = taskName {
+                query = """
+                    SELECT DATE_TRUNC('minute', finished_at) AS bucket,
+                           name AS task_name,
+                           COUNT(*)::integer AS count,
+                           PERCENTILE_CONT(0.50) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p50_ms,
+                           PERCENTILE_CONT(0.95) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p95_ms
+                    FROM strand.trace_spans
+                    WHERE namespace_id = \(namespaceID)
+                      AND kind IN ('WORKFLOW', 'ACTIVITY')
+                      AND state = 'COMPLETED'
+                      AND started_at IS NOT NULL
+                      AND finished_at IS NOT NULL
+                      AND finished_at >= \(cutoff)
+                      AND name = \(taskName)
+                    GROUP BY 1, 2
+                    ORDER BY 1
+                    """
+            } else {
+                query = """
+                    SELECT DATE_TRUNC('minute', finished_at) AS bucket,
+                           name AS task_name,
+                           COUNT(*)::integer AS count,
+                           PERCENTILE_CONT(0.50) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p50_ms,
+                           PERCENTILE_CONT(0.95) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p95_ms
+                    FROM strand.trace_spans
+                    WHERE namespace_id = \(namespaceID)
+                      AND kind IN ('WORKFLOW', 'ACTIVITY')
+                      AND state = 'COMPLETED'
+                      AND started_at IS NOT NULL
+                      AND finished_at IS NOT NULL
+                      AND finished_at >= \(cutoff)
+                    GROUP BY 1, 2
+                    ORDER BY 1
+                    """
+            }
+        } else {
+            if let taskName = taskName {
+                query = """
+                    SELECT DATE_TRUNC('hour', finished_at) AS bucket,
+                           name AS task_name,
+                           COUNT(*)::integer AS count,
+                           PERCENTILE_CONT(0.50) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p50_ms,
+                           PERCENTILE_CONT(0.95) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p95_ms
+                    FROM strand.trace_spans
+                    WHERE namespace_id = \(namespaceID)
+                      AND kind IN ('WORKFLOW', 'ACTIVITY')
+                      AND state = 'COMPLETED'
+                      AND started_at IS NOT NULL
+                      AND finished_at IS NOT NULL
+                      AND finished_at >= \(cutoff)
+                      AND name = \(taskName)
+                    GROUP BY 1, 2
+                    ORDER BY 1
+                    """
+            } else {
+                query = """
+                    SELECT DATE_TRUNC('hour', finished_at) AS bucket,
+                           name AS task_name,
+                           COUNT(*)::integer AS count,
+                           PERCENTILE_CONT(0.50) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p50_ms,
+                           PERCENTILE_CONT(0.95) WITHIN GROUP (
+                             ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                           ) AS p95_ms
+                    FROM strand.trace_spans
+                    WHERE namespace_id = \(namespaceID)
+                      AND kind IN ('WORKFLOW', 'ACTIVITY')
+                      AND state = 'COMPLETED'
+                      AND started_at IS NOT NULL
+                      AND finished_at IS NOT NULL
+                      AND finished_at >= \(cutoff)
+                    GROUP BY 1, 2
+                    ORDER BY 1
+                    """
+            }
+        }
+        let stream = try await client.query(query, logger: logger)
+        var rows: [OLAPBucketRow] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            let bucket = try col.next()!.decode(Date.self, context: .default)
+            let name = try col.next()!.decode(String.self, context: .default)
+            let count = try col.next()!.decode(Int.self, context: .default)
+            let p50 = try col.next()!.decode(Double?.self, context: .default)
+            let p95 = try col.next()!.decode(Double?.self, context: .default)
+            rows.append(OLAPBucketRow(bucket: bucket, taskName: name, count: count, p50Ms: p50, p95Ms: p95))
+        }
         return rows
     }
 }
