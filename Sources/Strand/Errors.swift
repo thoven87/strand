@@ -10,24 +10,16 @@ public import Foundation
 public enum StrandError: Error, LocalizedError, Sendable {
     /// A durable wait (`awaitEvent`, `awaitTaskResult`, `waitForEvent`) exceeded its timeout.
     case timeout(message: String)
-    /// The task was cancelled before or during execution.
-    case cancelled
     /// No registered handler found for the given task name.
     case unknownTask(name: String)
     /// Queue name is empty or exceeds 57 UTF-8 bytes.
     case invalidQueueName(String)
-    /// The worker's lease on a task expired before the handler finished.
-    case leaseExpired(taskID: String)
     /// A Postgres-level error propagated from PostgresNIO.
     case database(underlying: any Error)
     /// JSON encoding or decoding failed.
     case serialization(underlying: any Error)
     /// Installed schema version is older than the SDK requires.
     case schemaMismatch(installed: String, required: String)
-    /// An activity reached its terminal FAILED state (all retries exhausted).
-    case activityFailed(name: String, state: String)
-    /// A child workflow reached a terminal error state.
-    case childWorkflowFailed(name: String, state: String)
 
     // MARK: - LocalizedError
 
@@ -37,23 +29,46 @@ public enum StrandError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .timeout(let msg): return "Timeout: \(msg)"
-        case .cancelled: return "Task was cancelled"
         case .unknownTask(let name): return "No registered handler for task '\(name)'"
         case .invalidQueueName(let name): return "Invalid queue name '\(name)'"
-        case .leaseExpired(let id): return "Worker lease expired for task \(id)"
         case .database(let err): return "Database error: \(err)"
         case .serialization(let err): return "Serialization error: \(err)"
         case .schemaMismatch(let ins, let req):
             return "Schema mismatch: installed \(ins), required \(req)"
-        case .activityFailed(let name, let state):
-            return "Activity '\(name)' reached terminal state: \(state)"
-        case .childWorkflowFailed(let name, let state):
-            return "Child workflow '\(name)' reached terminal state: \(state)"
         }
     }
 }
 
+// MARK: - WorkflowError
 
+/// Thrown when a workflow execution reaches a terminal non-success state.
+///
+/// Raised by both ``WorkflowHandle/result(timeout:)`` (root workflow) and
+/// ``WorkflowContext/runChildWorkflow(_:options:input:)`` (nested workflow).
+/// This keeps workflows as a distinct first-class concept — separate from
+/// ``ActivityError`` even though both represent "a unit of work that failed".
+///
+/// ```swift
+/// do {
+///     let result = try await handle.result(timeout: .seconds(60))
+/// } catch let err as WorkflowError {
+///     switch err.state {
+///     case .failed:    // workflow threw an unhandled error
+///     case .cancelled: // cancelTask() was called externally
+///     default: break
+///     }
+/// }
+/// ```
+public struct WorkflowError: Error, LocalizedError, Sendable {
+    /// The registered name of the workflow (e.g. `"OrderWorkflow"`).
+    public let workflowName: String
+    /// The terminal state the workflow reached.
+    public let state: TaskState
+
+    public var errorDescription: String? {
+        "Workflow '\(workflowName)' reached terminal state: \(state.rawValue)"
+    }
+}
 
 /// Internal sentinel errors used to signal clean lifecycle transitions.
 /// Never surfaced to user code.

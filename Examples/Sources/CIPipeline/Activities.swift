@@ -141,3 +141,22 @@ struct DeployActivity: Activity {
         )
     }
 }
+
+// ── Activity container ────────────────────────────────────────────────────
+//
+// Groups all pipeline activities for worker registration.
+// `@ActivityContainer` synthesises `activities: [any ActivityDefinition]`
+// from each `@ContainerActivity` stored property, eliminating the manual
+// array literal in the worker config.
+//
+// Usage: `.init(name: "ci-pipeline", ..., activities: CIPipelineActivities().activities)`
+
+@ActivityContainer
+struct CIPipelineActivities {
+    @ContainerActivity var checkout = CheckoutActivity()
+    @ContainerActivity var lint = LintActivity()
+    @ContainerActivity var unitTests = UnitTestActivity()
+    @ContainerActivity var security = SecurityScanActivity()
+    @ContainerActivity var build = BuildActivity()
+    @ContainerActivity var deploy = DeployActivity()
+}

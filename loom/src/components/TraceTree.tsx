@@ -50,6 +50,7 @@ export interface TraceSpan {
         | "SLEEP"
         | "WAIT"
         | "SIGNAL"
+        | "UPDATE"
         | "EMIT"
         | "CONDITION"
         | "LOG";
@@ -335,8 +336,9 @@ function barClass(kind: TraceSpan["kind"], state: SpanState): string {
             return "bg-violet-500/20 border border-dashed border-violet-400/50";
         return "bg-violet-500/30 border border-dashed border-violet-400/70";
     }
-    // SIGNAL and EMIT are point-in-time — rendered as diamond markers, not bars.
-    if (kind === "SIGNAL" || kind === "EMIT") return "bg-transparent";
+    // SIGNAL, UPDATE and EMIT are point-in-time — rendered as diamond markers, not bars.
+    if (kind === "SIGNAL" || kind === "UPDATE" || kind === "EMIT")
+        return "bg-transparent";
 
     switch (state) {
         case "FAILED":
@@ -682,18 +684,21 @@ export function TraceTree({
 
     // Build the filter ID set from the active search / errorsOnly toggles.
     const activeSearch = search.trim().toLowerCase();
-    const filterIds: Set<string> | null =
-        !activeSearch && !errorsOnly
-            ? null
-            : getFilterIds(spans, (s) => {
-                  if (
-                      activeSearch &&
-                      !s.name.toLowerCase().includes(activeSearch)
-                  )
-                      return false;
-                  if (errorsOnly && !isErrorSpan(s)) return false;
-                  return true;
-              });
+    const filterIds: Set<string> | null = useMemo(
+        () =>
+            !activeSearch && !errorsOnly
+                ? null
+                : getFilterIds(spans, (s) => {
+                      if (
+                          activeSearch &&
+                          !s.name.toLowerCase().includes(activeSearch)
+                      )
+                          return false;
+                      if (errorsOnly && !isErrorSpan(s)) return false;
+                      return true;
+                  }),
+        [spans, activeSearch, errorsOnly],
+    );
 
     const toggle = useCallback((id: string) => {
         setExpanded((prev) => {
@@ -741,7 +746,10 @@ export function TraceTree({
         [inspectorWidthPct],
     );
 
-    const flatRows = flattenVisible(spans, expanded, filterIds);
+    const flatRows = useMemo(
+        () => flattenVisible(spans, expanded, filterIds),
+        [spans, expanded, filterIds],
+    );
     const allSpans = useMemo(() => flattenAll(spans), [spans]);
 
     const rowVirtualizer = useVirtualizer({
@@ -755,26 +763,39 @@ export function TraceTree({
     const visibleEndMs = (totalMs * brushEnd) / 100;
     const visibleRangeMs = Math.max(1, visibleEndMs - visibleStartMs);
 
-    const ticks = generateTicks(visibleRangeMs, visibleStartMs);
+    const ticks = useMemo(
+        () => generateTicks(visibleRangeMs, visibleStartMs),
+        [visibleRangeMs, visibleStartMs],
+    );
     const cursorTimeMs =
         cursorX !== null && ganttW > 0
             ? Math.round(visibleStartMs + (cursorX / ganttW) * visibleRangeMs)
             : null;
 
     // Position of an absolute-ms value within the visible range (→ CSS % string).
-    const pct = (ms: number) =>
-        `${((ms - visibleStartMs) / visibleRangeMs) * 100}%`;
-    // Same, as a plain number.
-    const pctN = (ms: number) => ((ms - visibleStartMs) / visibleRangeMs) * 100;
-    // A duration (not absolute position) as % of the visible range (for bar widths).
-    const pctDur = (durMs: number) => (durMs / visibleRangeMs) * 100;
+    const pct = useCallback(
+        (ms: number) => `${((ms - visibleStartMs) / visibleRangeMs) * 100}%`,
+        [visibleStartMs, visibleRangeMs],
+    );
+    const pctN = useCallback(
+        (ms: number) => ((ms - visibleStartMs) / visibleRangeMs) * 100,
+        [visibleStartMs, visibleRangeMs],
+    );
+    const pctDur = useCallback(
+        (durMs: number) => (durMs / visibleRangeMs) * 100,
+        [visibleRangeMs],
+    );
 
     // End-tick color: green for clean traces, red if any root span failed.
-    const rootFailed = spans.some(
-        (s) =>
-            s.state === "FAILED" ||
-            s.state === "CRASHED" ||
-            s.state === "TIMED_OUT",
+    const rootFailed = useMemo(
+        () =>
+            spans.some(
+                (s) =>
+                    s.state === "FAILED" ||
+                    s.state === "CRASHED" ||
+                    s.state === "TIMED_OUT",
+            ),
+        [spans],
     );
     const endTickClass = rootFailed ? "text-red-400" : "text-green-400";
 
@@ -940,7 +961,9 @@ export function TraceTree({
                             const leftPadPx = row.depth * INDENT + 8;
                             const isLog = row.kind === "LOG";
                             const isInstant =
-                                row.kind === "SIGNAL" || row.kind === "EMIT";
+                                row.kind === "SIGNAL" ||
+                                row.kind === "UPDATE" ||
+                                row.kind === "EMIT";
                             const endPct = pctN(row.startMs + row.durationMs);
                             const labelNearEdge = endPct > 85;
 
@@ -1070,6 +1093,11 @@ export function TraceTree({
                                                 Wait
                                             </span>
                                         )}
+                                        {row.kind === "UPDATE" && (
+                                            <span className="relative shrink-0 text-[9px] bg-violet-500/20 text-violet-400 border border-violet-500/25 rounded px-[5px] font-mono py-[2px] leading-none">
+                                                Upd
+                                            </span>
+                                        )}
                                         {row.kind === "SIGNAL" && (
                                             <span className="relative shrink-0 text-[9px] bg-purple-500/20 text-purple-400 border border-purple-500/25 rounded px-[5px] font-mono py-[2px] leading-none">
                                                 Sig
@@ -1135,7 +1163,9 @@ export function TraceTree({
                                                     "absolute top-1/2 -translate-y-1/2 size-2 rotate-45",
                                                     row.kind === "SIGNAL"
                                                         ? "bg-purple-400"
-                                                        : "bg-amber-400",
+                                                        : row.kind === "UPDATE"
+                                                          ? "bg-violet-400"
+                                                          : "bg-amber-400",
                                                 )}
                                                 style={{
                                                     left: pct(row.startMs),

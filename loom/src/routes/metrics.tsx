@@ -13,9 +13,12 @@ import {
     PieChart,
     Pie,
     Cell,
+    LineChart,
+    Line,
 } from "recharts";
 import { RefreshCw, Activity, TrendingDown } from "lucide-react";
-import { getMetrics } from "@/api/metrics";
+import { getMetrics, getLatencyMetrics } from "@/api/metrics";
+import type { LatencyData } from "@/api/metrics";
 
 import { getTaskDefinitionActivity, getTaskKinds } from "@/api/workflows";
 import type { DailyActivity, TaskKindEntry } from "@/api/workflows";
@@ -320,6 +323,247 @@ function ThroughputChart({ data }: { data: CombinedBucket[] }) {
                 />
             </BarChart>
         </ResponsiveContainer>
+    );
+}
+
+// ── Historical latency chart ────────────────────────────────────────────────────────
+// Top-10 tasks by volume as simultaneous lines; p50 | p95 picker (default p95).
+// Backed by strand.trace_spans PERCENTILE_CONT — exact, not DDSketch ±2%.
+
+const SERIES_COLORS = [
+    "#3b82f6",
+    "#f59e0b",
+    "#10b981",
+    "#ef4444",
+    "#8b5cf6",
+    "#f97316",
+    "#06b6d4",
+    "#84cc16",
+    "#ec4899",
+    "#6366f1",
+] as const;
+
+const TOP_N = 10;
+
+function HistoricalLatencyChart({
+    latencyData,
+    hours,
+}: {
+    latencyData: LatencyData | undefined;
+    hours: number;
+}) {
+    const [pct, setPct] = useState<"p50" | "p95">("p95");
+
+    const topTasks = useMemo(
+        () => (latencyData?.tasks ?? []).slice(0, TOP_N),
+        [latencyData],
+    );
+    const topNames = useMemo(
+        () => new Set(topTasks.map((t) => t.taskName)),
+        [topTasks],
+    );
+
+    const chartData = useMemo(() => {
+        const bucketMap = new Map<string, Record<string, unknown>>();
+        for (const row of latencyData?.timeSeries ?? []) {
+            if (!topNames.has(row.taskName)) continue;
+            if (!bucketMap.has(row.bucket)) {
+                const label =
+                    hours <= 1
+                        ? new Date(row.bucket).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: false,
+                          })
+                        : fmtHour(row.bucket);
+                bucketMap.set(row.bucket, { _label: label });
+            }
+            const entry = bucketMap.get(row.bucket)!;
+            entry[row.taskName] = pct === "p50" ? row.p50Ms : row.p95Ms;
+        }
+        return [...bucketMap.entries()]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([, v]) => v);
+    }, [latencyData?.timeSeries, topNames, pct, hours]);
+
+    const fmtMs = (v: number) =>
+        v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${Math.round(v)}ms`;
+
+    if (topTasks.length === 0) {
+        return (
+            <div className="flex items-center justify-center h-28">
+                <p className="text-xs text-muted-foreground">
+                    No completed tasks in the last {hours}h
+                </p>
+            </div>
+        );
+    }
+
+    return (
+        <div>
+            {/* Header + percentile picker */}
+            <div className="flex items-center justify-between mb-3">
+                <p className="text-[11px] text-muted-foreground">
+                    Top {topTasks.length} by volume &middot; exact &middot;{" "}
+                    {hours}h
+                </p>
+                <div className="flex rounded border border-border overflow-hidden text-[11px] font-mono">
+                    {(["p50", "p95"] as const).map((p) => (
+                        <button
+                            key={p}
+                            onClick={() => setPct(p)}
+                            className={`px-2.5 py-1 transition-colors ${
+                                pct === p
+                                    ? "bg-primary/10 text-foreground font-semibold"
+                                    : "text-muted-foreground hover:bg-secondary/20"
+                            }`}
+                        >
+                            {p}
+                        </button>
+                    ))}
+                </div>
+            </div>
+
+            {/* Multi-line chart */}
+            <ResponsiveContainer width="100%" height={220}>
+                <LineChart
+                    data={chartData}
+                    margin={{ top: 4, right: 12, bottom: 0, left: -10 }}
+                >
+                    <CartesianGrid
+                        strokeDasharray="3 3"
+                        stroke="rgba(128,128,128,0.08)"
+                        vertical={false}
+                    />
+                    <XAxis
+                        dataKey="_label"
+                        tick={{ fontSize: 10, fill: "#64748b" }}
+                        axisLine={false}
+                        tickLine={false}
+                        interval="preserveStartEnd"
+                    />
+                    <YAxis
+                        tick={{ fontSize: 10, fill: "#64748b" }}
+                        axisLine={false}
+                        tickLine={false}
+                        tickFormatter={(v: number) =>
+                            v >= 1000
+                                ? `${(v / 1000).toFixed(1)}s`
+                                : `${Math.round(v)}ms`
+                        }
+                    />
+                    <Tooltip
+                        content={({ active, payload, label }) => {
+                            if (!active || !payload?.length) return null;
+                            const sorted = [...payload]
+                                .filter((p) => p.value != null)
+                                .sort(
+                                    (a, b) =>
+                                        ((b.value as number) ?? 0) -
+                                        ((a.value as number) ?? 0),
+                                );
+                            return (
+                                <div className="rounded border border-border bg-background px-3 py-2 text-xs shadow-lg space-y-0.5 max-w-[260px]">
+                                    <p className="text-muted-foreground pb-1">
+                                        {label} &middot; {pct}
+                                    </p>
+                                    {sorted.map((p, i) => (
+                                        <p
+                                            key={i}
+                                            style={{ color: p.color as string }}
+                                            className="font-mono truncate"
+                                        >
+                                            {String(p.name ?? "")}:{" "}
+                                            {fmtMs(p.value as number)}
+                                        </p>
+                                    ))}
+                                </div>
+                            );
+                        }}
+                    />
+                    {topTasks.map((task, i) => (
+                        <Line
+                            key={task.taskName}
+                            type="monotone"
+                            dataKey={task.taskName}
+                            stroke={SERIES_COLORS[i % SERIES_COLORS.length]}
+                            dot={false}
+                            strokeWidth={1.5}
+                            connectNulls
+                        />
+                    ))}
+                </LineChart>
+            </ResponsiveContainer>
+
+            {/* Compact exact-numbers reference table */}
+            <div className="mt-4 border-t border-border/40 pt-3 overflow-x-auto">
+                <table className="w-full text-xs">
+                    <thead>
+                        <tr>
+                            {[
+                                "Task",
+                                "Count",
+                                "Min",
+                                "p50",
+                                "p95",
+                                "p99",
+                                "Max",
+                            ].map((h, i) => (
+                                <th
+                                    key={h}
+                                    className={`pb-1.5 px-2 text-[11px] font-medium text-muted-foreground uppercase tracking-wide whitespace-nowrap ${
+                                        i === 0 ? "text-left" : "text-right"
+                                    }`}
+                                >
+                                    {h}
+                                </th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {topTasks.map((t, i) => (
+                            <tr
+                                key={t.taskName}
+                                className="border-t border-border/20"
+                            >
+                                <td className="py-1.5 px-2 font-mono text-foreground">
+                                    <span className="flex items-center gap-1.5">
+                                        <span
+                                            className="inline-block w-2 h-2 rounded-full shrink-0"
+                                            style={{
+                                                backgroundColor:
+                                                    SERIES_COLORS[
+                                                        i % SERIES_COLORS.length
+                                                    ],
+                                            }}
+                                        />
+                                        {t.taskName}
+                                    </span>
+                                </td>
+                                <td className="py-1.5 px-2 text-right tabular-nums text-muted-foreground">
+                                    {t.count.toLocaleString()}
+                                </td>
+                                <td className="py-1.5 px-2 text-right tabular-nums">
+                                    {fmtDuration(t.minMs)}
+                                </td>
+                                <td className="py-1.5 px-2 text-right tabular-nums">
+                                    {fmtDuration(t.p50Ms)}
+                                </td>
+                                <td className="py-1.5 px-2 text-right tabular-nums">
+                                    {fmtDuration(t.p95Ms)}
+                                </td>
+                                <td className="py-1.5 px-2 text-right tabular-nums">
+                                    {fmtDuration(t.p99Ms)}
+                                </td>
+                                <td className="py-1.5 px-2 text-right tabular-nums">
+                                    {fmtDuration(t.maxMs)}
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </div>
     );
 }
 
@@ -996,6 +1240,13 @@ export function MetricsPage() {
     const [secondsAgo, setSecondsAgo] = useState(0);
     const [hours, setHours] = useState<number>(24);
 
+    const { data: latencyData } = useQuery({
+        queryKey: ["latency", namespace, hours, TOP_N],
+        queryFn: () => getLatencyMetrics(namespace, hours, TOP_N),
+        refetchInterval: 30_000,
+        staleTime: 10_000,
+    });
+
     const { data, isLoading, error, refetch } = useQuery({
         queryKey: [...qk.metrics.get(namespace), hours],
         queryFn: () => getMetrics(namespace, hours),
@@ -1282,7 +1533,7 @@ export function MetricsPage() {
                                     size={13}
                                     className="text-muted-foreground"
                                 />
-                                Executions (last 24 h)
+                                Runs (last 24 h)
                             </h2>
                             <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
                                 <span className="flex items-center gap-1">
@@ -1310,6 +1561,19 @@ export function MetricsPage() {
                         />
                         <TopFailing tasks={taskSummaries} />
                     </div>
+
+                    {/* ── Historical Latency (OLAP) ────────────────── */}
+                    <section className="rounded-lg border border-border bg-card/40 p-4">
+                        <div className="mb-4">
+                            <h2 className="text-sm font-medium text-foreground">
+                                Run Time
+                            </h2>
+                        </div>
+                        <HistoricalLatencyChart
+                            latencyData={latencyData}
+                            hours={hours}
+                        />
+                    </section>
                 </>
             )}
         </div>

@@ -258,7 +258,7 @@ struct ScheduleRoutes {
             )
             return RunScheduleResponse(
                 taskId: result.taskID,
-                runId:  result.runID
+                runId: result.runID
             )
         }
 

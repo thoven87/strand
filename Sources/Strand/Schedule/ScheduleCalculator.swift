@@ -368,8 +368,8 @@ public struct ScheduleCalculator {
     /// Counts the number of schedule slots in `range` (start **inclusive**, end exclusive).
     ///
     /// The start is made inclusive by searching from `lowerBound - 1 s` so a slot
-    /// that falls exactly on the range boundary is counted. This matches Temporal’s
-    /// backfill semantics where `StartTime` is adjusted by -1 ms before evaluation.
+    /// that falls exactly on the range boundary is counted, matching standard
+    /// backfill semantics where the lower bound is adjusted by -1 before evaluation.
     ///
     /// Capped at `cap` (default 100 000) to bound O(n) iteration for large ranges.
     public static func countSlots(

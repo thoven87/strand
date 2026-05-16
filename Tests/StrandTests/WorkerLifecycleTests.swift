@@ -142,11 +142,11 @@ struct WorkerLifecycleTests {
     //     next sweep fires immediately.
     //  6. Start worker 2 with `leaseExpiryInterval: .seconds(1)` so the sweep
     //     runs within 1 second rather than the 5-second default.
-    //  7. Worker 2's `leaseExpiryLoop` calls `sweepExpiredLeases`, which calls
-    //     `failRun`, which creates a new PENDING run for attempt 2.
-    //  8. Worker 2 claims attempt 2 → WltHungActivity.run returns immediately
-    //     (runNumber == 1 on retry) → task reaches COMPLETED.
-    //  9. Assert state == .completed and attempt == 2.
+    //  7. Worker 2's `leaseExpiryLoop` calls `sweepExpiredLeases`, which resets
+    //     the existing run to PENDING (same attempt — no attempt counter increment).
+    //  8. Worker 2 claims the re-queued run → WltHungActivity.run returns immediately
+    //     (runNumber == 1, the second invocation) → task reaches COMPLETED.
+    //  9. Assert state == .completed and attempt == 1 (lease expiry is transparent).
     //
     @Test(
         "expired lease is swept by leaseExpiryLoop and re-queued transparently at the same attempt",
@@ -175,11 +175,17 @@ struct WorkerLifecycleTests {
                 activities: [WltHungActivity(executionCount: counter)]
             )
 
-            // 3. Wait until the run is RUNNING (worker has claimed and entered the handler).
+            // 3. Wait until the run is RUNNING AND the activity handler has
+            //    actually started executing (counter >= 1). The DB transitions
+            //    to RUNNING the moment claimTasks fires — before the Swift
+            //    handler begins. Checking only the DB state leaves a race where
+            //    worker1Task.cancel() fires before executionCount.increment(),
+            //    so counter stays 0 and worker 2 sleeps 60 s instead of returning.
             let runDeadline = ContinuousClock.now + .seconds(10)
             while ContinuousClock.now < runDeadline {
                 if let snap = try await client.fetchTaskResult(id: enq.taskID),
-                    snap.state == .running
+                    snap.state == .running,
+                    counter.value >= 1  // handler has incremented past the gate
                 {
                     break
                 }

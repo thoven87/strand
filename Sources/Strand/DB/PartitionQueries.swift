@@ -18,8 +18,8 @@ import Foundation
 /// Postgres autovacuum silently skips partitioned **parent** tables — it only
 /// processes child partitions. Without a periodic `ANALYZE strand.runs`, the
 /// query planner has zero statistics for the parent and produces catastrophically
-/// wrong row estimates (Hatchet observed 6 000 000× off in production), causing
-/// the claim path to fall back to sequential scans under load. Every function in
+/// wrong row estimates — in the millions — causing the claim path to fall back
+/// to sequential scans under load. Every function in
 /// this file that touches the schema also calls ``analyzeParentTables(on:logger:)``
 /// to keep planner statistics current.
 ///
@@ -222,9 +222,10 @@ package enum PartitionQueries {
         }
 
         // Build a version-appropriate WHERE predicate for pending-detach state.
-        let pendingFilter = versionNum >= 170_000
-            ? "i.inhdetachpending = TRUE"      // PG17+
-            : "child.relisbeingdetached = TRUE" // PG14–16
+        let pendingFilter =
+            versionNum >= 170_000
+            ? "i.inhdetachpending = TRUE"  // PG17+
+            : "child.relisbeingdetached = TRUE"  // PG14–16
 
         let stream = try await client.query(
             """

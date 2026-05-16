@@ -148,6 +148,9 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
 
     /// Checkpoint values loaded at activation start. Keyed by seq_num (Int).
     var checkpointCache: [Int: ByteBuffer]
+    /// Version gate values loaded at activation start from `strand.workflow_version_markers`.
+    /// Keyed by changeID — version gates do not consume sequence numbers.
+    var versionMarkerCache: [String: Bool]
     /// Monotonic activation counter — each context call produces a unique seq_num.
     var activationCounter: ActivationCounter
 
@@ -175,6 +178,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         executor: StrandWorkflowExecutor,
         stateBox: ArcBox<W>,
         checkpointCache: [Int: ByteBuffer],
+        versionMarkerCache: [String: Bool],
         namespace: String,
         activationTime: Date
     ) {
@@ -193,6 +197,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         self.executor = executor
         self.stateBox = stateBox
         self.checkpointCache = checkpointCache
+        self.versionMarkerCache = versionMarkerCache
         self.activationCounter = ActivationCounter()
         self.namespace = namespace
         self.activationTime = activationTime
@@ -215,6 +220,13 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     /// Updates the in-memory checkpoint cache only (no DB write).
     func cacheCheckpoint(seqNum: Int, buffer: ByteBuffer) {
         checkpointCache[seqNum] = buffer
+    }
+
+    func cachedVersionMarker(for changeID: String) -> Bool? {
+        versionMarkerCache[changeID]
+    }
+    func cacheVersionMarker(changeID: String, value: Bool) {
+        versionMarkerCache[changeID] = value
     }
 
     // MARK: - Persistence helpers
@@ -386,6 +398,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///   - options: Routing, retry, and timeout overrides. Inherits from workflow defaults if omitted.
     /// - Throws: `A.Failure` directly when the activity failed with a typed failure (if declared).
     ///           `ActivityError` when the activity reached a terminal error state (all retries exhausted or cancelled).
+    @discardableResult
     public func runActivity<A: Activity>(
         _ type: A.Type,
         input: A.Input,
@@ -438,8 +451,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 throw typedErr
             }
             let cause = nonSuccess.failureReason.flatMap { ActivityFailure.decode(from: $0) }
+            // ClaimTimeoutError.failureName is derived from the type name — rename-safe.
+            let isTimeout: Bool = cause.map { $0.name == ClaimTimeoutError.failureName } ?? false
             let retryState: ActivityRetryState =
-                nonSuccess.state == .cancelled ? .cancelled : .maximumAttemptsReached
+                nonSuccess.state == .cancelled ? .cancelled : isTimeout ? .timedOut : .maximumAttemptsReached
             throw ActivityError(activityName: A.name, retryState: retryState, cause: cause)
         }
 
@@ -508,6 +523,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```swift
     /// let result = try await context.runActivity(SendEmailActivity.self)
     /// ```
+    @discardableResult
     public func runActivity<A: Activity>(
         _ type: A.Type,
         options: ActivityOptions = .init(),
@@ -803,7 +819,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 eventName: name,
                 seqNum: seqNum,
                 timeoutAt: timeoutAt,
-                predicate: predicateBuf   // nil → DB stores '{}', matches any payload
+                predicate: predicateBuf  // nil → DB stores '{}', matches any payload
             )
         )
 
@@ -1073,6 +1089,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///   - type: The `Activity` conforming type to execute.
     ///   - input: Forwarded verbatim to the activity handler.
     ///   - options: Execution options (reserved for future use).
+    @discardableResult
     public func runLocalActivity<A: Activity>(
         _ type: A.Type,
         input: A.Input,
@@ -1100,6 +1117,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     }
 
     /// Convenience overload for activities with no input (`StrandVoid`).
+    @discardableResult
     public func runLocalActivity<A: Activity>(
         _ type: A.Type,
         options: LocalActivityOptions = .init()
@@ -1110,16 +1128,22 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     // MARK: - version
 
     /// Records whether this workflow instance first encountered `changeID` under
-    /// new code, enabling safe deployment of logic changes while workflows are in-flight.
+    /// new code, enabling safe deployment of logic changes while in-flight workflows
+    /// continue running.
     ///
-    /// Returns `true` the first time this code path is reached by this workflow instance,
-    /// then replays that same stored value on every subsequent activation.
+    /// On the first encounter returns `true` and writes to `strand.workflow_version_markers`.
+    /// On replay (the workflow was activated before and already passed this gate) returns
+    /// the stored value.
+    ///
+    /// Unlike other context calls, `version(changeID:)` does **not** consume a sequence
+    /// number — it is not a suspension point and can be called conditionally without
+    /// affecting the replay determinism of other operations.
     ///
     /// ```swift
     /// // Deploying a new activity implementation:
-    /// if try context.version(changeID: "v2-payment-processor") {
+    /// if context.version(changeID: "v2-payment-processor") {
     ///     // New workflows and in-flight workflows reaching this for the first time
-    ///     // will use the new path and store 'true' as the checkpoint.
+    ///     // will use the new path and store 'true'.
     ///     let r = try await context.runActivity(NewPaymentActivity.self, input: input)
     /// } else {
     ///     // In-flight workflows that already stored 'false' replay the old path.
@@ -1127,46 +1151,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// }
     /// ```
     ///
-    /// ## Determinism constraint
-    ///
-    /// `version(changeID:)` consumes a **sequence number** from the same monotonic
-    /// counter as `runActivity`, `sleep`, and `waitForEvent`. It must be called at the
-    /// **same unconditional position** in the control flow on every activation of this
-    /// workflow instance. Placing it inside a branch whose condition can change between
-    /// activations (e.g. a signal-mutated flag) shifts all downstream sequence numbers
-    /// and corrupts checkpoint replay.
-    ///
-    /// ```swift
-    /// // ✗ WRONG — only reached when isPaused is true; downstream seqNums shift.
-    /// if isPaused {
-    ///     let _ = try context.version(changeID: "v2-feature")
-    /// }
-    ///
-    /// // ✓ CORRECT — always reached; return value drives the branch.
-    /// let useV2 = try context.version(changeID: "v2-feature")
-    /// if isPaused && useV2 { ... }
-    /// ```
-    ///
     /// For a full deployment guide — including `markVersion`, multi-step migrations,
     /// and strategy selection — see <doc:VersioningGuide>.
     ///
     /// - Parameter changeID: A stable, unique string identifying this code change point.
-    ///   Use a descriptive name like `"v2-add-notification"` — it must never be reused
-    ///   for a different change in the same workflow.
-    /// - Returns: `true` on the first encounter; the stored value on replay.
-    /// - Throws: `StrandError.serialization` if the version checkpoint cannot be encoded.
-    public func version(changeID: String) throws(StrandError) -> Bool {
-        let seqNum = _impl.nextSeqNum()
-
-        // Replay fast path — return the value stored when this was first reached.
-        if let cached = _impl.checkpointCache[seqNum] {
-            return (try? JSON.decode(Bool.self, from: cached)) ?? true
+    /// - Returns: `true` on first encounter; the stored value on replay.
+    public func version(changeID: String) -> Bool {
+        // Replay: return the value stored when this was first reached.
+        if let cached = _impl.versionMarkerCache[changeID] {
+            return cached
         }
-
-        // First time: store `true` (this activation is running the new code) and return it.
-        let buf = try JSON.encode(true)
-        _impl.checkpointCache[seqNum] = buf
-        _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: changeID, value: buf))
+        // First encounter: cache locally and emit command to write to DB.
+        _impl.versionMarkerCache[changeID] = true
+        _impl.executor.emit(.recordVersionMarker(changeID: changeID, value: true))
         return true
     }
 
@@ -1184,7 +1181,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///   - type: The `Workflow` conforming type to enqueue as a child.
     ///   - options: Queue, priority, and concurrency overrides.
     ///   - input: Forwarded verbatim to the child workflow handler.
-    /// - Throws: `StrandError.childWorkflowFailed` when the child reached a terminal error state.
+    /// - Throws: `WorkflowError` when the child reached a terminal error state.
     public func runChildWorkflow<CW: Workflow>(
         _ type: CW.Type,
         options: ChildWorkflowOptions = .init(),
@@ -1199,10 +1196,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
         if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
-            throw StrandError.childWorkflowFailed(
-                name: CW.workflowName,
-                state: nonSuccess.state.rawValue
-            )
+            throw WorkflowError(workflowName: CW.workflowName, state: nonSuccess.state)
         }
 
         // Fast path 2: pre-loaded result (child completed in a prior activation).
@@ -1255,10 +1249,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             _impl.executor.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
             return try JSON.decode(CW.Output.self, from: resultBuffer)
         } catch let signal as _ActivityFailureSignal {
-            throw StrandError.childWorkflowFailed(
-                name: CW.workflowName,
-                state: signal.state.rawValue
-            )
+            throw WorkflowError(workflowName: CW.workflowName, state: signal.state)
         }
     }
 }

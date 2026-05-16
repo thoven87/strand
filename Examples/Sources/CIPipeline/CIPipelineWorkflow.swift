@@ -1,4 +1,3 @@
-import NIOCore
 import Strand
 
 /// Durable CI/CD pipeline workflow.
@@ -13,7 +12,8 @@ import Strand
 /// **Durability demo:** kill the process at any point and restart — the
 /// workflow resumes from the last completed stage. Try killing during the
 /// Build stage; on restart it will re-run Build and continue to Approval.
-struct CIPipelineWorkflow: Workflow {
+@Workflow
+struct CIPipelineWorkflow {
     typealias Input = PipelineInput
     typealias Output = PipelineOutput
 
@@ -21,36 +21,25 @@ struct CIPipelineWorkflow: Workflow {
 
     var approvalDecision: ApprovalDecision? = nil
 
-    // ── Signal definitions ──────────────────────────────────────────────────
+    // ── Signals ──────────────────────────────────────────────────────────────
 
-    /// Send to approve or reject the deployment.
+    /// Approve or reject the deployment.
     ///
-    ///   try await handle.signal(CIPipelineWorkflow.Approve.self,
-    ///                           payload: ApprovalDecision(approved: true, approver: "alice"))
-    struct Approve: WorkflowSignalDefinition {
-        typealias W = CIPipelineWorkflow
-        typealias Input = ApprovalDecision
-        static func apply(to w: inout CIPipelineWorkflow, input: ApprovalDecision) {
-            w.approvalDecision = input
-            let verdict = input.approved ? "✅  approved" : "❌  rejected"
-            print("  Signal received: \(verdict) by \(input.approver)")
-        }
+    /// ```swift
+    /// try await handle.signal(CIPipelineWorkflow.Approve.self,
+    ///                         payload: ApprovalDecision(approved: true, approver: "alice"))
+    /// ```
+    ///
+    /// `@Workflow` synthesises the `Approve` nested struct and the
+    /// `handleSignal` dispatcher — no boilerplate needed.
+    @WorkflowSignal
+    mutating func approve(_ decision: ApprovalDecision) {
+        approvalDecision = decision
+        let verdict = decision.approved ? "✅  approved" : "❌  rejected"
+        print("  Signal received: \(verdict) by \(decision.approver)")
     }
 
-    // ── Signal dispatcher ───────────────────────────────────────────────────
-
-    mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
-        switch name {
-        case Approve.signalName:
-            if let decision = try? decodeSignalPayload(ApprovalDecision.self, from: payload) {
-                Approve.apply(to: &self, input: decision)
-            }
-        default:
-            break
-        }
-    }
-
-    // ── Orchestration ───────────────────────────────────────────────────────
+    // ── Orchestration ─────────────────────────────────────────────────────────
 
     mutating func run(
         context: WorkflowContext<Self>,
@@ -113,7 +102,6 @@ struct CIPipelineWorkflow: Workflow {
         )
 
         // Suspend until the Approve signal arrives (or 24 h elapses).
-        // Note: predicate argument precedes timeout — this is the correct call order.
         try await context.condition({ $0.approvalDecision != nil }, timeout: .hours(24))
 
         guard let decision = approvalDecision, decision.approved else {
@@ -133,7 +121,6 @@ struct CIPipelineWorkflow: Workflow {
 
         // ── Summary ────────────────────────────────────────────────────────
         let passed = stages.filter(\.passed).count
-        let total = stages.count
         print(
             """
 
@@ -143,7 +130,7 @@ struct CIPipelineWorkflow: Workflow {
               Repo:     \(input.repo)
               Branch:   \(input.branch)
               SHA:      \(input.sha)
-              Stages:   \(passed)/\(total) passed
+              Stages:   \(passed)/\(stages.count) passed
               Approved: \(decision.approver)
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             """

@@ -49,14 +49,7 @@ import Foundation
                         name: "ci-pipeline",
                         namespace: "ci-pipeline-demo",
                         workflows: [CIPipelineWorkflow.self],
-                        activities: [
-                            CheckoutActivity(),
-                            LintActivity(),
-                            UnitTestActivity(),
-                            SecurityScanActivity(),
-                            BuildActivity(),
-                            DeployActivity(),
-                        ],
+                        activities: CIPipelineActivities().activities,
                         workflowConcurrency: 4,
                         activityConcurrency: 8,
                         pollInterval: .milliseconds(100)

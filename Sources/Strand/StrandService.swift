@@ -41,7 +41,7 @@ public struct StrandService: Service {
         /// One entry per logical worker. At least one queue is required.
         public var queues: [QueueConfig]
         /// Automatic task pruning. Enabled by default with ``StrandPrunerOptions``
-        /// defaults: 30-second DELETE cycle (same as River's `JobCleanerIntervalDefault`),
+        /// defaults: 30-second DELETE cycle,
         /// 12-hour partition management, row limit of 10,000 per cycle, and
         /// retention read per-namespace from `strand.namespaces.retention_days`
         /// (default: 30 days). All registered namespaces are pruned each cycle.

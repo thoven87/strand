@@ -162,6 +162,16 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         var checkpointCache: [Int: ByteBuffer] = [:]
         for row in checkpointRows { checkpointCache[row.seqNum] = row.stateBuffer }
 
+        // ── 1b. Version marker cache ─────────────────────────────────────────────
+        let versionMarkerRows = try await WorkflowStateQueries.listVersionMarkers(
+            on: exec.postgres,
+            namespaceID: exec.namespace,
+            taskID: claimed.taskID,
+            logger: exec.logger
+        )
+        var versionMarkerCache: [String: Bool] = [:]
+        for row in versionMarkerRows { versionMarkerCache[row.changeID] = row.value }
+
         // ── 2. Workflow state ────────────────────────────────────────────────────
         let storedStateBuf = try await WorkflowStateQueries.loadState(
             on: exec.postgres,
@@ -245,6 +255,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             executor: executor,
             stateBox: stateBox,
             checkpointCache: checkpointCache,
+            versionMarkerCache: versionMarkerCache,
             namespace: exec.namespace,
             activationTime: activationTime
         )
@@ -360,6 +371,18 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             for row in freshCheckpoints where activation.cachedCheckpoint(for: row.seqNum) == nil {
                 activation.cacheCheckpoint(seqNum: row.seqNum, buffer: row.stateBuffer)
             }
+            // Refresh version markers — picks up markVersion(...) calls made while the
+            // workflow was sleeping between activations.
+            let freshMarkers = try await WorkflowStateQueries.listVersionMarkers(
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                logger: exec.logger
+            )
+            for marker in freshMarkers {
+                // Always overwrite — markVersion can change the value while workflow sleeps.
+                activation.cacheVersionMarker(changeID: marker.changeID, value: marker.value)
+            }
         }
 
         // ── Signals ──────────────────────────────────────────────────────────
@@ -417,11 +440,19 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             case .completed:
                 if let result { executor.resumeActivity(seqNum: seqNum, result: result) }
             case .failed, .cancelled:
+                // Detect timeout: ClaimTimeoutError appears in the failure reason
+                // when the 2x claim-window threshold is exceeded.
+                // ClaimTimeoutError.failureName is derived from the type name, not
+                // a bare string literal — rename-safe.
+                let isTimeout: Bool =
+                    failureReason.flatMap {
+                        ActivityFailure.decode(from: $0)
+                    }.map { $0.name == ClaimTimeoutError.failureName } ?? false
                 let retryState: ActivityRetryState =
-                    state == .cancelled ? .cancelled : .maximumAttemptsReached
+                    state == .cancelled ? .cancelled : isTimeout ? .timedOut : .maximumAttemptsReached
                 let err: Error
                 if kind == .workflow {
-                    err = StrandError.childWorkflowFailed(name: name, state: state.rawValue)
+                    err = WorkflowError(workflowName: name, state: state)
                 } else {
                     // Use _ActivityFailureSignal so runActivity<A> can decode A.Failure.
                     err = _ActivityFailureSignal(
@@ -489,9 +520,10 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
     // MARK: - Shared activation helpers
 
-    /// Loads all pending signals, applies them to `state`, appends `SIGNAL_RECEIVED`
-    /// history events, persists the updated state, and deletes the processed signal rows.
-    /// No-op when no signals are pending.
+    /// Loads all pending signals, routes update signals through `handleUpdate`,
+    /// applies regular signals through `handleSignal`, emits update results as
+    /// named events, appends `SIGNAL_RECEIVED` history events, persists the updated
+    /// state, and deletes the processed signal rows. No-op when no signals are pending.
     private func applyAndPersistSignals(
         to state: inout W,
         exec: _WorkerExec,
@@ -504,22 +536,85 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             namespaceID: exec.namespace,
             logger: exec.logger
         )
-        for signal in signals {
-            try state.handleSignal(name: signal.name, payload: signal.payload)
-        }
         guard !signals.isEmpty else { return }
+
+        var updateResults: [(correlationID: String, result: ByteBuffer)] = []
+        var updateErrors: [(correlationID: String, error: String)] = []
+
         for signal in signals {
+            if let correlationID = signal.updateCorrelationID {
+                do {
+                    if let result = try state.handleUpdate(
+                        name: signal.name,
+                        correlationID: correlationID,
+                        payload: signal.payload
+                    ) {
+                        updateResults.append((correlationID, result))
+                    } else {
+                        updateErrors.append((correlationID, "Unknown update: \(signal.name)"))
+                    }
+                } catch {
+                    updateErrors.append((correlationID, strandErrorMessage(error)))
+                }
+            } else {
+                try state.handleSignal(name: signal.name, payload: signal.payload)
+            }
+        }
+
+        // Write update results to strand.workflow_updates (not strand.events)
+        for (correlationID, result) in updateResults {
+            try await WorkflowStateQueries.writeUpdateResult(
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                correlationID: correlationID,
+                result: result,
+                error: nil,
+                logger: exec.logger
+            )
+        }
+        for (correlationID, errorMsg) in updateErrors {
+            try await WorkflowStateQueries.writeUpdateResult(
+                on: exec.postgres,
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                correlationID: correlationID,
+                result: nil,
+                error: errorMsg,
+                logger: exec.logger
+            )
+        }
+
+        // Write history — updates get UPDATE_APPLIED, signals get SIGNAL_RECEIVED.
+        // signal.name is always the clean handler name for both kinds.
+        for signal in signals {
+            let eventType: WorkflowStateQueries.HistoryEventType =
+                signal.updateCorrelationID != nil ? .updateApplied : .signalReceived
             let sigData = try? JSON.encode(WorkflowStateQueries.SignalReceivedData(name: signal.name))
             try await WorkflowStateQueries.appendHistory(
                 on: exec.postgres,
                 namespaceID: exec.namespace,
                 taskID: claimed.taskID,
                 seq: historySeq,
-                eventType: .signalReceived,
+                eventType: eventType,
                 eventData: sigData,
                 logger: exec.logger
             )
             historySeq += 1
+            // Write-through to trace_spans — instant span for this signal/update.
+            try? await TraceSpanQueries.insertInstantSpan(
+                on: exec.postgres,
+                id: "\(claimed.taskID.uuidString):\(historySeq - 1)",
+                namespaceID: exec.namespace,
+                taskID: claimed.taskID,
+                parentID: claimed.taskID.uuidString,
+                kind: signal.updateCorrelationID != nil ? .update : .signal,
+                name: signal.name,
+                at: Date(),
+                eventType: signal.updateCorrelationID != nil ? .updateApplied : .signalReceived,
+                seqNum: historySeq - 1,
+                logger: exec.logger
+            )
         }
         let stateBuf = try JSON.encode(state)
         try await WorkflowStateQueries.saveState(

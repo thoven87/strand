@@ -67,12 +67,11 @@ $$;
 --
 -- Naming convention: strand.<table>_<YYYYMM>  e.g. strand.runs_202601
 --
--- IMPORTANT (Hatchet production lesson): Postgres autovacuum does NOT run
--- ANALYZE on partitioned parent tables — only on their child partitions. Without
--- periodic manual ANALYZE on strand.runs and strand.workflow_history the query
--- planner uses wrong row estimates (up to 6 000 000× off in production), causing
--- sequential scans on the claim path. StrandPruner.analyzeParentTables() calls
--- ANALYZE on both parents every 12 h.
+-- IMPORTANT: Postgres autovacuum does NOT run ANALYZE on partitioned parent
+-- tables — only on their child partitions. Without periodic manual ANALYZE on
+-- strand.runs and strand.workflow_history the query planner produces wildly
+-- wrong row estimates, causing sequential scans on the claim path under load.
+-- StrandPruner.analyzeParentTables() calls ANALYZE on both parents every 12 h.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- create_range_partition(base_table, month_start, fill_factor)
@@ -423,19 +422,6 @@ CREATE TABLE IF NOT EXISTS strand.runs (
 CREATE INDEX IF NOT EXISTS strand_runs_id_idx
     ON strand.runs (id);
 
--- strand.runs is the highest-churn table: attempt, state, lease_expires_at,
--- started_at and finished_at all change on every execution. fillfactor = 80
--- gives extra headroom for HOT updates. autovacuum is more aggressive than the
--- Postgres default (5 % scale factor) to keep dead-tuple accumulation in check.
-ALTER TABLE strand.runs SET (
-    fillfactor                      = 80,
-    autovacuum_vacuum_scale_factor  = 0.05,
-    autovacuum_analyze_scale_factor = 0.02,
-    autovacuum_vacuum_threshold     = 50,
-    autovacuum_analyze_threshold    = 50,
-    autovacuum_vacuum_cost_delay    = 2
-);
-
 -- Hot claim path: namespace_id first, then priority ASC so critical tasks are never starved.
 CREATE INDEX IF NOT EXISTS strand_runs_claim_idx
     ON strand.runs (namespace_id, queue, priority ASC, available_at, id)
@@ -476,6 +462,32 @@ CREATE TABLE IF NOT EXISTS strand.checkpoints (
 
 CREATE INDEX IF NOT EXISTS strand_checkpoints_ns_idx
     ON strand.checkpoints (namespace_id, task_id, seq_num);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Workflow version markers — queryable projection of context.version(changeID:) calls.
+--
+-- Written in two paths:
+--   1. First encounter of version(changeID:) — via the .recordVersionMarker
+--      WorkflowCommand processed in applyScheduleCommands.
+--   2. client.markVersion(...) — operator-driven migration tooling.
+--
+-- The canonical source of truth for replay is strand.checkpoints.
+-- This table exists for observability and namespace-level migration queries:
+--   SELECT task_id FROM strand.workflow_version_markers
+--   WHERE namespace_id = 'default' AND change_id = 'v2-payment' AND value = false;
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strand.workflow_version_markers (
+    namespace_id TEXT        NOT NULL REFERENCES strand.namespaces(id) ON DELETE CASCADE,
+    task_id      UUID        NOT NULL REFERENCES strand.tasks(id)      ON DELETE CASCADE,
+    change_id    TEXT        NOT NULL,
+    value        BOOLEAN     NOT NULL,
+    marked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_workflow_version_markers_pkey PRIMARY KEY (task_id, change_id)
+);
+
+-- Namespace-level migration query: find all tasks where change_id X = false.
+CREATE INDEX IF NOT EXISTS strand_version_markers_migration_idx
+    ON strand.workflow_version_markers (namespace_id, change_id, value);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Events — append-only emission log.
@@ -658,6 +670,7 @@ CREATE TABLE IF NOT EXISTS strand.workflow_signals (
     task_id      UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
     signal_name  TEXT        NOT NULL,
     payload      BYTEA,
+    update_correlation_id TEXT,      -- non-NULL for @WorkflowUpdate signals; NULL for @WorkflowSignal
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT strand_workflow_signals_pkey PRIMARY KEY (id)
 );
@@ -667,6 +680,28 @@ CREATE TABLE IF NOT EXISTS strand.workflow_signals (
 -- total order even when two concurrent transactions commit in the wrong wall-clock order.
 CREATE INDEX IF NOT EXISTS strand_workflow_signals_inbox_idx
     ON strand.workflow_signals (namespace_id, task_id, seq ASC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Workflow update results — stores the typed result (or error) of every
+-- @WorkflowUpdate handler call so the caller can poll for it.
+--
+-- Separate from strand.events so update results never appear in Loom's
+-- Events page (which shows only user-emitted ctx.emitEvent() rows).
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strand.workflow_updates (
+    id              UUID        NOT NULL DEFAULT strand.gen_uuid_v7(),
+    namespace_id    TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
+    correlation_id  TEXT        NOT NULL,   -- UUID generated by the caller; unique per update
+    task_id         UUID        NOT NULL REFERENCES strand.tasks(id) ON DELETE CASCADE,
+    result          BYTEA,                  -- JSON-encoded Output on success (null on error)
+    error           TEXT,                   -- validation error message (null on success)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_workflow_updates_pkey    PRIMARY KEY (id),
+    CONSTRAINT strand_workflow_updates_corr_uk UNIQUE (namespace_id, correlation_id)
+);
+
+CREATE INDEX IF NOT EXISTS strand_workflow_updates_corr_idx
+    ON strand.workflow_updates (namespace_id, correlation_id);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Task logs — structured per-task log lines emitted by context.log(…).
@@ -747,6 +782,63 @@ ALTER TABLE strand.workflow_history SET (
     autovacuum_analyze_threshold    = 50,
     autovacuum_vacuum_cost_delay    = 2
 );
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Trace spans — write-through OLAP table for the Loom trace and history views.
+--
+-- Written by the engine at every span lifecycle event (same transactions as the
+-- transactional tables). The dashboard reads exclusively from this table:
+--
+--   /trace   → WHERE namespace_id=$1 AND root_task_id=$2 ORDER BY queued_at
+--   /history → WHERE namespace_id=$1 AND task_id=$2 AND event_type IS NOT NULL ORDER BY seq_num
+--
+-- id format:
+--   Task spans  : task_id.uuidString              (e.g. "019E2ED0-7891-...")
+--   History spans: "\(taskID):\(seqNum)"          (e.g. "019E2ED0-7891-...:4")
+--
+-- root_task_id is the top-level workflow's task_id. For root tasks it equals
+-- task_id. For children it is propagated from the parent's root_task_id via a
+-- subquery at INSERT time (parent span is always inserted before its children).
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strand.trace_spans (
+    id           TEXT        NOT NULL,
+    namespace_id TEXT        NOT NULL DEFAULT 'default' REFERENCES strand.namespaces(id) ON DELETE CASCADE,
+    root_task_id UUID        NOT NULL,  -- top-level workflow task; index key for /trace
+    task_id      UUID        NOT NULL,  -- owning task; index key for /history
+    parent_id    TEXT,                  -- parent span id (task_id string or history span id)
+    kind         TEXT        NOT NULL,  -- WORKFLOW|ACTIVITY|SLEEP|WAIT|SIGNAL|UPDATE|EMIT|CONDITION
+    name         TEXT        NOT NULL,
+    state        TEXT        NOT NULL,  -- QUEUED|RUNNING|COMPLETED|FAILED|CANCELLED
+    attempt      INT         NOT NULL DEFAULT 0,
+    worker_id    TEXT,
+    max_attempts INT,
+    queued_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ,
+    error        TEXT,
+    -- History tab fields (only populated for discrete history events)
+    event_type   TEXT,                  -- raw HistoryEventType e.g. "ACTIVITY_SCHEDULED"
+    event_data   BYTEA,                 -- raw JSON payload for the history tab expand drawer
+    seq_num      INT,                   -- ordering for history view
+    CONSTRAINT strand_trace_spans_pkey PRIMARY KEY (id)
+);
+
+-- /trace endpoint: one index scan per workflow execution
+CREATE INDEX IF NOT EXISTS strand_trace_spans_root_idx
+    ON strand.trace_spans (namespace_id, root_task_id, queued_at ASC);
+
+-- /history endpoint: one index scan per task
+CREATE INDEX IF NOT EXISTS strand_trace_spans_task_idx
+    ON strand.trace_spans (namespace_id, task_id, seq_num ASC NULLS LAST);
+
+-- OLAP latency queries: PERCENTILE_CONT per task name over a time window
+-- Powers: GET /api/:namespace/metrics/latency
+CREATE INDEX IF NOT EXISTS strand_trace_spans_latency_idx
+    ON strand.trace_spans (namespace_id, finished_at DESC)
+    WHERE kind IN ('WORKFLOW', 'ACTIVITY')
+      AND state = 'COMPLETED'
+      AND started_at IS NOT NULL
+      AND finished_at IS NOT NULL;
 
 -- ────────────────────────────────────────────────────────────────────────────────────
 -- Schedules — cron/interval/one-shot task triggers.

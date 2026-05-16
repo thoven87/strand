@@ -1,4 +1,4 @@
-public import NIOCore  // ByteBuffer in public handleSignal(name:payload:ByteBuffer?)
+@_exported import NIOCore  // re-export so consumers get ByteBuffer without importing NIOCore directly
 
 #if canImport(FoundationEssentials)
 public import FoundationEssentials  // Date in WorkflowOptions.delayUntil
@@ -115,11 +115,28 @@ public protocol Workflow: WorkflowRegistrable, Codable & Sendable {
     /// Apply an externally-delivered signal before `run()` on each activation.
     /// Default implementation silently ignores unknown signals.
     mutating func handleSignal(name: String, payload: ByteBuffer?) throws
+
+    /// Runtime hook for `@WorkflowUpdate` handlers. Do not implement directly —
+    /// the `@Workflow` macro generates this from `@WorkflowUpdate`-annotated methods.
+    ///
+    /// Returns the JSON-encoded result on success, `nil` when the update name is
+    /// unrecognised. Throw to propagate a validation error back to the caller.
+    @_documentation(visibility: internal)
+    mutating func handleUpdate(
+        name: String,
+        correlationID: String,
+        payload: ByteBuffer?
+    ) throws -> ByteBuffer?
 }
 
 extension Workflow {
     public static var workflowName: String { String(describing: Self.self) }
     public mutating func handleSignal(name: String, payload: ByteBuffer?) throws {}
+    public mutating func handleUpdate(
+        name: String,
+        correlationID: String,
+        payload: ByteBuffer?
+    ) throws -> ByteBuffer? { nil }
 
     /// Decodes a typed payload from the raw `ByteBuffer?` delivered to `handleSignal`.
     ///
@@ -152,30 +169,31 @@ extension Workflow {
 
 /// A named, typed event that a workflow can wait for and a client can emit.
 ///
-/// ## Instance-scoped delivery
+/// ## Instance-scoped delivery via `matching:` predicate
 ///
-/// The typed `waitForEvent` and `emit(to:)` APIs are **instance-scoped**: the
-/// event name is automatically suffixed with the target workflow's task UUID,
-/// so a single `OrderApprovedEvent` emission reaches exactly one waiting
-/// workflow instance rather than broadcasting to all.
+/// Multiple concurrent workflow instances can share the same event name.
+/// Use the `matching:` parameter on `waitForEvent` to filter by a payload
+/// field — Postgres evaluates `payload @> predicate` at emission time via a
+/// GIN index, so only the matching workflow instance is woken:
 ///
 /// ```swift
 /// // 1. Define the event once:
 /// struct OrderApprovedEvent: WorkflowEvent {
 ///     typealias Payload = ApprovalPayload
-///     static let name   = "order.approved"  // human-readable, no ID needed
+///     static let name = "order.approved"
 /// }
 ///
-/// ```swift
-/// // 2. Wait in the workflow, filtering by a payload field:
+/// // 2. Wait in the workflow — filter by orderId so only this instance wakes:
 /// let approval = try await context.waitForEvent(
 ///     OrderApprovedEvent.self,
-///     matching: \.orderId == input.orderId   // only wake when orderId matches
+///     matching: \.orderId == input.orderId
 /// )
 ///
-/// // 3. Emit from an HTTP handler — routing is done by the waiter's predicate:
-/// try await client.emit(OrderApprovedEvent.self,
-///     payload: ApprovalPayload(orderId: "abc-123", approved: true))
+/// // 3. Emit from a handler — predicate routing happens in Postgres:
+/// try await client.emit(
+///     OrderApprovedEvent.self,
+///     payload: ApprovalPayload(orderId: "abc-123", approved: true)
+/// )
 /// ```
 ///
 /// ## Broadcast (no predicate)
@@ -237,7 +255,8 @@ public struct EventPredicate<Target>: Sendable {
     public init<V: Codable & Sendable>(path: String, equals value: V) {
         self.pathComponents = path.components(separatedBy: ".")
             .filter { !$0.isEmpty }
-        self.valueBytes = (try? JSON.encode(value))
+        self.valueBytes =
+            (try? JSON.encode(value))
             .map { Array($0.readableBytesView) } ?? []
     }
 
@@ -261,7 +280,8 @@ public struct EventPredicate<Target>: Sendable {
             guard let keyBuf = try? JSON.encode(component) else {
                 throw EventPredicateError.invalidValue
             }
-            result = [UInt8(ascii: "{")] + Array(keyBuf.readableBytesView)
+            result =
+                [UInt8(ascii: "{")] + Array(keyBuf.readableBytesView)
                 + [UInt8(ascii: ":")] + result + [UInt8(ascii: "}")]
         }
         return result
@@ -302,25 +322,31 @@ public func == <Root, Value: Codable & Sendable>(
     return EventPredicate(pathComponents: components, valueBytes: bytes)
 }
 
-// MARK: - WorkflowSignalDefinition
+// MARK: - WorkflowSignal
 
 /// Describes a named, typed signal a workflow can receive.
 ///
-/// Conforming types are generated automatically by the `@WorkflowSignal` macro
-/// (not yet implemented). Until the macro lands, define them manually as nested
-/// types inside your workflow struct:
+/// Conforming types are generated automatically by the `@WorkflowSignal` macro.
+/// You can also define them manually as nested types inside your workflow struct:
 ///
 /// ```swift
 /// struct OrderWorkflow: Workflow {
 ///     var isPaused: Bool = false
 ///
 ///     // Manual equivalent of @WorkflowSignal
-///     struct Pause: WorkflowSignalDefinition {
+///     struct Pause: WorkflowSignal {
 ///         typealias Input = StrandVoid
 ///         typealias W     = OrderWorkflow
-///         static let signalName = "pause"
 ///         static func apply(to workflow: inout OrderWorkflow, input: StrandVoid) {
 ///             workflow.isPaused = true
+///         }
+///     }
+///
+///     // Wire the definition into handleSignal — the @WorkflowSignal macro
+///     // generates this automatically.
+///     mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
+///         if name == Pause.signalName {
+///             Pause.apply(to: &self, input: .done)
 ///         }
 ///     }
 /// }
@@ -328,11 +354,7 @@ public func == <Root, Value: Codable & Sendable>(
 /// // Type-safe call site:
 /// try await handle.signal(OrderWorkflow.Pause.self)
 /// ```
-///
-/// The `handleSignal(name:payload:)` implementation in `Workflow` dispatches
-/// to registered definitions automatically when the workflow conforms to
-/// ``WorkflowWithSignals``.
-public protocol WorkflowSignalDefinition {
+public protocol WorkflowSignal {
     /// The workflow type that owns this signal.
     associatedtype W: Workflow
 
@@ -346,10 +368,118 @@ public protocol WorkflowSignalDefinition {
     static func apply(to workflow: inout W, input: Input)
 }
 
-extension WorkflowSignalDefinition {
+extension WorkflowSignal {
     /// Default: the lowercased Swift type name (e.g. `Pause` → `"pause"`).
     public static var signalName: String {
         String(describing: Self.self).lowercased()
+    }
+}
+
+// MARK: - WorkflowQuery
+
+/// A read-only query on the current workflow state.
+///
+/// Apply `@WorkflowQuery` to a function inside a `@Workflow` struct to generate
+/// a conforming nested struct automatically:
+///
+/// ```swift
+/// @Workflow
+/// struct OrderWorkflow {
+///     var isPaused = false
+///
+///     @WorkflowQuery
+///     func getStatus() -> OrderStatus {
+///         OrderStatus(isPaused: isPaused, ...)
+///     }
+/// }
+///
+/// // Call site — reads the persisted workflow state without blocking the workflow:
+/// let status = try await handle.query(OrderWorkflow.GetStatus.self)
+/// ```
+///
+/// Queries are **read-only** and execute synchronously against the last persisted
+/// state in `strand.workflow_state`. They never create a new workflow activation.
+public protocol WorkflowQuery: Sendable {
+    /// The workflow type this query belongs to.
+    associatedtype W: Workflow
+    /// The value returned by the query.
+    associatedtype Output: Sendable
+    /// Evaluates the query against a snapshot of the workflow state.
+    static func run(workflow: W) throws -> Output
+}
+
+// MARK: - WorkflowUpdateDefinition
+
+/// A synchronous workflow update: validates, mutates workflow state, and returns a result.
+///
+/// Apply `@WorkflowUpdate` to a `mutating func(input:) throws -> Output` inside a
+/// `@Workflow` struct. The caller sends the update via `handle.executeUpdate(_:payload:)`
+/// and awaits the typed result without creating a separate workflow activation.
+///
+/// ```swift
+/// @Workflow
+/// struct OrderWorkflow {
+///     var priority = "standard"
+///
+///     @WorkflowUpdate
+///     mutating func setPriority(input: String) throws -> String {
+///         guard ["standard", "expedited"].contains(input) else {
+///             throw WorkflowUpdateError("Invalid priority: \(input)")
+///         }
+///         let old = priority
+///         priority = input
+///         return "Priority changed from \(old) to \(priority)"
+///     }
+/// }
+///
+/// // Call site:
+/// let msg = try await handle.executeUpdate(OrderWorkflow.SetPriority.self, payload: "expedited")
+/// ```
+public protocol WorkflowUpdateDefinition {
+    /// The workflow type that owns this update.
+    associatedtype W: Workflow
+    /// Input type. Must be `Codable & Sendable`.
+    associatedtype Input: Codable & Sendable
+    /// Output type. Must be `Codable & Sendable`.
+    associatedtype Output: Codable & Sendable
+    /// Update name used for dispatch. Defaults to the function name (camelCase).
+    static var updateName: String { get }
+    /// Applies the update to the workflow struct and returns a result.
+    static func apply(to workflow: inout W, input: Input) throws -> Output
+}
+
+extension WorkflowUpdateDefinition {
+    /// Default: the function name with the first letter lowercased
+    /// (e.g. `SetPriority` → `"setPriority"`).
+    public static var updateName: String {
+        let s = String(describing: Self.self)
+        return s.prefix(1).lowercased() + s.dropFirst()
+    }
+}
+
+// MARK: - WorkflowUpdateError
+
+/// Thrown by `WorkflowHandle.update` when the workflow's `handleUpdate`
+/// implementation throws a validation error.
+public struct WorkflowUpdateError: Error, LocalizedError, Sendable {
+    /// Human-readable description of what went wrong.
+    public let message: String
+    public var errorDescription: String? { message }
+    public init(_ message: String) { self.message = message }
+}
+
+// MARK: - _StrandCoder
+
+/// JSON encode/decode helpers used by `@Workflow`-generated `handleUpdate` implementations.
+///
+/// Underscore prefix: infrastructure detail, not part of the public API.
+/// Only macro-generated code should call these methods directly.
+public enum _StrandCoder {
+    public static func decode<T: Decodable & Sendable>(_ type: T.Type, from buf: ByteBuffer) throws -> T {
+        try JSON.decode(type, from: buf)
+    }
+    public static func encode<T: Encodable & Sendable>(_ value: T) throws -> ByteBuffer {
+        try JSON.encode(value)
     }
 }
 

@@ -1,3 +1,4 @@
+import CompilerPluginSupport
 // swift-tools-version: 6.3
 import PackageDescription
 
@@ -9,10 +10,7 @@ let package = Package(
         .library(name: "StrandServer", targets: ["StrandServer"]),
     ],
     dependencies: [
-        // Pinned to commit 820771e which includes the runTimer continuation leak fix
-        // (PR #641: pool idle-timer reschedule dropped CheckedContinuation).
-        // Revert to `from: "1.x.x"` once a release including that patch is cut.
-        .package(url: "https://github.com/vapor/postgres-nio.git", revision: "820771e"),
+        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.33.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.99.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.12.0"),
         .package(
@@ -30,11 +28,20 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
         .package(url: "https://github.com/adam-fowler/compress-nio.git", from: "1.4.2"),
         .package(url: "https://github.com/swift-extras/swift-extras-base64.git", from: "1.0.0"),
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "603.0.1"),
     ],
     targets: [
+        .macro(
+            name: "StrandMacrosPlugin",
+            dependencies: [
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftCompilerPlugin", package: "swift-syntax"),
+            ]
+        ),
         .target(
             name: "Strand",
             dependencies: [
+                "StrandMacrosPlugin",
                 .product(name: "PostgresNIO", package: "postgres-nio"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
@@ -87,6 +94,17 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Metrics", package: "swift-metrics"),
                 .product(name: "Tracing", package: "swift-distributed-tracing"),
+            ]
+        ),
+        .testTarget(
+            name: "StrandMacrosTests",
+            dependencies: [
+                "Strand",
+                "StrandMacrosPlugin",
+                .product(name: "SwiftParser", package: "swift-syntax"),
+                .product(name: "SwiftBasicFormat", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacroExpansion", package: "swift-syntax"),
             ]
         ),
     ],
