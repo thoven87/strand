@@ -68,21 +68,29 @@ package enum BackfillQueries {
         totalSlots: Int,
         logger: Logger
     ) async throws {
-        try await client.query(
-            """
-            INSERT INTO strand.backfills
-                (id, namespace_id, queue, task_name, task_kind, params, headers,
-                 retry_strategy, max_attempts, schedule_pattern,
-                 range_start, range_end, concurrency, allow_overwrite, description,
-                 schedule_id, next_slot_time, total_slots)
-            VALUES
-                (\(id), \(namespaceID), \(queue), \(taskName), \(taskKind),
-                 \(paramsBuffer), \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
-                 \(schedulePatternBuffer), \(rangeStart), \(rangeEnd), \(concurrency),
-                 \(allowOverwrite), \(description), \(scheduleId), \(nextSlotTime), \(totalSlots))
-            """,
-            logger: logger
-        )
+        try await client.withConnection { conn in
+            try await Queries.createQueue(
+                on: conn,
+                namespaceID: namespaceID,
+                name: queue,
+                logger: logger
+            )
+            try await conn.query(
+                """
+                INSERT INTO strand.backfills
+                    (id, namespace_id, queue, task_name, task_kind, params, headers,
+                     retry_strategy, max_attempts, schedule_pattern,
+                     range_start, range_end, concurrency, allow_overwrite, description,
+                     schedule_id, next_slot_time, total_slots)
+                VALUES
+                    (\(id), \(namespaceID), \(queue), \(taskName), \(taskKind),
+                     \(paramsBuffer), \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
+                     \(schedulePatternBuffer), \(rangeStart), \(rangeEnd), \(concurrency),
+                     \(allowOverwrite), \(description), \(scheduleId), \(nextSlotTime), \(totalSlots))
+                """,
+                logger: logger
+            )
+        }
     }
 
     // MARK: - List running (called by StrandScheduler each poll cycle)
