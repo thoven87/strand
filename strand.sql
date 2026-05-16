@@ -422,19 +422,6 @@ CREATE TABLE IF NOT EXISTS strand.runs (
 CREATE INDEX IF NOT EXISTS strand_runs_id_idx
     ON strand.runs (id);
 
--- strand.runs is the highest-churn table: attempt, state, lease_expires_at,
--- started_at and finished_at all change on every execution. fillfactor = 80
--- gives extra headroom for HOT updates. autovacuum is more aggressive than the
--- Postgres default (5 % scale factor) to keep dead-tuple accumulation in check.
-ALTER TABLE strand.runs SET (
-    fillfactor                      = 80,
-    autovacuum_vacuum_scale_factor  = 0.05,
-    autovacuum_analyze_scale_factor = 0.02,
-    autovacuum_vacuum_threshold     = 50,
-    autovacuum_analyze_threshold    = 50,
-    autovacuum_vacuum_cost_delay    = 2
-);
-
 -- Hot claim path: namespace_id first, then priority ASC so critical tasks are never starved.
 CREATE INDEX IF NOT EXISTS strand_runs_claim_idx
     ON strand.runs (namespace_id, queue, priority ASC, available_at, id)
