@@ -153,6 +153,7 @@ struct RunResponse: Codable, Sendable {
     let attempt: Int
     let state: String
     let workerID: String?
+    let sdkVersion: String?
     let startedAt: Date?
     let finishedAt: Date?
     let leaseExpiresAt: Date?
@@ -164,6 +165,7 @@ struct RunResponse: Codable, Sendable {
         attempt = row.attempt
         state = row.state.rawValue
         workerID = row.workerID
+        sdkVersion = row.sdkVersion
         startedAt = row.startedAt
         finishedAt = row.finishedAt
         leaseExpiresAt = row.leaseExpiresAt
@@ -422,6 +424,7 @@ struct WorkerDetailResponse: Codable, Sendable {
     let lastSeenAt: Date?
     let leaseExpiresAt: Date?
     let isHealthy: Bool
+    let sdkVersion: String?
     let recentTasks: [WorkerTaskResponse]
 }
 extension WorkerDetailResponse: ResponseCodable {}

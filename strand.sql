@@ -383,6 +383,8 @@ CREATE TABLE IF NOT EXISTS strand.runs (
 
     state            TEXT        NOT NULL DEFAULT 'PENDING',
     worker_id        TEXT,
+    sdk_version      TEXT,        -- Strand SDK version of the worker that claimed this run
+    has_buffered_completion BOOLEAN NOT NULL DEFAULT FALSE,  -- set by emitTaskCompletionSignal when parent is RUNNING
     lease_expires_at TIMESTAMPTZ,
     available_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -958,6 +960,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS strand.workers (
     queue        TEXT        NOT NULL,
     concurrency  INTEGER     NOT NULL,    -- configured workflowConcurrency + activityConcurrency
     running      INTEGER     NOT NULL DEFAULT 0,   -- currently executing tasks
+    sdk_version  TEXT,                              -- Strand SDK version from build, e.g. "1.0.0" or commit SHA
     paused       BOOLEAN     NOT NULL DEFAULT FALSE,
     started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

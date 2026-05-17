@@ -115,6 +115,7 @@ export interface Run {
     attempt: number;
     state: TaskState;
     workerID: string | null;
+    sdkVersion: string | null;
     startedAt: string | null;
     finishedAt: string | null;
     leaseExpiresAt: string | null;

@@ -18,6 +18,7 @@ struct WorkerResponse: Codable, Sendable {
     let lastSeenAt: Date?
     let leaseExpiresAt: Date?
     let isHealthy: Bool
+    let sdkVersion: String?
 
     init(from row: WorkerRow) {
         workerID = row.workerID
@@ -29,6 +30,7 @@ struct WorkerResponse: Codable, Sendable {
         lastSeenAt = row.lastSeenAt
         leaseExpiresAt = row.leaseExpiresAt
         isHealthy = row.leaseExpiresAt.map { $0 > Date.now } ?? (row.lastSeenAt.map { Date.now.timeIntervalSince($0) < 30 } ?? false)
+        sdkVersion = row.sdkVersion
     }
 }
 extension WorkerResponse: ResponseCodable {}
@@ -75,6 +77,7 @@ struct WorkerRoutes {
                 lastSeenAt: s.lastSeenAt,
                 leaseExpiresAt: s.leaseExpiresAt,
                 isHealthy: s.leaseExpiresAt.map { $0 > Date.now } ?? (s.lastSeenAt.map { Date.now.timeIntervalSince($0) < 30 } ?? false),
+                sdkVersion: s.sdkVersion,
                 recentTasks: tasks.map(WorkerTaskResponse.init)
             )
         }

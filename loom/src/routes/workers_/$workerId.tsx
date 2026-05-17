@@ -33,6 +33,7 @@ interface WorkerDetail {
     lastSeenAt: string | null;
     leaseExpiresAt: string | null;
     isHealthy: boolean;
+    sdkVersion: string | null;
     recentTasks: WorkerTask[];
 }
 
@@ -214,15 +215,22 @@ export function WorkerDetailPage() {
                     </div>
 
                     {data && (
-                        <span
-                            className={`ml-2 inline-flex items-center rounded border px-2 py-0.5 text-xs font-normal ${
-                                data.isHealthy
-                                    ? "bg-green-500/20 text-green-300 border-green-500/30"
-                                    : "bg-slate-500/20 text-slate-300 border-slate-500/30"
-                            }`}
-                        >
-                            {data.isHealthy ? "Active" : "Idle"}
-                        </span>
+                        <div className="ml-2 flex items-center gap-2">
+                            <span
+                                className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-normal ${
+                                    data.isHealthy
+                                        ? "bg-green-500/20 text-green-300 border-green-500/30"
+                                        : "bg-slate-500/20 text-slate-300 border-slate-500/30"
+                                }`}
+                            >
+                                {data.isHealthy ? "Active" : "Idle"}
+                            </span>
+                            {data.sdkVersion && (
+                                <span className="inline-flex items-center rounded border px-2 py-0.5 text-xs font-mono text-muted-foreground border-border/60 bg-secondary/20">
+                                    v{data.sdkVersion}
+                                </span>
+                            )}
+                        </div>
                     )}
                 </div>
             </div>

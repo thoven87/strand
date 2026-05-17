@@ -10,6 +10,7 @@ export interface Worker {
     lastSeenAt: string | null;
     leaseExpiresAt: string | null;
     isHealthy: boolean;
+    sdkVersion: string | null;
 }
 
 export const getWorkers = (namespace: string): Promise<Worker[]> =>
