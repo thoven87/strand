@@ -15,6 +15,7 @@ interface Worker {
     lastSeenAt: string | null;
     leaseExpiresAt: string | null;
     isHealthy: boolean;
+    sdkVersion: string | null;
 }
 
 export function WorkersPage() {
@@ -59,6 +60,7 @@ export function WorkersPage() {
                                 {[
                                     "Worker ID",
                                     "Queue",
+                                    "Version",
                                     "Concurrency",
                                     "Running",
                                     "Completed (5 min)",
@@ -99,6 +101,17 @@ export function WorkersPage() {
                                     </td>
                                     <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                                         {w.queue}
+                                    </td>
+                                    <td className="px-4 py-2.5">
+                                        {w.sdkVersion ? (
+                                            <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] font-mono text-muted-foreground border-border/60 bg-secondary/20">
+                                                v{w.sdkVersion}
+                                            </span>
+                                        ) : (
+                                            <span className="text-muted-foreground/40 text-xs">
+                                                —
+                                            </span>
+                                        )}
                                     </td>
                                     <td className="px-4 py-2.5">
                                         {w.concurrency}

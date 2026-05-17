@@ -371,6 +371,7 @@ public struct StrandWorker: Service {
             queue: options.queue,
             concurrency: options.workflowConcurrency + options.activityConcurrency,
             running: 0,
+            sdkVersion: StrandVersion.current,
             logger: logger
         )
 
@@ -614,6 +615,7 @@ public struct StrandWorker: Service {
                     metadata: .forError(error) + ["strand.queue": .string(queueName)]
                 )
             }
+
         }
     }
 
@@ -646,6 +648,7 @@ public struct StrandWorker: Service {
                 queue: options.queue,
                 concurrency: options.workflowConcurrency + options.activityConcurrency,
                 running: running.value,
+                sdkVersion: StrandVersion.current,
                 logger: logger
             )
             // Sweep stale worker rows left by crashed peers
@@ -673,26 +676,6 @@ public struct StrandWorker: Service {
         let channel = StrandChannels.tasks
         let myNotification = StrandChannels.Notification(namespace: namespace, queue: options.queue)
 
-        // cancelWhenGracefulShutdown is used for two reasons:
-        //
-        // 1. Fast voluntary exit on graceful shutdown.
-        //    cancelWhenGracefulShutdown detects Task.isShuttingDownGracefully
-        //    and cancels the postgres.withConnection body via an inner task
-        //    group.  Without it the loop would keep the connection open until
-        //    the while-condition check on the next iteration (up to the full
-        //    reconnect / poll cycle).
-        //
-        // 2. NIO runTimer continuation safety.
-        //    When cancelWhenGracefulShutdown cancels the inner scope, the
-        //    *outer* listenLoop task is still alive (it will execute the
-        //    catch block and return).  NIO's event-loop cleanup callbacks —
-        //    including any runTimer continuations scheduled during connection
-        //    teardown — have time to fire within this window.  If the outer
-        //    task were torn down at the same moment (e.g. by the grace-period
-        //    throw after gracefulShutdownTimeout), those continuations would
-        //    be leaked.
-        //
-        // The reconnect sleep uses the same wrapper for reason 2.
         while !Task.isShuttingDownGracefully && !Task.isCancelled {
             do {
                 try await cancelWhenGracefulShutdown {
@@ -713,8 +696,6 @@ public struct StrandWorker: Service {
                     "LISTEN connection lost — reconnecting",
                     metadata: .forError(error)
                 )
-                // Wrap the reconnect sleep for the same reason: a raw
-                // group.cancelAll() mid-sleep leaks the runTimer continuation.
                 try await cancelWhenGracefulShutdown {
                     try await Task.sleep(for: .seconds(1))
                 }
@@ -722,7 +703,7 @@ public struct StrandWorker: Service {
         }
     }
 
-    // MARK: - Task execution
+    // MARK: - Task run
 
     private func runTask(_ claimed: ClaimedTask) async {
         // Scope the logger to this specific task/run for structured log output.
@@ -743,7 +724,7 @@ public struct StrandWorker: Service {
                     logger: taskLogger
                 )
             } catch {
-                taskLogger.error("failed to defer unknown task", metadata: .forError(error))
+                taskLogger.trace("failed to defer unknown task", metadata: .forError(error))
             }
             return
         }
@@ -1066,7 +1047,7 @@ public struct StrandWorker: Service {
                 logger: logger
             )
         } catch {
-            logger.error(
+            logger.trace(
                 "failRun DB call failed — run will be swept by leaseExpiryLoop",
                 metadata: .forError(error)
             )

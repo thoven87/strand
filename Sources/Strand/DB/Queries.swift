@@ -643,6 +643,7 @@ enum Queries {
                 UPDATE strand.runs r
                 SET state            = \(TaskState.running),
                     worker_id        = \(workerID),
+                    sdk_version      = \(StrandVersion.current),
                     lease_expires_at = NOW() + COALESCE(NULLIF(c.timeout_seconds, 0), \(claimTimeoutSeconds)) * INTERVAL '1 second',
                     started_at       = COALESCE(r.started_at, NOW())
                 FROM candidate c WHERE r.id = c.id
@@ -1785,16 +1786,18 @@ enum Queries {
         queue: String,
         concurrency: Int,
         running: Int,
+        sdkVersion: String,
         logger: Logger
     ) async throws {
         try await client.query(
             """
-            INSERT INTO strand.workers (id, namespace_id, queue, concurrency, running, started_at, updated_at)
-            VALUES (\(workerID), \(namespaceID), \(queue), \(concurrency), \(running), NOW(), NOW())
+            INSERT INTO strand.workers (id, namespace_id, queue, concurrency, running, sdk_version, started_at, updated_at)
+            VALUES (\(workerID), \(namespaceID), \(queue), \(concurrency), \(running), \(sdkVersion), NOW(), NOW())
             ON CONFLICT (id, namespace_id, queue)
             DO UPDATE SET
                 concurrency  = EXCLUDED.concurrency,
                 running      = EXCLUDED.running,
+                sdk_version  = EXCLUDED.sdk_version,
                 updated_at   = NOW()
             """,
             logger: logger
@@ -2419,6 +2422,19 @@ enum Queries {
                   AND  r.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
                   AND  r.namespace_id = \(namespaceID)
                 RETURNING r.id AS run_id
+            ),
+            flag_parent AS (
+                -- When the parent run is RUNNING (mid-activation), the woken CTE above
+                -- returned 0 rows for it. Set has_buffered_completion so that step 7's
+                -- UPDATE strand.runs (which acquires a row lock) sees the flag after
+                -- unblocking from any concurrent emitTaskCompletionSignal — eliminating
+                -- the READ COMMITTED race that previously left runs permanently stuck WAITING.
+                UPDATE strand.runs r
+                SET    has_buffered_completion = TRUE
+                FROM   waits w
+                WHERE  r.id           = w.run_id
+                  AND  r.state        = \(TaskState.running)
+                  AND  r.namespace_id = \(namespaceID)
             ),
             del_waits AS (
                 -- Only delete the event_wait when the wake succeeded.

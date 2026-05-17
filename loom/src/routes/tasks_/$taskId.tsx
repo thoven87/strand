@@ -701,6 +701,11 @@ function RunRow({
                         {duration}
                     </span>
                 )}
+                {run.sdkVersion && (
+                    <span className="text-[11px] font-mono text-muted-foreground/50 border border-border/40 rounded px-1 hidden sm:block">
+                        v{run.sdkVersion}
+                    </span>
+                )}
                 {run.workerID && (
                     <span className="text-[11px] font-mono text-muted-foreground/60 ml-1 hidden sm:block truncate max-w-32">
                         {run.workerID}

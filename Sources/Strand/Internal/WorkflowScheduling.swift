@@ -790,12 +790,13 @@ extension WorkflowRegistration {
                 ),
                 run_upd AS (
                     UPDATE strand.runs
-                    SET state            = CASE WHEN (SELECT COUNT(*) FROM missed) > 0
+                    SET state            = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
                                                THEN \(TaskState.pending)
                                                ELSE \(TaskState.waiting) END,
-                        available_at     = CASE WHEN (SELECT COUNT(*) FROM missed) > 0
+                        available_at     = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
                                                THEN NOW()
                                                ELSE available_at END,
+                        has_buffered_completion = FALSE,   -- reset regardless: either consumed (PENDING) or already caught by flag
                         worker_id        = NULL,
                         lease_expires_at = NULL
                     WHERE id = \(claimed.runID)

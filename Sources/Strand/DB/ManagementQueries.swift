@@ -112,6 +112,7 @@ package struct RunSummaryRow: Sendable {
     package let attempt: Int
     package let state: TaskState
     package let workerID: String?
+    package let sdkVersion: String?
     package let startedAt: Date?
     package let finishedAt: Date?
     package let leaseExpiresAt: Date?
@@ -126,6 +127,7 @@ extension RunSummaryRow {
         attempt = try col.next()!.decode(Int.self, context: .default)
         state = try col.next()!.decode(TaskState.self, context: .default)
         workerID = try col.next()!.decode(String?.self, context: .default)
+        sdkVersion = try col.next()!.decode(String?.self, context: .default)
         startedAt = try col.next()!.decode(Date?.self, context: .default)
         finishedAt = try col.next()!.decode(Date?.self, context: .default)
         leaseExpiresAt = try col.next()!.decode(Date?.self, context: .default)
@@ -403,8 +405,8 @@ package enum ManagementQueries {
     ) async throws -> [RunSummaryRow] {
         let stream = try await client.query(
             """
-            SELECT id, attempt, state, worker_id, started_at, finished_at,
-                   lease_expires_at, created_at, failure_reason
+            SELECT id, attempt, state, worker_id, sdk_version,
+                   started_at, finished_at, lease_expires_at, created_at, failure_reason
             FROM strand.runs
             WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)
             ORDER BY attempt DESC
@@ -1009,6 +1011,7 @@ package struct WorkerRow: Sendable {
     package let startedAt: Date  // from strand.workers.started_at
     package let lastSeenAt: Date?  // from strand.workers.updated_at
     package let leaseExpiresAt: Date?  // from strand.runs JOIN
+    package let sdkVersion: String?  // from strand.workers.sdk_version
 }
 
 extension WorkerRow {
@@ -1022,6 +1025,7 @@ extension WorkerRow {
         startedAt = try col.next()!.decode(Date.self, context: .default)
         lastSeenAt = try col.next()!.decode(Date?.self, context: .default)
         leaseExpiresAt = try col.next()!.decode(Date?.self, context: .default)
+        sdkVersion = try col.next()!.decode(String?.self, context: .default)
     }
 }
 
@@ -1116,7 +1120,8 @@ extension ManagementQueries {
               COALESCE(r.completed_recently, 0) AS completed_recently,
               w.started_at,
               w.updated_at      AS last_seen_at,
-              r.lease_expires_at
+              r.lease_expires_at,
+              w.sdk_version
             FROM strand.workers w
             LEFT JOIN (
               SELECT
@@ -1161,7 +1166,8 @@ extension ManagementQueries {
               COALESCE(r.completed_recently, 0) AS completed_recently,
               w.started_at,
               w.updated_at      AS last_seen_at,
-              r.lease_expires_at
+              r.lease_expires_at,
+              w.sdk_version
             FROM strand.workers w
             LEFT JOIN (
               SELECT
