@@ -14,18 +14,6 @@ import Foundation
 
 // MARK: - Types
 
-struct OrderInput: Codable, Sendable {
-    let orderId: String
-    let amount: Double
-    let items: [String]
-}
-
-struct OrderResult: Codable, Sendable {
-    let orderId: String
-    let status: String
-    let trackingNumber: String
-}
-
 struct ReportInput: Codable, Sendable {
     let reportId: String
     let dataset: String
@@ -47,26 +35,6 @@ struct GreetResult: Codable, Sendable {
 }
 
 // MARK: - Workflows
-
-/// Multi-step order pipeline — shows checkpoints in the run timeline.
-struct ProcessOrderWorkflow: Workflow {
-    typealias Input = OrderInput
-    typealias Output = OrderResult
-
-    mutating func run(
-        context: WorkflowContext<Self>,
-        input: OrderInput
-    ) async throws -> OrderResult {
-        // Values derived purely from input — deterministic, no checkpoint needed.
-        let paymentId = "pay_\(input.orderId.prefix(8).lowercased())"
-        let tracking = "TRK-\(paymentId.suffix(6).uppercased())"
-        return OrderResult(
-            orderId: input.orderId,
-            status: "completed",
-            trackingNumber: tracking
-        )
-    }
-}
 
 /// Sleeps before processing — lets you see SLEEPING state in the UI.
 struct GenerateReportWorkflow: Workflow {
@@ -207,19 +175,50 @@ private func seedBatch(
     reports: StrandClient,
     logger: Logger
 ) async {
-    let initialOrders: [(String, Double, [String])] = [
-        ("ORD-1001", 49.99, ["widget-a", "widget-b"]),
-        ("ORD-1002", 129.00, ["gadget-x"]),
-        ("ORD-1003", 19.95, ["sticker-pack", "mug"]),
-        ("ORD-1004", 299.00, ["pro-kit"]),
+    // Seed initial orders — mix of 1–3 items to exercise both the linear path
+    // and the parallel ReserveInventory fan-out
+    let initialOrders: [(String, String, String, [OrderLineItem], String)] = [
+        (
+            "ORD-1001", "cust-101", "alice@example.com",
+            [
+                OrderLineItem(sku: "SKU-WIDGET", name: "Widget Pro", quantity: 2, unitPriceCents: 2999),
+                OrderLineItem(sku: "SKU-MODULE", name: "Module X", quantity: 1, unitPriceCents: 1499),
+            ],
+            "42 Pine St, Seattle, WA 98101"
+        ),
+        (
+            "ORD-1002", "cust-207", "bob@example.com",
+            [OrderLineItem(sku: "SKU-GADGET", name: "Gadget Plus", quantity: 1, unitPriceCents: 4999)],
+            "7 Oak Ave, Portland, OR 97201"
+        ),
+        (
+            "ORD-1003", "cust-318", "carol@example.com",
+            [
+                OrderLineItem(sku: "SKU-KIT", name: "Starter Kit", quantity: 1, unitPriceCents: 7999),
+                OrderLineItem(sku: "SKU-WIDGET", name: "Widget Pro", quantity: 3, unitPriceCents: 2999),
+                OrderLineItem(sku: "SKU-MODULE", name: "Module X", quantity: 2, unitPriceCents: 1499),
+            ],
+            "88 Elm Rd, San Francisco, CA 94102"
+        ),
+        (
+            "ORD-1004", "cust-429", "dave@example.com",
+            [OrderLineItem(sku: "SKU-GADGET", name: "Gadget Plus", quantity: 2, unitPriceCents: 4999)],
+            "5 Maple Blvd, Austin, TX 78701"
+        ),
     ]
-    for (id, amount, items) in initialOrders {
+    for (id, custId, email, items, address) in initialOrders {
         do {
             _ = try await orders.startWorkflow(
                 ProcessOrderWorkflow.self,
-                input: OrderInput(orderId: id, amount: amount, items: items)
+                input: OrderInput(
+                    orderId: id,
+                    customerId: custId,
+                    customerEmail: email,
+                    items: items,
+                    shippingAddress: address
+                )
             )
-            logger.info("[seeder] order \(id) enqueued")
+            logger.info("[seeder] order \(id) enqueued (\(items.count) item(s))")
         } catch {
             logger.warning("[seeder] order \(id): \(error)")
         }
@@ -263,14 +262,39 @@ private func seedBatch(
 
 private func seedOne(orders: StrandClient, logger: Logger) async {
     let id = "ORD-\(Int.random(in: 2000...9999))"
-    let catalog = ["widget", "gadget", "module", "adapter", "kit"]
-    let items = ["\(catalog.randomElement()!)-\(Int.random(in: 1...9))"]
+    // Fully random customer — no hardcoded list
+    let custId = "cust-\(Int.random(in: 1000...9999))"
+    let firstName = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "hank"].randomElement()!
+    let domain = ["example.com", "test.org", "demo.net", "sample.io"].randomElement()!
+    let email = "\(firstName)\(Int.random(in: 1...99))@\(domain)"
+    let streets = ["Main St", "Oak Ave", "Elm Rd", "Pine Blvd", "Maple Dr", "Cedar Ln"]
+    let cities = [
+        ("Seattle", "WA", "981"), ("Portland", "OR", "972"), ("Austin", "TX", "787"),
+        ("Denver", "CO", "802"), ("Chicago", "IL", "606"), ("Boston", "MA", "021"),
+    ]
+    let (city, state, zip) = cities.randomElement()!
+    let address = "\(Int.random(in: 1...999)) \(streets.randomElement()!), \(city), \(state) \(zip)\(Int.random(in: 10...99))"
+    let skus = [
+        ("SKU-WIDGET", "Widget Pro", 2999), ("SKU-GADGET", "Gadget Plus", 4999),
+        ("SKU-MODULE", "Module X", 1499), ("SKU-KIT", "Starter Kit", 7999),
+    ]
+    // 1–3 items: exercises single-item path and fan-out inventory reservation
+    let items = (0..<Int.random(in: 1...3)).map { _ -> OrderLineItem in
+        let (sku, name, price) = skus.randomElement()!
+        return OrderLineItem(sku: sku, name: name, quantity: Int.random(in: 1...3), unitPriceCents: price)
+    }
     do {
         _ = try await orders.startWorkflow(
             ProcessOrderWorkflow.self,
-            input: OrderInput(orderId: id, amount: Double.random(in: 9.99...299.99), items: items)
+            input: OrderInput(
+                orderId: id,
+                customerId: custId,
+                customerEmail: email,
+                items: items,
+                shippingAddress: address
+            )
         )
-        logger.info("[seeder] periodic order \(id)")
+        logger.info("[seeder] periodic order \(id) (\(items.count) item(s)) for \(email)")
     } catch {
         logger.warning("[seeder] periodic order: \(error)")
     }
@@ -478,6 +502,10 @@ private func seedOnePodcast(client: StrandClient, logger: Logger) async {
                 TrainVoiceAssistantWorkflow.self,
                 TrainCountryModelWorkflow.self,
                 PodcastTranscriptionWorkflow.self,
+            ],
+            activityContainers: [
+                // @ActivityContainer groups related activities — no manual list
+                ProcessOrderActivities()
             ],
             activities: [
                 CalculateInvoiceActivity(),

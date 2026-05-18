@@ -168,6 +168,16 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     /// Updated by WorkflowContext public functions; read by activate() on handler failure.
     var lastCallSite: (fileID: String, line: Int)? = nil
 
+    /// Set to `true` when `claimed.cancelRequested` is set at activation start.
+    ///
+    /// Needed as a separate flag (not just `Task.isCancelled`) because condition
+    /// predicates are evaluated in the worker-task context after `drain()` returns,
+    /// not inside the handler Task. `Task.isCancelled` would always be `false` there.
+    /// The activation paths set this from `claimed.cancelRequested` and also call
+    /// `handlerTask.cancel()` so that slow-path `try Task.checkCancellation()` gates
+    /// in `runActivity`/`sleep`/`waitForEvent` throw natively inside the handler Task.
+    var isCancelRequested: Bool = false
+
     // MARK: - Init
 
     init(
@@ -382,6 +392,30 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```
     public var historyEventCount: Int { _impl.historyEventCount }
 
+    /// Returns `true` when this workflow has received a cooperative cancellation request
+    /// from its parent workflow (i.e. the parent closed with
+    /// `ChildWorkflowOptions.parentClosePolicy = .requestCancel`).
+    ///
+    /// The flag is set at activation start when the claimed run has `cancel_requested = true`.
+    /// It is sticky — once set it is never cleared for the lifetime of this workflow.
+    ///
+    /// Two mechanisms work together:
+    /// - **`isCancelRequested` flag** (this property): readable from `condition` predicates,
+    ///   which run in the worker-task context outside the handler Task.
+    /// - **`handlerTask.cancel()`**: causes `try Task.checkCancellation()` gates at
+    ///   slow-path suspension points in `runActivity`, `sleep`, and `waitForEvent` to throw
+    ///   `CancellationError` natively inside the handler Task.
+    ///
+    /// Use in `condition` to detect and respond to the request gracefully:
+    /// ```swift
+    /// try await context.condition({ _ in context.isCancelRequested })
+    /// // perform cleanup, then return normally
+    /// ```
+    ///
+    /// Unlike hard `cancelTask()`, `requestCancel` is fully cooperative:
+    /// the workflow continues running until it returns or throws.
+    public var isCancelRequested: Bool { _impl.isCancelRequested }
+
     /// Scheduling metadata injected by ``StrandScheduler`` when this workflow was
     /// triggered by a schedule. `nil` when enqueued directly via ``StrandClient``.
     ///
@@ -524,6 +558,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Slow path: activity not yet complete — emit command and suspend ─────────────
+        // Guard: if this workflow has been cooperative-cancelled (requestCancel policy),
+        // throw CancellationError here rather than scheduling a new activity that would
+        // never be needed. Fast paths above are unaffected — already-completed work replays.
+        try Task.checkCancellation()
         let inputBuffer = try JSON.encode(input)
         // Use caller-supplied ID if set; otherwise derive a stable key from
         // the workflow task UUID and call-site sequence number.
@@ -743,6 +781,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // Slow path: timer not yet elapsed — suspend via continuation.
+        // Guard: don't start new timers when cooperatively cancelled.
+        try Task.checkCancellation()
         _impl.executor.emit(.startTimer(wakeAt: resolvedWakeAt, seqNum: seqNum))
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             _impl.executor.suspendTimer(seqNum: seqNum, continuation: cont)
@@ -864,6 +904,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Slow path: event not yet received — emit command and suspend ──────────
+        // Guard: don't register new event waits when cooperatively cancelled.
+        try Task.checkCancellation()
         let predicateBuf: ByteBuffer? = try predicate.flatMap { p in
             ByteBuffer(bytes: try p.toJSONBytes())
         }

@@ -290,6 +290,16 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             }
         }
 
+        // Deliver cooperative cancel: if this workflow's parent closed with
+        // parentClosePolicy = .requestCancel, set the activation flag (readable
+        // from condition predicates in the worker-task context) AND cancel the
+        // handler Task (so slow-path try Task.checkCancellation() gates throw
+        // CancellationError natively inside the handler Task).
+        if claimed.cancelRequested {
+            activation.isCancelRequested = true
+            handlerTask.cancel()
+        }
+
         // Run the handler on the serial executor until it either completes or
         // every in-flight task has parked its continuation (pending activity,
         // timer, or event wait).
@@ -397,7 +407,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             }
         }
 
-        // ── Signals ──────────────────────────────────────────────────────────
+        // ── Signals ────────────────────────────────────────────────────
         try await applyAndPersistSignals(to: &stateBox.value, exec: exec, claimed: claimed, historySeq: &historySeq)
 
         // ── Completed children ──────────────────────────────────────────────────
@@ -504,6 +514,15 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // If woken without an event name a sleep timer (or condition deadline) fired.
         if claimed.wakeEvent == nil { executor.resumeAllTimers() }
 
+        // Deliver cooperative cancel AFTER resuming real results so already-completed
+        // continuations are delivered first. Set both the activation flag (for condition
+        // predicates) and cancel the handler Task (for slow-path CancellationError gates).
+        // isCancelRequested is sticky — OR with existing value so it is never cleared.
+        if claimed.cancelRequested {
+            activation.isCancelRequested = true
+            cached.task.cancel()
+        }
+
         // ── Drain + conditions ────────────────────────────────────────────────
         executor.drain()
         while executor.resumeExpiredConditions() { executor.drain() }
@@ -542,6 +561,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
     /// applies regular signals through `handleSignal`, emits update results as
     /// named events, appends `SIGNAL_RECEIVED` history events, persists the updated
     /// state, and deletes the processed signal rows. No-op when no signals are pending.
+    ///
     private func applyAndPersistSignals(
         to state: inout W,
         exec: _WorkerExec,

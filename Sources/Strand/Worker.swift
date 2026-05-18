@@ -504,7 +504,24 @@ public struct StrandWorker: Service {
                     continue
                 }
 
-                // ── Claim up to `free` tasks ───────────────────────────────────
+                // ── Claim up to `free` tasks ──────────────────────────────
+                // Transition WAITING runs whose children have completed to PENDING
+                // so they are immediately eligible for the claimTasks call below.
+                // Errors are non-fatal: a transient failure is retried on the next
+                // poll tick without affecting the claim path.
+                do {
+                    try await Queries.wakeCompletedWaiting(
+                        on: postgres,
+                        namespaceID: namespace,
+                        queue: queueName,
+                        logger: logger
+                    )
+                } catch {
+                    logger.warning(
+                        "wakeCompletedWaiting failed",
+                        metadata: .forError(error) + ["strand.queue": .string(queueName)]
+                    )
+                }
                 let claimed: [ClaimedTask]
                 do {
                     claimed = try await Queries.claimTasks(
