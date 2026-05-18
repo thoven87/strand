@@ -240,6 +240,30 @@ function eventSummary(_type: string, raw: string | null): string | null {
     }
 }
 
+// ── ACTIVITY_STARTED inline detail ────────────────────────────────────────
+
+interface ActivityStartedInfo {
+    attempt: number;
+    workerID: string | null;
+}
+
+/**
+ * Parses the `ActivityStartedData` payload for inline display in the timeline.
+ * Returns `null` when the event data is absent or unparseable.
+ */
+function parseActivityStarted(raw: string | null): ActivityStartedInfo | null {
+    if (!raw) return null;
+    try {
+        const d = JSON.parse(raw) as Record<string, unknown>;
+        return {
+            attempt: typeof d.attempt === "number" ? d.attempt : 1,
+            workerID: typeof d.worker_id === "string" ? d.worker_id : null,
+        };
+    } catch {
+        return null;
+    }
+}
+
 // ── Event grouping ──────────────────────────────────────────────────
 
 interface EventGroup {
@@ -252,27 +276,83 @@ interface EventGroup {
     events: HistoryEvent[];
 }
 
-/** Collapse consecutive events with the same type + same logical summary into one group. */
+/**
+ * Collapse consecutive events with the same type + same logical summary into groups.
+ *
+ * Two merging strategies:
+ * ① Consecutive: adjacent events with identical (eventType, summary) → always merged.
+ *    This handles ACTIVITY_SCHEDULED ×N batches written in one activation.
+ *
+ * ② Activity batch (non-consecutive): for ACTIVITY_STARTED and ACTIVITY_COMPLETED,
+ *    look back through the preceding groups for a same-(eventType, summary) match.
+ *    Merge if every group in between is also an ACTIVITY event for the same activity
+ *    name. This handles the sequential fan-out pattern:
+ *      SCHEDULED ×8, STARTED-1, COMPLETED-1, STARTED-2, COMPLETED-2, …
+ *    which becomes:
+ *      SCHEDULED ×8 | STARTED ×8 | COMPLETED ×8
+ *    The ×N group is anchored at the timestamp of the FIRST event in the group.
+ */
 function groupEvents(events: HistoryEvent[]): EventGroup[] {
     const groups: EventGroup[] = [];
     for (const evt of events) {
         const s = eventSummary(evt.eventType, evt.eventData);
         const last = groups[groups.length - 1];
+
+        // ① Consecutive same-type + same-summary
         if (last && last.eventType === evt.eventType && last.summary === s) {
             last.count++;
             last.lastCreatedAt = evt.createdAt;
             last.events.push(evt);
-        } else {
-            groups.push({
-                eventType: evt.eventType,
-                summary: s,
-                count: 1,
-                firstSeq: evt.seq,
-                firstCreatedAt: evt.createdAt,
-                lastCreatedAt: evt.createdAt,
-                events: [evt],
-            });
+            continue;
         }
+
+        // ② Non-consecutive activity batch merging.
+        // Only applies to STARTED/COMPLETED for a named activity.
+        if (
+            s !== null &&
+            (evt.eventType === "ACTIVITY_STARTED" ||
+                evt.eventType === "ACTIVITY_COMPLETED")
+        ) {
+            // Search backwards for a prior group with the same (type, summary).
+            // Stop the search as soon as we encounter a group that is NOT an
+            // activity event for the same activity — that signals a boundary
+            // between unrelated batches.
+            let matchIdx = -1;
+            for (let i = groups.length - 1; i >= 0; i--) {
+                const g = groups[i];
+                if (g.eventType === evt.eventType && g.summary === s) {
+                    matchIdx = i;
+                    break;
+                }
+                // Allow skipping past ACTIVITY_STARTED, ACTIVITY_COMPLETED, and
+                // ACTIVITY_SCHEDULED for the same activity name; anything else
+                // (different activity, different event category) breaks the batch.
+                const sameActivity =
+                    g.summary === s &&
+                    (g.eventType === "ACTIVITY_STARTED" ||
+                        g.eventType === "ACTIVITY_COMPLETED" ||
+                        g.eventType === "ACTIVITY_SCHEDULED");
+                if (!sameActivity) break;
+            }
+            if (matchIdx !== -1) {
+                const match = groups[matchIdx];
+                match.count++;
+                match.lastCreatedAt = evt.createdAt;
+                match.events.push(evt);
+                continue;
+            }
+        }
+
+        // ③ New group
+        groups.push({
+            eventType: evt.eventType,
+            summary: s,
+            count: 1,
+            firstSeq: evt.seq,
+            firstCreatedAt: evt.createdAt,
+            lastCreatedAt: evt.createdAt,
+            events: [evt],
+        });
     }
     return groups;
 }
@@ -398,6 +478,31 @@ function ActivityTimeline({
                                             {grp.summary}
                                         </span>
                                     )}
+                                    {/* ACTIVITY_STARTED: attempt badge + muted worker ID */}
+                                    {grp.eventType === "ACTIVITY_STARTED" &&
+                                        grp.count === 1 &&
+                                        (() => {
+                                            const info = parseActivityStarted(
+                                                grp.events[0]?.eventData ??
+                                                    null,
+                                            );
+                                            if (!info) return null;
+                                            return (
+                                                <>
+                                                    {info.attempt > 1 && (
+                                                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary/70 text-muted-foreground tabular-nums">
+                                                            attempt{" "}
+                                                            {info.attempt}
+                                                        </span>
+                                                    )}
+                                                    {info.workerID && (
+                                                        <span className="text-[10px] font-mono text-muted-foreground/40 truncate">
+                                                            {info.workerID}
+                                                        </span>
+                                                    )}
+                                                </>
+                                            );
+                                        })()}
                                     {/* Count badge for grouped events */}
                                     {grp.count > 1 && (
                                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary text-muted-foreground tabular-nums">

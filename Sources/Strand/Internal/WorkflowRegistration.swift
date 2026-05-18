@@ -160,7 +160,11 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             logger: exec.logger
         )
         var checkpointCache: [Int: ByteBuffer] = [:]
-        for row in checkpointRows { checkpointCache[row.seqNum] = row.stateBuffer }
+        var checkpointNameCache: [Int: String] = [:]
+        for row in checkpointRows {
+            checkpointCache[row.seqNum] = row.stateBuffer
+            checkpointNameCache[row.seqNum] = row.name
+        }
 
         // ── 1b. Version marker cache ─────────────────────────────────────────────
         let versionMarkerRows = try await WorkflowStateQueries.listVersionMarkers(
@@ -200,6 +204,8 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             taskID: claimed.taskID,
             logger: exec.logger
         )
+        // Count of events written before this activation — exposed via ctx.historyEventCount.
+        let historyEventCount = historySeq - 1
         let isFirstActivation = historySeq == 1
         if isFirstActivation {
             try await WorkflowStateQueries.appendHistory(
@@ -255,9 +261,11 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             executor: executor,
             stateBox: stateBox,
             checkpointCache: checkpointCache,
+            checkpointNameCache: checkpointNameCache,
             versionMarkerCache: versionMarkerCache,
             namespace: exec.namespace,
-            activationTime: activationTime
+            activationTime: activationTime,
+            historyEventCount: historyEventCount
         )
         let context = WorkflowContext<W>(activation: activation)
         let input = try JSON.decode(W.Input.self, from: claimed.paramsBuffer)
@@ -354,6 +362,10 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             taskID: claimed.taskID,
             logger: exec.logger
         )
+        let historyEventCount = historySeq - 1
+        // Refresh the history event count on each cached re-activation so
+        // ctx.historyEventCount reflects accumulated events across all prior activations.
+        cached.activation.historyEventCount = historyEventCount
 
         // ── External checkpoint refresh ──────────────────────────────────────────────
         // `client.markVersion` writes checkpoints directly to the DB without sending
@@ -369,7 +381,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                 logger: exec.logger
             )
             for row in freshCheckpoints where activation.cachedCheckpoint(for: row.seqNum) == nil {
-                activation.cacheCheckpoint(seqNum: row.seqNum, buffer: row.stateBuffer)
+                activation.cacheCheckpoint(seqNum: row.seqNum, name: row.name, buffer: row.stateBuffer)
             }
             // Refresh version markers — picks up markVersion(...) calls made while the
             // workflow was sleeping between activations.
@@ -399,7 +411,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // The crash-recovery (fresh) path reads them from there via fast path 2
         // (resolveCompleted → preloadedResults), so writing them again to
         // strand.checkpoints is redundant.  We still extend the claim so that
-        // activations processing many simultaneous completions don’t expire.
+        // activations processing many simultaneous completions don't expire.
         if !completedChildren.isEmpty {
             try await Queries.extendClaim(
                 on: exec.postgres,
@@ -409,6 +421,12 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                 logger: exec.logger
             )
         }
+
+        // Populate preloaded results and start-time metadata. The start-time metadata
+        // feeds ACTIVITY_STARTED history writes in applyScheduleCommands. The preloaded
+        // results enable fast-path-2 for any sibling activities that also completed
+        // concurrently but whose continuations are not yet parked.
+        executor.resolveCompleted(completedChildren)
 
         // CHILD_WORKFLOW_COMPLETED history is written by the step-2 loop — see _activate.
 
@@ -435,7 +453,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // Clear commands from the previous activation before re-draining.
         executor.clearPendingCommands()
 
-        for (seqNum, result, failureReason, state, kind, name) in completedChildren {
+        for (seqNum, result, failureReason, state, kind, name, _, _, _) in completedChildren {
             switch state {
             case .completed:
                 if let result { executor.resumeActivity(seqNum: seqNum, result: result) }
@@ -587,32 +605,22 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // Write history — updates get UPDATE_APPLIED, signals get SIGNAL_RECEIVED.
         // signal.name is always the clean handler name for both kinds.
+        var historyBatch: [(seq: Int, eventType: WorkflowStateQueries.HistoryEventType, eventData: ByteBuffer?)] = []
         for signal in signals {
             let eventType: WorkflowStateQueries.HistoryEventType =
                 signal.updateCorrelationID != nil ? .updateApplied : .signalReceived
             let sigData = try? JSON.encode(WorkflowStateQueries.SignalReceivedData(name: signal.name))
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: eventType,
-                eventData: sigData,
-                logger: exec.logger
-            )
+            let seq = historySeq
             historySeq += 1
-            // Write-through to trace_spans — instant span for this signal/update.
-            try? await TraceSpanQueries.insertInstantSpan(
+            historyBatch.append((seq: seq, eventType: eventType, eventData: sigData))
+        }
+        // Write all signal history events in one batch — one round-trip regardless of N signals.
+        if !historyBatch.isEmpty {
+            try await WorkflowStateQueries.batchAppendHistory(
                 on: exec.postgres,
-                id: "\(claimed.taskID.uuidString):\(historySeq - 1)",
                 namespaceID: exec.namespace,
                 taskID: claimed.taskID,
-                parentID: claimed.taskID.uuidString,
-                kind: signal.updateCorrelationID != nil ? .update : .signal,
-                name: signal.name,
-                at: Date(),
-                eventType: signal.updateCorrelationID != nil ? .updateApplied : .signalReceived,
-                seqNum: historySeq - 1,
+                events: historyBatch,
                 logger: exec.logger
             )
         }
@@ -654,7 +662,50 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     continue
                 }
                 do {
-                    let result = try await runner(entry.input, exec, claimed.taskID)
+                    // Heartbeat: extend the claim every max(claimTimeoutSecs/2, 1)
+                    // seconds DURING local activity execution so that long-running
+                    // local activities never hit the lease-expiry deadline before
+                    // setCheckpointState's own extendClaim fires post-completion.
+                    //
+                    // Keeps the Postgres lease alive during local activity execution so
+                    // the expiry sweep never re-queues the run while it is still running.
+                    //
+                    // try? on Task.sleep — CancellationError from defer { heartbeat.cancel() }
+                    // is expected and should not propagate.  try? on extendClaim — best-effort;
+                    // the run will eventually be swept by leaseExpiryLoop if the lease truly
+                    // lapses.  Concurrent calls to extendClaim from this heartbeat and from
+                    // setCheckpointState below are idempotent (both write NOW() + interval).
+                    let heartbeat = Task<Void, Never> {
+                        let halfInterval = max(claimTimeoutSecs / 2, 1)
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(halfInterval))
+                            guard !Task.isCancelled else { break }
+                            try? await Queries.extendClaim(
+                                on: exec.postgres,
+                                namespaceID: exec.namespace,
+                                runID: claimed.runID,
+                                extendBySeconds: claimTimeoutSecs,
+                                logger: exec.logger
+                            )
+                        }
+                    }
+                    defer { heartbeat.cancel() }
+                    let result: ByteBuffer
+                    if let timeout = entry.options.timeout {
+                        // Race the runner against a per-attempt timeout from LocalActivityOptions.
+                        result = try await withThrowingTaskGroup(of: ByteBuffer.self) { tg in
+                            tg.addTask { try await runner(entry.input, exec, claimed.taskID) }
+                            tg.addTask {
+                                try await Task.sleep(for: timeout)
+                                throw StrandError.timeout(message: "Local activity '\(entry.name)' exceeded per-attempt timeout")
+                            }
+                            let r = try await tg.next()!
+                            tg.cancelAll()
+                            return r
+                        }
+                    } else {
+                        result = try await runner(entry.input, exec, claimed.taskID)
+                    }
                     try await Queries.setCheckpointState(
                         on: exec.postgres,
                         namespaceID: exec.namespace,

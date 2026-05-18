@@ -577,7 +577,7 @@ public struct StrandWorker: Service {
                             running.decrement()
                             slotFreeSignal.signal()
                         }
-                        await self.runTask(claimedTask)
+                        await self.runTask(claimedTask, workerID: workerID)
                     }
                 }
                 // No explicit sleep: fall through to re-poll immediately.
@@ -604,6 +604,12 @@ public struct StrandWorker: Service {
             guard !Task.isShuttingDownGracefully && !Task.isCancelled else { break }
             do {
                 try await Queries.sweepExpiredLeases(
+                    on: postgres,
+                    namespaceID: namespace,
+                    queue: queueName,
+                    logger: logger
+                )
+                try await Queries.sweepStartTimeoutActivities(
                     on: postgres,
                     namespaceID: namespace,
                     queue: queueName,
@@ -705,7 +711,7 @@ public struct StrandWorker: Service {
 
     // MARK: - Task run
 
-    private func runTask(_ claimed: ClaimedTask) async {
+    private func runTask(_ claimed: ClaimedTask, workerID: String) async {
         // Scope the logger to this specific task/run for structured log output.
         let taskLogger = logger.withTaskContext(claimed)
 
@@ -840,6 +846,7 @@ public struct StrandWorker: Service {
                         span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(
                             Int64(claimed.attempt)
                         )
+
                         return try await reg.run(claimed, fatalDeadline)
                     }
                 }
@@ -1099,7 +1106,7 @@ package struct ClaimTimeoutError: Error {
 /// first observed the failure (e.g. which `context.runActivity(...)` line threw).
 // A final class (not struct) because `cause` is recursive — Swift value types
 // cannot have stored properties that directly contain themselves.
-private final class FailureReason: Codable, Sendable {
+final class FailureReason: Codable, Sendable {
     let name: String
     let message: String
     let cause: FailureReason?

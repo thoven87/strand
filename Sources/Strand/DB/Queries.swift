@@ -158,6 +158,7 @@ enum Queries {
         scheduledAt: Date? = nil,
         timeoutSeconds: Int? = nil,
         heartbeatTimeoutSeconds: Int? = nil,
+        scheduleToStartTimeoutSeconds: Int? = nil,
         deadlineAt: Date? = nil,
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
@@ -165,6 +166,7 @@ enum Queries {
         parentTaskID: UUID? = nil,
         firstTaskID: UUID? = nil,
         backfillID: UUID? = nil,
+        parentClosePolicy: ParentClosePolicy? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
         try await client.withTransaction(logger: logger) { conn in
@@ -176,16 +178,16 @@ enum Queries {
                 """
                 INSERT INTO strand.tasks
                     (namespace_id, id, queue, name, params, headers, scheduling_metadata,
-                     retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds,
+                     retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, schedule_to_start_timeout_seconds,
                      cancellation, idempotency_key, priority, fairness_key, fairness_weight,
-                     state, kind, parent_task_id, first_task_id, deadline_at, backfill_id)
+                     state, kind, parent_task_id, first_task_id, deadline_at, backfill_id, parent_close_policy)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
                         \(headersBuffer), \(schedulingMetadata),
                         \(retryStrategyBuffer), \(maxAttempts),
-                        \(timeoutSeconds), \(heartbeatTimeoutSeconds),
+                        \(timeoutSeconds), \(heartbeatTimeoutSeconds), \(scheduleToStartTimeoutSeconds),
                         \(cancellationBuffer), \(idempotencyKey), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
-                        \(kind), \(parentTaskID), \(firstTaskID), \(deadlineAt), \(backfillID))
+                        \(kind), \(parentTaskID), \(firstTaskID), \(deadlineAt), \(backfillID), \(parentClosePolicy))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
                 """,
                 logger: logger
@@ -217,8 +219,9 @@ enum Queries {
                 )
                 // pg_notify is transactional — delivered only after this transaction commits.
                 try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
-                // Write-through to trace_spans — best-effort, never blocks the main flow.
-                try? await TraceSpanQueries.upsertTaskSpan(
+                // Write-through to trace_spans — atomic with the enqueue transaction.
+                // If this fails the whole transaction rolls back and the caller retries.
+                try await TraceSpanQueries.upsertTaskSpan(
                     on: conn,
                     id: taskID.uuidString,
                     namespaceID: namespaceID,
@@ -229,7 +232,6 @@ enum Queries {
                     state: .waiting,
                     maxAttempts: maxAttempts,
                     queuedAt: scheduledAt ?? Date(),
-                    eventType: kind == .workflow ? .workflowStarted : .activityScheduled,
                     logger: logger
                 )
                 return EnqueueRow(taskID: taskID, runID: runID, attempt: 1, created: true)
@@ -279,6 +281,8 @@ enum Queries {
         let scheduledAt: Date?
         let timeoutSeconds: Int?
         let heartbeatTimeoutSeconds: Int?
+        let scheduleToStartTimeoutSeconds: Int?
+        let parentClosePolicy: ParentClosePolicy?
         let deadlineAt: Date?
         let fairnessKey: String?
         let fairnessWeight: Double
@@ -327,14 +331,14 @@ enum Queries {
             // typed parameter — one round-trip for all N tasks.
             var taskInterp = PostgresQuery.StringInterpolation(
                 literalCapacity: 300 + children.count * 256,
-                interpolationCount: children.count * 18
+                interpolationCount: children.count * 20
             )
             taskInterp.appendLiteral(
                 "INSERT INTO strand.tasks "
                     + "(namespace_id, id, queue, name, params, headers, "
                     + "retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, "
-                    + "idempotency_key, priority, fairness_key, fairness_weight, "
-                    + "state, kind, parent_task_id, deadline_at) VALUES "
+                    + "schedule_to_start_timeout_seconds, parent_close_policy, idempotency_key, priority, "
+                    + "fairness_key, fairness_weight, state, kind, parent_task_id, deadline_at) VALUES "
             )
             for (i, child) in children.enumerated() {
                 if i > 0 { taskInterp.appendLiteral(", ") }
@@ -358,6 +362,10 @@ enum Queries {
                 taskInterp.appendInterpolation(child.timeoutSeconds)
                 taskInterp.appendLiteral(", ")
                 taskInterp.appendInterpolation(child.heartbeatTimeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.scheduleToStartTimeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(child.parentClosePolicy)
                 taskInterp.appendLiteral(", ")
                 taskInterp.appendInterpolation(child.idempotencyKey)
                 taskInterp.appendLiteral(", ")
@@ -430,9 +438,10 @@ enum Queries {
                     runInterp.appendLiteral(")")
                 }
                 try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
-                // Write-through to trace_spans — best-effort, one row per new child.
+                // Write-through to trace_spans — atomic with the batch enqueue transaction.
+                // If any write fails the whole transaction rolls back and the caller retries.
                 for child in newChildren {
-                    try? await TraceSpanQueries.upsertTaskSpan(
+                    try await TraceSpanQueries.upsertTaskSpan(
                         on: conn,
                         id: child.taskID.uuidString,
                         namespaceID: namespaceID,
@@ -443,7 +452,6 @@ enum Queries {
                         state: .waiting,
                         maxAttempts: child.maxAttempts,
                         queuedAt: child.scheduledAt ?? Date(),
-                        eventType: child.kind == .workflow ? .workflowStarted : .activityScheduled,
                         logger: logger
                     )
                 }
@@ -564,7 +572,6 @@ enum Queries {
                     UPDATE strand.runs
                     SET state        = \(newState),
                         available_at = CASE WHEN \(allDone) THEN NOW() ELSE available_at END,
-                        worker_id    = NULL,
                         lease_expires_at = NULL
                     WHERE id    = \(parentRunID)
                       AND state != \(TaskState.sleeping)  -- do not overwrite named-event / timer sleep
@@ -615,6 +622,7 @@ enum Queries {
                   AND r.state IN (\(TaskState.pending), \(TaskState.sleeping))
                   AND r.available_at <= NOW()
                   AND (t.deadline_at IS NULL OR t.deadline_at > NOW())
+                  AND  t.state NOT IN (\(TaskState.cancelled), \(TaskState.failed), \(TaskState.completed))
                   AND (
                       r.fairness_key IS NULL
                       OR NOT EXISTS (
@@ -632,8 +640,20 @@ enum Queries {
                             )
                       )
                   )
+                -- Sticky affinity: within the same priority band, prefer runs this
+                -- worker last processed. The cached handler Task is more likely to
+                -- be in memory on that worker, avoiding a fresh-path replay.
+                -- Fairness-weighted random is the primary ordering within a priority
+                -- band: dividing by fairness_weight means higher-weight keys are
+                -- statistically first, providing the starve-free frontier guarantee.
+                -- Sticky affinity (prefer runs last processed by this worker) is a
+                -- secondary tiebreaker that must come AFTER fairness-weighted random
+                -- so it cannot override the fairness guarantee. In practice random()
+                -- produces unique values so sticky rarely fires here; its main benefit
+                -- is reducing cache misses when the candidate pool has no fairness keys.
                 ORDER BY r.priority ASC,
                          (random() / GREATEST(r.fairness_weight, 0.001)) ASC,
+                         CASE WHEN r.worker_id = \(workerID) THEN 0 ELSE 1 END ASC,
                          r.available_at,
                          r.id
                 LIMIT \(qty)
@@ -655,6 +675,20 @@ enum Queries {
                     attempt      = GREATEST(t.attempt, c.attempt),
                     first_run_at = COALESCE(t.first_run_at, NOW())
                 FROM claimed c WHERE t.id = c.task_id
+            ),
+            trace_upd AS (
+                -- Inline RUNNING state into the claim CTE so trace_spans stays
+                -- consistent with strand.runs atomically — eliminates the old
+                -- post-claim try? loop that could leave span state stale when
+                -- the worker processed multiple tasks concurrently.
+                -- trace_spans.id is TEXT; c.task_id is UUID — ::text cast required.
+                UPDATE strand.trace_spans
+                SET state      = \(WorkflowSpanState.running),
+                    started_at = COALESCE(started_at, NOW()),
+                    worker_id  = \(workerID),
+                    attempt    = c.attempt
+                FROM claimed c
+                WHERE strand.trace_spans.id = c.task_id::text
             )
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
@@ -669,22 +703,6 @@ enum Queries {
         )
         var tasks: [ClaimedTask] = []
         for try await row in stream { tasks.append(try ClaimedTask(row: row)) }
-        // Write-through to trace_spans — best-effort RUNNING update per claimed task.
-        // trace_spans.id is TEXT (supports both "<uuid>" and "<uuid>:<seqNum>" formats),
-        // so task IDs must be bound as strings, not UUIDs.
-        for task in tasks {
-            _ = try? await client.query(
-                """
-                UPDATE strand.trace_spans
-                SET state      = \(WorkflowSpanState.running),
-                    started_at = COALESCE(started_at, NOW()),
-                    worker_id  = \(workerID),
-                    attempt    = \(task.attempt)
-                WHERE id = \(task.taskID.uuidString)
-                """,
-                logger: logger
-            )
-        }
         return tasks
     }
 
@@ -708,7 +726,7 @@ enum Queries {
             // still safely covering runs that started just before a month boundary.
             let stateStream = try await conn.query(
                 """
-                SELECT t.state, t.id, t.kind
+                SELECT t.state, t.id
                 FROM   strand.runs r
                 JOIN   strand.tasks t ON t.id = r.task_id
                 WHERE  r.id            = \(runID)
@@ -722,7 +740,6 @@ enum Queries {
             var col = row.makeIterator()
             let taskState = try col.next()!.decode(TaskState.self, context: .default)
             let taskID = try col.next()!.decode(UUID.self, context: .default)
-            let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
             if taskState == .cancelled { throw InternalError.cancelled }
 
             // CAS on version — if another worker already wrote a completion, bail out.
@@ -749,15 +766,14 @@ enum Queries {
                 "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
                 logger: logger
             )
-            // Write-through to trace_spans — best-effort COMPLETED update.
-            let _spanCompleteET: WorkflowStateQueries.HistoryEventType =
-                taskKind == .workflow ? .workflowCompleted : .activityCompleted
-            _ = try? await conn.query(
+            // Write-through to trace_spans — atomic with the completion transaction.
+            // If this fails the whole transaction rolls back; the run stays RUNNING,
+            // lease expires, sweep re-queues, activation retries with consistent data.
+            try await conn.query(
                 """
                 UPDATE strand.trace_spans
                 SET state       = \(WorkflowSpanState.completed),
-                    finished_at = NOW(),
-                    event_type  = \(_spanCompleteET)
+                    finished_at = NOW()
                 WHERE id = \(taskID.uuidString)
                 """,
                 logger: logger
@@ -777,6 +793,69 @@ enum Queries {
     private struct _ErrorType: Decodable { let name: String? }
     private struct _FailureMessage: Decodable { let message: String? }
 
+    /// Recursively cancel all non-terminal descendants of `parentTaskID` that have
+    /// `parent_close_policy = NULL` (default .terminate) or `= 'TERMINATE'`.
+    /// Descendants with `parent_close_policy = 'ABANDON'` or `= 'REQUEST_CANCEL'`
+    /// are left running. Called from every permanent-failure exit of `failRun`.
+    private static func cancelDescendants(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        parentTaskID: UUID,
+        logger: Logger
+    ) async throws {
+        // ── Identify which descendants to cancel ──────────────────────────────
+        // The recursive CTE stops at ABANDON and REQUEST_CANCEL nodes so their
+        // subtrees are not traversed — children of those nodes are unaffected.
+        // to_terminate: full cancel (task + all runs including RUNNING)
+        // to_request_cancel: soft cancel (task + non-RUNNING runs only, no cascade)
+        // ABANDON: skipped entirely
+        try await conn.query(
+            """
+            WITH RECURSIVE descendants AS (
+                SELECT id, parent_close_policy FROM strand.tasks
+                WHERE parent_task_id = \(parentTaskID)
+                  AND namespace_id   = \(namespaceID)
+                UNION ALL
+                SELECT t.id, t.parent_close_policy FROM strand.tasks t
+                JOIN descendants d ON t.parent_task_id = d.id
+                WHERE t.namespace_id = \(namespaceID)
+                  AND (d.parent_close_policy IS NULL OR d.parent_close_policy = \(ParentClosePolicy.terminate))
+            ),
+            to_terminate AS (
+                SELECT id FROM descendants
+                WHERE parent_close_policy IS NULL OR parent_close_policy = \(ParentClosePolicy.terminate)
+            ),
+            to_request_cancel AS (
+                SELECT id FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
+            ),
+            task_cancel AS (
+                UPDATE strand.tasks
+                SET state = \(TaskState.cancelled), cancelled_at = NOW()
+                WHERE id IN (SELECT id FROM to_terminate UNION ALL SELECT id FROM to_request_cancel)
+                  AND state NOT IN (
+                      \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                  )
+            ),
+            run_terminate AS (
+                UPDATE strand.runs
+                SET state = \(TaskState.cancelled), finished_at = NOW()
+                WHERE task_id IN (SELECT id FROM to_terminate)
+                  AND namespace_id = \(namespaceID)
+                  AND state NOT IN (
+                      \(TaskState.running),
+                      \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                  )
+            )
+            UPDATE strand.runs
+            SET state = \(TaskState.cancelled), finished_at = NOW()
+            WHERE task_id IN (SELECT id FROM to_request_cancel)
+              AND namespace_id = \(namespaceID)
+              AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))
+            """,
+            logger: logger
+        )
+    }
+
     /// Marks a run as failed and schedules a retry if attempts remain.
     static func failRun(
         on client: PostgresClient,
@@ -788,7 +867,7 @@ enum Queries {
         try await client.withTransaction(logger: logger) { conn in
             let infoStream = try await conn.query(
                 """
-                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.queue, t.deadline_at, t.kind
+                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.deadline_at, t.kind
                 FROM   strand.runs r
                 JOIN   strand.tasks t ON t.id = r.task_id
                 WHERE  r.id           = \(runID)
@@ -803,7 +882,6 @@ enum Queries {
             let attempt = try col.next()!.decode(Int.self, context: .default)
             let maxAttempts = try col.next()!.decode(Int?.self, context: .default)
             let retryStrategyBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
-            _ = try col.next()!.decode(String.self, context: .default)
             let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
             let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
             // Guard: only fail if this run is still running.
@@ -817,18 +895,15 @@ enum Queries {
                 "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
                 logger: logger
             )
-            // Write-through to trace_spans — best-effort FAILED update.
+            // Write-through to trace_spans — atomic with the failure transaction.
             // If a retry is scheduled, claimTasks will later overwrite this with state='RUNNING'.
             let _spanError: String? = (try? JSON.decode(_FailureMessage.self, from: reasonBuffer))?.message
-            let _spanFailET: WorkflowStateQueries.HistoryEventType =
-                taskKind == .workflow ? .workflowFailed : .activityFailed
-            _ = try? await conn.query(
+            try await conn.query(
                 """
                 UPDATE strand.trace_spans
                 SET state       = \(WorkflowSpanState.failed),
                     finished_at = NOW(),
-                    error       = \(_spanError),
-                    event_type  = \(_spanFailET)
+                    error       = \(_spanError)
                 WHERE id        = \(taskID.uuidString)
                 """,
                 logger: logger
@@ -850,6 +925,9 @@ enum Queries {
                     resultBuffer: nil,
                     logger: logger
                 )
+                if taskKind == .workflow {
+                    try await cancelDescendants(on: conn, namespaceID: namespaceID, parentTaskID: taskID, logger: logger)
+                }
                 return
             }
 
@@ -879,6 +957,9 @@ enum Queries {
                         resultBuffer: nil,
                         logger: logger
                     )
+                    if taskKind == .workflow {
+                        try await cancelDescendants(on: conn, namespaceID: namespaceID, parentTaskID: taskID, logger: logger)
+                    }
                     return
                 }
             }
@@ -898,6 +979,9 @@ enum Queries {
                     resultBuffer: nil,
                     logger: logger
                 )
+                if taskKind == .workflow {
+                    try await cancelDescendants(on: conn, namespaceID: namespaceID, parentTaskID: taskID, logger: logger)
+                }
                 return
             }
 
@@ -916,6 +1000,9 @@ enum Queries {
                     resultBuffer: nil,
                     logger: logger
                 )
+                if taskKind == .workflow {
+                    try await cancelDescendants(on: conn, namespaceID: namespaceID, parentTaskID: taskID, logger: logger)
+                }
                 return
             }
             let delay = retryDelay(strategy: retryStrategyBuf, attempt: attempt)
@@ -965,8 +1052,9 @@ enum Queries {
             WITH r AS (
                 UPDATE strand.runs
                 SET state = \(TaskState.sleeping), available_at = \(wakeAt),
-                    worker_id = NULL, lease_expires_at = NULL
+                    lease_expires_at = NULL
                 WHERE id = \(runID) AND namespace_id = \(namespaceID)
+                  AND created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
                 RETURNING id
             )
             UPDATE strand.tasks SET state = \(TaskState.sleeping)
@@ -1064,48 +1152,55 @@ enum Queries {
                 logger: logger
             )
 
-            // ── Step 3: Cascade to all descendant tasks (recursive) ───────────────
-            // Child activities and child workflows spawned by this workflow are also
-            // cancelled so they do not continue to consume worker slots after the
-            // parent is gone.
+            // ── Step 3 + 4: Policy-aware cascade to descendants ────────────────────
+            // ABANDON: skip entirely (left running independently)
+            // REQUEST_CANCEL: mark task CANCELLED + cancel non-RUNNING runs, no cascade to its children
+            // TERMINATE / NULL: full cancel (all runs including RUNNING) + recurse
+            //
+            // The recursion stops at ABANDON and REQUEST_CANCEL nodes so their
+            // children are not traversed.
             try await conn.query(
                 """
                 WITH RECURSIVE descendants AS (
-                    SELECT id FROM strand.tasks
-                    WHERE parent_task_id = \(taskID)
-                      AND namespace_id   = \(namespaceID)
-                    UNION ALL
-                    SELECT t.id
-                    FROM strand.tasks t
-                    JOIN descendants d ON t.parent_task_id = d.id
-                    WHERE t.namespace_id = \(namespaceID)
-                )
-                UPDATE strand.tasks
-                SET state = \(TaskState.cancelled), cancelled_at = NOW()
-                WHERE id IN (SELECT id FROM descendants)
-                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
-                """,
-                logger: logger
-            )
-
-            // ── Step 4: Cancel/interrupt all descendant runs ───────────────────────
-            try await conn.query(
-                """
-                WITH RECURSIVE descendants AS (
-                    SELECT id FROM strand.tasks
-                    WHERE parent_task_id = \(taskID)
-                      AND namespace_id   = \(namespaceID)
-                    UNION ALL
-                    SELECT t.id
-                    FROM strand.tasks t
-                    JOIN descendants d ON t.parent_task_id = d.id
-                    WHERE t.namespace_id = \(namespaceID)
+                    SELECT id, parent_close_policy FROM strand.tasks
+                        WHERE parent_task_id = \(taskID)
+                          AND namespace_id   = \(namespaceID)
+                        UNION ALL
+                        SELECT t.id, t.parent_close_policy FROM strand.tasks t
+                        JOIN descendants d ON t.parent_task_id = d.id
+                        WHERE t.namespace_id = \(namespaceID)
+                          AND (d.parent_close_policy IS NULL OR d.parent_close_policy = \(ParentClosePolicy.terminate))
+                    ),
+                    to_terminate AS (
+                        SELECT id FROM descendants
+                        WHERE parent_close_policy IS NULL OR parent_close_policy = \(ParentClosePolicy.terminate)
+                    ),
+                    to_request_cancel AS (
+                        SELECT id FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
+                    ),
+                task_cancel AS (
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.cancelled), cancelled_at = NOW()
+                    WHERE id IN (SELECT id FROM to_terminate UNION ALL SELECT id FROM to_request_cancel)
+                      AND state NOT IN (
+                          \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                      )
+                ),
+                run_terminate AS (
+                    UPDATE strand.runs
+                    SET state = \(TaskState.cancelled)
+                    WHERE task_id IN (SELECT id FROM to_terminate)
+                      AND namespace_id = \(namespaceID)
+                      AND state IN (
+                          \(TaskState.pending), \(TaskState.sleeping),
+                          \(TaskState.waiting), \(TaskState.running)
+                      )
                 )
                 UPDATE strand.runs
                 SET state = \(TaskState.cancelled)
-                WHERE task_id IN (SELECT id FROM descendants)
+                WHERE task_id IN (SELECT id FROM to_request_cancel)
                   AND namespace_id = \(namespaceID)
-                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting), \(TaskState.running))
+                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))
                 """,
                 logger: logger
             )
@@ -1184,46 +1279,49 @@ enum Queries {
                 logger: logger
             )
 
-            // ── Step 3: Cascade to all descendant tasks (recursive CTE, bulk) ────────
+            // ── Steps 3 + 4: Policy-aware cascade to descendants (bulk) ──────────
             try await conn.query(
                 """
                 WITH RECURSIVE descendants AS (
-                    SELECT id FROM strand.tasks
-                    WHERE parent_task_id = ANY(\(cancelledIDs))
-                      AND namespace_id   = \(namespaceID)
-                    UNION ALL
-                    SELECT t.id
-                    FROM strand.tasks t
-                    JOIN descendants d ON t.parent_task_id = d.id
-                    WHERE t.namespace_id = \(namespaceID)
-                )
-                UPDATE strand.tasks
-                SET state = \(TaskState.cancelled), cancelled_at = NOW()
-                WHERE id IN (SELECT id FROM descendants)
-                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
-                """,
-                logger: logger
-            )
-
-            // ── Step 4: Cancel/interrupt all descendant runs (bulk) ────────────────
-            try await conn.query(
-                """
-                WITH RECURSIVE descendants AS (
-                    SELECT id FROM strand.tasks
-                    WHERE parent_task_id = ANY(\(cancelledIDs))
-                      AND namespace_id   = \(namespaceID)
-                    UNION ALL
-                    SELECT t.id
-                    FROM strand.tasks t
-                    JOIN descendants d ON t.parent_task_id = d.id
-                    WHERE t.namespace_id = \(namespaceID)
+                    SELECT id, parent_close_policy FROM strand.tasks
+                        WHERE parent_task_id = ANY(\(cancelledIDs))
+                          AND namespace_id   = \(namespaceID)
+                        UNION ALL
+                        SELECT t.id, t.parent_close_policy FROM strand.tasks t
+                        JOIN descendants d ON t.parent_task_id = d.id
+                        WHERE t.namespace_id = \(namespaceID)
+                          AND (d.parent_close_policy IS NULL OR d.parent_close_policy = \(ParentClosePolicy.terminate))
+                    ),
+                    to_terminate AS (
+                        SELECT id FROM descendants
+                        WHERE parent_close_policy IS NULL OR parent_close_policy = \(ParentClosePolicy.terminate)
+                    ),
+                    to_request_cancel AS (
+                        SELECT id FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
+                    ),
+                task_cancel AS (
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.cancelled), cancelled_at = NOW()
+                    WHERE id IN (SELECT id FROM to_terminate UNION ALL SELECT id FROM to_request_cancel)
+                      AND state NOT IN (
+                          \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                      )
+                ),
+                run_terminate AS (
+                    UPDATE strand.runs
+                    SET state = \(TaskState.cancelled)
+                    WHERE task_id IN (SELECT id FROM to_terminate)
+                      AND namespace_id = \(namespaceID)
+                      AND state IN (
+                          \(TaskState.pending), \(TaskState.sleeping),
+                          \(TaskState.waiting), \(TaskState.running)
+                      )
                 )
                 UPDATE strand.runs
                 SET state = \(TaskState.cancelled)
-                WHERE task_id IN (SELECT id FROM descendants)
+                WHERE task_id IN (SELECT id FROM to_request_cancel)
                   AND namespace_id = \(namespaceID)
-                  AND state IN (\(TaskState.pending), \(TaskState.sleeping),
-                                \(TaskState.waiting), \(TaskState.running))
+                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))
                 """,
                 logger: logger
             )
@@ -1368,12 +1466,70 @@ enum Queries {
         }
     }
 
-    /// Writes multiple checkpoints in a single transaction.
-    ///
-    /// When there is only one checkpoint the call delegates to ``setCheckpointState`` so
-    /// the lease is extended via the same single-round-trip path. For two or more
-    /// checkpoints a transaction is opened and the lease is extended **once** at the end
-    /// — this is the key throughput optimisation over calling `setCheckpointState` N times.
+    /// Writes multiple checkpoints in one SQL statement on an existing connection.
+    /// Does not extend the claim lease — callers do that separately.
+    /// Used by `WorkflowScheduling.flushWrites()` to commit checkpoints and history atomically.
+    static func batchSetCheckpointsOnConn(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        taskID: UUID,
+        runID: UUID,
+        checkpoints: [(seqNum: Int, name: String?, state: ByteBuffer)],
+        logger: Logger
+    ) async throws {
+        guard !checkpoints.isEmpty else { return }
+        if checkpoints.count == 1 {
+            let c = checkpoints[0]
+            try await setCheckpointState(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seqNum: c.seqNum,
+                name: c.name,
+                stateBuffer: c.state,
+                runID: runID,
+                logger: logger
+            )
+            return
+        }
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 200 + checkpoints.count * 100,
+            interpolationCount: checkpoints.count * 6
+        )
+        interp.appendLiteral(
+            "INSERT INTO strand.checkpoints "
+                + "(namespace_id, task_id, seq_num, name, state, run_id) VALUES "
+        )
+        for (i, c) in checkpoints.enumerated() {
+            if i > 0 { interp.appendLiteral(", ") }
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(c.seqNum)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(c.name)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(c.state)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(runID)
+            interp.appendLiteral(")")
+        }
+        interp.appendLiteral(
+            " ON CONFLICT (task_id, seq_num) DO UPDATE"
+                + " SET state = EXCLUDED.state,"
+                + "     run_id = EXCLUDED.run_id,"
+                + "     created_at = NOW()"
+                + " WHERE (SELECT attempt FROM strand.runs WHERE id = strand.checkpoints.run_id)"
+                + "    <= (SELECT attempt FROM strand.runs WHERE id = EXCLUDED.run_id)"
+        )
+        try await conn.query(PostgresQuery(stringInterpolation: interp), logger: logger)
+    }
+
+    /// Writes checkpoints and optionally extends the claim lease.
+    /// Delegates to ``batchSetCheckpointsOnConn`` so the SQL lives in one place.
+    /// For N=1 uses ``setCheckpointState`` (single-row path with inline lease extension).
     static func batchSetCheckpoints(
         on client: PostgresClient,
         namespaceID: String,
@@ -1400,29 +1556,27 @@ enum Queries {
             return
         }
         try await client.withTransaction(logger: logger) { conn in
-            for c in checkpoints {
-                try await conn.query(
-                    """
-                    INSERT INTO strand.checkpoints (namespace_id, task_id, seq_num, name, state, run_id)
-                    VALUES (\(namespaceID), \(taskID), \(c.seqNum), \(c.name), \(c.state), \(runID))
-                    ON CONFLICT (task_id, seq_num) DO UPDATE
-                        SET state      = EXCLUDED.state,
-                            run_id     = EXCLUDED.run_id,
-                            created_at = NOW()
-                        WHERE (SELECT attempt FROM strand.runs WHERE id = strand.checkpoints.run_id)
-                           <= (SELECT attempt FROM strand.runs WHERE id = EXCLUDED.run_id)
-                    """,
-                    logger: logger
-                )
-            }
+            try await batchSetCheckpointsOnConn(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                runID: runID,
+                checkpoints: checkpoints,
+                logger: logger
+            )
             if let secs = extendClaimBySeconds {
-                try await extendClaim(
-                    on: conn,
-                    namespaceID: namespaceID,
-                    runID: runID,
-                    extendBySeconds: secs,
-                    logger: logger
-                )
+                do {
+                    try await extendClaim(
+                        on: conn,
+                        namespaceID: namespaceID,
+                        runID: runID,
+                        extendBySeconds: secs,
+                        logger: logger
+                    )
+                } catch InternalError.cancelled {
+                    // Run is no longer RUNNING — checkpoint still commits, lease
+                    // extension skipped. sweepExpiredLeases handles the stale claim.
+                }
             }
         }
     }
@@ -1478,7 +1632,7 @@ enum Queries {
                         UPDATE strand.runs
                         SET state = \(TaskState.sleeping), available_at = \(timeoutAt),
                             wake_event = \(eventName), event_payload = NULL,
-                            worker_id = NULL, lease_expires_at = NULL
+                            lease_expires_at = NULL
                         WHERE id = \(runID)
                         RETURNING id
                     )
@@ -1493,7 +1647,7 @@ enum Queries {
                         UPDATE strand.runs
                         SET state = \(TaskState.waiting),
                             wake_event = \(eventName), event_payload = NULL,
-                            worker_id = NULL, lease_expires_at = NULL
+                            lease_expires_at = NULL
                         WHERE id = \(runID)
                         RETURNING id
                     )
@@ -1772,6 +1926,142 @@ enum Queries {
                 metadata: ["queue": "\(queue)"]
             )
             try await client.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+        }
+    }
+
+    /// Reschedules or permanently fails PENDING/SLEEPING activities whose
+    /// `schedule_to_start_timeout_seconds` elapsed before any worker claimed them.
+    ///
+    /// Two outcomes:
+    ///   - `maxDuration` exceeded → mark task FAILED, wake parent workflow
+    ///   - Otherwise → reset `available_at` with retry backoff, workflow not notified
+    ///
+    /// Each expired run is re-checked inside its own transaction with `FOR UPDATE`.
+    /// If a worker claimed the run between the outer SELECT and the lock, the run
+    /// is RUNNING and the `guard state == .pending || .sleeping` check skips it.
+    static func sweepStartTimeoutActivities(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        logger: Logger
+    ) async throws {
+        // One transaction per expired run: SELECT (lock) + fail + optional retry.
+        // `try?` makes individual-run failures soft — a transient error on one run
+        // does not prevent the rest from being processed.
+        let stream = try await client.query(
+            """
+            SELECT r.id, r.task_id, r.attempt
+            FROM   strand.runs r
+            JOIN   strand.tasks t ON t.id = r.task_id
+            WHERE  r.namespace_id = \(namespaceID)
+              AND  r.queue        = \(queue)
+              AND  r.state        IN (\(TaskState.pending), \(TaskState.sleeping))
+              AND  t.kind         = \(TaskKind.activity)
+              AND  t.schedule_to_start_timeout_seconds IS NOT NULL
+              AND  r.available_at + t.schedule_to_start_timeout_seconds
+                   * INTERVAL '1 second' <= NOW()
+            ORDER  BY r.id
+            LIMIT  50
+            """,
+            logger: logger
+        )
+        var expired: [(runID: UUID, taskID: UUID, attempt: Int)] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            let runID = try col.next()!.decode(UUID.self, context: .default)
+            let taskID = try col.next()!.decode(UUID.self, context: .default)
+            let attempt = try col.next()!.decode(Int.self, context: .default)
+            expired.append((runID: runID, taskID: taskID, attempt: attempt))
+        }
+        guard !expired.isEmpty else { return }
+        let noun: Logger.Message =
+            expired.count == 1
+            ? "sweeping 1 schedule-to-start timeout activity"
+            : "sweeping \(expired.count) schedule-to-start timeout activities"
+        logger.debug(noun, metadata: ["strand.queue": .string(queue)])
+        let reasonBuffer = (try? JSON.encode(FailureReason(error: _ScheduleToStartTimeoutError()))) ?? ByteBuffer()
+        for item in expired {
+            try? await client.withTransaction(logger: logger) { conn in
+                // Atomically re-check and fail this specific run.
+                // FOR UPDATE ensures a concurrent worker that just claimed it sees
+                // a RUNNING state — the next UPDATE will find 0 rows and skip it,
+                // matching Temporal's stale-attempt guard.
+                let lockStream = try await conn.query(
+                    """
+                    SELECT r.state, t.retry_strategy, t.deadline_at
+                    FROM   strand.runs r
+                    JOIN   strand.tasks t ON t.id = r.task_id
+                    WHERE  r.id            = \(item.runID)
+                      AND  r.namespace_id  = \(namespaceID)
+                    FOR UPDATE
+                    """,
+                    logger: logger
+                )
+                guard let lockRow = try await lockStream.first(where: { _ in true }) else { return }
+                var col = lockRow.makeIterator()
+                let state = try col.next()!.decode(TaskState.self, context: .default)
+                let retryStratBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
+                let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
+
+                // If a worker claimed the run between the outer SELECT and this
+                // FOR UPDATE, it's now RUNNING. Skip it — the worker owns it.
+                guard state == .pending || state == .sleeping else { return }
+
+                // Only maxDuration is a hard stop for schedule-to-start retries.
+                // maxAttempts counts handler executions — nothing ran here, so it
+                // is not decremented. If maxDuration is not set the activity keeps
+                // re-queuing (with retry backoff) until a worker claims it.
+                let isPermanent = deadlineAt.map { Date.now >= $0 } ?? false
+
+                if isPermanent {
+                    // maxDuration exceeded — fail permanently and wake the parent.
+                    try await conn.query(
+                        "UPDATE strand.runs SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(item.runID)",
+                        logger: logger
+                    )
+                    try await conn.query(
+                        "UPDATE strand.tasks SET state = \(TaskState.failed) WHERE id = \(item.taskID) AND namespace_id = \(namespaceID)",
+                        logger: logger
+                    )
+                    try await emitTaskCompletionSignal(
+                        conn: conn,
+                        namespaceID: namespaceID,
+                        taskID: item.taskID,
+                        state: .failed,
+                        resultBuffer: nil,
+                        logger: logger
+                    )
+                } else {
+                    // Re-queue in place. Nothing was executed so neither the attempt
+                    // counter nor maxAttempts budget is consumed. The run is reset to
+                    // PENDING/SLEEPING with the retry backoff applied to available_at.
+                    let delay = retryDelay(strategy: retryStratBuf, attempt: item.attempt)
+                    let wakeAt = Date.now.addingTimeInterval(delay)
+                    let newState: TaskState = delay > 0 ? .sleeping : .pending
+                    try await conn.query(
+                        """
+                        UPDATE strand.runs
+                        SET state = \(newState), available_at = \(wakeAt),
+                            worker_id = NULL, lease_expires_at = NULL
+                        WHERE id = \(item.runID)
+                        """,
+                        logger: logger
+                    )
+                    try await conn.query(
+                        "UPDATE strand.tasks SET state = \(newState) WHERE id = \(item.taskID) AND namespace_id = \(namespaceID)",
+                        logger: logger
+                    )
+                    if newState == .pending {
+                        try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+                    }
+                }
+            }
+        }
+    }
+
+    private struct _ScheduleToStartTimeoutError: Error, CustomStringConvertible {
+        var description: String {
+            "schedule-to-start timeout: activity was not claimed by any worker within the allowed window"
         }
     }
 

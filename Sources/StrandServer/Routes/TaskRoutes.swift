@@ -338,6 +338,9 @@ struct TaskRoutes {
         // GET /api/:namespace/tasks/:taskID/trace
         router.get("tasks/:taskID/trace") { _, ctx -> [TraceSpanResponse] in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
+
+            // 1. Task-level spans (WORKFLOW, ACTIVITY) from trace_spans — always
+            //    written atomically inside enqueueTask / completeRun / failRun CTEs.
             let spanRows = try await TraceSpanQueries.getTraceSpans(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,
@@ -347,7 +350,32 @@ struct TaskRoutes {
             guard !spanRows.isEmpty else {
                 throw HTTPError(.notFound, message: "Task not found")
             }
-            return Self.buildTraceFromSpans(spanRows)
+
+            // 2. History-event spans (SLEEP, WAIT, CONDITION, SIGNAL, UPDATE, EMIT)
+            //    derived from workflow_history — the authoritative record, always consistent.
+            //    Load all workflow task histories in ONE query (batchListHistory uses
+            //    WHERE task_id = ANY(…) on the existing PK index — one round-trip
+            //    regardless of how many child workflows are in the trace tree).
+            let workflowSpans = spanRows.filter { $0.kind == WorkflowSpanKind.workflow.rawValue }
+            var derivedSpans: [TraceSpanQueries.SpanRow] = []
+            if !workflowSpans.isEmpty {
+                let historyByTask = try await WorkflowStateQueries.batchListHistory(
+                    on: self.postgres,
+                    taskIDs: workflowSpans.map(\.taskID),
+                    logger: self.client.logger
+                )
+                for span in workflowSpans {
+                    let derived = TraceSpanQueries.deriveHistorySpans(
+                        from: historyByTask[span.taskID] ?? [],
+                        taskID: span.taskID,
+                        namespaceID: ctx.namespaceID,
+                        rootTaskID: span.rootTaskID
+                    )
+                    derivedSpans.append(contentsOf: derived)
+                }
+            }
+
+            return Self.buildTraceFromSpans(spanRows + derivedSpans)
         }
     }
 
