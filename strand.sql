@@ -236,6 +236,8 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     max_attempts    INTEGER,
     timeout_seconds INTEGER,                  -- per-attempt execution cap in seconds; NULL = worker's claimTimeout
     heartbeat_timeout_seconds INTEGER,        -- max seconds between heartbeats; NULL = claimTimeout
+    schedule_to_start_timeout_seconds INTEGER, -- max seconds waiting in queue before failing; NULL = no cap
+    parent_close_policy TEXT,                  -- TERMINATE|ABANDON|REQUEST_CANCEL; NULL = TERMINATE (default)
     idempotency_key TEXT,
 
     -- Dispatch routing
@@ -792,11 +794,12 @@ ALTER TABLE strand.workflow_history SET (
 -- transactional tables). The dashboard reads exclusively from this table:
 --
 --   /trace   → WHERE namespace_id=$1 AND root_task_id=$2 ORDER BY queued_at
---   /history → WHERE namespace_id=$1 AND task_id=$2 AND event_type IS NOT NULL ORDER BY seq_num
+--   /history → reads from strand.workflow_history directly (not this table)
 --
 -- id format:
---   Task spans  : task_id.uuidString              (e.g. "019E2ED0-7891-...")
---   History spans: "\(taskID):\(seqNum)"          (e.g. "019E2ED0-7891-...:4")
+--   Task spans: task_id.uuidString  (e.g. "019E2ED0-7891-...")
+--   History-event span IDs (SLEEP/WAIT/CONDITION/SIGNAL/UPDATE/EMIT) are derived
+--   from workflow_history on read — they are NOT stored in this table.
 --
 -- root_task_id is the top-level workflow's task_id. For root tasks it equals
 -- task_id. For children it is propagated from the parent's root_task_id via a
@@ -808,7 +811,7 @@ CREATE TABLE IF NOT EXISTS strand.trace_spans (
     root_task_id UUID        NOT NULL,  -- top-level workflow task; index key for /trace
     task_id      UUID        NOT NULL,  -- owning task; index key for /history
     parent_id    TEXT,                  -- parent span id (task_id string or history span id)
-    kind         TEXT        NOT NULL,  -- WORKFLOW|ACTIVITY|SLEEP|WAIT|SIGNAL|UPDATE|EMIT|CONDITION
+    kind         TEXT        NOT NULL,  -- WORKFLOW|ACTIVITY (history-event kinds derived on read)
     name         TEXT        NOT NULL,
     state        TEXT        NOT NULL,  -- QUEUED|RUNNING|COMPLETED|FAILED|CANCELLED
     attempt      INT         NOT NULL DEFAULT 0,
@@ -818,20 +821,12 @@ CREATE TABLE IF NOT EXISTS strand.trace_spans (
     started_at   TIMESTAMPTZ,
     finished_at  TIMESTAMPTZ,
     error        TEXT,
-    -- History tab fields (only populated for discrete history events)
-    event_type   TEXT,                  -- raw HistoryEventType e.g. "ACTIVITY_SCHEDULED"
-    event_data   BYTEA,                 -- raw JSON payload for the history tab expand drawer
-    seq_num      INT,                   -- ordering for history view
     CONSTRAINT strand_trace_spans_pkey PRIMARY KEY (id)
 );
 
 -- /trace endpoint: one index scan per workflow execution
 CREATE INDEX IF NOT EXISTS strand_trace_spans_root_idx
     ON strand.trace_spans (namespace_id, root_task_id, queued_at ASC);
-
--- /history endpoint: one index scan per task
-CREATE INDEX IF NOT EXISTS strand_trace_spans_task_idx
-    ON strand.trace_spans (namespace_id, task_id, seq_num ASC NULLS LAST);
 
 -- OLAP latency queries: PERCENTILE_CONT per task name over a time window
 -- Powers: GET /api/:namespace/metrics/latency

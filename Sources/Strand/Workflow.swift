@@ -1,4 +1,5 @@
 @_exported import NIOCore  // re-export so consumers get ByteBuffer without importing NIOCore directly
+public import PostgresNIO  // required for ParentClosePolicy/ChildWorkflowCancellationType PostgresCodable conformances
 
 #if canImport(FoundationEssentials)
 public import FoundationEssentials  // Date in WorkflowOptions.delayUntil
@@ -604,6 +605,91 @@ public struct WorkflowOptions: Sendable {
     }
 }
 
+// MARK: - ParentClosePolicy / ChildWorkflowCancellationType
+
+/// What happens to a child workflow when its parent workflow closes.
+///
+/// - `.terminate`: Terminate the child when the parent fails or is cancelled.
+///   This is the default. Children that are still running are cancelled atomically
+///   when the parent reaches a terminal failure state.
+/// - `.abandon`: Let the child continue running independently. The child's result
+///   is no longer tracked by the parent.
+/// - `.requestCancel`: Send a cancellation signal to the child and let it clean up
+///   gracefully before terminating.
+///
+/// The policy is stored in `strand.tasks.parent_close_policy` (TEXT column).
+/// `.terminate` and `.abandon` are enforced by `failRun`'s recursive cascade.
+/// `.requestCancel` sends a cancellation signal — enforcement planned.
+public enum ParentClosePolicy: String, Sendable, Codable {
+    case terminate = "TERMINATE"
+    case abandon = "ABANDON"
+    case requestCancel = "REQUEST_CANCEL"
+}
+
+/// How the parent workflow handles cancellation propagation to a child workflow.
+///
+/// - `.waitCancellationCompleted`: Wait for the child to finish or acknowledge
+///   cancellation before the parent continues. Default.
+/// - `.tryCancel`: Send cancellation and continue immediately.
+/// - `.abandon`: Do not cancel the child when the parent is cancelled.
+/// - `.terminate`: Terminate the child immediately.
+public enum ChildWorkflowCancellationType: String, Sendable, Codable {
+    case waitCancellationCompleted = "WAIT_CANCELLATION_COMPLETED"
+    case tryCancel = "TRY_CANCEL"
+    case abandon = "ABANDON"
+    case terminate = "TERMINATE"
+}
+
+extension ParentClosePolicy: PostgresCodable {
+    public static var psqlType: PostgresDataType { .text }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let value = ParentClosePolicy(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = value
+    }
+}
+
+extension ChildWorkflowCancellationType: PostgresCodable {
+    public static var psqlType: PostgresDataType { .text }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let value = ChildWorkflowCancellationType(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = value
+    }
+}
+
 // MARK: - ChildWorkflowOptions
 
 /// Options for ``WorkflowContext/runChildWorkflow(_:options:input:)``.
@@ -630,6 +716,23 @@ public struct ChildWorkflowOptions: Sendable {
     /// Equivalent to ``WorkflowOptions/maxDuration`` for top-level workflows.
     public var maxDuration: Duration?
 
+    /// Explicit identifier for this child workflow execution.
+    ///
+    /// Used for deduplication: if a child workflow with this key already exists the
+    /// existing task is returned instead of creating a new one.
+    /// When `nil` (default) Strand auto-generates `"<parentTaskID>:<seqNum>"`.
+    public var id: String?
+
+    /// What happens to this child workflow when the parent fails or is cancelled.
+    ///
+    /// Defaults to `.terminate` — children are cancelled when the parent fails permanently.
+    public var parentClosePolicy: ParentClosePolicy
+
+    /// How the parent handles cancellation of this child workflow.
+    ///
+    /// Defaults to `.waitCancellationCompleted`.
+    public var cancellationType: ChildWorkflowCancellationType
+
     public init(
         queue: String? = nil,
         priority: TaskPriority = .normal,
@@ -639,7 +742,10 @@ public struct ChildWorkflowOptions: Sendable {
         fairnessWeight: Double = 1.0,
         retryStrategy: RetryStrategy? = nil,
         delayUntil: Date? = nil,
-        maxDuration: Duration? = nil
+        maxDuration: Duration? = nil,
+        id: String? = nil,
+        parentClosePolicy: ParentClosePolicy = .terminate,
+        cancellationType: ChildWorkflowCancellationType = .waitCancellationCompleted
     ) {
         self.queue = queue
         self.priority = priority
@@ -650,5 +756,8 @@ public struct ChildWorkflowOptions: Sendable {
         self.retryStrategy = retryStrategy
         self.delayUntil = delayUntil
         self.maxDuration = maxDuration
+        self.id = id
+        self.parentClosePolicy = parentClosePolicy
+        self.cancellationType = cancellationType
     }
 }

@@ -113,7 +113,8 @@ enum WorkflowCommand: Sendable {
         fairnessWeight: Double,  // 1.0 = default weight
         retryStrategy: RetryStrategy?,  // nil = worker default
         scheduledAt: Date?,  // nil = immediately
-        deadlineAt: Date?  // nil = no total execution budget
+        deadlineAt: Date?,  // nil = no total execution budget
+        parentClosePolicy: ParentClosePolicy  // what happens to child when parent closes
     )
 }
 
@@ -137,6 +138,8 @@ struct LocalActivityEntry {
     let input: ByteBuffer
     /// Activation sequence number — result is persisted here so re-activations fast-path it.
     let seqNum: Int
+    /// Execution options (timeout, retries, cancellation type) for this local activity.
+    let options: LocalActivityOptions
     /// Parked continuation. Linked immediately after the task suspends.
     var continuation: CheckedContinuation<ByteBuffer, Error>?
 }
@@ -187,6 +190,11 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     /// command and returns immediately — no suspension, no DB round-trip.
     /// This is the replay fast path that makes re-activations idempotent.
     private var preloadedResults: [Int: ByteBuffer] = [:]
+
+    /// Start-time metadata for each completed child, keyed by seq_num.
+    /// Populated by `resolveCompleted`; consumed by `applyScheduleCommands`
+    /// to write `ACTIVITY_STARTED` alongside `ACTIVITY_COMPLETED`.
+    private var preloadedStartInfo: [Int: (startedAt: Date?, attempt: Int, workerID: String?)] = [:]
 
     /// Terminal non-success states for child activities/workflows (FAILED, CANCELLED).
     /// Keyed by seq_num → `(state, failureReason)`. Checked by fast path 2a in
@@ -324,10 +332,12 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     func resolveCompleted(
         _ completions: [(
             seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
-            state: TaskState, kind: TaskKind, name: String
+            state: TaskState, kind: TaskKind, name: String,
+            startedAt: Date?, runAttempt: Int, workerID: String?
         )]
     ) {
-        for (seqNum, result, failureReason, state, _, _) in completions {
+        for (seqNum, result, failureReason, state, _, _, startedAt, runAttempt, workerID) in completions {
+            preloadedStartInfo[seqNum] = (startedAt: startedAt, attempt: runAttempt, workerID: workerID)
             switch state {
             case .completed:
                 if let result { preloadedResults[seqNum] = result }
@@ -359,6 +369,12 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
         preloadedNonCompletions[seqNum]
     }
 
+    /// Returns the run start metadata for `seqNum`, or `nil` if not available.
+    /// Used by `applyScheduleCommands` to write `ACTIVITY_STARTED` history events.
+    func preloadedStartInfo(for seqNum: Int) -> (startedAt: Date?, attempt: Int, workerID: String?)? {
+        preloadedStartInfo[seqNum]
+    }
+
     // MARK: - Command emission API (called by WorkflowContext methods during drain)
 
     /// Append a command to the pending list.
@@ -373,13 +389,14 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
 
     /// Register a local activity for in-process execution post-drain. Returns an ID
     /// that is used to link the `CheckedContinuation` and later resolve the result.
-    func scheduleLocalActivity(name: String, input: ByteBuffer, seqNum: Int) -> Int {
+    func scheduleLocalActivity(name: String, input: ByteBuffer, seqNum: Int, options: LocalActivityOptions = .init()) -> Int {
         let id = nextLocalActivityID
         nextLocalActivityID += 1
         localActivityEntries[id] = LocalActivityEntry(
             name: name,
             input: input,
-            seqNum: seqNum
+            seqNum: seqNum,
+            options: options
         )
         return id
     }
@@ -586,6 +603,9 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
         conditionEntries.removeAll()
         localActivityEntries.removeAll()
         eventNameToSeqNum.removeAll()
+        preloadedStartInfo.removeAll()
+        preloadedResults.removeAll()
+        preloadedNonCompletions.removeAll()
     }
 
     // MARK: - Inspection

@@ -98,6 +98,140 @@ struct FetchWeatherActivity: Activity {
 }
 ```
 
+## Idempotency — activities run at least once
+
+Strand guarantees that the **result** of an activity is applied to the parent
+workflow exactly once. But the `run(input:context:)` body itself can execute
+more than once.
+
+If a worker runs your activity code, the external call succeeds, and then the
+worker crashes before the Postgres completion transaction commits — the run is
+re-queued and a second worker calls `run` again with the same input. From
+Strand's perspective the first execution never happened.
+
+```
+Worker A:  run() → charges Stripe → CRASH (before completeRun commits)
+Strand:    lease expires → re-queue → Worker B claims same run
+Worker B:  run() → charges Stripe again  ← duplicate charge
+```
+
+This is the standard model for all durable workflow engines: the state machine
+advances exactly once, but the handler body runs at least once. **Activities
+must be idempotent** or must use one of the patterns below to detect and skip
+duplicate executions.
+
+### Pattern 1 — idempotency key via `context.taskID`
+
+`ActivityContext.taskID` is a stable UUID that is the same on every retry of
+the same activity. Use it as the idempotency key when calling external APIs
+that support one:
+
+```swift
+struct ChargeCardActivity: Activity {
+    typealias Input  = ChargeInput
+    typealias Output = ChargeResult
+
+    let stripe: StripeClient
+
+    func run(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
+        // Stripe deduplicates by idempotency key within 24 h.
+        // Using taskID means retries never create duplicate charges.
+        let charge = try await stripe.charges.create(
+            amount: input.amountCents,
+            currency: "usd",
+            customer: input.customerID,
+            idempotencyKey: context.taskID.uuidString   // ← stable across retries
+        )
+        return ChargeResult(chargeID: charge.id)
+    }
+}
+```
+
+### Pattern 2 — check-then-act
+
+When the external system doesn't support idempotency keys, query whether the
+work was already done before performing it:
+
+```swift
+struct ProvisionDatabaseActivity: Activity {
+    typealias Input  = ProvisionInput
+    typealias Output = ProvisionResult
+
+    let cloud: CloudClient
+
+    func run(input: ProvisionInput, context: ActivityContext) async throws -> ProvisionResult {
+        // Safe to call on retry: returns the existing DB if already provisioned.
+        if let existing = try await cloud.databases.find(name: input.dbName) {
+            return ProvisionResult(host: existing.host)
+        }
+        let db = try await cloud.databases.create(name: input.dbName, tier: input.tier)
+        return ProvisionResult(host: db.host)
+    }
+}
+```
+
+### Pattern 3 — progress heartbeat to skip completed steps
+
+For activities with multiple stages, persist a cursor via `context.heartbeat(_:)`
+after each stage. On retry, `context.heartbeatDetails(as:)` returns the last
+checkpoint so already-completed stages are skipped entirely:
+
+```swift
+struct MigrateDataActivity: Activity {
+    typealias Input  = MigrationInput
+    typealias Output = MigrationResult
+
+    func run(input: MigrationInput, context: ActivityContext) async throws -> MigrationResult {
+        // Pick up from the last committed batch on retry.
+        var cursor = context.heartbeatDetails(as: String.self) ?? input.startCursor
+        var totalMigrated = 0
+
+        while let page = try await db.fetchPage(after: cursor, limit: 500) {
+            try await db.writePage(page)   // idempotent upsert
+            cursor = page.nextCursor
+            totalMigrated += page.rows.count
+            try await context.heartbeat(cursor)  // checkpoint: retry resumes here
+        }
+        return MigrationResult(totalMigrated: totalMigrated)
+    }
+}
+```
+
+### Pattern 4 — non-retryable errors for validation failures
+
+If an activity can determine early that retrying will never succeed (e.g. the
+input is structurally invalid), throw a `NonRetryableError` to stop the retry
+loop immediately without waiting for `maxAttempts` to exhaust:
+
+```swift
+enum ValidationError: Error, Codable, NonRetryableError {
+    case invalidCurrency(String)
+    case amountBelowMinimum(Int)
+}
+
+struct ChargeCardActivity: Activity {
+    typealias Failure = ValidationError
+
+    func run(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
+        guard input.amountCents >= 50 else {
+            throw ValidationError.amountBelowMinimum(input.amountCents)
+            // Strand marks this failed immediately — no retries attempted.
+        }
+        // ...
+    }
+}
+```
+
+### What is and isn't guaranteed
+
+| Guarantee | Status |
+|---|---|
+| Activity result applied to workflow exactly once | ✅ `version` CAS + `task_completions ON CONFLICT DO NOTHING` |
+| Activity `run()` body executes exactly once | ❌ At-least-once — use idempotency keys or check-then-act |
+| `maxAttempts` is respected | ✅ Attempts counter incremented only on explicit failure, not lease expiry |
+| Lease expiry does not count as a failed attempt | ✅ `sweepExpiredLeases` re-queues as PENDING at the same attempt number |
+| 2× `claimTimeout` watchdog counts as a failed attempt | ✅ `ClaimTimeoutError` goes through `failRun`, increments attempt counter |
+
 ## Long-running activities — heartbeats
 
 ### Liveness heartbeat

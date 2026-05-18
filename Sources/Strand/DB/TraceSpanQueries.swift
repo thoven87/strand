@@ -1,5 +1,5 @@
 package import Logging
-package import NIOCore
+import NIOCore
 package import PostgresNIO
 
 #if canImport(FoundationEssentials)
@@ -52,9 +52,6 @@ package enum TraceSpanQueries {
         startedAt: Date? = nil,
         finishedAt: Date? = nil,
         error: String? = nil,
-        eventType: WorkflowStateQueries.HistoryEventType? = nil,
-        eventData: ByteBuffer? = nil,
-        seqNum: Int? = nil,
         logger: Logger
     ) async throws {
         let effectiveQueuedAt = queuedAt ?? Date()
@@ -64,8 +61,7 @@ package enum TraceSpanQueries {
             INSERT INTO strand.trace_spans
                 (id, namespace_id, root_task_id, task_id, parent_id,
                  kind, name, state, attempt, worker_id, max_attempts,
-                 queued_at, started_at, finished_at, error,
-                 event_type, event_data, seq_num)
+                 queued_at, started_at, finished_at, error)
             SELECT \(id), \(namespaceID),
                    COALESCE(
                        (SELECT root_task_id FROM strand.trace_spans WHERE id = \(parentLookup) LIMIT 1),
@@ -75,113 +71,280 @@ package enum TraceSpanQueries {
                    \(kind), \(name), \(state),
                    COALESCE(\(attempt), 0),
                    \(workerID), \(maxAttempts),
-                   \(effectiveQueuedAt), \(startedAt), \(finishedAt), \(error),
-                   \(eventType), \(eventData), \(seqNum)
+                   \(effectiveQueuedAt), \(startedAt), \(finishedAt), \(error)
             ON CONFLICT (id) DO UPDATE
                 SET state       = EXCLUDED.state,
                     attempt     = GREATEST(EXCLUDED.attempt, strand.trace_spans.attempt),
                     worker_id   = COALESCE(EXCLUDED.worker_id,   strand.trace_spans.worker_id),
                     started_at  = COALESCE(EXCLUDED.started_at,  strand.trace_spans.started_at),
                     finished_at = COALESCE(EXCLUDED.finished_at, strand.trace_spans.finished_at),
-                    error       = COALESCE(EXCLUDED.error,       strand.trace_spans.error),
-                    event_type  = COALESCE(EXCLUDED.event_type,  strand.trace_spans.event_type),
-                    event_data  = COALESCE(EXCLUDED.event_data,  strand.trace_spans.event_data)
+                    error       = COALESCE(EXCLUDED.error,       strand.trace_spans.error)
             """,
             logger: logger
         )
     }
 
-    /// Insert a zero-duration span for instant events: SIGNAL, UPDATE, EMIT.
-    package static func insertInstantSpan(
-        on postgres: PostgresClient,
-        id: String,
-        namespaceID: String,
+    // MARK: - History-event span derivation
+
+    /// Derive SLEEP, WAIT, CONDITION, SIGNAL, UPDATE, and EMIT spans from
+    /// `workflow_history` rows.
+    ///
+    /// History-event spans are derived from `workflow_history` at read time rather
+    /// than written to a separate OLAP table — giving the trace waterfall the same
+    /// durability guarantee as the history itself.
+    ///
+    /// Duration spans (SLEEP, WAIT, CONDITION) are paired by matching start/end events:
+    ///   - TIMER:     by `seqNum` in `TimerStartedData`/`TimerFiredData` when present,
+    ///                sequential stack otherwise (covers old rows pre-seqNum addition)
+    ///   - WAIT:      by `eventName` from `NamedEventData` (unique per pending wait)
+    ///   - CONDITION: sequential stack (at most one active at a time in Strand)
+    ///
+    /// Unclosed spans (workflow still running) are returned with `finishedAt = nil`
+    /// and `state = "RUNNING"`.
+    package static func deriveHistorySpans(
+        from historyRows: [WorkflowStateQueries.HistoryEventRow],
         taskID: UUID,
-        parentID: String?,
-        kind: WorkflowSpanKind,
-        name: String,
-        at: Date,
-        eventType: WorkflowStateQueries.HistoryEventType? = nil,
-        seqNum: Int? = nil,
-        logger: Logger
-    ) async throws {
-        let parentLookup = parentID ?? id
-        let completed = WorkflowSpanState.completed
-        try await postgres.query(
-            """
-            INSERT INTO strand.trace_spans
-                (id, namespace_id, root_task_id, task_id, parent_id,
-                 kind, name, state, queued_at, started_at, finished_at,
-                 event_type, seq_num)
-            SELECT \(id), \(namespaceID),
-                   COALESCE(
-                       (SELECT root_task_id FROM strand.trace_spans WHERE id = \(parentLookup) LIMIT 1),
-                       \(taskID)
-                   ),
-                   \(taskID), \(parentID),
-                   \(kind), \(name), \(completed), \(at), \(at), \(at),
-                   \(eventType), \(seqNum)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            logger: logger
-        )
-    }
-
-    /// Insert an open-ended duration span: SLEEP, WAIT, CONDITION.
-    package static func openDurationSpan(
-        on postgres: PostgresClient,
-        id: String,
         namespaceID: String,
-        taskID: UUID,
-        parentID: String?,
-        kind: WorkflowSpanKind,
-        name: String,
-        startedAt: Date,
-        eventType: WorkflowStateQueries.HistoryEventType? = nil,
-        seqNum: Int? = nil,
-        logger: Logger
-    ) async throws {
-        let parentLookup = parentID ?? id
-        let running = WorkflowSpanState.running
-        try await postgres.query(
-            """
-            INSERT INTO strand.trace_spans
-                (id, namespace_id, root_task_id, task_id, parent_id,
-                 kind, name, state, queued_at, started_at,
-                 event_type, seq_num)
-            SELECT \(id), \(namespaceID),
-                   COALESCE(
-                       (SELECT root_task_id FROM strand.trace_spans WHERE id = \(parentLookup) LIMIT 1),
-                       \(taskID)
-                   ),
-                   \(taskID), \(parentID),
-                   \(kind), \(name), \(running), \(startedAt), \(startedAt),
-                   \(eventType), \(seqNum)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            logger: logger
-        )
-    }
+        rootTaskID: UUID
+    ) -> [SpanRow] {
+        var spans: [SpanRow] = []
+        let parentID = taskID.uuidString
 
-    /// Close a duration span by stamping `finished_at` and the terminal `event_type`.
-    package static func closeDurationSpan(
-        on postgres: PostgresClient,
-        id: String,
-        state: WorkflowSpanState,
-        finishedAt: Date,
-        endEventType: WorkflowStateQueries.HistoryEventType? = nil,
-        logger: Logger
-    ) async throws {
-        try await postgres.query(
-            """
-            UPDATE strand.trace_spans
-            SET state       = \(state),
-                finished_at = \(finishedAt),
-                event_type  = COALESCE(\(endEventType), event_type)
-            WHERE id = \(id)
-            """,
-            logger: logger
-        )
+        // Open timer spans keyed by activation seqNum (when available) or sequential stack.
+        var openTimersBySeq: [Int: (historySeq: Int, createdAt: Date)] = [:]
+        var openTimerStack: [(historySeq: Int, createdAt: Date)] = []
+
+        // Open event-wait spans keyed by eventName.
+        var openEventWaits: [String: (historySeq: Int, createdAt: Date)] = [:]
+
+        // Open condition spans — sequential stack (one active at a time).
+        var openConditions: [(historySeq: Int, createdAt: Date)] = []
+
+        func makeID(_ histSeq: Int) -> String { "\(taskID.uuidString):h\(histSeq)" }
+
+        func spanRow(
+            historySeq: Int,
+            kind: WorkflowSpanKind,
+            name: String,
+            state: WorkflowSpanState,
+            startedAt: Date,
+            finishedAt: Date?
+        ) -> SpanRow {
+            SpanRow(
+                virtual: makeID(historySeq),
+                rootTaskID: rootTaskID,
+                taskID: taskID,
+                parentID: parentID,
+                kind: kind.rawValue,
+                name: name,
+                state: state.rawValue,
+                queuedAt: startedAt,
+                startedAt: startedAt,
+                finishedAt: finishedAt
+            )
+        }
+
+        for row in historyRows {
+            switch row.eventType {
+
+            case .timerStarted:
+                let td = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.TimerStartedData.self, from: $0) }
+                let entry = (historySeq: row.seq, createdAt: row.createdAt)
+                if let k = td?.seqNum {
+                    openTimersBySeq[k] = entry
+                } else {
+                    openTimerStack.append(entry)
+                }
+
+            case .timerFired:
+                let fd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.TimerFiredData.self, from: $0) }
+                let open: (historySeq: Int, createdAt: Date)?
+                if let k = fd?.seqNum, let e = openTimersBySeq.removeValue(forKey: k) {
+                    open = e
+                } else if !openTimerStack.isEmpty {
+                    open = openTimerStack.removeFirst()
+                } else {
+                    open = nil
+                }
+                if let e = open {
+                    spans.append(
+                        spanRow(
+                            historySeq: e.historySeq,
+                            kind: .sleep,
+                            name: "sleep",
+                            state: .completed,
+                            startedAt: e.createdAt,
+                            finishedAt: row.createdAt
+                        )
+                    )
+                }
+
+            case .eventWaitStarted:
+                let nd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.EventWaitStartedData.self, from: $0) }
+                let eventName = nd?.eventName ?? ""
+                openEventWaits[eventName] = (historySeq: row.seq, createdAt: row.createdAt)
+
+            case .eventReceived:
+                let nd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.NamedEventData.self, from: $0) }
+                let eventName = nd?.eventName ?? ""
+                if let e = openEventWaits.removeValue(forKey: eventName) {
+                    spans.append(
+                        spanRow(
+                            historySeq: e.historySeq,
+                            kind: .wait,
+                            name: eventName,
+                            state: .completed,
+                            startedAt: e.createdAt,
+                            finishedAt: row.createdAt
+                        )
+                    )
+                }
+
+            case .eventWaitTimedOut:
+                let nd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.NamedEventData.self, from: $0) }
+                let eventName = nd?.eventName ?? ""
+                if let e = openEventWaits.removeValue(forKey: eventName) {
+                    spans.append(
+                        spanRow(
+                            historySeq: e.historySeq,
+                            kind: .wait,
+                            name: eventName,
+                            state: .timedOut,
+                            startedAt: e.createdAt,
+                            finishedAt: row.createdAt
+                        )
+                    )
+                }
+
+            case .conditionWaiting:
+                openConditions.append((historySeq: row.seq, createdAt: row.createdAt))
+
+            case .conditionMet:
+                if !openConditions.isEmpty {
+                    let e = openConditions.removeFirst()
+                    spans.append(
+                        spanRow(
+                            historySeq: e.historySeq,
+                            kind: .condition,
+                            name: "condition",
+                            state: .completed,
+                            startedAt: e.createdAt,
+                            finishedAt: row.createdAt
+                        )
+                    )
+                }
+
+            case .conditionTimedOut:
+                if !openConditions.isEmpty {
+                    let e = openConditions.removeFirst()
+                    spans.append(
+                        spanRow(
+                            historySeq: e.historySeq,
+                            kind: .condition,
+                            name: "condition",
+                            state: .timedOut,
+                            startedAt: e.createdAt,
+                            finishedAt: row.createdAt
+                        )
+                    )
+                }
+
+            case .signalReceived:
+                let nd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.SignalReceivedData.self, from: $0) }
+                spans.append(
+                    spanRow(
+                        historySeq: row.seq,
+                        kind: .signal,
+                        name: nd?.name ?? "signal",
+                        state: .completed,
+                        startedAt: row.createdAt,
+                        finishedAt: row.createdAt
+                    )
+                )
+
+            case .updateApplied:
+                let nd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.SignalReceivedData.self, from: $0) }
+                spans.append(
+                    spanRow(
+                        historySeq: row.seq,
+                        kind: .update,
+                        name: nd?.name ?? "update",
+                        state: .completed,
+                        startedAt: row.createdAt,
+                        finishedAt: row.createdAt
+                    )
+                )
+
+            case .eventEmitted:
+                let nd = row.eventData.flatMap { try? JSON.decode(WorkflowStateQueries.NamedEventData.self, from: $0) }
+                spans.append(
+                    spanRow(
+                        historySeq: row.seq,
+                        kind: .emit,
+                        name: nd?.eventName ?? "emit",
+                        state: .completed,
+                        startedAt: row.createdAt,
+                        finishedAt: row.createdAt
+                    )
+                )
+
+            default:
+                break  // workflowStarted/Completed/Failed, activityScheduled/Started/Completed/Failed,
+            // childWorkflow* — handled by task-level spans in trace_spans, not derived here
+            }
+        }
+
+        // Unclosed spans — workflow is still running, suspended in this state
+        for e in openTimersBySeq.values {
+            spans.append(
+                spanRow(
+                    historySeq: e.historySeq,
+                    kind: .sleep,
+                    name: "sleep",
+                    state: .running,
+                    startedAt: e.createdAt,
+                    finishedAt: nil
+                )
+            )
+        }
+        for e in openTimerStack {
+            spans.append(
+                spanRow(
+                    historySeq: e.historySeq,
+                    kind: .sleep,
+                    name: "sleep",
+                    state: .running,
+                    startedAt: e.createdAt,
+                    finishedAt: nil
+                )
+            )
+        }
+        for (name, e) in openEventWaits {
+            spans.append(
+                spanRow(
+                    historySeq: e.historySeq,
+                    kind: .wait,
+                    name: name,
+                    state: .running,
+                    startedAt: e.createdAt,
+                    finishedAt: nil
+                )
+            )
+        }
+        for e in openConditions {
+            spans.append(
+                spanRow(
+                    historySeq: e.historySeq,
+                    kind: .condition,
+                    name: "condition",
+                    state: .running,
+                    startedAt: e.createdAt,
+                    finishedAt: nil
+                )
+            )
+        }
+
+        return spans
     }
 
     // MARK: - Read helpers (dashboard routes)
@@ -202,9 +365,69 @@ package enum TraceSpanQueries {
         package let startedAt: Date?
         package let finishedAt: Date?
         package let error: String?
-        package let eventType: String?
-        package let eventData: ByteBuffer?
-        package let seqNum: Int?
+
+        /// Full memberwise init used by `decodeRow` to populate from a `strand.trace_spans` DB row.
+        package init(
+            id: String,
+            rootTaskID: UUID,
+            taskID: UUID,
+            parentID: String?,
+            kind: String,
+            name: String,
+            state: String,
+            attempt: Int,
+            workerID: String?,
+            maxAttempts: Int?,
+            queuedAt: Date,
+            startedAt: Date?,
+            finishedAt: Date?,
+            error: String?
+        ) {
+            self.id = id
+            self.rootTaskID = rootTaskID
+            self.taskID = taskID
+            self.parentID = parentID
+            self.kind = kind
+            self.name = name
+            self.state = state
+            self.attempt = attempt
+            self.workerID = workerID
+            self.maxAttempts = maxAttempts
+            self.queuedAt = queuedAt
+            self.startedAt = startedAt
+            self.finishedAt = finishedAt
+            self.error = error
+        }
+
+        /// Creates a span row for history-event spans reconstructed at read time.
+        package init(
+            virtual id: String,
+            rootTaskID: UUID,
+            taskID: UUID,
+            parentID: String?,
+            kind: String,
+            name: String,
+            state: String,
+            queuedAt: Date,
+            startedAt: Date?,
+            finishedAt: Date?
+        ) {
+            self.id = id
+            self.rootTaskID = rootTaskID
+            self.taskID = taskID
+            self.parentID = parentID
+            self.kind = kind
+            self.name = name
+            self.state = state
+            self.attempt = 0
+            self.workerID = nil
+            self.maxAttempts = nil
+            self.queuedAt = queuedAt
+            self.startedAt = startedAt
+            self.finishedAt = finishedAt
+            self.error = nil
+        }
+
     }
 
     private static func decodeRow(_ row: PostgresRow) throws -> SpanRow {
@@ -223,10 +446,7 @@ package enum TraceSpanQueries {
             queuedAt: try col.next()!.decode(Date.self, context: .default),
             startedAt: try col.next()!.decode(Date?.self, context: .default),
             finishedAt: try col.next()!.decode(Date?.self, context: .default),
-            error: try col.next()!.decode(String?.self, context: .default),
-            eventType: try col.next()!.decode(String?.self, context: .default),
-            eventData: try col.next()!.decode(ByteBuffer?.self, context: .default),
-            seqNum: try col.next()!.decode(Int?.self, context: .default)
+            error: try col.next()!.decode(String?.self, context: .default)
         )
     }
 
@@ -242,8 +462,7 @@ package enum TraceSpanQueries {
             """
             SELECT id, root_task_id, task_id, parent_id,
                    kind, name, state, attempt, worker_id, max_attempts,
-                   queued_at, started_at, finished_at, error,
-                   event_type, event_data, seq_num
+                   queued_at, started_at, finished_at, error
             FROM   strand.trace_spans
             WHERE  namespace_id = \(namespaceID)
               AND  root_task_id = \(rootTaskID)
@@ -256,30 +475,4 @@ package enum TraceSpanQueries {
         return rows
     }
 
-    /// Returns history events for a single task ordered by `seq_num`.
-    /// Replaces `WorkflowStateQueries.listHistory` — one index scan.
-    package static func getHistoryFromSpans(
-        on postgres: PostgresClient,
-        namespaceID: String,
-        taskID: UUID,
-        logger: Logger
-    ) async throws -> [SpanRow] {
-        let stream = try await postgres.query(
-            """
-            SELECT id, root_task_id, task_id, parent_id,
-                   kind, name, state, attempt, worker_id, max_attempts,
-                   queued_at, started_at, finished_at, error,
-                   event_type, event_data, seq_num
-            FROM   strand.trace_spans
-            WHERE  namespace_id = \(namespaceID)
-              AND  task_id      = \(taskID)
-              AND  event_type   IS NOT NULL
-            ORDER  BY seq_num ASC NULLS LAST, queued_at ASC
-            """,
-            logger: logger
-        )
-        var rows: [SpanRow] = []
-        for try await row in stream { rows.append(try decodeRow(row)) }
-        return rows
-    }
 }

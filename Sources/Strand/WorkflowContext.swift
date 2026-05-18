@@ -134,6 +134,10 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     /// `WorkflowContext.activationTime` so the value is stable for the duration
     /// of the activation rather than drifting with `Date.now`.
     let activationTime: Date
+    /// Number of history events recorded before this activation started.
+    /// Derived from `nextHistorySeq() - 1` at activation load time.
+    /// Use `WorkflowContext.historyEventCount` to check this in a handler.
+    var historyEventCount: Int
 
     // MARK: - Dependencies (set once in init, never mutated)
 
@@ -148,6 +152,10 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
 
     /// Checkpoint values loaded at activation start. Keyed by seq_num (Int).
     var checkpointCache: [Int: ByteBuffer]
+    /// Names stored alongside each checkpoint, keyed by seq_num.
+    /// Populated from DB rows at activation start; updated when new checkpoints are written.
+    /// Used by fast-path-1 to detect non-determinism (wrong activity replaying a stale result).
+    var checkpointNameCache: [Int: String] = [:]
     /// Version gate values loaded at activation start from `strand.workflow_version_markers`.
     /// Keyed by changeID — version gates do not consume sequence numbers.
     var versionMarkerCache: [String: Bool]
@@ -178,9 +186,11 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         executor: StrandWorkflowExecutor,
         stateBox: ArcBox<W>,
         checkpointCache: [Int: ByteBuffer],
+        checkpointNameCache: [Int: String],
         versionMarkerCache: [String: Bool],
         namespace: String,
-        activationTime: Date
+        activationTime: Date,
+        historyEventCount: Int
     ) {
         self.taskUUID = taskUUID
         self.runUUID = runUUID
@@ -197,10 +207,12 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         self.executor = executor
         self.stateBox = stateBox
         self.checkpointCache = checkpointCache
+        self.checkpointNameCache = checkpointNameCache
         self.versionMarkerCache = versionMarkerCache
         self.activationCounter = ActivationCounter()
         self.namespace = namespace
         self.activationTime = activationTime
+        self.historyEventCount = historyEventCount
     }
 
     // MARK: - Activation sequence counter
@@ -218,8 +230,11 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     }
 
     /// Updates the in-memory checkpoint cache only (no DB write).
-    func cacheCheckpoint(seqNum: Int, buffer: ByteBuffer) {
+    /// Passing a non-nil `name` also updates the name cache used for non-determinism detection.
+    /// Nil names are ignored so DB-loaded names are never overwritten by call sites that lack them.
+    func cacheCheckpoint(seqNum: Int, name: String? = nil, buffer: ByteBuffer) {
         checkpointCache[seqNum] = buffer
+        if let name { checkpointNameCache[seqNum] = name }
     }
 
     func cachedVersionMarker(for changeID: String) -> Bool? {
@@ -245,7 +260,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
             extendClaimBySeconds: claimTimeoutSeconds,
             logger: logger
         )
-        checkpointCache[seqNum] = buffer
+        cacheCheckpoint(seqNum: seqNum, name: name, buffer: buffer)
     }
 
     /// Transitions the run to SLEEPING at `wakeAt` via a DB update.
@@ -350,6 +365,23 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// so it is durably checkpointed.
     public var activationTime: Date { _impl.activationTime }
 
+    /// The number of history events recorded before this activation started.
+    ///
+    /// Use this to decide when to call `ctx.continueAsNew()` proactively.
+    /// Workflows accumulate one event per significant lifecycle transition
+    /// (activity scheduled, completed, timer started, signal received, etc.).
+    /// Very large histories slow the trace waterfall and the history tab.
+    ///
+    /// A reasonable threshold depends on workflow complexity but is typically
+    /// 1,000–10,000 events. Reset to 0 after `continueAsNew`.
+    ///
+    /// ```swift
+    /// if ctx.historyEventCount > 5_000 {
+    ///     try ctx.continueAsNew(input: nextBatch)
+    /// }
+    /// ```
+    public var historyEventCount: Int { _impl.historyEventCount }
+
     /// Scheduling metadata injected by ``StrandScheduler`` when this workflow was
     /// triggered by a schedule. `nil` when enqueued directly via ``StrandClient``.
     ///
@@ -411,6 +443,27 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // ── Fast path 1: checkpoint cache (result persisted in a prior activation) ──────
         if let cached = _impl.checkpointCache[seqNum] {
+            // Non-determinism check: if the stored checkpoint name doesn't match the
+            // activity being replayed, the workflow code was changed in a way that
+            // reorders or renames activities. The result being returned may be wrong.
+            // Use context.version(changeID:) to gate incompatible code changes.
+            if let storedName = _impl.checkpointNameCache[seqNum],
+                storedName != A.name
+            {
+                let msg =
+                    "non-determinism: checkpoint at seq \(seqNum) was written for '\(storedName)'"
+                    + " but is being replayed for '\(A.name)' — result may be incorrect;"
+                    + " use context.version(changeID:) to gate incompatible code changes"
+                _impl.logger.warning(
+                    "\(msg)",
+                    metadata: [
+                        "strand.task_id": .stringConvertible(_impl.taskUUID),
+                        "strand.seq_num": .stringConvertible(seqNum),
+                        "strand.stored": .string(storedName),
+                        "strand.expected": .string(A.name),
+                    ]
+                )
+            }
             // An ActivityFailedSentinel means the activity failed or was cancelled.
             // Re-throw the stored error without emitting any command — exactly-once guard
             // that prevents ACTIVITY_FAILED from being written more than once on replay.
@@ -463,7 +516,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // results for all child activities that already finished. No DB round-trip needed.
         if let preloaded = _impl.executor.preloadedResult(for: seqNum) {
             // Cache in memory so subsequent replay within this activation hits fast path 1.
-            _impl.checkpointCache[seqNum] = preloaded
+            _impl.cacheCheckpoint(seqNum: seqNum, name: A.name, buffer: preloaded)
             // Emit a checkpoint write so the worker persists this result after drain.
             _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: preloaded))
             _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
@@ -472,7 +525,9 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // ── Slow path: activity not yet complete — emit command and suspend ─────────────
         let inputBuffer = try JSON.encode(input)
-        let idempotencyKey = "\(_impl.taskUUID):\(seqNum)"
+        // Use caller-supplied ID if set; otherwise derive a stable key from
+        // the workflow task UUID and call-site sequence number.
+        let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
 
         _impl.executor.emit(
             .scheduleActivity(
@@ -495,7 +550,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             // Continuation resumed — activity completed in this activation.
             // Write a checkpoint so fresh-path replays use fast path 1 without needing
             // task_completions. Emit .activityCompleted for the ACTIVITY_COMPLETED history event.
-            _impl.checkpointCache[seqNum] = resultBuffer
+            _impl.cacheCheckpoint(seqNum: seqNum, name: A.name, buffer: resultBuffer)
             _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: resultBuffer))
             _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
             return try JSON.decode(A.Output.self, from: resultBuffer)
@@ -1107,7 +1162,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         let id = _impl.executor.scheduleLocalActivity(
             name: A.name,
             input: inputBuffer,
-            seqNum: seqNum
+            seqNum: seqNum,
+            options: options
         )
         let result = try await withCheckedThrowingContinuation {
             (cont: CheckedContinuation<ByteBuffer, Error>) in
@@ -1203,7 +1259,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // loadCompletedChildActivities covers child workflows too (same parent_task_id JOIN).
         // A checkpoint is written here so subsequent replays use fast path 1.
         if let preloaded = _impl.executor.preloadedResult(for: seqNum) {
-            _impl.checkpointCache[seqNum] = preloaded
+            _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: preloaded)
             _impl.executor.emit(
                 .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded)
             )
@@ -1213,7 +1269,9 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Slow path: child not yet complete — emit command and suspend via continuation.
         let inputBuffer = try JSON.encode(input)
-        let idempotencyKey = "\(_impl.taskUUID):\(seqNum)"
+        // Use caller-supplied ID if set; otherwise derive a stable key from
+        // the workflow task UUID and call-site sequence number.
+        let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
         // Note: options.headers forwarding intentionally omitted from the command —
         // the worker injects parent context headers when enqueuing the child task.
 
@@ -1231,7 +1289,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 fairnessWeight: options.fairnessWeight,
                 retryStrategy: options.retryStrategy,
                 scheduledAt: options.delayUntil,
-                deadlineAt: childDeadlineAt
+                deadlineAt: childDeadlineAt,
+                parentClosePolicy: options.parentClosePolicy
             )
         )
 
@@ -1242,7 +1301,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             }
             // Slow path: continuation resumed — child completed in this activation.
             // Write a checkpoint so replays use fast path 1.
-            _impl.checkpointCache[seqNum] = resultBuffer
+            _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: resultBuffer)
             _impl.executor.emit(
                 .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: resultBuffer)
             )

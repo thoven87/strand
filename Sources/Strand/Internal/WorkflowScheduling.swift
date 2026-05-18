@@ -47,20 +47,69 @@ extension WorkflowRegistration {
         // call site only specifies the two that vary (eventType, eventData).
         // A nested `func` (not a stored closure) is used because it can capture
         // the `inout historySeq` parameter directly.
-        func record(_ type: WorkflowStateQueries.HistoryEventType, _ data: ByteBuffer?) async throws {
-            try await WorkflowStateQueries.appendHistory(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                seq: historySeq,
-                eventType: type,
-                eventData: data,
-                logger: exec.logger
-            )
+        // History accumulator — populated synchronously by record(), flushed in one
+        // batchAppendHistory call at each exit point. record() has zero DB I/O;
+        // all history events are committed in a single round-trip at activation exit.
+        var pendingHistory: [(seq: Int, eventType: WorkflowStateQueries.HistoryEventType, eventData: ByteBuffer?)] = []
+        var pendingCheckpoints: [(seqNum: Int, name: String?, state: ByteBuffer)] = []
+
+        // record() is now a pure synchronous accumulator — no DB I/O, no try await.
+        func record(_ type: WorkflowStateQueries.HistoryEventType, _ data: ByteBuffer?) {
+            pendingHistory.append((seq: historySeq, eventType: type, eventData: data))
             historySeq += 1
         }
 
-        // Non-suspending writes first — durable regardless of what follows.
+        // Flush: write activity-result checkpoints and history events in one transaction.
+        //
+        // Atomicity guarantee: if the transaction fails the next fresh-path activation
+        // replays fully — fast-path-1 does not trigger because no checkpoint exists —
+        // and both are written correctly on the retry.
+        func flushWrites() async throws {
+            guard !pendingCheckpoints.isEmpty || !pendingHistory.isEmpty else { return }
+            try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                if !pendingCheckpoints.isEmpty {
+                    try await Queries.batchSetCheckpointsOnConn(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        runID: claimed.runID,
+                        checkpoints: pendingCheckpoints,
+                        logger: exec.logger
+                    )
+                    // Extend the claim if the run is still RUNNING. For SLEEPING/WAITING
+                    // runs (workflow suspended via sleep/waitForEvent/condition) extendClaim
+                    // returns no rows and throws InternalError.cancelled — the run has already
+                    // transitioned out of RUNNING and sweepExpiredLeases only targets RUNNING
+                    // runs, so no extension is needed. Catch the error so the transaction
+                    // still commits with the checkpoint and history writes intact.
+                    do {
+                        try await Queries.extendClaim(
+                            on: conn,
+                            namespaceID: exec.namespace,
+                            runID: claimed.runID,
+                            extendBySeconds: claimTimeoutSecs,
+                            logger: exec.logger
+                        )
+                    } catch InternalError.cancelled {
+                        // Run already transitioned to SLEEPING/WAITING/PENDING — no lease
+                        // extension needed; checkpoints and history still commit.
+                    }
+                }
+                if !pendingHistory.isEmpty {
+                    try await WorkflowStateQueries.batchAppendHistory(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        events: pendingHistory,
+                        logger: exec.logger
+                    )
+                }
+            }
+        }
+
+        // Non-suspending writes first — accumulated into pendingCheckpoints and written
+        // atomically with history in flushWrites(). The in-memory cache is populated
+        // immediately so fast-path-1 works within the same activation chain.
         let checkpointWrites = commands.compactMap {
             cmd -> (seqNum: Int, name: String?, state: ByteBuffer)? in
             if case .writeCheckpoint(let seqNum, let name, let value) = cmd {
@@ -68,19 +117,9 @@ extension WorkflowRegistration {
             }
             return nil
         }
-        if !checkpointWrites.isEmpty {
-            try await Queries.batchSetCheckpoints(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                runID: claimed.runID,
-                checkpoints: checkpointWrites,
-                extendClaimBySeconds: claimTimeoutSecs,
-                logger: exec.logger
-            )
-            for (seqNum, _, value) in checkpointWrites {
-                activation.cacheCheckpoint(seqNum: seqNum, buffer: value)
-            }
+        for (seqNum, name, value) in checkpointWrites {
+            pendingCheckpoints.append((seqNum: seqNum, name: name, state: value))
+            activation.cacheCheckpoint(seqNum: seqNum, name: name, buffer: value)
         }
 
         // ── 1b. Version marker writes (queryable projection of version checkpoints) ─
@@ -88,13 +127,12 @@ extension WorkflowRegistration {
             if case .recordVersionMarker(let changeID, let value) = cmd { return (changeID, value) }
             return nil
         }
-        for marker in versionMarkerWrites {
-            try await WorkflowStateQueries.writeVersionMarker(
+        if !versionMarkerWrites.isEmpty {
+            try await WorkflowStateQueries.batchWriteVersionMarkers(
                 on: exec.postgres,
                 namespaceID: exec.namespace,
                 taskID: claimed.taskID,
-                changeID: marker.changeID,
-                value: marker.value,
+                markers: versionMarkerWrites,
                 logger: exec.logger
             )
         }
@@ -103,18 +141,9 @@ extension WorkflowRegistration {
         for cmd in commands {
             switch cmd {
             case .timerFired(let timerSeqNum):
-                // Close the SLEEP span that was opened by the corresponding .startTimer command.
-                try? await TraceSpanQueries.closeDurationSpan(
-                    on: exec.postgres,
-                    id: "\(claimed.taskID.uuidString):\(timerSeqNum)",
-                    state: .completed,
-                    finishedAt: Date(),
-                    endEventType: .timerFired,
-                    logger: exec.logger
-                )
-                try await record(.timerFired, nil)
+                record(.timerFired, try? JSON.encode(WorkflowStateQueries.TimerFiredData(seqNum: timerSeqNum)))
             case .eventReceived(let eventName):
-                try await record(.eventReceived, try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
+                record(.eventReceived, try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
             case .eventWaitTimedOut(let eventName, let seqNum):
                 try await Queries.writeEventWaitTimedOut(
                     on: exec.postgres,
@@ -127,15 +156,6 @@ extension WorkflowRegistration {
                     logger: exec.logger
                 )
                 historySeq += 1
-                // Close the WAIT span opened when the event wait was registered.
-                try? await TraceSpanQueries.closeDurationSpan(
-                    on: exec.postgres,
-                    id: "\(claimed.taskID.uuidString):\(seqNum)",
-                    state: .timedOut,
-                    finishedAt: Date(),
-                    endEventType: .eventWaitTimedOut,
-                    logger: exec.logger
-                )
             case .conditionMet(let seqNum):
                 if let seqNum = seqNum {
                     // Timeout variant — write sentinel + history atomically.
@@ -150,18 +170,9 @@ extension WorkflowRegistration {
                         logger: exec.logger
                     )
                     historySeq += 1
-                    // Close the CONDITION span opened when the condition parked.
-                    try? await TraceSpanQueries.closeDurationSpan(
-                        on: exec.postgres,
-                        id: "\(claimed.taskID.uuidString):\(seqNum)",
-                        state: .completed,
-                        finishedAt: Date(),
-                        endEventType: .conditionMet,
-                        logger: exec.logger
-                    )
                 } else {
                     // No-timeout variant — no checkpoint guard, just write history.
-                    try await record(.conditionMet, nil)
+                    record(.conditionMet, nil)
                 }
             case .conditionTimedOut(let seqNum):
                 try await Queries.writeConditionResult(
@@ -175,21 +186,29 @@ extension WorkflowRegistration {
                     logger: exec.logger
                 )
                 historySeq += 1
-                // Close the CONDITION span opened when the condition parked (timed out path).
-                try? await TraceSpanQueries.closeDurationSpan(
-                    on: exec.postgres,
-                    id: "\(claimed.taskID.uuidString):\(seqNum)",
-                    state: .timedOut,
-                    finishedAt: Date(),
-                    endEventType: .conditionTimedOut,
-                    logger: exec.logger
-                )
             case .activityCompleted(let name, let seqNum, let failed):
+                // Write ACTIVITY_STARTED before ACTIVITY_COMPLETED so the history tab shows
+                // the actual queue wait time. Data comes from strand.runs via resolveCompleted —
+                // no extra DB round-trip, no separate connection, no advisory locks.
+                if let startInfo = executor.preloadedStartInfo(for: seqNum) {
+                    record(
+                        .activityStarted,
+                        try? JSON.encode(
+                            WorkflowStateQueries.ActivityStartedData(
+                                activity: name,
+                                seqNum: seqNum,
+                                attempt: startInfo.attempt,
+                                workerID: startInfo.workerID ?? "",
+                                startedAt: startInfo.startedAt
+                            )
+                        )
+                    )
+                }
                 // Record activity completion or failure. runActivity emits this command
                 // exactly once; for successes the accompanying .writeCheckpoint ensures
                 // replays return from fast-path-1 without re-emitting; for failures an
                 // ActivityFailedSentinel checkpoint guards the same invariant.
-                try await record(
+                record(
                     failed ? .activityFailed : .activityCompleted,
                     try? JSON.encode(WorkflowStateQueries.ActivityScheduledData(activity: name, seqNum: seqNum))
                 )
@@ -197,7 +216,7 @@ extension WorkflowRegistration {
                 // Record child workflow completion. runChildWorkflow emits this command
                 // exactly once; the accompanying checkpoint ensures replays return from
                 // fast-path-1 without re-emitting.
-                try await record(
+                record(
                     .childWorkflowCompleted,
                     try? JSON.encode(WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum))
                 )
@@ -219,21 +238,7 @@ extension WorkflowRegistration {
                 )
                 // Record the emission in workflow history so it appears in the trace view.
                 let emitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
-                try await record(.eventEmitted, emitData)
-                // Write-through to trace_spans — instant EMIT span.
-                try? await TraceSpanQueries.insertInstantSpan(
-                    on: exec.postgres,
-                    id: "\(claimed.taskID.uuidString):\(historySeq - 1)",
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    parentID: claimed.taskID.uuidString,
-                    kind: .emit,
-                    name: eventName,
-                    at: Date(),
-                    eventType: .eventEmitted,
-                    seqNum: historySeq - 1,
-                    logger: exec.logger
-                )
+                record(.eventEmitted, emitData)
             default:
                 break
             }
@@ -254,7 +259,8 @@ extension WorkflowRegistration {
                 stateBuffer: finalStateBuf,
                 logger: exec.logger
             )
-            try await record(.workflowCompleted, nil)
+            record(.workflowCompleted, nil)
+            try await flushWrites()
             return try JSON.encode(output)
 
         case .failure(let error):
@@ -274,7 +280,8 @@ extension WorkflowRegistration {
             }
             teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
             let errData = try? JSON.encode(WorkflowStateQueries.WorkflowFailedData(error: String(describing: error)))
-            try await record(.workflowFailed, errData)
+            record(.workflowFailed, errData)
+            try await flushWrites()
             // Stamp the last WorkflowContext call site onto the error.
             if let site = activation.lastCallSite {
                 throw CallSiteAnnotatedError(
@@ -350,6 +357,8 @@ extension WorkflowRegistration {
                             scheduledAt: options.delayUntil,
                             timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
                             heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
+                            scheduleToStartTimeoutSeconds: options.scheduleToStartTimeout.map { Int($0.components.seconds) },
+                            parentClosePolicy: options.cancellationType == .abandon ? .abandon : nil,
                             deadlineAt: options.maxDuration.map { activation.activationTime.addingDuration($0) },
                             fairnessKey: options.fairnessKey,
                             fairnessWeight: options.fairnessWeight,
@@ -374,7 +383,7 @@ extension WorkflowRegistration {
                         WITH r AS (
                             UPDATE strand.runs
                             SET state = \(TaskState.sleeping), available_at = \(wakeAt),
-                                worker_id = NULL, lease_expires_at = NULL
+                                lease_expires_at = NULL
                             WHERE id = \(claimed.runID)
                             RETURNING id
                         )
@@ -384,23 +393,9 @@ extension WorkflowRegistration {
                         logger: exec.logger
                     )
                     let timerData = try? JSON.encode(
-                        WorkflowStateQueries.TimerStartedData(durationMs: Int(wakeAt.timeIntervalSinceNow * 1000))
+                        WorkflowStateQueries.TimerStartedData(durationMs: Int(wakeAt.timeIntervalSinceNow * 1000), seqNum: timerSeqNum)
                     )
-                    try await record(.timerStarted, timerData)
-                    // Write-through to trace_spans — open a SLEEP span (closed by timerFired).
-                    try? await TraceSpanQueries.openDurationSpan(
-                        on: exec.postgres,
-                        id: "\(claimed.taskID.uuidString):\(timerSeqNum)",
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        parentID: claimed.taskID.uuidString,
-                        kind: .sleep,
-                        name: "sleep",
-                        startedAt: Date(),
-                        eventType: .timerStarted,
-                        seqNum: timerSeqNum,
-                        logger: exec.logger
-                    )
+                    record(.timerStarted, timerData)
 
                 case .emitEvent(let eventName, let payload):
                     // Append-only insert; duplicate emits find no active waiters so wakeups
@@ -486,7 +481,6 @@ extension WorkflowRegistration {
                                         available_at  = NOW(),
                                         wake_event    = \(eventName),
                                         event_payload = \(existingPayload),
-                                        worker_id     = NULL,
                                         lease_expires_at = NULL
                                     WHERE id = \(runID)
                                 )
@@ -521,7 +515,6 @@ extension WorkflowRegistration {
                                         available_at  = \(availableAt),
                                         wake_event    = \(eventName),
                                         event_payload = NULL,
-                                        worker_id     = NULL,
                                         lease_expires_at = NULL
                                     WHERE id = \(runID)
                                 )
@@ -532,22 +525,10 @@ extension WorkflowRegistration {
                             )
                         }
                     }
-                    let eventWaitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName, timeoutAt: timeoutAt))
-                    try await record(.eventWaitStarted, eventWaitData)
-                    // Write-through to trace_spans — open a WAIT span (closed by eventReceived/timedOut).
-                    try? await TraceSpanQueries.openDurationSpan(
-                        on: exec.postgres,
-                        id: "\(claimed.taskID.uuidString):\(seqNum)",
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        parentID: claimed.taskID.uuidString,
-                        kind: .wait,
-                        name: eventName,
-                        startedAt: Date(),
-                        eventType: .eventWaitStarted,
-                        seqNum: seqNum,
-                        logger: exec.logger
+                    let eventWaitData = try? JSON.encode(
+                        WorkflowStateQueries.EventWaitStartedData(eventName: eventName, timeoutAt: timeoutAt, seqNum: seqNum)
                     )
+                    record(.eventWaitStarted, eventWaitData)
 
                 case .scheduleChildWorkflow(
                     let name,
@@ -561,7 +542,8 @@ extension WorkflowRegistration {
                     let childFairnessWeight,
                     let childRetryStrategy,
                     let childScheduledAt,
-                    let childDeadlineAt
+                    let childDeadlineAt,
+                    let childParentClosePolicy
                 ):
                     let targetQueue = childQueue ?? exec.queue
                     pendingChildren.append(
@@ -580,6 +562,8 @@ extension WorkflowRegistration {
                             scheduledAt: childScheduledAt,
                             timeoutSeconds: nil,
                             heartbeatTimeoutSeconds: nil,
+                            scheduleToStartTimeoutSeconds: nil,
+                            parentClosePolicy: childParentClosePolicy,
                             deadlineAt: childDeadlineAt,
                             fairnessKey: childFairnessKey,
                             fairnessWeight: childFairnessWeight,
@@ -618,18 +602,9 @@ extension WorkflowRegistration {
                     children: pendingChildren,
                     logger: exec.logger
                 )
-                // Append workflow history for all children (preserves submission order).
-                for historyItem in childHistoryItems {
-                    try await WorkflowStateQueries.appendHistory(
-                        on: exec.postgres,
-                        namespaceID: exec.namespace,
-                        taskID: claimed.taskID,
-                        seq: historySeq,
-                        eventType: historyItem.eventType,
-                        eventData: historyItem.eventData,
-                        logger: exec.logger
-                    )
-                    historySeq += 1
+                // Accumulate child history events — flushed with the activation batch.
+                for item in childHistoryItems {
+                    record(item.eventType, item.eventData)
                 }
             }
         }
@@ -670,7 +645,7 @@ extension WorkflowRegistration {
                             available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
                                                THEN NOW()
                                                ELSE \(wakeAt) END,
-                            worker_id = NULL, lease_expires_at = NULL
+                            lease_expires_at = NULL
                         WHERE id = \(condRunID)
                         RETURNING state
                     )
@@ -697,7 +672,7 @@ extension WorkflowRegistration {
                             available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
                                                THEN NOW()
                                                ELSE available_at END,
-                            worker_id = NULL, lease_expires_at = NULL
+                            lease_expires_at = NULL
                         WHERE id = \(condRunID)
                         RETURNING state
                     )
@@ -728,22 +703,7 @@ extension WorkflowRegistration {
             // If pending signals sent us straight to PENDING the workflow never
             // entered a wait — recording the event would mislead the history view.
             if conditionState != .pending {
-                let condSpanSeq = historySeq
-                try await record(.conditionWaiting, nil)
-                // Write-through to trace_spans — open a CONDITION span (closed by conditionMet/TimedOut).
-                try? await TraceSpanQueries.openDurationSpan(
-                    on: exec.postgres,
-                    id: "\(claimed.taskID.uuidString):\(condSpanSeq)",
-                    namespaceID: exec.namespace,
-                    taskID: claimed.taskID,
-                    parentID: claimed.taskID.uuidString,
-                    kind: .condition,
-                    name: "condition",
-                    startedAt: Date(),
-                    eventType: .conditionWaiting,
-                    seqNum: condSpanSeq,
-                    logger: exec.logger
-                )
+                record(.conditionWaiting, nil)
             }
         }
         // No else branch: if scheduleCommands is empty and no conditions remain,
@@ -797,7 +757,6 @@ extension WorkflowRegistration {
                                                THEN NOW()
                                                ELSE available_at END,
                         has_buffered_completion = FALSE,   -- reset regardless: either consumed (PENDING) or already caught by flag
-                        worker_id        = NULL,
                         lease_expires_at = NULL
                     WHERE id = \(claimed.runID)
                     RETURNING state
@@ -847,7 +806,6 @@ extension WorkflowRegistration {
                     UPDATE strand.runs
                     SET state        = \(TaskState.pending),
                         available_at = NOW(),
-                        worker_id    = NULL,
                         lease_expires_at = NULL
                     WHERE id    = \(claimed.runID)
                       AND state = \(TaskState.waiting)
@@ -882,6 +840,7 @@ extension WorkflowRegistration {
         //
         // For the cached path: cache.set is idempotent — it simply refreshes the
         // same references already stored from the previous activation.
+        try await flushWrites()
         cache.set(
             claimed.taskID,
             _WorkflowTaskCache<W>.CachedState(

@@ -250,18 +250,21 @@ package enum WorkflowStateQueries {
         logger: Logger
     ) async throws -> [(
         seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
-        state: TaskState, kind: TaskKind, name: String
+        state: TaskState, kind: TaskKind, name: String,
+        startedAt: Date?, runAttempt: Int, workerID: String?
     )] {
         let prefix = "\(parentTaskID):"
         let prefixPattern = prefix + "%"
         let stream = try await postgres.query(
             """
             SELECT t.idempotency_key, tc.result, tc.state,
-                   r.failure_reason, t.kind, t.name
+                   r.failure_reason, t.kind, t.name,
+                   r.started_at, r.attempt, r.worker_id
             FROM strand.task_completions tc
             JOIN strand.tasks t ON t.id = tc.task_id
             LEFT JOIN LATERAL (
-                SELECT failure_reason FROM strand.runs
+                SELECT failure_reason, started_at, attempt, worker_id
+                FROM strand.runs
                 WHERE task_id = t.id
                 ORDER BY attempt DESC LIMIT 1
             ) r ON true
@@ -275,7 +278,8 @@ package enum WorkflowStateQueries {
         var completions:
             [(
                 seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
-                state: TaskState, kind: TaskKind, name: String
+                state: TaskState, kind: TaskKind, name: String,
+                startedAt: Date?, runAttempt: Int, workerID: String?
             )] = []
         for try await row in stream {
             var col = row.makeIterator()
@@ -285,6 +289,9 @@ package enum WorkflowStateQueries {
             let failureReason = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let kindRaw = try col.next()!.decode(String.self, context: .default)
             let taskName = try col.next()!.decode(String.self, context: .default)
+            let startedAt = try col.next()!.decode(Date?.self, context: .default)
+            let runAttemptOpt = try col.next()!.decode(Int?.self, context: .default)
+            let workerID = try col.next()!.decode(String?.self, context: .default)
             guard idempotencyKey.hasPrefix(prefix),
                 let seqNum = Int(String(idempotencyKey.dropFirst(prefix.count))),
                 let state = TaskState(rawValue: stateRaw),
@@ -293,7 +300,8 @@ package enum WorkflowStateQueries {
             completions.append(
                 (
                     seqNum: seqNum, result: result, failureReason: failureReason,
-                    state: state, kind: kind, name: taskName
+                    state: state, kind: kind, name: taskName,
+                    startedAt: startedAt, runAttempt: runAttemptOpt ?? 1, workerID: workerID
                 )
             )
         }
@@ -335,6 +343,7 @@ package enum WorkflowStateQueries {
         case activityScheduled = "ACTIVITY_SCHEDULED"
         case activityCompleted = "ACTIVITY_COMPLETED"
         case activityFailed = "ACTIVITY_FAILED"
+        case activityStarted = "ACTIVITY_STARTED"
         case timerStarted = "TIMER_STARTED"
         case timerFired = "TIMER_FIRED"
         case conditionWaiting = "CONDITION_WAITING"
@@ -372,6 +381,27 @@ package enum WorkflowStateQueries {
         }
     }
 
+    /// Payload for `ACTIVITY_STARTED`.
+    ///
+    /// JSON shape: `{"activity":"ChargeCardActivity","seq_num":4,"attempt":2,"worker_id":"host:1234"}`.
+    /// `seq_num` correlates with the matching `ACTIVITY_SCHEDULED` event.
+    package struct ActivityStartedData: Encodable {
+        package let activity: String
+        /// `nil` when the event_wait was already deleted (activity cancelled before starting).
+        package let seqNum: Int?
+        package let attempt: Int
+        package let workerID: String
+        package let startedAt: Date?
+
+        private enum CodingKeys: String, CodingKey {
+            case activity
+            case seqNum = "seq_num"
+            case attempt
+            case workerID = "worker_id"
+            case startedAt = "started_at"
+        }
+    }
+
     /// Payload for `CHILD_WORKFLOW_STARTED` and `CHILD_WORKFLOW_COMPLETED`.
     ///
     /// JSON shape: `{"workflow":"OrderWorkflow","seq_num":"3"}`.
@@ -391,38 +421,60 @@ package enum WorkflowStateQueries {
         }
     }
 
-    /// Payload for `EVENT_WAIT_STARTED`, `EVENT_RECEIVED`, and `EVENT_WAIT_TIMED_OUT`.
+    /// Payload for `EVENT_WAIT_STARTED`.
     ///
-    /// JSON shape: `{"event_name":"order.approved"}` for received/timed-out rows;
-    /// `{"event_name":"order.approved","timeout_at":"2026-05-12T06:27:54Z"}` for
-    /// started rows where a deadline was configured. `timeout_at` is omitted when
-    /// `waitForEvent` was called without a timeout (`nil`).
-    package struct NamedEventData: Codable {
+    /// Written when `context.waitForEvent(_:)` registers a new wait. Contains the
+    /// activation step counter so `deriveHistorySpans` can pair this event with the
+    /// matching `EVENT_RECEIVED` or `EVENT_WAIT_TIMED_OUT` when concurrent event
+    /// waits exist (e.g. two `waitForEvent` calls inside a `withThrowingTaskGroup`).
+    package struct EventWaitStartedData: Codable {
         package let eventName: String
-        /// Absolute deadline passed to `waitForEvent(timeout:)`. Nil when no
-        /// timeout was set. Written only on `EVENT_WAIT_STARTED` rows.
         package let timeoutAt: Date?
-
-        package init(eventName: String, timeoutAt: Date? = nil) {
-            self.eventName = eventName
-            self.timeoutAt = timeoutAt
-        }
+        /// Activation step counter — always present.
+        package let seqNum: Int
 
         private enum CodingKeys: String, CodingKey {
             case eventName = "event_name"
             case timeoutAt = "timeout_at"
+            case seqNum = "seq_num"
+        }
+    }
+
+    /// Payload for `EVENT_RECEIVED`, `EVENT_WAIT_TIMED_OUT`, and `EVENT_EMITTED`.
+    package struct NamedEventData: Codable {
+        package let eventName: String
+
+        private enum CodingKeys: String, CodingKey {
+            case eventName = "event_name"
         }
     }
 
     /// Payload for `TIMER_STARTED`.
     ///
-    /// JSON shape: `{"duration_ms":5000}` — stored as a JSON number so the
-    /// dashboard can display it without parsing.
+    /// JSON shape: `{"duration_ms":5000,"seq_num":3}`. The `seq_num` is the activation
+    /// step counter; it pairs with the matching `TIMER_FIRED` row so `deriveHistorySpans`
+    /// can reconstruct SLEEP spans when concurrent timers are active.
     package struct TimerStartedData: Codable {
         package let durationMs: Int
+        /// Activation step counter — always present.
+        package let seqNum: Int
 
         private enum CodingKeys: String, CodingKey {
             case durationMs = "duration_ms"
+            case seqNum = "seq_num"
+        }
+    }
+
+    /// Payload for `TIMER_FIRED`.
+    ///
+    /// JSON shape: `{"seq_num":3}`. Matches `TimerStartedData.seqNum` to close the
+    /// corresponding SLEEP span in `deriveHistorySpans`.
+    package struct TimerFiredData: Codable {
+        /// Activation step counter matching `TimerStartedData.seqNum`.
+        package let seqNum: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case seqNum = "seq_num"
         }
     }
 
@@ -564,18 +616,118 @@ package enum WorkflowStateQueries {
             )
             return
         }
-        try await postgres.withTransaction(logger: logger) { conn in
-            for e in events {
-                try await conn.query(
-                    """
-                    INSERT INTO strand.workflow_history (namespace_id, task_id, seq, event_type, event_data)
-                    VALUES (\(namespaceID), \(taskID), \(e.seq), \(e.eventType), \(e.eventData))
-                    ON CONFLICT (task_id, seq) DO NOTHING
-                    """,
-                    logger: logger
-                )
-            }
+        // Multi-row VALUES INSERT — one round-trip regardless of N events.
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 140 + events.count * 80,
+            interpolationCount: events.count * 5 + 2
+        )
+        interp.appendLiteral(
+            "INSERT INTO strand.workflow_history "
+                + "(namespace_id, task_id, seq, event_type, event_data) VALUES "
+        )
+        for (i, e) in events.enumerated() {
+            if i > 0 { interp.appendLiteral(", ") }
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(e.seq)
+            interp.appendLiteral(", ")
+            try interp.appendInterpolation(e.eventType)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(e.eventData)
+            interp.appendLiteral(")")
         }
+        interp.appendLiteral(" ON CONFLICT (task_id, seq) DO NOTHING")
+        try await postgres.query(PostgresQuery(stringInterpolation: interp), logger: logger)
+    }
+
+    /// Connection variant of ``batchAppendHistory`` for use inside an existing transaction.
+    /// Called from `flushWrites()` alongside `batchSetCheckpointsOnConn` so checkpoints
+    /// and history commit atomically.
+    package static func batchAppendHistory(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        taskID: UUID,
+        events: [(seq: Int, eventType: HistoryEventType, eventData: ByteBuffer?)],
+        logger: Logger
+    ) async throws {
+        guard !events.isEmpty else { return }
+        if events.count == 1 {
+            let e = events[0]
+            try await appendHistory(
+                on: conn,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                seq: e.seq,
+                eventType: e.eventType,
+                eventData: e.eventData,
+                logger: logger
+            )
+            return
+        }
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 140 + events.count * 80,
+            interpolationCount: events.count * 5 + 2
+        )
+        interp.appendLiteral(
+            "INSERT INTO strand.workflow_history "
+                + "(namespace_id, task_id, seq, event_type, event_data) VALUES "
+        )
+        for (i, e) in events.enumerated() {
+            if i > 0 { interp.appendLiteral(", ") }
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(e.seq)
+            interp.appendLiteral(", ")
+            try interp.appendInterpolation(e.eventType)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(e.eventData)
+            interp.appendLiteral(")")
+        }
+        interp.appendLiteral(" ON CONFLICT (task_id, seq) DO NOTHING")
+        try await conn.query(PostgresQuery(stringInterpolation: interp), logger: logger)
+    }
+
+    /// Load history events for multiple workflow tasks in one round-trip.
+    ///
+    /// Used by the `/trace` route to batch-load history for all WORKFLOW spans
+    /// in a trace tree instead of issuing K separate `listHistory` calls.
+    /// The existing PRIMARY KEY `(task_id, seq)` on `strand.workflow_history`
+    /// covers `WHERE task_id = ANY(...)` via per-value range scans — no new index needed.
+    package static func batchListHistory(
+        on postgres: PostgresClient,
+        taskIDs: [UUID],
+        logger: Logger
+    ) async throws -> [UUID: [HistoryEventRow]] {
+        guard !taskIDs.isEmpty else { return [:] }
+        let stream = try await postgres.query(
+            """
+            SELECT task_id, seq, event_type, event_data, created_at
+            FROM   strand.workflow_history
+            WHERE  task_id = ANY(\(taskIDs))
+            ORDER  BY task_id, seq ASC
+            """,
+            logger: logger
+        )
+        var result: [UUID: [HistoryEventRow]] = [:]
+        for try await row in stream {
+            var col = row.makeIterator()
+            let taskID = try col.next()!.decode(UUID.self, context: .default)
+            let seq = try col.next()!.decode(Int.self, context: .default)
+            let rawType = try col.next()!.decode(String.self, context: .default)
+            let eventData = try col.next()!.decode(ByteBuffer?.self, context: .default)
+            let createdAt = try col.next()!.decode(Date.self, context: .default)
+            guard let eventType = HistoryEventType(rawValue: rawType) else { continue }
+            result[taskID, default: []].append(
+                HistoryEventRow(seq: seq, eventType: eventType, eventData: eventData, createdAt: createdAt)
+            )
+        }
+        return result
     }
 }
 
@@ -603,6 +755,56 @@ extension WorkflowStateQueries {
             """,
             logger: logger
         )
+    }
+
+    /// Writes multiple version markers in a single round-trip.
+    /// Falls back to `writeVersionMarker` for the single-marker case to avoid
+    /// the StringInterpolation overhead when N = 1.
+    package static func batchWriteVersionMarkers(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        markers: [(changeID: String, value: Bool)],
+        logger: Logger
+    ) async throws {
+        guard !markers.isEmpty else { return }
+        if markers.count == 1 {
+            let m = markers[0]
+            try await writeVersionMarker(
+                on: postgres,
+                namespaceID: namespaceID,
+                taskID: taskID,
+                changeID: m.changeID,
+                value: m.value,
+                logger: logger
+            )
+            return
+        }
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 120 + markers.count * 60,
+            interpolationCount: markers.count * 3 + 2
+        )
+        interp.appendLiteral(
+            "INSERT INTO strand.workflow_version_markers "
+                + "(namespace_id, task_id, change_id, value, marked_at) VALUES "
+        )
+        for (i, m) in markers.enumerated() {
+            if i > 0 { interp.appendLiteral(", ") }
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(m.changeID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(m.value)
+            interp.appendLiteral(", NOW())")
+        }
+        interp.appendLiteral(
+            " ON CONFLICT (task_id, change_id) "
+                + "DO UPDATE SET value = EXCLUDED.value, marked_at = NOW()"
+        )
+        try await postgres.query(PostgresQuery(stringInterpolation: interp), logger: logger)
     }
 
     package struct VersionMarkerRow: Sendable {

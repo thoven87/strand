@@ -367,11 +367,50 @@ extension TaskState: PostgresCodable {
 
 /// Options for in-process local activity execution.
 ///
-/// Local activities run on the same worker process as the workflow, within the
-/// same activation — no DB task row, no queue round-trip. If the activity
-/// fails the whole activation fails (no independent retry).
+/// Configuration options for local activity execution within a workflow.
+///
+/// Local activities run in-process on the same worker that schedules them —
+/// no queue round-trip, no independent retry. These options control the
+/// execution budget and retry behaviour.
 public struct LocalActivityOptions: Sendable {
-    public init() {}
+    /// Maximum time for each individual execution attempt.
+    ///
+    /// If the activity has not returned within this window the attempt is
+    /// cancelled and (if retries remain) retried. `nil` means no per-attempt cap.
+    public var timeout: Duration?
+
+    /// Maximum total wall-clock time from scheduling to permanent completion
+    /// across all retry attempts.
+    ///
+    /// `nil` means no total budget.
+    public var maxDuration: Duration?
+
+    /// Maximum execution attempts before the activity is marked permanently failed.
+    ///
+    /// `nil` = no attempt cap (retries indefinitely on failure within `maxDuration`).
+    public var maxAttempts: Int?
+
+    /// Retry policy on failure. `nil` uses the worker default (exponential backoff).
+    public var retryStrategy: RetryStrategy?
+
+    /// How the workflow handles cancellation of this local activity.
+    ///
+    /// Defaults to `.tryCancel`.
+    public var cancellationType: ActivityCancellationType
+
+    public init(
+        timeout: Duration? = nil,
+        maxDuration: Duration? = nil,
+        maxAttempts: Int? = nil,
+        retryStrategy: RetryStrategy? = nil,
+        cancellationType: ActivityCancellationType = .tryCancel
+    ) {
+        self.timeout = timeout
+        self.maxDuration = maxDuration
+        self.maxAttempts = maxAttempts
+        self.retryStrategy = retryStrategy
+        self.cancellationType = cancellationType
+    }
 }
 
 public struct TaskFailure: Sendable, Codable {

@@ -1,6 +1,6 @@
 public import Logging  // Logger in ActivityContext.logger is public API
 package import NIOCore  // ByteBuffer is part of the package-internal interface (_heartbeatImpl signature, init heartbeatDetailsBuffer)
-import PostgresNIO  // PostgresClient captured in heartbeatImpl closure; internal to _run()
+public import PostgresNIO  // PostgresClient captured in heartbeatImpl closure; internal to _run(); public import required for PostgresCodable conformances
 import Synchronization  // Mutex<Bool> for _ActivityCancellationFlag
 import Tracing
 
@@ -27,6 +27,52 @@ public struct StrandVoid: Codable, Sendable, Equatable {
     /// The single shared instance. Return this from your activity handler.
     public static let done = StrandVoid()
     public init() {}
+}
+
+// MARK: - ActivityCancellationType
+
+/// How the workflow handles cancellation propagation to an activity.
+///
+/// - `.tryCancel`: Send a cancellation request; the workflow continues without
+///   waiting for the activity to acknowledge. Default.
+/// - `.waitCancellationCompleted`: Send cancellation and wait for the activity
+///   to finish before the workflow proceeds.
+/// - `.abandon`: Do not send cancellation to this activity when the workflow
+///   is cancelled. The activity runs to completion independently.
+///
+/// `.abandon` is enforced: activities with this type are excluded from the
+/// `cancelTask` cascade when the parent workflow is cancelled or fails.
+/// `.waitCancellationCompleted` propagation semantics are planned for a future
+/// milestone.
+public enum ActivityCancellationType: String, Sendable, Codable {
+    case tryCancel = "TRY_CANCEL"
+    case waitCancellationCompleted = "WAIT_CANCELLATION_COMPLETED"
+    case abandon = "ABANDON"
+}
+
+extension ActivityCancellationType: PostgresCodable {
+    public static var psqlType: PostgresDataType { .text }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let value = ActivityCancellationType(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = value
+    }
 }
 
 // MARK: - ActivityOptions
@@ -87,10 +133,28 @@ public struct ActivityOptions: Sendable {
     /// Key-value metadata forwarded with the activity task (e.g. trace IDs).
     public var headers: [String: String]
 
-    /// Deduplication key. If an activity with this key already exists the
-    /// existing task ID is returned instead of creating a new one.
-    /// `nil` = auto-generated from parent task UUID + call-site counter.
-    public var idempotencyKey: String?
+    /// Stable identifier for this activity execution.
+    ///
+    /// Used for deduplication: if an activity with this key already exists in the
+    /// same workflow, the existing task ID is returned instead of creating a new one.
+    /// When `nil` (default) Strand auto-generates `"<workflowTaskID>:<seqNum>"` — a
+    /// stable key that is the same on every replay of the same call site.
+    public var id: String?
+
+    /// Maximum time an activity can wait in the queue before being picked up by a worker.
+    ///
+    /// When exceeded the activity fails immediately rather than waiting indefinitely.
+    /// Useful for detecting worker pool exhaustion.
+    ///
+    /// > Note: Enforcement requires a schema migration (`schedule_to_start_timeout_seconds`
+    /// > column on `strand.tasks`). The field is accepted and stored; the timeout is not
+    /// > yet enforced at the database level.
+    public var scheduleToStartTimeout: Duration?
+
+    /// How the workflow handles cancellation of this activity.
+    ///
+    /// Defaults to `.tryCancel` — sends a cancel signal and continues immediately.
+    public var cancellationType: ActivityCancellationType
 
     /// Automatic cancellation policy for this activity.
     public var cancellation: CancellationPolicy?
@@ -107,8 +171,10 @@ public struct ActivityOptions: Sendable {
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
         headers: [String: String] = [:],
-        idempotencyKey: String? = nil,
-        cancellation: CancellationPolicy? = nil
+        id: String? = nil,
+        cancellation: CancellationPolicy? = nil,
+        scheduleToStartTimeout: Duration? = nil,
+        cancellationType: ActivityCancellationType = .tryCancel
     ) {
         self.timeout = timeout
         self.heartbeatTimeout = heartbeatTimeout
@@ -121,8 +187,10 @@ public struct ActivityOptions: Sendable {
         self.fairnessKey = fairnessKey
         self.fairnessWeight = max(fairnessWeight, 0.001)
         self.headers = headers
-        self.idempotencyKey = idempotencyKey
+        self.id = id
         self.cancellation = cancellation
+        self.scheduleToStartTimeout = scheduleToStartTimeout
+        self.cancellationType = cancellationType
     }
 }
 
