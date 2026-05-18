@@ -94,15 +94,9 @@ private struct RequestCancelChildWorkflow: Workflow {
         context: WorkflowContext<Self>,
         input: StrandVoid
     ) async throws -> String {
-        // Wait for the cooperative cancel signal (parent closed with .requestCancel).
-        // The predicate captures `context` whose _impl is the same _WorkflowActivation
-        // class instance across all activations — mutations to isCancelRequested are
-        // immediately visible when the condition is re-evaluated after signal delivery.
-        let met = try await context.condition(
-            { _ in context.isCancelRequested },
-            timeout: .seconds(10)
-        )
-        return met ? "cancelled" : "timeout"
+        // Block until the parent requests cooperative cancellation.
+        try await context.waitForCancellation()
+        return "cancelled"
     }
 }
 

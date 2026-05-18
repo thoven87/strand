@@ -399,22 +399,57 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// The flag is set at activation start when the claimed run has `cancel_requested = true`.
     /// It is sticky — once set it is never cleared for the lifetime of this workflow.
     ///
-    /// Two mechanisms work together:
-    /// - **`isCancelRequested` flag** (this property): readable from `condition` predicates,
-    ///   which run in the worker-task context outside the handler Task.
-    /// - **`handlerTask.cancel()`**: causes `try Task.checkCancellation()` gates at
-    ///   slow-path suspension points in `runActivity`, `sleep`, and `waitForEvent` to throw
-    ///   `CancellationError` natively inside the handler Task.
-    ///
-    /// Use in `condition` to detect and respond to the request gracefully:
+    /// Prefer ``waitForCancellation()`` over checking this property inline; reserve
+    /// `isCancelRequested` for mixing with other conditions:
     /// ```swift
-    /// try await context.condition({ _ in context.isCancelRequested })
-    /// // perform cleanup, then return normally
+    /// try await context.condition { $0.isPaused || context.isCancelRequested }
     /// ```
     ///
     /// Unlike hard `cancelTask()`, `requestCancel` is fully cooperative:
     /// the workflow continues running until it returns or throws.
     public var isCancelRequested: Bool { _impl.isCancelRequested }
+
+    /// Suspends the workflow until the parent requests cooperative cancellation
+    /// (`ChildWorkflowOptions.parentClosePolicy = .requestCancel`).
+    ///
+    /// **This call suspends the entire handler.** The workflow parks in `WAITING`
+    /// state and no activities can run until `isCancelRequested` is set.  Only
+    /// use it in one of two situations:
+    ///
+    /// **1. Pure waiting workflow** — the workflow's only job is to wait:
+    /// ```swift
+    /// try await context.waitForCancellation()
+    /// return .cleanedUp
+    /// ```
+    ///
+    /// **2. Racing inside a task group** — unblocks as soon as cancel arrives,
+    /// aborting concurrent activities:
+    /// ```swift
+    /// try await withThrowingTaskGroup(of: ...) { group in
+    ///     for item in items {
+    ///         group.addTask { try await context.runActivity(..., input: item) }
+    ///     }
+    ///     group.addTask {
+    ///         try await context.waitForCancellation()
+    ///         throw CancellationError()   // abort the group
+    ///     }
+    ///     for try await result in group { ... }
+    /// }
+    /// ```
+    ///
+    /// **For sequential activity pipelines, use an inline check instead** —
+    /// it is synchronous (no suspension) and lets you return a meaningful result:
+    /// ```swift
+    /// let charge = try await context.runActivity(ChargePayment.self, input: ...)
+    /// if context.isCancelRequested { return .cancelled }   // ← zero-cost check
+    /// let fulfillment = try await context.runActivity(FulfillOrder.self, input: ...)
+    /// ```
+    public func waitForCancellation() async throws {
+        // Capture `_impl` (the class reference) so the closure reads the live
+        // value of `isCancelRequested` on each evaluation, not a snapshot.
+        let impl = _impl
+        try await condition { _ in impl.isCancelRequested }
+    }
 
     /// Scheduling metadata injected by ``StrandScheduler`` when this workflow was
     /// triggered by a schedule. `nil` when enqueued directly via ``StrandClient``.
