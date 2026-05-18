@@ -643,11 +643,17 @@ enum Queries {
                 -- Sticky affinity: within the same priority band, prefer runs this
                 -- worker last processed. The cached handler Task is more likely to
                 -- be in memory on that worker, avoiding a fresh-path replay.
-                -- Falls back to fairness-weighted random when worker_id = NULL (new
-                -- tasks) or when the run belongs to a different worker.
+                -- Fairness-weighted random is the primary ordering within a priority
+                -- band: dividing by fairness_weight means higher-weight keys are
+                -- statistically first, providing the starve-free frontier guarantee.
+                -- Sticky affinity (prefer runs last processed by this worker) is a
+                -- secondary tiebreaker that must come AFTER fairness-weighted random
+                -- so it cannot override the fairness guarantee. In practice random()
+                -- produces unique values so sticky rarely fires here; its main benefit
+                -- is reducing cache misses when the candidate pool has no fairness keys.
                 ORDER BY r.priority ASC,
-                         CASE WHEN r.worker_id = \(workerID) THEN 0 ELSE 1 END ASC,
                          (random() / GREATEST(r.fairness_weight, 0.001)) ASC,
+                         CASE WHEN r.worker_id = \(workerID) THEN 0 ELSE 1 END ASC,
                          r.available_at,
                          r.id
                 LIMIT \(qty)
