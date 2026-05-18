@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     heartbeat_timeout_seconds INTEGER,        -- max seconds between heartbeats; NULL = claimTimeout
     schedule_to_start_timeout_seconds INTEGER, -- max seconds waiting in queue before failing; NULL = no cap
     parent_close_policy TEXT,                  -- TERMINATE|ABANDON|REQUEST_CANCEL; NULL = TERMINATE (default)
+    cancel_requested    BOOLEAN NOT NULL DEFAULT FALSE,  -- set by cancelDescendants when parent closes with REQUEST_CANCEL
     idempotency_key TEXT,
 
     -- Dispatch routing

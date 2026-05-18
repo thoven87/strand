@@ -355,6 +355,9 @@ package enum WorkflowStateQueries {
         case childWorkflowStarted = "CHILD_WORKFLOW_STARTED"
         case childWorkflowCompleted = "CHILD_WORKFLOW_COMPLETED"
         case eventEmitted = "EVENT_EMITTED"  // ctx.emitEvent(...)
+        /// Workflow closed cooperatively after receiving a REQUEST_CANCEL from its parent.
+        /// Written in `applyScheduleCommands` when the handler exits via `CancellationError`.
+        case workflowCancelled = "WORKFLOW_CANCELLED"
     }
 
     // MARK: - History event data payloads

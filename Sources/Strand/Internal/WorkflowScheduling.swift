@@ -64,6 +64,10 @@ extension WorkflowRegistration {
         // Atomicity guarantee: if the transaction fails the next fresh-path activation
         // replays fully — fast-path-1 does not trigger because no checkpoint exists —
         // and both are written correctly on the retry.
+        //
+        // Clears pendingCheckpoints and pendingHistory after a successful commit so that
+        // flushWrites() can be called multiple times (once combined with a state transition
+        // in step 7, once at step 8 for any remaining items) without double-writing.
         func flushWrites() async throws {
             guard !pendingCheckpoints.isEmpty || !pendingHistory.isEmpty else { return }
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
@@ -105,6 +109,9 @@ extension WorkflowRegistration {
                     )
                 }
             }
+            // Clear after successful commit so double-calling is safe (no duplicate writes).
+            pendingCheckpoints.removeAll()
+            pendingHistory.removeAll()
         }
 
         // Non-suspending writes first — accumulated into pendingCheckpoints and written
@@ -278,6 +285,49 @@ extension WorkflowRegistration {
                 teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
                 throw signal
             }
+            // CancellationError means the workflow received a cooperative cancel request
+            // (parentClosePolicy = .requestCancel from a closing parent). The handler
+            // Task was cancelled via handlerTask.cancel(); the first new suspension point
+            // threw CancellationError. Transition to CANCELLED — not FAILED — and
+            // unblock any awaitTaskResult callers.
+            //
+            // Distinct from worker-shutdown CancellationError (which propagates from
+            // applyScheduleCommands' own await points, never reaching this branch).
+            if error is CancellationError {
+                teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
+                record(.workflowCancelled, nil)
+                try await flushWrites()
+                // Transition run + task to CANCELLED and wake awaitTaskResult callers.
+                try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                    try await conn.query(
+                        """
+                        WITH r AS (
+                            UPDATE strand.runs
+                            SET state = \(TaskState.cancelled), finished_at = NOW()
+                            WHERE id          = \(claimed.runID)
+                              AND state       = \(TaskState.running)
+                        )
+                        UPDATE strand.tasks
+                        SET state        = \(TaskState.cancelled),
+                            cancelled_at = NOW()
+                        WHERE id          = \(claimed.taskID)
+                          AND state NOT IN (
+                              \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                          )
+                        """,
+                        logger: exec.logger
+                    )
+                    try await Queries.emitTaskCompletionSignal(
+                        conn: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        state: .cancelled,
+                        resultBuffer: nil,
+                        logger: exec.logger
+                    )
+                }
+                return nil
+            }
             teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
             let errData = try? JSON.encode(WorkflowStateQueries.WorkflowFailedData(error: String(describing: error)))
             record(.workflowFailed, errData)
@@ -375,19 +425,32 @@ extension WorkflowRegistration {
                     )
 
                 case .startTimer(let wakeAt, let timerSeqNum):
-                    // Transition run to SLEEPING. Both UPDATEs are one SQL statement
-                    // (data-modifying CTE) so PostgreSQL commits them atomically —
-                    // no explicit BEGIN/COMMIT wrapper needed.
+                    // Transition run to SLEEPING. If signals are already pending (e.g. a
+                    // REQUEST_CANCEL was inserted while this activation was running), go PENDING
+                    // instead so the signal is delivered at the next activation rather than
+                    // waiting until the timer fires.
                     try await exec.postgres.query(
                         """
-                        WITH r AS (
+                        WITH
+                        pending_sigs AS (
+                            SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                            WHERE task_id     = \(claimed.taskID)
+                              AND namespace_id = \(exec.namespace)
+                        ),
+                        r AS (
                             UPDATE strand.runs
-                            SET state = \(TaskState.sleeping), available_at = \(wakeAt),
+                            SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                   THEN \(TaskState.pending)
+                                                   ELSE \(TaskState.sleeping) END,
+                                available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                   THEN NOW()
+                                                   ELSE \(wakeAt) END,
                                 lease_expires_at = NULL
                             WHERE id = \(claimed.runID)
-                            RETURNING id
+                            RETURNING state
                         )
-                        UPDATE strand.tasks SET state = \(TaskState.sleeping)
+                        UPDATE strand.tasks
+                        SET state = (SELECT state FROM r)
                         WHERE id = \(claimed.taskID)
                         """,
                         logger: exec.logger
@@ -504,21 +567,38 @@ extension WorkflowRegistration {
                             try await conn.notifyWorkers(namespace: exec.namespace, queue: queueName, logger: exec.logger)
                         } else {
                             // Event not yet emitted — set run to WAITING (or SLEEPING for timed waits).
+                            // If signals are already pending (e.g. a REQUEST_CANCEL arrived while
+                            // this activation was running), go PENDING instead so the signal is
+                            // delivered promptly rather than waiting for the event or timer.
                             let availableAt =
                                 timeoutAt ?? Date(timeIntervalSince1970: 32_503_680_000)
                             let runState: TaskState = timeoutAt != nil ? .sleeping : .waiting
                             try await conn.query(
                                 """
-                                WITH r AS (
+                                WITH
+                                pending_sigs AS (
+                                    SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                                    WHERE task_id     = \(taskID)
+                                      AND namespace_id = \(exec.namespace)
+                                ),
+                                r AS (
                                     UPDATE strand.runs
-                                    SET state        = \(runState),
-                                        available_at  = \(availableAt),
-                                        wake_event    = \(eventName),
+                                    SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                           THEN \(TaskState.pending)
+                                                           ELSE \(runState) END,
+                                        available_at  = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                           THEN NOW()
+                                                           ELSE \(availableAt) END,
+                                        wake_event    = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                           THEN NULL
+                                                           ELSE \(eventName) END,
                                         event_payload = NULL,
                                         lease_expires_at = NULL
                                     WHERE id = \(runID)
+                                    RETURNING state
                                 )
-                                UPDATE strand.tasks SET state = \(runState)
+                                UPDATE strand.tasks
+                                SET state = (SELECT state FROM r)
                                 WHERE id = \(taskID)
                                 """,
                                 logger: exec.logger
@@ -609,6 +689,13 @@ extension WorkflowRegistration {
             }
         }
 
+        // ── 6–7. State transition + history atomicity invariant ──────────────────────
+        // The run MUST stay RUNNING in Postgres until both checkpoints and history
+        // are durable.  Steps 6 and 7 therefore merge their state-transition SQL
+        // inside the same withTransaction as the checkpoint/history writes, so no
+        // other worker can claim the run before the current activation's writes commit.
+        var needsNotifyAfterFlush = false
+
         // ── 6. Unsatisfied conditions ────────────────────────────────────────────────────
         // Any conditions not satisfied post-drain need a DB state transition so
         // the worker releases this run until a signal or timer wakes it.
@@ -620,91 +707,109 @@ extension WorkflowRegistration {
             let condTaskID = claimed.taskID
             let condRunID = claimed.runID
 
-            // Both branches use the same post-CTE logic: read the final state from
-            // RETURNING, then notify only if PENDING and write history only if
-            // the run actually parked (SLEEPING or WAITING).
-            //
-            // If a signal arrived while the run was RUNNING it couldn't flip the run
-            // directly (the signal UPDATE only matches SLEEPING/WAITING). The
-            // pending_sigs CTE catches that race: if workflow_signals already has rows
-            // for this task we go straight to PENDING rather than parking.
-            let condStateStream: PostgresRowSequence
-            if let wakeAt = executor.conditionMinWakeAt {
-                condStateStream = try await exec.postgres.query(
-                    """
-                    WITH
-                    pending_sigs AS (
-                        SELECT COUNT(*) AS cnt FROM strand.workflow_signals
-                        WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
-                    ),
-                    run_upd AS (
-                        UPDATE strand.runs
-                        SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                               THEN \(TaskState.pending)
-                                               ELSE \(TaskState.sleeping) END,
-                            available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                               THEN NOW()
-                                               ELSE \(wakeAt) END,
-                            lease_expires_at = NULL
-                        WHERE id = \(condRunID)
-                        RETURNING state
-                    )
-                    UPDATE strand.tasks
-                    SET state = (SELECT state FROM run_upd)
-                    WHERE id = \(condTaskID)
-                    RETURNING state
-                    """,
-                    logger: exec.logger
-                )
-            } else {
-                condStateStream = try await exec.postgres.query(
-                    """
-                    WITH
-                    pending_sigs AS (
-                        SELECT COUNT(*) AS cnt FROM strand.workflow_signals
-                        WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
-                    ),
-                    run_upd AS (
-                        UPDATE strand.runs
-                        SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                               THEN \(TaskState.pending)
-                                               ELSE \(TaskState.waiting) END,
-                            available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                               THEN NOW()
-                                               ELSE available_at END,
-                            lease_expires_at = NULL
-                        WHERE id = \(condRunID)
-                        RETURNING state
-                    )
-                    UPDATE strand.tasks
-                    SET state = (SELECT state FROM run_upd)
-                    WHERE id = \(condTaskID)
-                    RETURNING state
-                    """,
-                    logger: exec.logger
-                )
-            }
-
-            // Read the state the CTE actually wrote.
+            // Run the state transition INSIDE the same transaction as checkpoints+history
+            // (see the step 6–7 comment above for why this is necessary).
             var conditionState: TaskState = .waiting
-            for try await row in condStateStream {
-                var col = row.makeIterator()
-                conditionState = try col.next()!.decode(TaskState.self, context: .default)
+            try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                // Write checkpoints + history accumulated so far.
+                if !pendingCheckpoints.isEmpty {
+                    try await Queries.batchSetCheckpointsOnConn(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        runID: claimed.runID,
+                        checkpoints: pendingCheckpoints,
+                        logger: exec.logger
+                    )
+                    do {
+                        try await Queries.extendClaim(
+                            on: conn,
+                            namespaceID: exec.namespace,
+                            runID: claimed.runID,
+                            extendBySeconds: claimTimeoutSecs,
+                            logger: exec.logger
+                        )
+                    } catch InternalError.cancelled {}
+                }
+                if !pendingHistory.isEmpty {
+                    try await WorkflowStateQueries.batchAppendHistory(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        events: pendingHistory,
+                        logger: exec.logger
+                    )
+                }
+                // Condition state transition — runs AFTER history is written in the same txn.
+                // pending_sigs CTE: if a signal arrived while RUNNING, go PENDING immediately
+                // rather than parking (the signal couldn't flip RUNNING runs directly).
+                let condSQL: PostgresRowSequence
+                if let wakeAt = executor.conditionMinWakeAt {
+                    condSQL = try await conn.query(
+                        """
+                        WITH
+                        pending_sigs AS (
+                            SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                            WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                        ),
+                        run_upd AS (
+                            UPDATE strand.runs
+                            SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                   THEN \(TaskState.pending)
+                                                   ELSE \(TaskState.sleeping) END,
+                                available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                   THEN NOW()
+                                                   ELSE \(wakeAt) END,
+                                lease_expires_at = NULL
+                            WHERE id = \(condRunID)
+                            RETURNING state
+                        )
+                        UPDATE strand.tasks
+                        SET state = (SELECT state FROM run_upd)
+                        WHERE id = \(condTaskID)
+                        RETURNING state
+                        """,
+                        logger: exec.logger
+                    )
+                } else {
+                    condSQL = try await conn.query(
+                        """
+                        WITH
+                        pending_sigs AS (
+                            SELECT COUNT(*) AS cnt FROM strand.workflow_signals
+                            WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                        ),
+                        run_upd AS (
+                            UPDATE strand.runs
+                            SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                   THEN \(TaskState.pending)
+                                                   ELSE \(TaskState.waiting) END,
+                                available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
+                                                   THEN NOW()
+                                                   ELSE available_at END,
+                                lease_expires_at = NULL
+                            WHERE id = \(condRunID)
+                            RETURNING state
+                        )
+                        UPDATE strand.tasks
+                        SET state = (SELECT state FROM run_upd)
+                        WHERE id = \(condTaskID)
+                        RETURNING state
+                        """,
+                        logger: exec.logger
+                    )
+                }
+                for try await row in condSQL {
+                    var col = row.makeIterator()
+                    conditionState = try col.next()!.decode(TaskState.self, context: .default)
+                }
             }
+            pendingCheckpoints.removeAll()
+            pendingHistory.removeAll()
 
-            // Notify only when the run went PENDING (signals were waiting).
-            // SLEEPING/WAITING runs don't need a notify — they wake via timer or
-            // the next _sendSignal call.
-            if conditionState == .pending {
-                try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
-            }
-
+            if conditionState == .pending { needsNotifyAfterFlush = true }
             // Only record CONDITION_WAITING when the run actually parked.
-            // If pending signals sent us straight to PENDING the workflow never
-            // entered a wait — recording the event would mislead the history view.
-            if conditionState != .pending {
-                record(.conditionWaiting, nil)
-            }
+            if conditionState != .pending { record(.conditionWaiting, nil) }
         }
         // No else branch: if scheduleCommands is empty and no conditions remain,
         // suspension came from sleep/waitForEvent which already wrote its own DB update.
@@ -725,121 +830,143 @@ extension WorkflowRegistration {
             && scheduleCommands.isEmpty
             && !executor.hasUnsatisfiedConditions
         {
-            try await exec.postgres.query(
-                """
-                WITH
-                missed AS (
-                    -- event_waits whose children have already completed but whose
-                    -- wake signal was silently dropped (parent was RUNNING at the time).
-                    -- child_task_id is a typed UUID FK — direct join, no string parsing.
-                    SELECT ew.child_task_id
-                    FROM strand.event_waits ew
-                    JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
-                    WHERE ew.run_id        = \(claimed.runID)
-                      AND ew.child_task_id IS NOT NULL
-                ),
-                del_orphans AS (
-                    -- Delete the orphaned event_waits immediately so they do not
-                    -- re-trigger a PENDING transition on the NEXT re-activation
-                    -- (which would cause a spin loop: re-activate → no progress →
-                    -- PENDING again, ad infinitum, until the remaining children finish).
-                    DELETE FROM strand.event_waits ew
-                    USING missed m
-                    WHERE ew.run_id        = \(claimed.runID)
-                      AND ew.child_task_id = m.child_task_id
-                ),
-                run_upd AS (
-                    UPDATE strand.runs
-                    SET state            = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
-                                               THEN \(TaskState.pending)
-                                               ELSE \(TaskState.waiting) END,
-                        available_at     = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
-                                               THEN NOW()
-                                               ELSE available_at END,
-                        has_buffered_completion = FALSE,   -- reset regardless: either consumed (PENDING) or already caught by flag
-                        lease_expires_at = NULL
-                    WHERE id = \(claimed.runID)
-                    RETURNING state
+            // Steps 7+7B are merged with checkpoints+history into one transaction so
+            // the run stays RUNNING in Postgres until all writes are durable.
+            // In Postgres READ COMMITTED, each statement in a transaction gets a fresh
+            // snapshot, so step 7B below can see concurrent task_completions commits that
+            // step 7 missed — same correctness guarantee as the old two-statement approach.
+            try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                // ── flushWrites content ───────────────────────────────────────────────
+                if !pendingCheckpoints.isEmpty {
+                    try await Queries.batchSetCheckpointsOnConn(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        runID: claimed.runID,
+                        checkpoints: pendingCheckpoints,
+                        logger: exec.logger
+                    )
+                    do {
+                        try await Queries.extendClaim(
+                            on: conn,
+                            namespaceID: exec.namespace,
+                            runID: claimed.runID,
+                            extendBySeconds: claimTimeoutSecs,
+                            logger: exec.logger
+                        )
+                    } catch InternalError.cancelled {}
+                }
+                if !pendingHistory.isEmpty {
+                    try await WorkflowStateQueries.batchAppendHistory(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        events: pendingHistory,
+                        logger: exec.logger
+                    )
+                }
+                // ── Step 7: partial-completion re-wait ────────────────────────────────
+                try await conn.query(
+                    """
+                    WITH
+                    missed AS (
+                        SELECT ew.child_task_id
+                        FROM strand.event_waits ew
+                        JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
+                        WHERE ew.run_id        = \(claimed.runID)
+                          AND ew.child_task_id IS NOT NULL
+                    ),
+                    del_orphans AS (
+                        DELETE FROM strand.event_waits ew
+                        USING missed m
+                        WHERE ew.run_id        = \(claimed.runID)
+                          AND ew.child_task_id = m.child_task_id
+                    ),
+                    run_upd AS (
+                        UPDATE strand.runs
+                        SET state            = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
+                                                   THEN \(TaskState.pending)
+                                                   ELSE \(TaskState.waiting) END,
+                            available_at     = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
+                                                   THEN NOW()
+                                                   ELSE available_at END,
+                            has_buffered_completion = FALSE,
+                            lease_expires_at = NULL
+                        WHERE id = \(claimed.runID)
+                        RETURNING state
+                    )
+                    UPDATE strand.tasks
+                    SET state = (SELECT state FROM run_upd)
+                    WHERE id = \(claimed.taskID)
+                      AND namespace_id = \(exec.namespace)
+                    """,
+                    logger: exec.logger
                 )
-                UPDATE strand.tasks
-                SET state = (SELECT state FROM run_upd)
-                WHERE id = \(claimed.taskID)
-                  AND namespace_id = \(exec.namespace)
-                """,
-                logger: exec.logger
-            )
-            // Notify speculatively: if the run went PENDING (missed > 0) workers should
-            // claim it immediately. If it went WAITING the notification is a spurious
-            // wakeup that costs at most one empty poll — acceptable.
-            try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
-
-            // ── 7B. Post-wait snapshot-isolation recovery ───────────────────────────────
-            // Step 7's CTE runs under Postgres snapshot isolation: it cannot see
-            // task_completions rows that committed AFTER step 7's snapshot started.
-            // In the exact race window where a sibling worker commits a child
-            // completion concurrently with step 7, the run goes WAITING with no
-            // further signal to ever wake it — stuck forever.
-            //
-            // This follow-up query executes as a NEW statement (READ COMMITTED —
-            // fresh snapshot) and therefore sees all concurrent commits that step 7
-            // missed.  If any remaining event_wait children have now completed,
-            // flip WAITING → PENDING and notify.
-            //
-            // del_orphans here serves the same spin-loop prevention role as in step 7.
-            let recoveryStream = try await exec.postgres.query(
-                """
-                WITH
-                missed AS (
-                    SELECT ew.child_task_id
-                    FROM strand.event_waits ew
-                    JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
-                    WHERE ew.run_id        = \(claimed.runID)
-                      AND ew.child_task_id IS NOT NULL
-                ),
-                del_orphans AS (
-                    DELETE FROM strand.event_waits ew
-                    USING missed m
-                    WHERE ew.run_id        = \(claimed.runID)
-                      AND ew.child_task_id = m.child_task_id
-                ),
-                run_upd AS (
-                    UPDATE strand.runs
-                    SET state        = \(TaskState.pending),
-                        available_at = NOW(),
-                        lease_expires_at = NULL
-                    WHERE id    = \(claimed.runID)
-                      AND state = \(TaskState.waiting)
-                      AND (SELECT COUNT(*) FROM missed) > 0
-                    RETURNING id
+                // ── Step 7B: snapshot-isolation recovery ────────────────────────────
+                // Each statement in a READ COMMITTED transaction gets a fresh snapshot,
+                // so this sees task_completions rows committed concurrently with step 7.
+                let recoveryStream = try await conn.query(
+                    """
+                    WITH
+                    missed AS (
+                        SELECT ew.child_task_id
+                        FROM strand.event_waits ew
+                        JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
+                        WHERE ew.run_id        = \(claimed.runID)
+                          AND ew.child_task_id IS NOT NULL
+                    ),
+                    del_orphans AS (
+                        DELETE FROM strand.event_waits ew
+                        USING missed m
+                        WHERE ew.run_id        = \(claimed.runID)
+                          AND ew.child_task_id = m.child_task_id
+                    ),
+                    run_upd AS (
+                        UPDATE strand.runs
+                        SET state        = \(TaskState.pending),
+                            available_at = NOW(),
+                            lease_expires_at = NULL
+                        WHERE id    = \(claimed.runID)
+                          AND state = \(TaskState.waiting)
+                          AND (SELECT COUNT(*) FROM missed) > 0
+                        RETURNING id
+                    )
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.pending)
+                    FROM run_upd
+                    WHERE strand.tasks.id           = \(claimed.taskID)
+                      AND strand.tasks.namespace_id = \(exec.namespace)
+                    RETURNING strand.tasks.id
+                    """,
+                    logger: exec.logger
                 )
-                UPDATE strand.tasks
-                SET state = \(TaskState.pending)
-                FROM run_upd
-                WHERE strand.tasks.id           = \(claimed.taskID)
-                  AND strand.tasks.namespace_id = \(exec.namespace)
-                RETURNING strand.tasks.id
-                """,
-                logger: exec.logger
-            )
-            if try await recoveryStream.first(where: { _ in true }) != nil {
-                exec.logger.debug(
-                    "partial-completion recovery: snapshot-isolation race detected — run set to PENDING",
-                    metadata: [
-                        "strand.task_id": .stringConvertible(claimed.taskID),
-                        "strand.run_id": .stringConvertible(claimed.runID),
-                    ]
-                )
-                try await exec.postgres.notifyWorkers(namespace: exec.namespace, queue: exec.queue, logger: exec.logger)
+                if try await recoveryStream.first(where: { _ in true }) != nil {
+                    exec.logger.debug(
+                        "partial-completion recovery: snapshot-isolation race detected — run set to PENDING",
+                        metadata: [
+                            "strand.task_id": .stringConvertible(claimed.taskID),
+                            "strand.run_id": .stringConvertible(claimed.runID),
+                        ]
+                    )
+                }
             }
+            pendingCheckpoints.removeAll()
+            pendingHistory.removeAll()
+            needsNotifyAfterFlush = true  // speculative: fires even if run went WAITING
         }
 
         // ── 8. Cache the live Task for the next activation ───────────────────────────
-        // The handler is parked on a continuation — do NOT call cancelPending().
-        // On the next activation, resumeActivation() delivers real results directly
-        // to those continuations and calls drain() to continue from where it paused.
+        // ── 8. Flush writes, then cache, then notify ─────────────────────────────────────────
+        // ORDER MATTERS:
+        //   1. flushWrites() commits checkpoints + history atomically.
+        //   2. cache.set() stores the live handler Task.
+        //   3. notifyWorkers() fires LAST — only after history is durable.
         //
-        // For the cached path: cache.set is idempotent — it simply refreshes the
-        // same references already stored from the previous activation.
+        // Sending pg_notify before flushWrites would let another worker claim
+        // the PENDING run, read the same nextHistorySeq(), and commit first.
+        // This activation's batchAppendHistory would then hit ON CONFLICT DO NOTHING,
+        // silently dropping history while the checkpoint UPSERT still succeeded —
+        // producing the checkpoint-without-history inconsistency.
         try await flushWrites()
         cache.set(
             claimed.taskID,
@@ -851,6 +978,17 @@ extension WorkflowRegistration {
                 activation: activation
             )
         )
+
+        // Fire deferred notifications now that history is committed.
+        // This is the last operation — another worker can safely claim
+        // the run and call nextHistorySeq() without racing this activation.
+        if needsNotifyAfterFlush {
+            try await exec.postgres.notifyWorkers(
+                namespace: exec.namespace,
+                queue: exec.queue,
+                logger: exec.logger
+            )
+        }
 
         return nil
     }

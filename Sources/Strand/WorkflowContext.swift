@@ -168,6 +168,16 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     /// Updated by WorkflowContext public functions; read by activate() on handler failure.
     var lastCallSite: (fileID: String, line: Int)? = nil
 
+    /// Set to `true` when `claimed.cancelRequested` is set at activation start.
+    ///
+    /// Needed as a separate flag (not just `Task.isCancelled`) because condition
+    /// predicates are evaluated in the worker-task context after `drain()` returns,
+    /// not inside the handler Task. `Task.isCancelled` would always be `false` there.
+    /// The activation paths set this from `claimed.cancelRequested` and also call
+    /// `handlerTask.cancel()` so that slow-path `try Task.checkCancellation()` gates
+    /// in `runActivity`/`sleep`/`waitForEvent` throw natively inside the handler Task.
+    var isCancelRequested: Bool = false
+
     // MARK: - Init
 
     init(
@@ -382,6 +392,65 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```
     public var historyEventCount: Int { _impl.historyEventCount }
 
+    /// Returns `true` when this workflow has received a cooperative cancellation request
+    /// from its parent workflow (i.e. the parent closed with
+    /// `ChildWorkflowOptions.parentClosePolicy = .requestCancel`).
+    ///
+    /// The flag is set at activation start when the claimed run has `cancel_requested = true`.
+    /// It is sticky — once set it is never cleared for the lifetime of this workflow.
+    ///
+    /// Prefer ``waitForCancellation()`` over checking this property inline; reserve
+    /// `isCancelRequested` for mixing with other conditions:
+    /// ```swift
+    /// try await context.condition { $0.isPaused || context.isCancelRequested }
+    /// ```
+    ///
+    /// Unlike hard `cancelTask()`, `requestCancel` is fully cooperative:
+    /// the workflow continues running until it returns or throws.
+    public var isCancelRequested: Bool { _impl.isCancelRequested }
+
+    /// Suspends the workflow until the parent requests cooperative cancellation
+    /// (`ChildWorkflowOptions.parentClosePolicy = .requestCancel`).
+    ///
+    /// **This call suspends the entire handler.** The workflow parks in `WAITING`
+    /// state and no activities can run until `isCancelRequested` is set.  Only
+    /// use it in one of two situations:
+    ///
+    /// **1. Pure waiting workflow** — the workflow's only job is to wait:
+    /// ```swift
+    /// try await context.waitForCancellation()
+    /// return .cleanedUp
+    /// ```
+    ///
+    /// **2. Racing inside a task group** — unblocks as soon as cancel arrives,
+    /// aborting concurrent activities:
+    /// ```swift
+    /// try await withThrowingTaskGroup(of: ...) { group in
+    ///     for item in items {
+    ///         group.addTask { try await context.runActivity(..., input: item) }
+    ///     }
+    ///     group.addTask {
+    ///         try await context.waitForCancellation()
+    ///         throw CancellationError()   // abort the group
+    ///     }
+    ///     for try await result in group { ... }
+    /// }
+    /// ```
+    ///
+    /// **For sequential activity pipelines, use an inline check instead** —
+    /// it is synchronous (no suspension) and lets you return a meaningful result:
+    /// ```swift
+    /// let charge = try await context.runActivity(ChargePayment.self, input: ...)
+    /// if context.isCancelRequested { return .cancelled }   // ← zero-cost check
+    /// let fulfillment = try await context.runActivity(FulfillOrder.self, input: ...)
+    /// ```
+    public func waitForCancellation() async throws {
+        // Capture `_impl` (the class reference) so the closure reads the live
+        // value of `isCancelRequested` on each evaluation, not a snapshot.
+        let impl = _impl
+        try await condition { _ in impl.isCancelRequested }
+    }
+
     /// Scheduling metadata injected by ``StrandScheduler`` when this workflow was
     /// triggered by a schedule. `nil` when enqueued directly via ``StrandClient``.
     ///
@@ -524,6 +593,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Slow path: activity not yet complete — emit command and suspend ─────────────
+        // Guard: if this workflow has been cooperative-cancelled (requestCancel policy),
+        // throw CancellationError here rather than scheduling a new activity that would
+        // never be needed. Fast paths above are unaffected — already-completed work replays.
+        try Task.checkCancellation()
         let inputBuffer = try JSON.encode(input)
         // Use caller-supplied ID if set; otherwise derive a stable key from
         // the workflow task UUID and call-site sequence number.
@@ -743,6 +816,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // Slow path: timer not yet elapsed — suspend via continuation.
+        // Guard: don't start new timers when cooperatively cancelled.
+        try Task.checkCancellation()
         _impl.executor.emit(.startTimer(wakeAt: resolvedWakeAt, seqNum: seqNum))
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             _impl.executor.suspendTimer(seqNum: seqNum, continuation: cont)
@@ -864,6 +939,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Slow path: event not yet received — emit command and suspend ──────────
+        // Guard: don't register new event waits when cooperatively cancelled.
+        try Task.checkCancellation()
         let predicateBuf: ByteBuffer? = try predicate.flatMap { p in
             ByteBuffer(bytes: try p.toJSONBytes())
         }

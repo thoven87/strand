@@ -695,7 +695,7 @@ enum Queries {
                    c.wake_event, c.event_payload,
                    t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
                    t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at,
-                   t.first_task_id
+                   t.first_task_id, t.cancel_requested
             FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
             ORDER BY c.id
             """,
@@ -793,30 +793,39 @@ enum Queries {
     private struct _ErrorType: Decodable { let name: String? }
     private struct _FailureMessage: Decodable { let message: String? }
 
-    /// Recursively cancel all non-terminal descendants of `parentTaskID` that have
-    /// `parent_close_policy = NULL` (default .terminate) or `= 'TERMINATE'`.
-    /// Descendants with `parent_close_policy = 'ABANDON'` or `= 'REQUEST_CANCEL'`
-    /// are left running. Called from every permanent-failure exit of `failRun`.
+    /// Recursively processes all non-terminal descendants of `parentTaskID` when the parent
+    /// workflow permanently fails.
+    ///
+    /// Three policies are enforced:
+    /// - **TERMINATE / nil**: full cancel — task CANCELLED, all non-RUNNING runs CANCELLED.
+    ///   RUNNING runs are left to expire via `sweepExpiredLeases` (transparent infrastructure event).
+    /// - **REQUEST_CANCEL (WORKFLOW kind)**: cooperative cancel — insert a
+    ///   `Signals.cancelRequested` signal and wake SLEEPING/WAITING runs to PENDING so the
+    ///   handler receives the signal at the next activation. The task is NOT marked CANCELLED;
+    ///   it completes naturally when the handler exits.
+    /// - **REQUEST_CANCEL (ACTIVITY kind)**: treated as ABANDON — activities have no signal
+    ///   handler so there is nothing to deliver.
+    /// - **ABANDON**: left entirely alone.
+    ///
+    /// Recursion stops at ABANDON and REQUEST_CANCEL nodes — their subtrees are unaffected.
+    ///
+    /// - Returns: Queue names of runs woken by REQUEST_CANCEL processing; callers should
+    ///   call `notifyWorkers` for each distinct queue so workers pick up the PENDING runs promptly.
+    @discardableResult
     private static func cancelDescendants(
         on conn: PostgresConnection,
         namespaceID: String,
         parentTaskID: UUID,
         logger: Logger
-    ) async throws {
-        // ── Identify which descendants to cancel ──────────────────────────────
-        // The recursive CTE stops at ABANDON and REQUEST_CANCEL nodes so their
-        // subtrees are not traversed — children of those nodes are unaffected.
-        // to_terminate: full cancel (task + all runs including RUNNING)
-        // to_request_cancel: soft cancel (task + non-RUNNING runs only, no cascade)
-        // ABANDON: skipped entirely
-        try await conn.query(
+    ) async throws -> [String] {
+        let stream = try await conn.query(
             """
             WITH RECURSIVE descendants AS (
-                SELECT id, parent_close_policy FROM strand.tasks
+                SELECT id, parent_close_policy, kind FROM strand.tasks
                 WHERE parent_task_id = \(parentTaskID)
                   AND namespace_id   = \(namespaceID)
                 UNION ALL
-                SELECT t.id, t.parent_close_policy FROM strand.tasks t
+                SELECT t.id, t.parent_close_policy, t.kind FROM strand.tasks t
                 JOIN descendants d ON t.parent_task_id = d.id
                 WHERE t.namespace_id = \(namespaceID)
                   AND (d.parent_close_policy IS NULL OR d.parent_close_policy = \(ParentClosePolicy.terminate))
@@ -826,12 +835,13 @@ enum Queries {
                 WHERE parent_close_policy IS NULL OR parent_close_policy = \(ParentClosePolicy.terminate)
             ),
             to_request_cancel AS (
-                SELECT id FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
+                SELECT id, kind FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
             ),
+            -- TERMINATE: cancel tasks + all non-RUNNING runs. RUNNING runs expire via leaseExpiryLoop.
             task_cancel AS (
                 UPDATE strand.tasks
                 SET state = \(TaskState.cancelled), cancelled_at = NOW()
-                WHERE id IN (SELECT id FROM to_terminate UNION ALL SELECT id FROM to_request_cancel)
+                WHERE id IN (SELECT id FROM to_terminate)
                   AND state NOT IN (
                       \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
                   )
@@ -845,15 +855,46 @@ enum Queries {
                       \(TaskState.running),
                       \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
                   )
+            ),
+            -- REQUEST_CANCEL (WORKFLOW only): wake suspended runs so the handler can see the signal.
+            -- Activities have no signal handler; treating REQUEST_CANCEL on activities as ABANDON.
+            request_cancel_wake AS (
+                UPDATE strand.runs
+                SET state            = \(TaskState.pending),
+                    available_at     = NOW(),
+                    lease_expires_at = NULL,
+                    wake_event       = NULL,
+                    event_payload    = NULL,
+                    worker_id        = NULL
+                WHERE task_id IN (SELECT id FROM to_request_cancel WHERE kind = \(TaskKind.workflow))
+                  AND namespace_id = \(namespaceID)
+                  AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
+                RETURNING queue
+            ),
+            request_cancel_task_wake AS (
+                UPDATE strand.tasks
+                SET state = \(TaskState.pending)
+                WHERE id IN (SELECT id FROM to_request_cancel WHERE kind = \(TaskKind.workflow))
+                  AND namespace_id = \(namespaceID)
+                  AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
+            ),
+            -- REQUEST_CANCEL: set cancel_requested = TRUE so the next activation delivers
+            -- Swift CancellationError natively to the handler via handlerTask.cancel().
+            cancel_requested_set AS (
+                UPDATE strand.tasks
+                SET cancel_requested = TRUE
+                WHERE id IN (SELECT id FROM to_request_cancel WHERE kind = \(TaskKind.workflow))
             )
-            UPDATE strand.runs
-            SET state = \(TaskState.cancelled), finished_at = NOW()
-            WHERE task_id IN (SELECT id FROM to_request_cancel)
-              AND namespace_id = \(namespaceID)
-              AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))
+            SELECT queue FROM request_cancel_wake
             """,
             logger: logger
         )
+        var queues: [String] = []
+        for try await row in stream {
+            var col = row.makeIterator()
+            queues.append(try col.next()!.decode(String.self, context: .default))
+        }
+        return queues
     }
 
     /// Marks a run as failed and schedules a retry if attempts remain.
@@ -1020,7 +1061,13 @@ enum Queries {
                 logger: logger
             )
             try await conn.query(
-                "UPDATE strand.tasks SET state = \(newState), attempt = \(nextAttempt) WHERE id = \(taskID)",
+                """
+                UPDATE strand.tasks
+                SET state            = \(newState),
+                    attempt          = \(nextAttempt),
+                    cancel_requested = FALSE
+                WHERE id = \(taskID)
+                """,
                 logger: logger
             )
             // Only notify when the retry is immediately runnable (no sleep delay).
@@ -1152,58 +1199,19 @@ enum Queries {
                 logger: logger
             )
 
-            // ── Step 3 + 4: Policy-aware cascade to descendants ────────────────────
-            // ABANDON: skip entirely (left running independently)
-            // REQUEST_CANCEL: mark task CANCELLED + cancel non-RUNNING runs, no cascade to its children
-            // TERMINATE / NULL: full cancel (all runs including RUNNING) + recurse
-            //
-            // The recursion stops at ABANDON and REQUEST_CANCEL nodes so their
-            // children are not traversed.
-            try await conn.query(
-                """
-                WITH RECURSIVE descendants AS (
-                    SELECT id, parent_close_policy FROM strand.tasks
-                        WHERE parent_task_id = \(taskID)
-                          AND namespace_id   = \(namespaceID)
-                        UNION ALL
-                        SELECT t.id, t.parent_close_policy FROM strand.tasks t
-                        JOIN descendants d ON t.parent_task_id = d.id
-                        WHERE t.namespace_id = \(namespaceID)
-                          AND (d.parent_close_policy IS NULL OR d.parent_close_policy = \(ParentClosePolicy.terminate))
-                    ),
-                    to_terminate AS (
-                        SELECT id FROM descendants
-                        WHERE parent_close_policy IS NULL OR parent_close_policy = \(ParentClosePolicy.terminate)
-                    ),
-                    to_request_cancel AS (
-                        SELECT id FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
-                    ),
-                task_cancel AS (
-                    UPDATE strand.tasks
-                    SET state = \(TaskState.cancelled), cancelled_at = NOW()
-                    WHERE id IN (SELECT id FROM to_terminate UNION ALL SELECT id FROM to_request_cancel)
-                      AND state NOT IN (
-                          \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
-                      )
-                ),
-                run_terminate AS (
-                    UPDATE strand.runs
-                    SET state = \(TaskState.cancelled)
-                    WHERE task_id IN (SELECT id FROM to_terminate)
-                      AND namespace_id = \(namespaceID)
-                      AND state IN (
-                          \(TaskState.pending), \(TaskState.sleeping),
-                          \(TaskState.waiting), \(TaskState.running)
-                      )
-                )
-                UPDATE strand.runs
-                SET state = \(TaskState.cancelled)
-                WHERE task_id IN (SELECT id FROM to_request_cancel)
-                  AND namespace_id = \(namespaceID)
-                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))
-                """,
+            // ── Step 3 + 4: Policy-aware cascade to descendants ─────────────────────
+            // cancelDescendants handles the three policies (TERMINATE / REQUEST_CANCEL /
+            // ABANDON) atomically. It returns queue names for any runs woken by
+            // REQUEST_CANCEL so we can notify workers immediately.
+            let cancelQueues = try await cancelDescendants(
+                on: conn,
+                namespaceID: namespaceID,
+                parentTaskID: taskID,
                 logger: logger
             )
+            for queue in Set(cancelQueues) {
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            }
 
             // ── Step 5: Wake any awaitTaskResult callers ───────────────────────────
             try await emitTaskCompletionSignal(
@@ -1279,15 +1287,18 @@ enum Queries {
                 logger: logger
             )
 
-            // ── Steps 3 + 4: Policy-aware cascade to descendants (bulk) ──────────
-            try await conn.query(
+            // ── Steps 3 + 4: Policy-aware cascade to descendants (bulk) ──────────────
+            // Mirror the single-task logic from cancelDescendants but for N parent IDs
+            // at once. REQUEST_CANCEL workflow descendants get a cooperative cancel signal;
+            // TERMINATE descendants are hard-cancelled; ABANDON descendants are untouched.
+            let wakeStream = try await conn.query(
                 """
                 WITH RECURSIVE descendants AS (
-                    SELECT id, parent_close_policy FROM strand.tasks
+                    SELECT id, parent_close_policy, kind FROM strand.tasks
                         WHERE parent_task_id = ANY(\(cancelledIDs))
                           AND namespace_id   = \(namespaceID)
                         UNION ALL
-                        SELECT t.id, t.parent_close_policy FROM strand.tasks t
+                        SELECT t.id, t.parent_close_policy, t.kind FROM strand.tasks t
                         JOIN descendants d ON t.parent_task_id = d.id
                         WHERE t.namespace_id = \(namespaceID)
                           AND (d.parent_close_policy IS NULL OR d.parent_close_policy = \(ParentClosePolicy.terminate))
@@ -1297,12 +1308,12 @@ enum Queries {
                         WHERE parent_close_policy IS NULL OR parent_close_policy = \(ParentClosePolicy.terminate)
                     ),
                     to_request_cancel AS (
-                        SELECT id FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
+                        SELECT id, kind FROM descendants WHERE parent_close_policy = \(ParentClosePolicy.requestCancel)
                     ),
                 task_cancel AS (
                     UPDATE strand.tasks
                     SET state = \(TaskState.cancelled), cancelled_at = NOW()
-                    WHERE id IN (SELECT id FROM to_terminate UNION ALL SELECT id FROM to_request_cancel)
+                    WHERE id IN (SELECT id FROM to_terminate)
                       AND state NOT IN (
                           \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
                       )
@@ -1316,15 +1327,44 @@ enum Queries {
                           \(TaskState.pending), \(TaskState.sleeping),
                           \(TaskState.waiting), \(TaskState.running)
                       )
+                ),
+                request_cancel_wake AS (
+                    UPDATE strand.runs
+                    SET state            = \(TaskState.pending),
+                        available_at     = NOW(),
+                        lease_expires_at = NULL,
+                        wake_event       = NULL,
+                        event_payload    = NULL,
+                        worker_id        = NULL
+                    WHERE task_id IN (SELECT id FROM to_request_cancel WHERE kind = \(TaskKind.workflow))
+                      AND namespace_id = \(namespaceID)
+                      AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
+                    RETURNING queue
+                ),
+                request_cancel_task_wake AS (
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.pending)
+                    WHERE id IN (SELECT id FROM to_request_cancel WHERE kind = \(TaskKind.workflow))
+                      AND namespace_id = \(namespaceID)
+                      AND state IN (\(TaskState.sleeping), \(TaskState.waiting))
+                ),
+                cancel_requested_set AS (
+                    UPDATE strand.tasks
+                    SET cancel_requested = TRUE
+                    WHERE id IN (SELECT id FROM to_request_cancel WHERE kind = \(TaskKind.workflow))
                 )
-                UPDATE strand.runs
-                SET state = \(TaskState.cancelled)
-                WHERE task_id IN (SELECT id FROM to_request_cancel)
-                  AND namespace_id = \(namespaceID)
-                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))
+                SELECT queue FROM request_cancel_wake
                 """,
                 logger: logger
             )
+            var cancelQueues: [String] = []
+            for try await row in wakeStream {
+                var col = row.makeIterator()
+                cancelQueues.append(try col.next()!.decode(String.self, context: .default))
+            }
+            for queue in Set(cancelQueues) {
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            }
 
             // ── Step 5: Wake any awaitTaskResult callers (one signal per root task) ─
             for taskID in cancelledIDs {
@@ -2551,7 +2591,10 @@ enum Queries {
             try await conn.query(
                 """
                 UPDATE strand.tasks
-                SET state = \(TaskState.pending), attempt = \(nextAttempt), max_attempts = \(newMaxAttempts)
+                SET state            = \(TaskState.pending),
+                    attempt          = \(nextAttempt),
+                    max_attempts     = \(newMaxAttempts),
+                    cancel_requested = FALSE
                 WHERE id = \(taskID)
                 """,
                 logger: logger
@@ -2667,14 +2710,19 @@ enum Queries {
 
     // MARK: - Task completion signals
 
-    /// Persists the completion and wakes every parent run waiting on this task.
+    /// Persists the child completion and signals any waiting parent workflow.
     ///
-    /// Single round trip: one CTE atomically inserts the completion record,
-    /// finds event_waits by child_task_id (FOR UPDATE SKIP LOCKED), wakes
-    /// WAITING/SLEEPING parent runs, conditionally removes event_waits (only
-    /// when the wake succeeded — RUNNING parents keep their event_wait so the
-    /// partial-completion re-wait CTE can detect the missed signal), and
-    /// transitions parent tasks to PENDING.
+    /// 1. **Insert** into `strand.task_completions` (idempotent via ON CONFLICT DO NOTHING).
+    /// 2. **Flag** RUNNING parents via `has_buffered_completion = TRUE`; step-7 detects
+    ///    this at the end of the parent's current activation and transitions to PENDING.
+    /// 3. **Notify** workers for WAITING/SLEEPING parents so the poll loop can call
+    ///    `wakeCompletedWaiting`.  RUNNING parents receive no notify here because
+    ///    step-7's own deferred `notifyWorkers` fires after its transaction commits.
+    ///
+    /// The parent run state is owned exclusively by:
+    ///   - step-7 `withTransaction`  (RUNNING → WAITING/PENDING)
+    ///   - `wakeCompletedWaiting`    (WAITING → PENDING, from poll loop)
+    ///   - External callers          (cancelTask, etc.)
     ///
     /// Must be called inside an existing transaction (`conn`).
     static func emitTaskCompletionSignal(
@@ -2685,7 +2733,6 @@ enum Queries {
         resultBuffer: ByteBuffer?,
         logger: Logger
     ) async throws {
-        let payloadBuf = try JSON.encode(["state": state.rawValue])
         try await conn.query(
             """
             WITH
@@ -2694,62 +2741,105 @@ enum Queries {
                 VALUES (\(namespaceID), \(taskID), \(state.rawValue), \(resultBuffer))
                 ON CONFLICT (task_id) DO NOTHING
             ),
-            waits AS (
-                SELECT task_id AS parent_task_id, run_id
-                FROM   strand.event_waits
-                WHERE  child_task_id = \(taskID)
-                FOR UPDATE SKIP LOCKED
-            ),
-            woken AS (
-                UPDATE strand.runs r
-                SET state            = \(TaskState.pending),
-                    available_at     = NOW(),
-                    event_payload    = \(payloadBuf),
-                    wake_event       = NULL,
-                    lease_expires_at = NULL
-                FROM   waits w
-                WHERE  r.id           = w.run_id
-                  AND  r.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
-                  AND  r.namespace_id = \(namespaceID)
-                RETURNING r.id AS run_id
-            ),
-            flag_parent AS (
-                -- When the parent run is RUNNING (mid-activation), the woken CTE above
-                -- returned 0 rows for it. Set has_buffered_completion so that step 7's
-                -- UPDATE strand.runs (which acquires a row lock) sees the flag after
-                -- unblocking from any concurrent emitTaskCompletionSignal — eliminating
-                -- the READ COMMITTED race that previously left runs permanently stuck WAITING.
+            flag_running AS (
+                -- Parent is RUNNING (mid-activation): set has_buffered_completion so
+                -- the parent's step-7 withTransaction detects the child at the end of
+                -- its current activation and transitions to PENDING.
+                -- The parent's activation holds the runs row lock — do NOT try to
+                -- modify runs.state here to avoid lock-order conflicts.
                 UPDATE strand.runs r
                 SET    has_buffered_completion = TRUE
-                FROM   waits w
-                WHERE  r.id           = w.run_id
-                  AND  r.state        = \(TaskState.running)
-                  AND  r.namespace_id = \(namespaceID)
-            ),
-            del_waits AS (
-                -- Only delete the event_wait when the wake succeeded.
-                -- If the parent was RUNNING, woken is empty for that run
-                -- and the event_wait survives so the partial-completion
-                -- re-wait CTE can detect it on the next WAITING transition.
-                DELETE FROM strand.event_waits ew
-                USING  woken k
+                FROM   strand.event_waits ew
                 WHERE  ew.child_task_id = \(taskID)
-                  AND  ew.run_id        = k.run_id
+                  AND  r.id             = ew.run_id
+                  AND  r.state          = \(TaskState.running)
+                  AND  r.namespace_id   = \(namespaceID)
             ),
-            task_upd AS (
-                UPDATE strand.tasks t SET state = \(TaskState.pending)
-                FROM   woken k
-                JOIN   waits w ON w.run_id = k.run_id
-                WHERE  t.id           = w.parent_task_id
-                  AND  t.state        IN (\(TaskState.sleeping), \(TaskState.waiting))
-                  AND  t.namespace_id = \(namespaceID)
-                RETURNING t.namespace_id, t.queue
+            notif AS (
+                -- Collect the parent queue for WAITING/SLEEPING parents so workers
+                -- can run wakeCompletedWaiting and transition them to PENDING.
+                -- RUNNING parents are excluded: step-7's deferred notifyWorkers fires
+                -- after its own transaction commits.
+                SELECT r.queue, r.namespace_id
+                FROM   strand.event_waits ew
+                JOIN   strand.runs r ON r.id = ew.run_id
+                WHERE  ew.child_task_id = \(taskID)
+                  AND  r.state IN (\(TaskState.waiting), \(TaskState.sleeping))
+                  AND  r.namespace_id   = \(namespaceID)
+                LIMIT 1
             )
             SELECT pg_notify(\(StrandChannels.tasks), namespace_id || '/' || queue)
-            FROM task_upd
+            FROM notif
             """,
             logger: logger
         )
+    }
+
+    /// Transitions WAITING workflow runs to PENDING when their child activities have
+    /// completed.  Called from each worker's poll loop immediately before `claimTasks`.
+    ///
+    /// A WAITING run has no active activation, so there is no concurrent writer:
+    /// this is the only code path that makes WAITING → PENDING transitions.
+    /// `FOR UPDATE SKIP LOCKED` lets multiple workers process different runs in
+    /// parallel without contention.
+    static func wakeCompletedWaiting(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        logger: Logger
+    ) async throws {
+        let stream = try await client.query(
+            """
+            WITH
+            to_wake AS (
+                -- WAITING runs that have at least one event_wait child already in
+                -- task_completions — the child completed but the parent was not
+                -- immediately transitioned (e.g. was RUNNING at completion time).
+                -- EXISTS is used instead of JOIN so that FOR UPDATE works without
+                -- a DISTINCT clause (Postgres forbids FOR UPDATE + DISTINCT).
+                SELECT r.id AS run_id, r.task_id
+                FROM   strand.runs r
+                WHERE  r.namespace_id = \(namespaceID)
+                  AND  r.queue        = \(queue)
+                  AND  r.state        = \(TaskState.waiting)
+                  AND  r.created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
+                  AND  EXISTS (
+                      SELECT 1
+                      FROM   strand.event_waits ew
+                      JOIN   strand.task_completions tc ON tc.task_id = ew.child_task_id
+                      WHERE  ew.run_id        = r.id
+                        AND  ew.child_task_id IS NOT NULL
+                  )
+                ORDER BY r.id
+                LIMIT 50
+                FOR UPDATE SKIP LOCKED
+            ),
+            woken AS (
+                UPDATE strand.runs
+                SET state        = \(TaskState.pending),
+                    available_at = NOW(),
+                    lease_expires_at = NULL
+                FROM to_wake
+                WHERE strand.runs.id = to_wake.run_id
+                RETURNING to_wake.run_id, to_wake.task_id
+            )
+            UPDATE strand.tasks
+            SET state = \(TaskState.pending)
+            FROM woken
+            WHERE strand.tasks.id           = woken.task_id
+              AND strand.tasks.namespace_id = \(namespaceID)
+            RETURNING woken.run_id
+            """,
+            logger: logger
+        )
+        var count = 0
+        for try await _ in stream { count += 1 }
+        if count > 0 {
+            logger.debug(
+                "woke \(count) WAITING run(s) with completed children",
+                metadata: ["strand.queue": .string(queue)]
+            )
+        }
     }
 }
 

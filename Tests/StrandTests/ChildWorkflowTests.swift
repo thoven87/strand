@@ -80,10 +80,126 @@ private struct SameQueueParentWorkflow: Workflow {
     }
 }
 
+// ── 5. RequestCancelChild / RequestCancelParent ───────────────────────────
+// Child workflow: suspends in `context.condition` until `context.isCancelRequested`
+// is set by the framework (cooperative cancel from parent) or the timeout fires.
+// Returns "cancelled" when the cancel signal arrives, "timeout" otherwise.
+// Used by: parentClosePolicyRequestCancelDeliversSignal.
+
+private struct RequestCancelChildWorkflow: Workflow {
+    typealias Input = StrandVoid
+    typealias Output = String
+
+    mutating func run(
+        context: WorkflowContext<Self>,
+        input: StrandVoid
+    ) async throws -> String {
+        // Block until the parent requests cooperative cancellation.
+        try await context.waitForCancellation()
+        return "cancelled"
+    }
+}
+
+// Parent: starts the child with .requestCancel policy and suspends waiting for it.
+// The test cancels the parent externally via `client.cancelTask`, which triggers
+// `cancelDescendants` and delivers the cooperative cancel signal to the child.
+private struct WaitForCancelableChildWorkflow: Workflow {
+    typealias Input = StrandVoid
+    typealias Output = String
+
+    mutating func run(
+        context: WorkflowContext<Self>,
+        input: StrandVoid
+    ) async throws -> String {
+        try await context.runChildWorkflow(
+            RequestCancelChildWorkflow.self,
+            options: .init(parentClosePolicy: .requestCancel),
+            input: StrandVoid()
+        )
+    }
+}
+
 // MARK: - Test suite
 
 @Suite("Integration — Child workflows", .tags(.integration), .serialized)
 struct ChildWorkflowTests {
+
+    // ── 0 ────────────────────────────────────────────────────────────────────────────
+    // `parentClosePolicy = .requestCancel` delivers the cooperative cancel signal when
+    // the parent is cancelled externally.
+    //
+    // Flow:
+    //   1. Start WaitForCancelableChildWorkflow (parent) which spawns RequestCancelChildWorkflow
+    //      (child) and suspends in WAITING state.
+    //   2. Child suspends in `context.condition({ _ in context.isCancelRequested })`.
+    //   3. Test cancels the parent via `cancelTask` which calls `cancelDescendants`:
+    //      - `cancelDescendants` sets `cancel_requested = TRUE` on the child's task row
+    //      - Wakes the child's WAITING run to PENDING
+    //   4. Worker claims child; `claimed.cancelRequested = true`:
+    //      - activation sets `activation.isCancelRequested = true` (for conditions)
+    //      - calls `handlerTask.cancel()` (for slow-path CancellationError gates)
+    //   5. `evaluateAndResumeFirstSatisfiedCondition` re-evaluates `{ _ in context.isCancelRequested }`
+    //      → returns `true` → condition satisfied → child returns "cancelled".
+    //   6. Test asserts the child's result is "cancelled".
+    @Test("parentClosePolicy .requestCancel delivers cooperative cancel signal and child returns gracefully")
+    func parentClosePolicyRequestCancelDeliversSignal() async throws {
+        try await withTestEnvironment { client in
+            let workerTask = startWorker(
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [
+                    WaitForCancelableChildWorkflow.self,
+                    RequestCancelChildWorkflow.self,
+                ]
+            )
+            defer { workerTask.cancel() }
+
+            // 1. Start the parent workflow.
+            let parentHandle = try await client.startWorkflow(
+                WaitForCancelableChildWorkflow.self,
+                options: .init(maxAttempts: 1),
+                input: StrandVoid()
+            )
+
+            // 2. Wait until the child task appears in the DB (parent has run at
+            //    least one activation and enqueued the child).
+            var childTaskID: UUID? = nil
+            for _ in 0..<50 {
+                let page = try await ManagementQueries.listChildTasks(
+                    on: client.postgres,
+                    namespaceID: "default",
+                    parentTaskID: parentHandle.taskID,
+                    cursor: nil,
+                    limit: 10,
+                    logger: client.logger
+                )
+                if let child = page.items.first {
+                    childTaskID = child.id
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            guard let childTaskID else {
+                Issue.record("child task never appeared in DB — parent did not start the child")
+                return
+            }
+
+            // 3. Cancel the parent. `cancelDescendants` runs atomically inside
+            //    `cancelTask`, delivering the cooperative cancel signal to the child
+            //    and waking its WAITING run to PENDING.
+            try await client.cancelTask(id: parentHandle.taskID)
+
+            // 4. Await the child's result. The child sees `isCancelRequested = true`,
+            //    its condition is satisfied, and it returns "cancelled" cooperatively.
+            let childResult = try await client.awaitTaskResult(
+                id: childTaskID,
+                as: String.self,
+                options: .init(timeout: .seconds(15))
+            )
+            #expect(childResult == "cancelled")
+        }
+    }
 
     // ── 1 ───────────────────────────────────────────────────────────────────
     // A single worker serves both the parent orchestrator and the child workflow

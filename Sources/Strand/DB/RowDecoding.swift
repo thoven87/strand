@@ -71,6 +71,17 @@ struct ClaimedTask: Sendable {
     /// `nil` for the first task in a chain, for child tasks, and for activities.
     let firstTaskID: UUID?
 
+    /// `true` when this workflow's parent closed with `parentClosePolicy = .requestCancel`
+    /// and the framework should deliver a cooperative cancellation by calling
+    /// `handlerTask.cancel()` at the next activation.
+    ///
+    /// When `true`, the activation machinery calls `handlerTask.cancel()` before
+    /// the first `executor.drain()`. This causes `try Task.checkCancellation()` at
+    /// slow-path suspension points (runActivity / sleep / waitForEvent) to throw
+    /// `CancellationError`, which is then handled as cooperative cancellation in
+    /// `applyScheduleCommands`.
+    let cancelRequested: Bool
+
     /// `true` when this attempt is the last one allowed.
     ///
     /// Used to decide whether a thrown error should mark the OTel span `ERROR`.
@@ -88,7 +99,7 @@ extension ClaimedTask {
     /// retry_strategy, max_attempts, headers, wake_event, event_payload,
     /// parent_task_id, kind, timeout_seconds, heartbeat_timeout_seconds,
     /// scheduling_metadata, available_at, heartbeat_details, deadline_at,
-    /// first_task_id
+    /// first_task_id, cancel_requested
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -119,6 +130,7 @@ extension ClaimedTask {
         heartbeatDetails = try col.next()!.decode(ByteBuffer?.self, context: .default)
         deadlineAt = try col.next()!.decode(Date?.self, context: .default)
         firstTaskID = try col.next()!.decode(UUID?.self, context: .default)
+        cancelRequested = try col.next()!.decode(Bool.self, context: .default)
     }
 }
 
