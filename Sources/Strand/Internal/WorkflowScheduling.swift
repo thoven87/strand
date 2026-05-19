@@ -148,9 +148,9 @@ extension WorkflowRegistration {
         for cmd in commands {
             switch cmd {
             case .timerFired(let timerSeqNum):
-                record(.timerFired, try? JSON.encode(WorkflowStateQueries.TimerFiredData(seqNum: timerSeqNum)))
+                record(.timerFired, try! JSON.encode(WorkflowStateQueries.TimerFiredData(seqNum: timerSeqNum)))
             case .eventReceived(let eventName):
-                record(.eventReceived, try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
+                record(.eventReceived, try! JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName)))
             case .eventWaitTimedOut(let eventName, let seqNum):
                 try await Queries.writeEventWaitTimedOut(
                     on: exec.postgres,
@@ -200,7 +200,7 @@ extension WorkflowRegistration {
                 if let startInfo = executor.preloadedStartInfo(for: seqNum) {
                     record(
                         .activityStarted,
-                        try? JSON.encode(
+                        try! JSON.encode(
                             WorkflowStateQueries.ActivityStartedData(
                                 activity: name,
                                 seqNum: seqNum,
@@ -217,7 +217,7 @@ extension WorkflowRegistration {
                 // ActivityFailedSentinel checkpoint guards the same invariant.
                 record(
                     failed ? .activityFailed : .activityCompleted,
-                    try? JSON.encode(WorkflowStateQueries.ActivityScheduledData(activity: name, seqNum: seqNum))
+                    try! JSON.encode(WorkflowStateQueries.ActivityScheduledData(activity: name, seqNum: seqNum))
                 )
             case .childWorkflowCompleted(let name, let seqNum):
                 // Record child workflow completion. runChildWorkflow emits this command
@@ -225,7 +225,7 @@ extension WorkflowRegistration {
                 // fast-path-1 without re-emitting.
                 record(
                     .childWorkflowCompleted,
-                    try? JSON.encode(WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum))
+                    try! JSON.encode(WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum))
                 )
             case .emitEvent(let eventName, let payload):
                 // Non-suspending: write to strand.events directly here.
@@ -244,7 +244,7 @@ extension WorkflowRegistration {
                     logger: exec.logger
                 )
                 // Record the emission in workflow history so it appears in the trace view.
-                let emitData = try? JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
+                let emitData = try! JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
                 record(.eventEmitted, emitData)
             default:
                 break
@@ -329,7 +329,7 @@ extension WorkflowRegistration {
                 return nil
             }
             teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
-            let errData = try? JSON.encode(WorkflowStateQueries.WorkflowFailedData(error: String(describing: error)))
+            let errData = try! JSON.encode(WorkflowStateQueries.WorkflowFailedData(error: String(describing: error)))
             record(.workflowFailed, errData)
             try await flushWrites()
             // Stamp the last WorkflowContext call site onto the error.
@@ -346,7 +346,12 @@ extension WorkflowRegistration {
             break
         }
 
-        // ── 4. Suspended: apply schedule commands ────────────────────────────────
+        // ── 4. Suspended: apply schedule commands ──────────────────────────────────
+        // Declare the deferred-notify flag here (before the scheduleCommands loop) so
+        // startTimer and awaitEvent can set it when the pending_sigs check transitions
+        // the run directly to PENDING instead of SLEEPING/WAITING.
+        var needsNotifyAfterFlush = false
+
         let scheduleCommands = commands.filter { cmd in
             switch cmd {
             case .scheduleActivity, .startTimer, .awaitEvent, .scheduleChildWorkflow:
@@ -408,7 +413,8 @@ extension WorkflowRegistration {
                             timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
                             heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
                             scheduleToStartTimeoutSeconds: options.scheduleToStartTimeout.map { Int($0.components.seconds) },
-                            parentClosePolicy: options.cancellationType == .abandon ? .abandon : nil,
+                            parentClosePolicy: options.cancellationType == .abandon
+                                ? .abandon : options.cancellationType == .waitCancellationCompleted ? .waitCancellationCompleted : nil,
                             deadlineAt: options.maxDuration.map { activation.activationTime.addingDuration($0) },
                             fairnessKey: options.fairnessKey,
                             fairnessWeight: options.fairnessWeight,
@@ -418,18 +424,24 @@ extension WorkflowRegistration {
                     childHistoryItems.append(
                         (
                             eventType: .activityScheduled,
-                            eventData: try? JSON.encode(
+                            eventData: try! JSON.encode(
                                 WorkflowStateQueries.ActivityScheduledData(activity: name, seqNum: seqNum)
                             )
                         )
                     )
 
                 case .startTimer(let wakeAt, let timerSeqNum):
-                    // Transition run to SLEEPING. If signals are already pending (e.g. a
-                    // REQUEST_CANCEL was inserted while this activation was running), go PENDING
-                    // instead so the signal is delivered at the next activation rather than
-                    // waiting until the timer fires.
-                    try await exec.postgres.query(
+                    // Flush accumulated checkpoints + history BEFORE the state transition
+                    // so history is durable before the run leaves RUNNING state.
+                    // For SLEEPING (normal case), available_at is in the future so there
+                    // is no immediate race, but flushing first is still correct and cheap.
+                    // For PENDING (pending_sigs case), this prevents a polling worker from
+                    // claiming the run before history is committed.
+                    try await flushWrites()
+                    // Execute the transition and capture the resulting state so we know
+                    // whether to send a notification (required when pending_sigs causes
+                    // the run to go PENDING instead of SLEEPING).
+                    let timerStateStream = try await exec.postgres.query(
                         """
                         WITH
                         pending_sigs AS (
@@ -452,10 +464,17 @@ extension WorkflowRegistration {
                         UPDATE strand.tasks
                         SET state = (SELECT state FROM r)
                         WHERE id = \(claimed.taskID)
+                        RETURNING (SELECT state FROM r)
                         """,
                         logger: exec.logger
                     )
-                    let timerData = try? JSON.encode(
+                    // The UPDATE targets a single run_id so at most one row is returned.
+                    if let timerRow = try await timerStateStream.first(where: { _ in true }) {
+                        var col = timerRow.makeIterator()
+                        let timerRunState = try col.next()!.decode(TaskState.self, context: .default)
+                        if timerRunState == .pending { needsNotifyAfterFlush = true }
+                    }
+                    let timerData = try! JSON.encode(
                         WorkflowStateQueries.TimerStartedData(durationMs: Int(wakeAt.timeIntervalSinceNow * 1000), seqNum: timerSeqNum)
                     )
                     record(.timerStarted, timerData)
@@ -475,23 +494,20 @@ extension WorkflowRegistration {
                     )
 
                 case .awaitEvent(let eventName, let seqNum, let timeoutAt, let predicate):
+                    // Flush accumulated checkpoints + history BEFORE the withTransaction
+                    // so history is durable before the run leaves RUNNING state.
+                    // The withTransaction atomically registers the event_wait and checks
+                    // whether the event already exists — this prevents the lost-wakeup
+                    // race described below.  Flushing first ensures that if the event is
+                    // already present (run goes PENDING inside the transaction) no worker
+                    // can claim the run before the current activation’s history is committed.
+                    try await flushWrites()
+
                     // Atomic check-or-wait: prevents the lost-wakeup race where the
                     // event fires between drain() returning and this transaction committing.
-                    //
-                    // Without this check:
-                    //   1. drain() returns — handler suspended, .awaitEvent command emitted
-                    //   2. client.emitEvent fires — finds no event_wait yet — run not woken
-                    //   3. worker inserts event_wait — run goes WAITING and stalls forever
-                    //
-                    // Both operations live in the same transaction: insert the event_wait
-                    // and check strand.events. If the event is already there, go PENDING
-                    // immediately so the next activation fast-paths through waitForEvent.
                     let taskID = claimed.taskID
                     let runID = claimed.runID
                     let queueName = exec.queue
-                    // Wrap predicate as RawJSONB — same approach as emitEvent.
-                    // nil predicate uses '{}' (matches any payload); non-nil uses the
-                    // serialized predicate bytes.
                     let predicateRaw = RawJSONB(predicate ?? ByteBuffer(string: "{}"))
 
                     try await exec.postgres.withTransaction(logger: exec.logger) { conn in
@@ -563,7 +579,11 @@ extension WorkflowRegistration {
                                 """,
                                 logger: exec.logger
                             )
-                            // Run is PENDING — notify workers to claim immediately.
+                            // Notify deferred: flushWrites() ran before this transaction,
+                            // so the notify fires after history is already committed.
+                            // Use the transactional pg_notify here (fires on commit)
+                            // rather than deferring to needsNotifyAfterFlush — the event
+                            // details (queue name) are only available inside the closure.
                             try await conn.notifyWorkers(namespace: exec.namespace, queue: queueName, logger: exec.logger)
                         } else {
                             // Event not yet emitted — set run to WAITING (or SLEEPING for timed waits).
@@ -573,7 +593,7 @@ extension WorkflowRegistration {
                             let availableAt =
                                 timeoutAt ?? Date(timeIntervalSince1970: 32_503_680_000)
                             let runState: TaskState = timeoutAt != nil ? .sleeping : .waiting
-                            try await conn.query(
+                            let waitStateStream = try await conn.query(
                                 """
                                 WITH
                                 pending_sigs AS (
@@ -600,12 +620,26 @@ extension WorkflowRegistration {
                                 UPDATE strand.tasks
                                 SET state = (SELECT state FROM r)
                                 WHERE id = \(taskID)
+                                RETURNING (SELECT state FROM r)
                                 """,
                                 logger: exec.logger
                             )
+                            // If pending_sigs caused the run to go PENDING, notify workers.
+                            // The UPDATE targets a single run_id so at most one row is returned.
+                            if let waitRow = try await waitStateStream.first(where: { _ in true }) {
+                                var col = waitRow.makeIterator()
+                                let ws = try col.next()!.decode(TaskState.self, context: .default)
+                                if ws == .pending {
+                                    try await conn.notifyWorkers(
+                                        namespace: exec.namespace,
+                                        queue: queueName,
+                                        logger: exec.logger
+                                    )
+                                }
+                            }
                         }
                     }
-                    let eventWaitData = try? JSON.encode(
+                    let eventWaitData = try! JSON.encode(
                         WorkflowStateQueries.EventWaitStartedData(eventName: eventName, timeoutAt: timeoutAt, seqNum: seqNum)
                     )
                     record(.eventWaitStarted, eventWaitData)
@@ -653,7 +687,7 @@ extension WorkflowRegistration {
                     childHistoryItems.append(
                         (
                             eventType: .childWorkflowStarted,
-                            eventData: try? JSON.encode(
+                            eventData: try! JSON.encode(
                                 WorkflowStateQueries.ChildWorkflowData(workflow: name, seqNum: seqNum)
                             )
                         )
@@ -694,7 +728,8 @@ extension WorkflowRegistration {
         // are durable.  Steps 6 and 7 therefore merge their state-transition SQL
         // inside the same withTransaction as the checkpoint/history writes, so no
         // other worker can claim the run before the current activation's writes commit.
-        var needsNotifyAfterFlush = false
+        // needsNotifyAfterFlush is declared before step 4 so startTimer / awaitEvent
+        // can also set it when the pending_sigs guard transitions the run to PENDING.
 
         // ── 6. Unsatisfied conditions ────────────────────────────────────────────────────
         // Any conditions not satisfied post-drain need a DB state transition so

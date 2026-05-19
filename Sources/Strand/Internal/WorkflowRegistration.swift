@@ -700,7 +700,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                         while !Task.isCancelled {
                             try? await Task.sleep(for: .seconds(halfInterval))
                             guard !Task.isCancelled else { break }
-                            try? await Queries.extendClaim(
+                            _ = try? await Queries.extendClaim(
                                 on: exec.postgres,
                                 namespaceID: exec.namespace,
                                 runID: claimed.runID,

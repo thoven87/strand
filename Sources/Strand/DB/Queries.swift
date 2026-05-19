@@ -719,6 +719,14 @@ enum Queries {
         resultBuffer: ByteBuffer?,
         logger: Logger
     ) async throws {
+        // Flag written inside the closure to signal the cancelled case to the
+        // caller.  We must NOT throw InternalError.cancelled from within the
+        // withTransaction closure because PostgresNIO wraps every closure throw
+        // in PostgresTransactionError — masking the original error so the
+        // `catch InternalError.cancelled` in runTask never matches, causing a
+        // spurious failRun.  Returning normally from the closure (empty commit)
+        // and throwing after the transaction avoids the wrapping entirely.
+        var taskWasCancelled = false
         try await client.withTransaction(logger: logger) { conn in
             // Fetch task state and ID — FOR UPDATE prevents concurrent completions.
             // Partition pruning: strand.runs is partitioned monthly by created_at.
@@ -740,7 +748,13 @@ enum Queries {
             var col = row.makeIterator()
             let taskState = try col.next()!.decode(TaskState.self, context: .default)
             let taskID = try col.next()!.decode(UUID.self, context: .default)
-            if taskState == .cancelled { throw InternalError.cancelled }
+            // Task was externally cancelled while this run was still executing.
+            // Set the flag and return — the transaction commits as a no-op (only a
+            // SELECT FOR UPDATE was issued), releasing the lock cleanly.
+            if taskState == .cancelled {
+                taskWasCancelled = true
+                return
+            }
 
             // CAS on version — if another worker already wrote a completion, bail out.
             // The tasks update is gated on the runs CAS via the CTE: if r is empty
@@ -787,6 +801,9 @@ enum Queries {
                 logger: logger
             )
         }
+        // Throw outside the transaction so InternalError.cancelled reaches
+        // runTask's `catch InternalError.cancelled` directly — unwrapped.
+        if taskWasCancelled { throw InternalError.cancelled }
     }
 
     private struct _NRFlag: Decodable { let non_retryable: Bool? }
@@ -1116,6 +1133,7 @@ enum Queries {
     /// Connection-level implementation — the single source of truth for claim extension.
     /// `heartbeatDetails` is stored when non-nil; when nil the existing value is preserved
     /// (`COALESCE(NULL, heartbeat_details) = heartbeat_details`).
+    @discardableResult
     static func extendClaim(
         on conn: PostgresConnection,
         namespaceID: String,
@@ -1123,25 +1141,33 @@ enum Queries {
         extendBySeconds: Int,
         heartbeatDetails: ByteBuffer? = nil,
         logger: Logger
-    ) async throws {
+    ) async throws -> Bool {
         let stream = try await conn.query(
             """
-            UPDATE strand.runs
+            UPDATE strand.runs r
             SET lease_expires_at  = NOW() + \(extendBySeconds) * INTERVAL '1 second',
                 heartbeat_details = COALESCE(\(heartbeatDetails), heartbeat_details)
-            WHERE id = \(runID)
-              AND state = \(TaskState.running)
-              AND namespace_id = \(namespaceID)
-            RETURNING id
+            FROM strand.tasks t
+            WHERE r.id           = \(runID)
+              AND r.state        = \(TaskState.running)
+              AND r.namespace_id = \(namespaceID)
+              AND t.id           = r.task_id
+            RETURNING r.id,
+                CASE WHEN t.state = \(TaskState.cancelled) THEN TRUE ELSE FALSE END AS task_cancelled
             """,
             logger: logger
         )
-        if try await stream.first(where: { _ in true }) == nil {
+        guard let row = try await stream.first(where: { _ in true }) else {
             throw InternalError.cancelled
         }
+        var col = row.makeIterator()
+        _ = try col.next()!.decode(UUID.self, context: .default)  // r.id
+        let taskCancelled = try col.next()!.decode(Bool.self, context: .default)
+        return taskCancelled
     }
 
     /// Pool-level overload — acquires a connection then delegates to the connection overload.
+    @discardableResult
     static func extendClaim(
         on client: PostgresClient,
         namespaceID: String,
@@ -1149,7 +1175,7 @@ enum Queries {
         extendBySeconds: Int,
         heartbeatDetails: ByteBuffer? = nil,
         logger: Logger
-    ) async throws {
+    ) async throws -> Bool {
         try await client.withConnection { conn in
             try await extendClaim(
                 on: conn,
@@ -1163,6 +1189,26 @@ enum Queries {
     }
 
     /// Cancels a task and all its pending/sleeping runs.
+    ///
+    /// ## `waitCancellationCompleted` deferred-cancel path
+    ///
+    /// When the task has child activities with `parent_close_policy = .waitCancellationCompleted`
+    /// that are still RUNNING, the cancellation is deferred so those activities can finish
+    /// naturally before the parent closes.
+    ///
+    /// Instead of immediately marking the task CANCELLED the engine:
+    ///   1. Sets `cancel_requested = TRUE` (the same cooperative-cancel flag used by
+    ///      `requestCancel` parent policies for child workflows).
+    ///   2. Cancels only PENDING runs (prevents new activations).
+    ///   3. Preserves RUNNING / WAITING / SLEEPING runs so the parent can complete
+    ///      any in-flight work and be re-activated when activity completions arrive.
+    ///
+    /// On the next activation the worker sees `claimed.cancelRequested = true`,
+    /// sets `activation.isCancelRequested = true`, and calls `handlerTask.cancel()`.
+    /// The handler processes any completed activity results (existing continuations are
+    /// NOT automatically cancelled), then `CancellationError` fires at the next slow-path
+    /// suspension point.  `applyScheduleCommands` catches it and transitions the task to
+    /// CANCELLED exactly as if the cancellation had been immediate.
     static func cancelTask(
         on client: PostgresClient,
         namespaceID: String,
@@ -1171,57 +1217,129 @@ enum Queries {
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
 
-            // ── Step 1: Cancel the task row itself ────────────────────────────────
-            try await conn.query(
+            // ── Step 0: Detect in-flight waitCancellationCompleted activities ───────
+            // If any child activity has a RUNNING run and
+            // parent_close_policy = .waitCancellationCompleted, defer the cancellation
+            // so the parent can wait for those activities to finish cooperatively.
+            let deferredStream = try await conn.query(
                 """
-                UPDATE strand.tasks
-                SET state = \(TaskState.cancelled), cancelled_at = NOW()
-                WHERE id = \(taskID)
-                  AND namespace_id = \(namespaceID)
-                  AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM   strand.tasks c
+                    JOIN   strand.runs  r ON r.task_id = c.id
+                                        AND r.state   = \(TaskState.running)
+                    WHERE  c.parent_task_id    = \(taskID)
+                      AND  c.namespace_id      = \(namespaceID)
+                      AND  c.parent_close_policy = \(ParentClosePolicy.waitCancellationCompleted)
+                      AND  c.state NOT IN (
+                               \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                           )
+                ) AS deferred
                 """,
                 logger: logger
             )
-
-            // ── Step 2: Cancel/interrupt this task's runs ─────────────────────────
-            // PENDING/SLEEPING/WAITING → CANCELLED immediately.
-            // RUNNING → also set to CANCELLED so the next extendClaim() call from
-            // the worker throws InternalError.cancelled, stopping the activity at
-            // its next heartbeat or checkpoint write.
-            try await conn.query(
-                """
-                UPDATE strand.runs
-                SET state = \(TaskState.cancelled)
-                WHERE task_id = \(taskID)
-                  AND namespace_id = \(namespaceID)
-                  AND state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting), \(TaskState.running))
-                """,
-                logger: logger
-            )
-
-            // ── Step 3 + 4: Policy-aware cascade to descendants ─────────────────────
-            // cancelDescendants handles the three policies (TERMINATE / REQUEST_CANCEL /
-            // ABANDON) atomically. It returns queue names for any runs woken by
-            // REQUEST_CANCEL so we can notify workers immediately.
-            let cancelQueues = try await cancelDescendants(
-                on: conn,
-                namespaceID: namespaceID,
-                parentTaskID: taskID,
-                logger: logger
-            )
-            for queue in Set(cancelQueues) {
-                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            let deferred: Bool
+            if let row = try await deferredStream.first(where: { _ in true }) {
+                var col = row.makeIterator()
+                deferred = try col.next()!.decode(Bool.self, context: .default)
+            } else {
+                deferred = false
             }
 
-            // ── Step 5: Wake any awaitTaskResult callers ───────────────────────────
-            try await emitTaskCompletionSignal(
-                conn: conn,
-                namespaceID: namespaceID,
-                taskID: taskID,
-                state: .cancelled,
-                resultBuffer: nil,
-                logger: logger
-            )
+            if deferred {
+                // ── Deferred-cancel path ──────────────────────────────────────────────
+                // Signal cooperative cancellation without immediately terminating the task.
+                // The handler will see isCancelRequested = true on the next activation and
+                // throw CancellationError after processing any in-flight activity results.
+                try await conn.query(
+                    """
+                    UPDATE strand.tasks
+                    SET cancel_requested = TRUE
+                    WHERE id = \(taskID)
+                      AND namespace_id = \(namespaceID)
+                      AND state NOT IN (
+                              \(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled)
+                          )
+                    """,
+                    logger: logger
+                )
+                // Cancel PENDING runs (no new activations), but preserve RUNNING /
+                // WAITING / SLEEPING runs so the parent can be re-activated when
+                // the waitCancellationCompleted activities finish.
+                try await conn.query(
+                    """
+                    UPDATE strand.runs
+                    SET state = \(TaskState.cancelled)
+                    WHERE task_id      = \(taskID)
+                      AND namespace_id = \(namespaceID)
+                      AND state        = \(TaskState.pending)
+                    """,
+                    logger: logger
+                )
+                // Cascade to descendants as normal (waitCancellationCompleted activities
+                // are in `to_terminate` which already preserves their RUNNING runs).
+                let cancelQueues = try await cancelDescendants(
+                    on: conn,
+                    namespaceID: namespaceID,
+                    parentTaskID: taskID,
+                    logger: logger
+                )
+                for queue in Set(cancelQueues) {
+                    try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+                }
+                // No emitTaskCompletionSignal here — the parent is still alive.
+                // applyScheduleCommands will emit it when the workflow finally cancels.
+            } else {
+                // ── Immediate-cancel path (standard) ─────────────────────────────
+
+                // ── Step 1: Cancel the task row itself ────────────────────────────────────
+                try await conn.query(
+                    """
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.cancelled), cancelled_at = NOW()
+                    WHERE id = \(taskID)
+                      AND namespace_id = \(namespaceID)
+                      AND state NOT IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                    """,
+                    logger: logger
+                )
+
+                // ── Step 2: Cancel/interrupt this task's runs ────────────────────────
+                try await conn.query(
+                    """
+                    UPDATE strand.runs
+                    SET state = \(TaskState.cancelled)
+                    WHERE task_id = \(taskID)
+                      AND namespace_id = \(namespaceID)
+                      AND state IN (
+                              \(TaskState.pending), \(TaskState.sleeping),
+                              \(TaskState.waiting), \(TaskState.running)
+                          )
+                    """,
+                    logger: logger
+                )
+
+                // ── Step 3 + 4: Policy-aware cascade to descendants ─────────────────
+                let cancelQueues = try await cancelDescendants(
+                    on: conn,
+                    namespaceID: namespaceID,
+                    parentTaskID: taskID,
+                    logger: logger
+                )
+                for queue in Set(cancelQueues) {
+                    try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+                }
+
+                // ── Step 5: Wake any awaitTaskResult callers ────────────────────────
+                try await emitTaskCompletionSignal(
+                    conn: conn,
+                    namespaceID: namespaceID,
+                    taskID: taskID,
+                    state: .cancelled,
+                    resultBuffer: nil,
+                    logger: logger
+                )
+            }
         }
 
         logger.debug(
@@ -2019,7 +2137,8 @@ enum Queries {
             ? "sweeping 1 schedule-to-start timeout activity"
             : "sweeping \(expired.count) schedule-to-start timeout activities"
         logger.debug(noun, metadata: ["strand.queue": .string(queue)])
-        let reasonBuffer = (try? JSON.encode(FailureReason(error: _ScheduleToStartTimeoutError()))) ?? ByteBuffer()
+        // FailureReason is a plain Codable class — encoding cannot fail; try! is safe.
+        let reasonBuffer = try! JSON.encode(FailureReason(error: _ScheduleToStartTimeoutError()))
         for item in expired {
             try? await client.withTransaction(logger: logger) { conn in
                 // Atomically re-check and fail this specific run.
@@ -2416,6 +2535,8 @@ enum Queries {
         logger: Logger
     ) async throws {
         let modeRaw = mode.rawValue
+        // The sentinel bytes are owned by the type — no duplication of the JSON key.
+        let sentinelBuf = ActivityFailedSentinel.encoded
         let stream = try await conn.query(
             """
             WITH RECURSIVE
@@ -2509,6 +2630,29 @@ enum Queries {
                   AND  namespace_id  = \(namespaceID)
                   AND  state        NOT IN ('PENDING', 'RUNNING', 'SLEEPING', 'WAITING')
                   AND  \(resetHistory)
+            ),
+            -- 5. Clear the parent workflow's ActivityFailedSentinel checkpoints
+            --    so the next activation re-dispatches the activities rather than
+            --    hitting fast-path-1 and replaying the cached failure.
+            --
+            --    When a child activity fails the parent writes an
+            --    ActivityFailedSentinel ({"failed":true}) at the activity's seq_num
+            --    in strand.checkpoints (task_id = parent workflow task).  Without
+            --    deleting it here the parent's next activation hits fast-path-1,
+            --    reads the sentinel, and throws the same ActivityError again without
+            --    ever re-dispatching the activity.
+            --
+            --    Every sentinel on this parent encodes to the same fixed byte
+            --    sequence, so a direct value match is sufficient — no need to
+            --    parse the idempotency key to recover the seq_num.
+            --    (Not needed when resetHistory=true: retryTask calls
+            --    clearWorkflowArtefacts which wipes all parent checkpoints.)
+            del_parent_sentinels AS (
+                DELETE FROM strand.checkpoints
+                WHERE  task_id      = \(rootTaskID)
+                  AND  namespace_id = \(namespaceID)
+                  AND  NOT \(resetHistory)
+                  AND  state        = \(sentinelBuf)
             )
             SELECT DISTINCT queue FROM new_runs
             """,

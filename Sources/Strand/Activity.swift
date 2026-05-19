@@ -594,7 +594,9 @@ extension Activity {
                     // Extend the Postgres lease to signal that the activity is still alive.
                     // When `details` is non-nil, persists the heartbeat progress checkpoint
                     // so the next retry attempt can resume exactly where it left off.
-                    try await Queries.extendClaim(
+                    // Returns true if the *task* is CANCELLED (even though the RUNNING
+                    // run is preserved — waitCancellationCompleted semantics).
+                    let taskCancelled = try await Queries.extendClaim(
                         on: postgres,
                         namespaceID: namespace,
                         runID: runID,
@@ -606,10 +608,23 @@ extension Activity {
                     // activity that regularly heartbeats is never killed by the 2×
                     // claimTimeout guard.
                     fatalDeadline?.renew()
+                    // For waitCancellationCompleted activities: the parent was cancelled
+                    // but the RUNNING run is intentionally preserved so the activity can
+                    // finish its cleanup. Signal isCancelled = true so the activity code
+                    // can detect the cancellation and exit gracefully — without being
+                    // hard-stopped by a thrown CancellationError.
+                    //
+                    // For regular (tryCancel) activities: when the parent is cancelled
+                    // the run itself is also cancelled, so extendClaim finds no RUNNING
+                    // row and throws InternalError before we ever reach this branch.
+                    if taskCancelled {
+                        cancellationFlag.markCancelled()
+                        // Don't throw — allow the activity to complete naturally.
+                    }
                 } catch is InternalError {
                     // extendClaim found no RUNNING row — the run was cancelled
                     // externally. Set the flag so context.isCancelled returns true
-                    // immediately, then throw CancellationError (Swift’s standard
+                    // immediately, then throw CancellationError (Swift's standard
                     // cancellation type) rather than leaking InternalError.
                     cancellationFlag.markCancelled()
                     throw CancellationError()
