@@ -1027,9 +1027,7 @@ public struct StrandWorker: Service {
             )
         } catch {
             let reason = FailureReason(error: error)
-            let buf =
-                (try? JSON.encode(reason))
-                ?? ByteBuffer(string: #"{"name":"unknown","message":"encoding failed"}"#)
+            let buf = (try? JSON.encode(reason)) ?? FailureReason.fallback
             await failAndRecord(
                 reasonBuffer: buf,
                 claimed: claimed,
@@ -1137,6 +1135,13 @@ final class FailureReason: Codable, Sendable {
             case line
         }
     }
+
+    /// Pre-encoded sentinel buffer used as a fallback when JSON encoding of a
+    /// `FailureReason` fails (which cannot happen for this plain-`Codable` type).
+    /// Centralises the literal here rather than scattering it at call sites.
+    static let fallback: ByteBuffer = ByteBuffer(
+        string: #"{"name":"unknown","message":"encoding failed"}"#
+    )
 
     init(error: any Error) {
         // Priority 1: call-site annotation stamped by WorkflowContext.runActivity etc.

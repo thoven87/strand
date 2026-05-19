@@ -624,6 +624,10 @@ public enum ParentClosePolicy: String, Sendable, Codable {
     case terminate = "TERMINATE"
     case abandon = "ABANDON"
     case requestCancel = "REQUEST_CANCEL"
+    /// The parent waits for the child activity to acknowledge cancellation before
+    /// proceeding. The RUNNING run is preserved so the activity can perform cleanup;
+    /// `context.isCancelled` is set to `true` via the heartbeat mechanism.
+    case waitCancellationCompleted = "WAIT_CANCELLATION_COMPLETED"
 }
 
 /// How the parent workflow handles cancellation propagation to a child workflow.

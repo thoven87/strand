@@ -172,6 +172,13 @@ public protocol NonRetryableError: Error {}
 struct _TypedActivityFailure: Error, CustomStringConvertible {
     let reasonBuffer: ByteBuffer
 
+    /// Pre-encoded sentinel buffer for `init(name:message:payload:nonRetryable:source:)`
+    /// fallback.  The fallback is unreachable in practice; the constant centralises the
+    /// literal in the type rather than scattering it at call sites.
+    static let fallback: ByteBuffer = ByteBuffer(
+        string: #"{"name":"unknown","message":"failure encoding failed"}"#
+    )
+
     /// Human-readable description used by OTel’s `withSpan` when recording this
     /// error as an exception attribute on the activity span.
     /// Without this, swift-distributed-tracing falls back to `String(describing:)`
@@ -211,9 +218,7 @@ struct _TypedActivityFailure: Error, CustomStringConvertible {
         // If encoding fails (essentially never) fall back to a static safe string.
         // We can't trust arbitrary content in `name` for manual JSON escaping,
         // so drop it and keep only the error signal.
-        self.reasonBuffer =
-            (try? JSON.encode(p))
-            ?? ByteBuffer(string: #"{"name":"unknown","message":"failure encoding failed"}"#)
+        self.reasonBuffer = (try? JSON.encode(p)) ?? _TypedActivityFailure.fallback
     }
 }
 

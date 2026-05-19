@@ -43,6 +43,13 @@ struct ActivityFailedSentinel: Codable {
     let failed: Bool
     init() { self.failed = true }
     private enum CodingKeys: String, CodingKey { case failed = "$activityFailed" }
+
+    /// Pre-encoded bytes of this sentinel.  Stored as a static constant so
+    /// SQL comparisons (e.g. in `resetChildTasks`) always derive from the type
+    /// rather than duplicating the JSON key as a string literal.
+    /// `try!` is safe: a single Bool field cannot fail JSON encoding.
+    static let encoded: ByteBuffer = try! JSON.encode(ActivityFailedSentinel())
+
     static func detect(in buffer: ByteBuffer) -> Bool {
         (try? JSON.decode(ActivityFailedSentinel.self, from: buffer))?.failed == true
     }
@@ -560,9 +567,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             _impl.lastCallSite = (fileID, line)
             // Write a failure sentinel so the next fresh-path replay hits fast path 1 and
             // does not re-emit .activityCompleted — exactly-once ACTIVITY_FAILED history write.
-            if let sentinel = try? JSON.encode(ActivityFailedSentinel()) {
-                _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: sentinel))
-            }
+            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: ActivityFailedSentinel.encoded))
             _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
             // Attempt to decode the original typed Failure value from the stored payload.
             // Falls back to ActivityError when Failure = Never or payload is absent.
@@ -630,9 +635,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         } catch let signal as _ActivityFailureSignal {
             // Re-activation delivered a typed failure signal.
             // Write a failure sentinel so fresh-path replays hit fast path 1 (exactly-once guard).
-            if let sentinel = try? JSON.encode(ActivityFailedSentinel()) {
-                _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: sentinel))
-            }
+            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: ActivityFailedSentinel.encoded))
             _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
             // Try to decode A.Failure from the stored payload.
             if let buf = signal.failureReason,

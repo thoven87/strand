@@ -155,6 +155,97 @@ mutating func run(context: WorkflowContext<Self>, input: LoopInput) async throws
 }
 ```
 
+## Cooperative cancellation (`requestCancel`)
+
+By default, when a parent workflow closes, its child workflows are hard-stopped.
+Set `parentClosePolicy: .requestCancel` on `ChildWorkflowOptions` to send a
+cooperative cancel request instead — the child keeps running and can finish
+cleanly, persist a partial result, or trigger compensating activities before
+it exits.
+
+```swift
+let result = try await context.runChildWorkflow(
+    CleanupWorkflow.self,
+    options: ChildWorkflowOptions(parentClosePolicy: .requestCancel),
+    input: CleanupInput(resourceID: id)
+)
+```
+
+Inside the child, `context.isCancelRequested` returns `true` once the request
+arrives. Three patterns cover the common cases:
+
+### Check between activities (most common)
+
+Poll `isCancelRequested` between sequential steps — no suspension overhead:
+
+```swift
+let invoice = try await context.runActivity(CalculateInvoice.self, input: ...)
+if context.isCancelRequested { return .cancelled }
+let charge  = try await context.runActivity(ChargeCard.self, input: ...)
+```
+
+### Automatic via `CancellationError` (zero boilerplate)
+
+`runActivity`, `sleep`, and `waitForEvent` throw `CancellationError` automatically
+when a cancel request is set. If you don't need to return a specific value on
+cancellation, no explicit check is required — the error propagates and the run
+transitions to CANCELLED naturally:
+
+```swift
+// runActivity / sleep / waitForEvent throw CancellationError automatically
+// when cancel_requested is set — no explicit check needed if you're OK
+// with the run ending as CANCELLED rather than returning a specific value.
+let result = try await context.runActivity(SomeActivity.self, input: ...)
+```
+
+### `waitForCancellation()` (idle workflows or racing inside a task group)
+
+Use `waitForCancellation()` when the workflow is idle and should only proceed
+once a cancel request arrives, or to race it against other conditions:
+
+```swift
+// Pure waiting workflow — suspends until cancellation is requested
+try await context.waitForCancellation()
+return .cleanedUp
+
+// Or: race cancellation against other conditions inside a task group
+try await withThrowingTaskGroup(of: Void.self) { group in
+    group.addTask { try await context.runActivity(LongTask.self, input: ...) }
+    group.addTask {
+        try await context.waitForCancellation()
+        throw CancellationError()
+    }
+    try await group.next()
+    group.cancelAll()
+}
+```
+
+### Letting activities finish before cancellation (`waitCancellationCompleted`)
+
+Activities whose `cancellationType` is `.waitCancellationCompleted` keep running
+when the parent is cancelled. The parent waits for them to finish before it
+transitions to CANCELLED, giving those activities a chance to flush state or
+write audit records. The activity receives `context.isCancelled = true` via
+heartbeat so it can wrap up at a natural checkpoint:
+
+```swift
+// Parent workflow
+let result = try await context.runActivity(
+    AuditActivity.self,
+    input: auditInput,
+    options: ActivityOptions(cancellationType: .waitCancellationCompleted)
+)
+
+// AuditActivity — checks isCancelled at natural checkpoints
+func run(input: AuditInput, context: ActivityContext) async throws -> AuditResult {
+    for record in input.records {
+        if context.isCancelled { break }   // finish the current batch cleanly
+        try await process(record)
+    }
+    return AuditResult(processed: count)
+}
+```
+
 ## Deterministic helpers
 
 Use these context methods instead of their non-deterministic Swift equivalents:

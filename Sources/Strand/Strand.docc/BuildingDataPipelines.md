@@ -130,16 +130,42 @@ Because each chunk is an independent child workflow:
 
 ## Scheduling a nightly pipeline
 
+When the schedule is known at compile time, register it at boot via
+`StrandService.addSchedule`. This is the recommended pattern because the
+schedule is declared alongside the rest of your service configuration and
+starts automatically with the worker process:
+
 ```swift
-try await client.schedule(
-    name: "nightly-ingestion",
+var strand = StrandService(
+    postgres: postgres,
+    options: .init(
+        queues: [
+            .init(name: "pipeline", workflows: [IngestionPipeline.self], activities: [DiscoverActivity()])
+        ],
+        scheduler: .init()   // enable the scheduler
+    )
+)
+strand.addSchedule(.workflow(
+    "nightly-ingestion",
     pattern: .daily(offset: "PT2H"),   // 02:00 UTC
     workflowType: IngestionPipeline.self,
-    input: PipelineInput(
-        sourceURL: "s3://my-bucket/data/",
-        datasetID: "nightly"
-    ),
+    input: PipelineInput(sourceURL: "s3://my-bucket/data/", datasetID: "nightly"),
+    queue: "pipeline",
     options: ScheduleOptions(accuracy: .latest)   // skip stale slots on restart
+))
+```
+
+`client.schedule(...)` is still valid when the schedule is created **at
+runtime** — for example, from an HTTP handler when a user configures a new
+pipeline:
+
+```swift
+// Runtime creation — e.g. from an HTTP handler when a user configures a new pipeline
+try await client.schedule(
+    name: "custom-ingestion-\(userID)",
+    pattern: .cron(userCron),
+    workflowType: IngestionPipeline.self,
+    input: PipelineInput(sourceURL: userBucket, datasetID: userID)
 )
 ```
 
