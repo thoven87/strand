@@ -16,7 +16,7 @@ import Foundation
 
 /// Store for values captured inside activity handlers so tests can
 /// assert on them after the worker has finished.
-private final class HeartbeatObserver: @unchecked Sendable {
+private final class HeartbeatObserver: Sendable {
     private let _lock = Mutex<State>(State())
 
     private struct State {

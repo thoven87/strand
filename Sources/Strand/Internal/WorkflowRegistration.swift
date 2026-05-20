@@ -44,9 +44,9 @@ extension Workflow {
 /// `@unchecked Sendable`: access to the dictionary is serialised by the `Mutex`;
 /// access to the cached executor is serialised by Postgres
 /// (`FOR UPDATE SKIP LOCKED` prevents two workers from claiming the same run).
-final class _WorkflowTaskCache<W: Workflow>: @unchecked Sendable {
+final class _WorkflowTaskCache<W: Workflow>: Sendable {
 
-    struct CachedState: @unchecked Sendable {
+    struct CachedState: Sendable {
         let executor: StrandWorkflowExecutor
         let task: Task<Void, Never>
         let handlerResult: ArcBox<Result<W.Output, Error>?>
