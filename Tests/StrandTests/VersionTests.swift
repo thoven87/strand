@@ -27,8 +27,12 @@ private struct VersionedWorkflow: Workflow {
     typealias Output = String
 
     mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String {
-        // Sleep briefly so the test window can call markVersion before this point.
-        try await context.sleep(for: .milliseconds(200))
+        // Sleep long enough that the test has a comfortable window to write
+        // markVersion and have it commit well before the timer fires.
+        // 200 ms was too tight: on this machine the worker claims the sleeping
+        // run within ~15 ms of available_at, leaving markVersion's DB write
+        // racing listVersionMarkers on the same connection pool.
+        try await context.sleep(for: .seconds(2))
         let isNew = context.version(changeID: "v2-feature")
         return isNew ? "new-path" : "old-path"
     }
@@ -62,8 +66,8 @@ private struct TwoVersionWorkflow: Workflow {
     typealias Output = String
 
     mutating func run(context: WorkflowContext<Self>, input: String) async throws -> String {
-        // Sleep first so the test can mark version values before they are read.
-        try await context.sleep(for: .milliseconds(200))
+        // Sleep long enough that markVersion writes commit well before the timer fires.
+        try await context.sleep(for: .seconds(2))
         // Both calls use distinct changeIDs — each keyed independently.
         let isV2 = context.version(changeID: "multi-v2")
         let isV3 = context.version(changeID: "multi-v3")

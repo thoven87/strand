@@ -446,6 +446,13 @@ CREATE INDEX IF NOT EXISTS strand_runs_lease_idx
     ON strand.runs (namespace_id, queue, lease_expires_at)
     WHERE state = 'RUNNING'::text AND lease_expires_at IS NOT NULL;
 
+-- Supports cancelDescendants (run_terminate CTE), resetChildTasks (del_old_runs),
+-- and cancelTasksBatch when cancelling non-terminal runs by task_id.
+-- Without this index those CTEs perform a full sequential scan across all
+-- monthly partitions — observed at 1264 ms on workflows with many descendants.
+CREATE INDEX IF NOT EXISTS strand_runs_task_idx
+    ON strand.runs (task_id);
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Checkpoints — sideEffect() / replay cache within a workflow activation.
 -- Keyed by (task_id, seq_num). Read at activation start; bypassed when hit.
@@ -966,6 +973,28 @@ CREATE UNLOGGED TABLE IF NOT EXISTS strand.workers (
 -- Live queue health lookup from the Workers dashboard page.
 CREATE INDEX IF NOT EXISTS strand_workers_ns_queue_idx
     ON strand.workers (namespace_id, queue);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rate-limit slots — leaky-bucket slot scheduler for per-activity rate limits.
+--
+-- Each row tracks when the NEXT slot is available for a (namespace, queue, key)
+-- bucket.  When an activity with a RateLimit is enqueued, one round-trip
+-- atomically advances next_slot_at by the slot interval and sets the run's
+-- available_at to the allocated slot time.
+--
+-- GREATEST(next_slot_at, NOW()) in the upsert resets stale cursors so tasks
+-- enqueued into an idle queue are never artificially delayed.
+--
+-- No pruning required: stale rows (next_slot_at in the past) are harmless;
+-- the GREATEST guard resets them on next use.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strand.rate_limit_slots (
+    namespace_id  TEXT        NOT NULL REFERENCES strand.namespaces(id) ON DELETE CASCADE,
+    queue         TEXT        NOT NULL,
+    slot_key      TEXT        NOT NULL,  -- activity name (global) or "ActivityName:entityKey"
+    next_slot_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT strand_rate_limit_slots_pkey PRIMARY KEY (namespace_id, queue, slot_key)
+);
 
 -- ───────────────────────────────────────────────────────────────────────────────
 -- Count estimate — fast approximate row counts for large tables.

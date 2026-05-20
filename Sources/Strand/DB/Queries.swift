@@ -167,6 +167,8 @@ enum Queries {
         firstTaskID: UUID? = nil,
         backfillID: UUID? = nil,
         parentClosePolicy: ParentClosePolicy? = nil,
+        rateLimitKey: String? = nil,
+        rateLimitIntervalMs: Int? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
         try await client.withTransaction(logger: logger) { conn in
@@ -217,6 +219,18 @@ enum Queries {
                         "strand.kind": .string(kind.rawValue),
                     ]
                 )
+                // Allocate a rate-limit slot when a RateLimit is set.
+                if let intervalMs = rateLimitIntervalMs {
+                    try await applyRateLimitSlots(
+                        on: conn,
+                        namespaceID: namespaceID,
+                        queues: [queue],
+                        slotKeys: [rateLimitKey ?? taskName],
+                        runIDs: [runID],
+                        intervalMses: [intervalMs],
+                        logger: logger
+                    )
+                }
                 // pg_notify is transactional — delivered only after this transaction commits.
                 try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
                 // Write-through to trace_spans — atomic with the enqueue transaction.
@@ -260,6 +274,93 @@ enum Queries {
         }
     }
 
+    // MARK: - Rate-limit slot allocation
+
+    /// Allocates rate-limit slots for one or more runs in a single round-trip.
+    ///
+    /// Used by both `enqueueTask` (N=1) and `enqueueChildTasksBatch` (N≥1);
+    /// the same batch CTE handles both cases correctly.
+    ///
+    /// **Algorithm** (three CTE steps):
+    ///
+    /// 1. `ranked` — `UNNEST … WITH ORDINALITY` assigns each run its position
+    ///    (`rank 0…cnt-1`) within its `(queue, slot_key)` group.
+    ///
+    /// 2. `advanced` — one upsert per distinct `(queue, slot_key)` advances the
+    ///    cursor by `cnt × interval`.  The INSERT seeds new buckets at
+    ///    `NOW() + cnt × I` (task 0 is immediately available).  The
+    ///    `ON CONFLICT` arm applies `GREATEST(cursor, NOW())` before advancing,
+    ///    resetting a stale cursor on an idle queue to `NOW()`.
+    ///
+    /// 3. Final `UPDATE` sets each run's `available_at` using closed-form offsets:
+    ///    `cursor − (cnt − rank) × I = base + rank × I`
+    ///    where `base = GREATEST(old_cursor, NOW())`.
+    ///
+    /// - Parameters:
+    ///   - queues:       Queue name for each run (`text[]`).
+    ///   - slotKeys:     Rate-limit bucket key for each run (`text[]`).
+    ///   - runIDs:       `strand.runs.id` for each run (`uuid[]`).
+    ///   - intervalMses: Slot interval in milliseconds for each run (`int8[]`).
+    ///
+    /// All four arrays must be the same length and non-empty; the caller is
+    /// responsible for the guard (both call sites already check `!isEmpty`).
+    static func applyRateLimitSlots(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        queues: [String],
+        slotKeys: [String],
+        runIDs: [UUID],
+        intervalMses: [Int],
+        logger: Logger
+    ) async throws {
+        try await conn.query(
+            """
+            WITH
+            ranked AS (
+                SELECT
+                    queue, slot_key, run_id, interval_ms,
+                    (ROW_NUMBER() OVER (PARTITION BY queue, slot_key ORDER BY ord)
+                     - 1)::int AS rank,
+                    COUNT(*) OVER (PARTITION BY queue, slot_key)::int AS cnt
+                FROM UNNEST(\(queues), \(slotKeys), \(runIDs), \(intervalMses))
+                     WITH ORDINALITY AS t(queue, slot_key, run_id, interval_ms, ord)
+            ),
+            advanced AS (
+                INSERT INTO strand.rate_limit_slots
+                    (namespace_id, queue, slot_key, next_slot_at)
+                SELECT DISTINCT ON (queue, slot_key)
+                    \(namespaceID), queue, slot_key,
+                    NOW() + cnt * interval_ms * INTERVAL '1 millisecond'
+                FROM ranked
+                ORDER BY queue, slot_key
+                ON CONFLICT (namespace_id, queue, slot_key) DO UPDATE
+                    SET next_slot_at = GREATEST(
+                            strand.rate_limit_slots.next_slot_at, NOW()
+                        ) + (
+                            SELECT r2.cnt * r2.interval_ms FROM ranked r2
+                            WHERE  r2.queue    = excluded.queue
+                              AND  r2.slot_key = excluded.slot_key
+                            LIMIT  1
+                        ) * INTERVAL '1 millisecond'
+                RETURNING queue, slot_key, next_slot_at AS cursor
+            )
+            UPDATE strand.runs
+            SET    available_at = GREATEST(
+                       available_at,
+                       a.cursor
+                           - (r.cnt - r.rank) * r.interval_ms
+                           * INTERVAL '1 millisecond'
+                   )
+            FROM   ranked r
+            JOIN   advanced a
+                   ON  a.queue    = r.queue
+                   AND a.slot_key = r.slot_key
+            WHERE  strand.runs.id = r.run_id
+            """,
+            logger: logger
+        )
+    }
+
     // MARK: - ChildEnqueueSpec
 
     /// One child task to enqueue as part of a batch spawned by a single workflow activation.
@@ -287,6 +388,12 @@ enum Queries {
         let fairnessKey: String?
         let fairnessWeight: Double
         let kind: TaskKind  // .activity or .workflow
+        /// Slot interval in milliseconds for the rate-limit bucket.
+        /// `nil` = no rate limiting; the run's `available_at` is unchanged.
+        let rateLimitIntervalMs: Int?
+        /// Rate-limit slot key.  `nil` falls back to `taskName` in the SQL.
+        /// Set to `"ActivityName:entityKey"` for per-entity buckets.
+        let rateLimitKey: String?
     }
 
     // MARK: - enqueueChildTasksBatch
@@ -455,6 +562,33 @@ enum Queries {
                         logger: logger
                     )
                 }
+            }
+
+            // ── 4b. Rate-limit slot allocation ──────────────────────────────────────────
+            // Collect rate-limited new children and forward to applyRateLimitSlots.
+            // Idempotency-hit tasks are excluded — their run already has the correct
+            // available_at from the original enqueue.  See applyRateLimitSlots for
+            // the full algorithm.
+            var rlQueues:       [String] = []
+            var rlSlotKeys:     [String] = []
+            var rlRunIDs:       [UUID]   = []
+            var rlIntervalMses: [Int]    = []
+            for child in newChildren where child.rateLimitIntervalMs != nil {
+                rlQueues.append(child.queue)
+                rlSlotKeys.append(child.rateLimitKey ?? child.taskName)
+                rlRunIDs.append(child.runID)
+                rlIntervalMses.append(child.rateLimitIntervalMs!)
+            }
+            if !rlRunIDs.isEmpty {
+                try await applyRateLimitSlots(
+                    on: conn,
+                    namespaceID: namespaceID,
+                    queues: rlQueues,
+                    slotKeys: rlSlotKeys,
+                    runIDs: rlRunIDs,
+                    intervalMses: rlIntervalMses,
+                    logger: logger
+                )
             }
 
             // ── 5. Notify workers — one pg_notify per distinct new child queue ────────

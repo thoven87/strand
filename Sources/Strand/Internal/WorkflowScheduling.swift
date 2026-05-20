@@ -396,6 +396,7 @@ extension WorkflowRegistration {
                     let seqNum,
                     let idKey
                 ):
+                    let rlParams = options.rateLimit.map { $0.slotParams(for: name) }
                     pendingChildren.append(
                         Queries.ChildEnqueueSpec(
                             seqNum: seqNum,
@@ -418,7 +419,9 @@ extension WorkflowRegistration {
                             deadlineAt: options.maxDuration.map { activation.activationTime.addingDuration($0) },
                             fairnessKey: options.fairnessKey,
                             fairnessWeight: options.fairnessWeight,
-                            kind: .activity
+                            kind: .activity,
+                            rateLimitIntervalMs: rlParams?.intervalMs,
+                            rateLimitKey: rlParams?.slotKey
                         )
                     )
                     childHistoryItems.append(
@@ -681,7 +684,9 @@ extension WorkflowRegistration {
                             deadlineAt: childDeadlineAt,
                             fairnessKey: childFairnessKey,
                             fairnessWeight: childFairnessWeight,
-                            kind: .workflow
+                            kind: .workflow,
+                            rateLimitIntervalMs: nil,
+                            rateLimitKey: nil
                         )
                     )
                     childHistoryItems.append(

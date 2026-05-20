@@ -78,6 +78,13 @@ public struct EnqueueOptions: Sendable {
     /// Only meaningful when multiple keys share the same queue and priority level.
     public var fairnessWeight: Double
 
+    /// Rate limit for this task.
+    ///
+    /// When non-nil, each enqueue atomically claims a time slot and sets the
+    /// run's `available_at` accordingly.  `nil` (the default) means no rate
+    /// limiting.  See ``RateLimit`` for full documentation.
+    public var rateLimit: RateLimit?
+
     public init(
         queue: String? = nil,
         maxAttempts: Int? = nil,
@@ -89,7 +96,8 @@ public struct EnqueueOptions: Sendable {
         delayUntil: Date? = nil,
         maxDuration: Duration? = nil,
         fairnessKey: String? = nil,
-        fairnessWeight: Double = 1.0
+        fairnessWeight: Double = 1.0,
+        rateLimit: RateLimit? = nil
     ) {
         self.queue = queue
         self.maxAttempts = maxAttempts
@@ -102,6 +110,7 @@ public struct EnqueueOptions: Sendable {
         self.maxDuration = maxDuration
         self.fairnessKey = fairnessKey
         self.fairnessWeight = max(fairnessWeight, 0.001)  // guard against divide-by-zero
+        self.rateLimit = rateLimit
     }
 }
 

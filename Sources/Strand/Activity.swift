@@ -75,6 +75,68 @@ extension ActivityCancellationType: PostgresCodable {
     }
 }
 
+// MARK: - RateLimit
+
+/// Leaky-bucket rate limit for an activity.  When set, each enqueue atomically
+/// claims a time slot; the run waits in PENDING until its slot arrives.
+///
+/// Only enforced when explicitly set — `nil` (the default) means no rate limit
+/// and the activity is enqueued at full speed, exactly as without this option.
+///
+/// - `limit` / `period`: together define the slot interval.
+///   `.init(limit: 10, period: .seconds(1))` → one slot every 100 ms.
+///   `.init(limit: 2, period: .minutes(1))` → one slot every 30 s.
+///
+/// - `key`: optional partition key that gives each entity its own independent
+///   bucket.  `nil` = one global bucket shared by all executions of this
+///   activity type on this queue.  Use the workflow's own computed value —
+///   there is no server-side expression language; Swift code is the expression.
+///
+/// ```swift
+/// // Global: 10 payment activities per second across all customers
+/// options: .init(rateLimit: .init(limit: 10, period: .seconds(1)))
+///
+/// // Per-customer: 2 enrichment calls per minute per customer ID
+/// options: .init(
+///     rateLimit: .init(limit: 2, period: .minutes(1), key: "customer:\(customerID)")
+/// )
+/// ```
+public struct RateLimit: Sendable {
+    /// Maximum executions allowed within `period`.
+    public var limit: Double
+    /// Time window over which `limit` applies. Default: `.seconds(1)`.
+    public var period: Duration
+    /// Optional partition key.  `nil` = one global bucket for this activity
+    /// type on this queue.  A non-nil value gives each entity its own bucket.
+    public var key: String?
+
+    /// Returns `nil` when `limit` is not positive; no crash.
+    public init?(limit: Double, period: Duration = .seconds(1), key: String? = nil) {
+        guard limit > 0 else { return nil }
+        self.limit = limit
+        self.period = period
+        self.key = key
+    }
+
+    // MARK: - Internal
+
+    /// Slot-allocation parameters for the `strand.rate_limit_slots` SQL.
+    ///
+    /// - Parameter activityName: the activity's registered name.
+    ///   Used as the bucket prefix when `key` is `nil` (global bucket),
+    ///   or as the prefix in `"ActivityName:entityKey"` (per-entity bucket).
+    /// - Returns: `slotKey` — the row key in `strand.rate_limit_slots`;
+    ///   `intervalMs` — milliseconds between consecutive slots,
+    ///   derived from `period / limit` and clamped to at least 1 ms.
+    internal func slotParams(for activityName: String) -> (slotKey: String, intervalMs: Int) {
+        let slotKey = key.map { "\(activityName):\($0)" } ?? activityName
+        let totalMs = period.components.seconds * 1_000
+                    + period.components.attoseconds / 1_000_000_000_000_000
+        let intervalMs = max(1, Int(Double(totalMs) / limit))
+        return (slotKey: slotKey, intervalMs: intervalMs)
+    }
+}
+
 // MARK: - ActivityOptions
 
 /// Per-activity execution configuration: timeout, retry, routing, priority, and fairness.
@@ -159,6 +221,14 @@ public struct ActivityOptions: Sendable {
     /// Automatic cancellation policy for this activity.
     public var cancellation: CancellationPolicy?
 
+    /// Rate limit for this activity execution.
+    ///
+    /// When non-nil, each enqueue atomically claims a time slot in
+    /// `strand.rate_limit_slots` and sets the run's `available_at` to that
+    /// slot time.  `nil` (the default) means no rate limiting — the activity
+    /// is enqueued immediately at full speed.
+    public var rateLimit: RateLimit?
+
     public init(
         timeout: Duration? = nil,
         heartbeatTimeout: Duration? = nil,
@@ -173,6 +243,7 @@ public struct ActivityOptions: Sendable {
         headers: [String: String] = [:],
         id: String? = nil,
         cancellation: CancellationPolicy? = nil,
+        rateLimit: RateLimit? = nil,
         scheduleToStartTimeout: Duration? = nil,
         cancellationType: ActivityCancellationType = .tryCancel
     ) {
@@ -189,6 +260,7 @@ public struct ActivityOptions: Sendable {
         self.headers = headers
         self.id = id
         self.cancellation = cancellation
+        self.rateLimit = rateLimit
         self.scheduleToStartTimeout = scheduleToStartTimeout
         self.cancellationType = cancellationType
     }
