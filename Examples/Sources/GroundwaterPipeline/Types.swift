@@ -14,6 +14,35 @@ enum CNRA {
     static let apiBase = "https://data.cnra.ca.gov/api/3/action/datastore_search"
     static let ollamaURL = "http://localhost:11434"
     static let ollamaModel = "qwen3"
+
+    // MARK: - Rate limits (tunable via environment variables)
+
+    /// Maximum chunk downloads started per second against the public CNRA CKAN API.
+    ///
+    /// CNRA doesn't publish a hard rate limit, but flooding a government data portal
+    /// with 125 simultaneous downloads is bad citizenship. Five per second spreads
+    /// the 125-chunk fan-out over ~25 s while still saturating the 20-worker pool.
+    ///
+    /// Override: `CNRA_DOWNLOAD_RPS=10 swift run GroundwaterPipeline`
+    static let cnraDownloadRPS: Double = {
+        let env = ProcessInfo.processInfo.environment
+        return env["CNRA_DOWNLOAD_RPS"].flatMap(Double.init) ?? 5.0
+    }()
+
+    /// Maximum Ollama requests released to the worker pool per second.
+    ///
+    /// Ollama runs on a single GPU thread — it processes requests sequentially.
+    /// With 58 counties all becoming claimable at once, the 5 gw-ai workers grab
+    /// them in bursts and Ollama's internal queue fills up with partially-processed
+    /// context windows, wasting VRAM. Releasing 1 request per 10 s paces the
+    /// pipeline to Ollama's actual throughput (~10–30 s per county on qwen3:8b),
+    /// keeping the queue short and memory pressure low.
+    ///
+    /// Override: `OLLAMA_RPS=0.5 swift run GroundwaterPipeline`
+    static let ollamaRPS: Double = {
+        let env = ProcessInfo.processInfo.environment
+        return env["OLLAMA_RPS"].flatMap(Double.init) ?? 0.1  // 1 request / 10 s
+    }()
 }
 
 // MARK: - Pipeline workflow I/O

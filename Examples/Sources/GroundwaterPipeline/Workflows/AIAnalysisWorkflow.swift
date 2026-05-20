@@ -19,8 +19,11 @@ struct AIAnalysisOutput: Codable, Sendable {
 ///   - trend classification: DECLINING | STABLE | RECOVERING | UNKNOWN
 ///   - 2-sentence narrative for non-technical stakeholders
 ///
-/// Rate limiting: the `gw-ai` queue has lower concurrency (5 workflows)
-/// so Ollama isn't overwhelmed with 58 simultaneous requests.
+/// Rate limiting: `CNRA.ollamaRPS` (default 0.1 req/s = 1 per 10 s) controls
+/// how quickly county analyses enter the claimable pool.  This is qualitatively
+/// different from queue concurrency: even if 5 gw-ai workers are idle, analyses
+/// are released one-at-a-time at the Ollama-native pace rather than all 58 at
+/// once.  Adjust `OLLAMA_RPS` to match your hardware's throughput.
 struct AIAnalysisWorkflow: Workflow {
     typealias Input = AIAnalysisInput
     typealias Output = AIAnalysisOutput
@@ -59,7 +62,14 @@ struct AIAnalysisWorkflow: Workflow {
                             earliestMsmt: stats.earliestMsmt,
                             latestMsmt: stats.latestMsmt
                         ),
-                        options: ActivityOptions(maxAttempts: 2)
+                        options: ActivityOptions(
+                            maxAttempts: 2,
+                            // Pace Ollama calls to its single-threaded processing speed.
+                            // Each county uses the same global key so all 58 analyses
+                            // share one slot bucket — activities are released one-by-one
+                            // at `ollamaRPS` regardless of worker concurrency.
+                            rateLimit: .init(limit: CNRA.ollamaRPS, period: .seconds(1))
+                        )
                     )
                 }
             }

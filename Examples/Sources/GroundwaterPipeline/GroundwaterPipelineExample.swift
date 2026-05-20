@@ -53,6 +53,11 @@ import Foundation
         let chunkSize = Int(env["CHUNK_SIZE"] ?? "50000") ?? 50_000
         let maxChunks = env["MAX_CHUNKS"].flatMap(Int.init)
         let runAI = (env["RUN_AI"] ?? "true").lowercased() != "false"
+        // CNRA.cnraDownloadRPS and CNRA.ollamaRPS are read lazily from env at first
+        // use; reference them here just to trigger eager initialisation so they
+        // appear in the startup banner below.
+        let downloadRPS = CNRA.cnraDownloadRPS
+        let ollamaRPS   = CNRA.ollamaRPS
         // RESUME_ONLY=true: start workers to continue existing in-flight
         // pipelines without spawning a new one. Use after a crash or Ctrl+C.
         let resumeOnly = (env["RESUME_ONLY"] ?? "false").lowercased() == "true"
@@ -167,6 +172,10 @@ import Foundation
                       Max chunks: \(maxChunks.map(String.init) ?? "all (~125)")
                       AI stage:   \(runAI ? "enabled (requires Ollama + qwen3)" : "disabled")
                       Job ID:     \(input.jobID)
+                    ─────────────────────────────────────────
+                      Rate limits (Strand slot scheduling):
+                        CNRA API: \(String(format: "%.1f", downloadRPS)) downloads/s  (CNRA_DOWNLOAD_RPS)
+                        Ollama:   \(String(format: "%.3g", ollamaRPS)) req/s           (OLLAMA_RPS)
                     ─────────────────────────────────────────
                     """
                 )

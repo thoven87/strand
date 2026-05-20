@@ -59,7 +59,8 @@ public struct StrandClient: Sendable {
         params: P,
         options enqueueOpts: EnqueueOptions = .init()
     ) async throws -> EnqueueResult {
-        try await _enqueue(
+        let rlParams = enqueueOpts.rateLimit.map { $0.slotParams(for: taskName) }
+        return try await _enqueue(
             queue: enqueueOpts.queue ?? queueName,
             taskName: taskName,
             params: params,
@@ -72,7 +73,9 @@ public struct StrandClient: Sendable {
             delayUntil: enqueueOpts.delayUntil,
             maxDuration: enqueueOpts.maxDuration,
             fairnessKey: enqueueOpts.fairnessKey,
-            fairnessWeight: enqueueOpts.fairnessWeight
+            fairnessWeight: enqueueOpts.fairnessWeight,
+            rateLimitKey: rlParams?.slotKey,
+            rateLimitIntervalMs: rlParams?.intervalMs
         )
     }
 
@@ -99,7 +102,8 @@ public struct StrandClient: Sendable {
         input: A.Input,
         options: ActivityOptions = .init()
     ) async throws -> EnqueueResult {
-        try await _enqueue(
+        let rlParams = options.rateLimit.map { $0.slotParams(for: A.name) }
+        return try await _enqueue(
             queue: options.queue ?? queueName,
             taskName: A.name,
             params: input,
@@ -118,7 +122,9 @@ public struct StrandClient: Sendable {
             fairnessKey: options.fairnessKey,
             fairnessWeight: options.fairnessWeight,
             kind: .activity,
-            parentTaskID: nil
+            parentTaskID: nil,
+            rateLimitKey: rlParams?.slotKey,
+            rateLimitIntervalMs: rlParams?.intervalMs
         )
     }
 
@@ -317,7 +323,9 @@ public struct StrandClient: Sendable {
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
         kind: TaskKind = .workflow,
-        parentTaskID: UUID? = nil
+        parentTaskID: UUID? = nil,
+        rateLimitKey: String? = nil,
+        rateLimitIntervalMs: Int? = nil
     ) async throws -> EnqueueResult {
         let deadlineAt: Date? = maxDuration.map { Date.now.addingDuration($0) }
         // Producer span: wraps the DB insert so that the context injected into
@@ -357,6 +365,8 @@ public struct StrandClient: Sendable {
                 kind: kind,
                 parentTaskID: parentTaskID,
                 parentClosePolicy: parentClosePolicy,
+                rateLimitKey: rateLimitKey,
+                rateLimitIntervalMs: rateLimitIntervalMs,
                 logger: logger
             )
             return EnqueueResult(

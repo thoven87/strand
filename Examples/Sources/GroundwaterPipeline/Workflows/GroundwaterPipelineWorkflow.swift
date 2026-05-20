@@ -21,7 +21,9 @@ import Foundation
 /// Stage 3 — AI  (gw-ai)
 ///   AIAnalysisWorkflow fans out Ollama (qwen3) to every county.
 ///   Classifies trend (DECLINING/STABLE/RECOVERING) + writes narrative.
-///   Rate-limited to 5 concurrent requests so Ollama isn't overwhelmed.
+///   Rate-limited via ActivityOptions.rateLimit (OLLAMA_RPS, default 0.1/s)
+///   so activities enter the claimable pool at Ollama’s native pace, not all
+///   at once.  Queue concurrency (5 workflows) caps simultaneous executions.
 ///
 /// Crash recovery:
 ///   Each stage is a child workflow. If the orchestrator process crashes
