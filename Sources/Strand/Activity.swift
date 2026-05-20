@@ -276,7 +276,7 @@ public struct ActivityOptions: Sendable {
 /// Using a reference type (class) lets both the struct and the closure refer
 /// to the same storage without copying. `@unchecked Sendable` is safe here:
 /// the `Mutex` provides the required thread safety.
-package final class _ActivityCancellationFlag: @unchecked Sendable {
+package final class _ActivityCancellationFlag: Sendable {
     private let _flag: Mutex<Bool> = Mutex(false)
     package var isCancelled: Bool { _flag.withLock { $0 } }
     package func markCancelled() { _flag.withLock { $0 = true } }

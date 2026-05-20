@@ -19,7 +19,7 @@ import Foundation
 // TestMetricsFactory. Injected directly into StrandWorker — no global
 // MetricsSystem.bootstrap needed.
 
-final class TestMetricsFactory: MetricsFactory, @unchecked Sendable {
+final class TestMetricsFactory: MetricsFactory, Sendable {
     private let lock = Mutex<State>(State())
 
     private struct State {
@@ -65,7 +65,7 @@ final class TestMetricsFactory: MetricsFactory, @unchecked Sendable {
     }
 }
 
-private final class _Counter: CounterHandler, @unchecked Sendable {
+private final class _Counter: CounterHandler, Sendable {
     let factory: TestMetricsFactory
     let label: String
     init(factory: TestMetricsFactory, label: String) {
@@ -75,7 +75,7 @@ private final class _Counter: CounterHandler, @unchecked Sendable {
     func increment(by amount: Int64) { factory.record(counter: label, amount: amount) }
     func reset() {}
 }
-private final class _Timer: TimerHandler, @unchecked Sendable {
+private final class _Timer: TimerHandler, Sendable {
     let factory: TestMetricsFactory
     let label: String
     init(factory: TestMetricsFactory, label: String) {
@@ -86,7 +86,7 @@ private final class _Timer: TimerHandler, @unchecked Sendable {
         factory.record(timer: label, nanoseconds: duration)
     }
 }
-private final class _Recorder: RecorderHandler, @unchecked Sendable {
+private final class _Recorder: RecorderHandler, Sendable {
     func record(_ value: Int64) {}
     func record(_ value: Double) {}
 }
@@ -95,7 +95,7 @@ private final class _Recorder: RecorderHandler, @unchecked Sendable {
 //
 // Stores spans by operation name so tests can assert on specific spans.
 
-final class TestTracer: Tracer, @unchecked Sendable {
+final class TestTracer: Tracer, Sendable {
     typealias Span = TestSpan
 
     private let spans = Mutex<[String: TestSpan]>([:])

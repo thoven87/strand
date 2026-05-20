@@ -133,7 +133,15 @@ struct RawJSONB: PostgresNonThrowingEncodable, PostgresDecodable, Sendable {
     // MARK: Decode (read side)
     //
     // PostgresNIO requests text format for this column because psqlFormat == .text.
-    // PostgreSQL sends the JSON string with no binary prefix, so we get clean bytes.
+    // PostgreSQL normally sends the JSON string with no binary prefix.
+    //
+    // Defensive: when a query runs inside a transaction that has accumulated binary
+    // state (e.g. applyScheduleCommands' withTransaction block), PostgresNIO may
+    // receive JSONB in binary format.  PostgreSQL's JSONB binary encoding prepends
+    // a single version byte (\x01) before the JSON text.  If we store that byte
+    // verbatim in a BYTEA column and later pass it to JSON.decode, the decoder
+    // fails with "Unexpected character '\x01'" (displays as the invisible '' in
+    // terminal output).  Strip the version byte when binary format is detected.
 
     init(
         from buffer: inout ByteBuffer,
@@ -141,6 +149,11 @@ struct RawJSONB: PostgresNonThrowingEncodable, PostgresDecodable, Sendable {
         format: PostgresFormat,
         context: PostgresDecodingContext<some PostgresJSONDecoder>
     ) throws {
+        if format == .binary {
+            // JSONB binary wire format: 1-byte version prefix (always \x01 today).
+            // Skip it so the remaining bytes are clean JSON text.
+            buffer.moveReaderIndex(forwardBy: 1)
+        }
         // readSlice shares the underlying storage (copy-on-write) — no copy.
         self.buffer = buffer.readSlice(length: buffer.readableBytes) ?? ByteBuffer()
     }
