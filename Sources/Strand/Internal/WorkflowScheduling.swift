@@ -782,42 +782,52 @@ extension WorkflowRegistration {
                 }
                 // Condition state transition — runs AFTER history is written in the same txn.
                 //
-                // Two reasons to go PENDING instead of parking (WAITING/SLEEPING):
+                // `pending_check` CTE merges two "go PENDING" signals into one read:
                 //
-                //   pending_sigs   — a @WorkflowSignal arrived while RUNNING; the signal
-                //                    couldn't flip RUNNING runs directly, so we must
-                //                    handle it here.
+                //   cancel_requested  — set by `cancelDescendants` when the parent closes
+                //                       with parentClosePolicy = .requestCancel.  Because
+                //                       `request_cancel_wake` only wakes SLEEPING/WAITING
+                //                       runs, a child whose first activation was still
+                //                       RUNNING when the parent was cancelled would park
+                //                       in WAITING forever without this check.
                 //
-                //   cancel_rq      — `cancelDescendants` set `cancel_requested = TRUE`
-                //                    while the run was still RUNNING.  `request_cancel_wake`
-                //                    only wakes SLEEPING/WAITING runs, so if the first
-                //                    activation was still in progress when the parent was
-                //                    cancelled, the run would park in WAITING forever
-                //                    without this check.  Catching it here ensures the run
-                //                    goes PENDING so the next activation sees
-                //                    `claimed.cancelRequested = true` and satisfies the
-                //                    `waitForCancellation()` condition.
+                //   workflow_signals   — a @WorkflowSignal arrived while RUNNING; signals
+                //                       can't flip a RUNNING run to PENDING directly.
+                //
+                // `FOR UPDATE` on strand.tasks is the concurrency key:
+                //   • In READ COMMITTED, FOR UPDATE reads the LATEST COMMITTED version of
+                //     the row, not the statement snapshot.  This closes the window where
+                //     `cancelDescendants` commits cancel_requested = TRUE after our
+                //     statement snapshot was taken (Sequence B).
+                //   • The exclusive lock serialises with `cancelDescendants`:
+                //     – If cancelDescendants is in flight: we block, then read TRUE → PENDING.
+                //     – If cancelDescendants hasn’t started yet: we take the lock first;
+                //       cancelDescendants blocks on it; after we commit (WAITING) it runs
+                //       request_cancel_wake and wakes the now-WAITING run (Sequence E).
                 let condSQL: PostgresRowSequence
                 if let wakeAt = executor.conditionMinWakeAt {
                     condSQL = try await conn.query(
                         """
                         WITH
-                        pending_sigs AS (
-                            SELECT COUNT(*) AS cnt FROM strand.workflow_signals
-                            WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
-                        ),
-                        cancel_rq AS (
-                            SELECT cancel_requested FROM strand.tasks
-                            WHERE id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                        pending_check AS (
+                            SELECT (
+                                t.cancel_requested
+                                OR EXISTS (
+                                    SELECT 1 FROM strand.workflow_signals
+                                    WHERE task_id = \(condTaskID)
+                                      AND namespace_id = \(exec.namespace)
+                                )
+                            ) AS wake
+                            FROM strand.tasks t
+                            WHERE t.id = \(condTaskID) AND t.namespace_id = \(exec.namespace)
+                            FOR UPDATE
                         ),
                         run_upd AS (
                             UPDATE strand.runs
-                            SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                                         OR (SELECT cancel_requested FROM cancel_rq)
+                            SET state        = CASE WHEN (SELECT wake FROM pending_check)
                                                    THEN \(TaskState.pending)
                                                    ELSE \(TaskState.sleeping) END,
-                                available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                                         OR (SELECT cancel_requested FROM cancel_rq)
+                                available_at = CASE WHEN (SELECT wake FROM pending_check)
                                                    THEN NOW()
                                                    ELSE \(wakeAt) END,
                                 lease_expires_at = NULL
@@ -835,22 +845,25 @@ extension WorkflowRegistration {
                     condSQL = try await conn.query(
                         """
                         WITH
-                        pending_sigs AS (
-                            SELECT COUNT(*) AS cnt FROM strand.workflow_signals
-                            WHERE task_id = \(condTaskID) AND namespace_id = \(exec.namespace)
-                        ),
-                        cancel_rq AS (
-                            SELECT cancel_requested FROM strand.tasks
-                            WHERE id = \(condTaskID) AND namespace_id = \(exec.namespace)
+                        pending_check AS (
+                            SELECT (
+                                t.cancel_requested
+                                OR EXISTS (
+                                    SELECT 1 FROM strand.workflow_signals
+                                    WHERE task_id = \(condTaskID)
+                                      AND namespace_id = \(exec.namespace)
+                                )
+                            ) AS wake
+                            FROM strand.tasks t
+                            WHERE t.id = \(condTaskID) AND t.namespace_id = \(exec.namespace)
+                            FOR UPDATE
                         ),
                         run_upd AS (
                             UPDATE strand.runs
-                            SET state        = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                                         OR (SELECT cancel_requested FROM cancel_rq)
+                            SET state        = CASE WHEN (SELECT wake FROM pending_check)
                                                    THEN \(TaskState.pending)
                                                    ELSE \(TaskState.waiting) END,
-                                available_at = CASE WHEN (SELECT cnt FROM pending_sigs) > 0
-                                                         OR (SELECT cancel_requested FROM cancel_rq)
+                                available_at = CASE WHEN (SELECT wake FROM pending_check)
                                                    THEN NOW()
                                                    ELSE available_at END,
                                 lease_expires_at = NULL
