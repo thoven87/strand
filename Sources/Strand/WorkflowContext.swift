@@ -944,8 +944,8 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // ── Slow path: event not yet received — emit command and suspend ──────────
         // Guard: don't register new event waits when cooperatively cancelled.
         try Task.checkCancellation()
-        let predicateBuf: ByteBuffer? = try predicate.flatMap { p in
-            ByteBuffer(bytes: try p.toJSONBytes())
+        let predicateBuf: ByteBuffer? = try predicate.map { p in
+            try p.toPredicateBuffer()
         }
         let timeoutAt: Date? = timeout.map { Date.now.addingDuration($0) }
 
@@ -959,8 +959,9 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         )
 
         // The executor resumes this continuation with StrandError.timeout (internal)
-        // when the timer fires via resumeEventWithTimeout. Convert it to the public
-        // EventWaitTimeoutError so user workflows never need to catch StrandError.
+        // when the deadline fires via resumeEventWithTimeout. We catch it here and
+        // return nil — timeout is normal control flow, not an error; the workflow
+        // receives nil as the "timed out" signal.
         let resultBuffer: ByteBuffer
         do {
             resultBuffer = try await withCheckedThrowingContinuation {

@@ -8,6 +8,7 @@ let package = Package(
     products: [
         .library(name: "Strand", targets: ["Strand"]),
         .library(name: "StrandServer", targets: ["StrandServer"]),
+        .library(name: "StrandTesting", targets: ["StrandTesting"]),
     ],
     dependencies: [
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.33.0"),
@@ -85,15 +86,30 @@ let package = Package(
                 .enableUpcomingFeature("InternalImportsByDefault")
             ]
         ),
+        .target(
+            name: "StrandTesting",
+            dependencies: [
+                "Strand",
+                .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "Metrics", package: "swift-metrics"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("InternalImportsByDefault")
+            ]
+        ),
         .testTarget(
             name: "StrandTests",
             dependencies: [
                 "Strand",
+                "StrandTesting",
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "PostgresNIO", package: "postgres-nio"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Metrics", package: "swift-metrics"),
                 .product(name: "Tracing", package: "swift-distributed-tracing"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
         ),
         .testTarget(

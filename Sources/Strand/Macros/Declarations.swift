@@ -126,7 +126,7 @@ public macro Workflow() =
 /// Marks a stored property as an activity managed by an `@ActivityContainer` struct.
 ///
 /// The `@ActivityContainer` extension macro on the enclosing struct collects all
-/// `@ContainerActivity`-annotated properties into the `activities: [any ActivityBox]` array.
+/// `@ContainerActivity`-annotated properties into the `activities: [any Activity]` array.
 ///
 /// ```swift
 /// @ActivityContainer
@@ -173,7 +173,7 @@ public macro Activity() =
 /// }
 /// // generates:
 /// // extension PaymentActivities: ActivityContainerProtocol {
-/// //     var activities: [any ActivityBox] {
+/// //     var activities: [any Activity] {
 /// //         [charge, refund]
 /// //     }
 /// // }

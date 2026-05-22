@@ -130,9 +130,7 @@ public struct RateLimit: Sendable {
     ///   derived from `period / limit` and clamped to at least 1 ms.
     internal func slotParams(for activityName: String) -> (slotKey: String, intervalMs: Int) {
         let slotKey = key.map { "\(activityName):\($0)" } ?? activityName
-        let totalMs = period.components.seconds * 1_000
-                    + period.components.attoseconds / 1_000_000_000_000_000
-        let intervalMs = max(1, Int(Double(totalMs) / limit))
+        let intervalMs = max(1, Int(Double(period.milliseconds) / limit))
         return (slotKey: slotKey, intervalMs: intervalMs)
     }
 }
@@ -493,8 +491,7 @@ public struct ActivityContext: Sendable {
 /// on ``StrandWorker`` via `activities:` or `activityContainers:`. The worker
 /// claims, executes, and retries them independently.
 ///
-/// `Activity` automatically satisfies ``ActivityBox``, so instances
-/// can be passed directly in the `activities:` array without any wrapper.
+/// Activity instances can be passed directly in the `activities:` array.
 ///
 /// ```swift
 /// struct ChargeCardActivity: Activity {
@@ -508,7 +505,7 @@ public struct ActivityContext: Sendable {
 ///     }
 /// }
 /// ```
-public protocol Activity: ActivityBox {
+public protocol Activity: Sendable {
     associatedtype Input: Codable & Sendable
     associatedtype Output: Codable & Sendable
     /// The typed error this activity can throw.
@@ -560,28 +557,9 @@ extension Activity {
     public static var defaultMaxAttempts: Int? { nil }
     public static var defaultTimeout: Duration? { nil }
 
-    // MARK: ActivityBox conformance
-
-    /// The registered activity name (instance-level, satisfies ActivityBox).
-    public var activityName: String { Self.name }
 }
 
-// Internal _makeToken() and _run() entry point.
-// Every Activity gets these for free — no manual implementation needed.
 extension Activity {
-
-    public func _makeToken() -> _ActivityToken {
-        _ActivityToken(
-            name: Self.name,
-            preferredQueue: nil,
-            run: { [self] claimed, exec, deadline in
-                try await self._run(claimed: claimed, exec: exec, fatalDeadline: deadline)
-            },
-            runLocal: { [self] input, exec, parentID in
-                try await self._runLocal(input: input, exec: exec, parentWorkflowID: parentID)
-            }
-        )
-    }
 
     /// Decode → run → encode for in-process local activity execution.
     /// No `ClaimedTask` needed — a minimal `ActivityContext` is synthesised.
@@ -606,7 +584,7 @@ extension Activity {
         return try JSON.encode(output)
     }
 
-    /// Decode → run → encode. Used by both _makeToken and StrandWorkerBuilder.buildExpression.
+    /// Decode → run → encode. Called by `_addActivityRegistration` and local-activity dispatch.
     func _run(
         claimed: ClaimedTask,
         exec: _WorkerExec,
@@ -713,12 +691,12 @@ extension Activity {
             return try JSON.encode(output)
         } catch let typedFailure as Failure {
             // Typed failure declared by the activity — encode the full Codable value.
-            let payloadData = (try? JSON.encode(typedFailure)).map { Data($0.readableBytesView) }
+            let payloadBuffer = try? JSON.encode(typedFailure)
             let src = (typedFailure as? any LocatableError).map { ($0.sourceFileID, $0.sourceLine) }
             throw _TypedActivityFailure(
                 name: String(describing: type(of: typedFailure)),
                 message: strandErrorMessage(typedFailure),
-                payload: payloadData,
+                payload: payloadBuffer,
                 nonRetryable: typedFailure is any NonRetryableError,
                 source: src
             )

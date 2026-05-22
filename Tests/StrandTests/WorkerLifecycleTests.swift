@@ -167,34 +167,29 @@ struct WorkerLifecycleTests {
                 )
             )
 
-            // 2. Start worker 1 with the hung activity registered.
-            let worker1Task = startWorker(
+            // 2-4. Start worker 1, wait for activity to start executing, then stop it.
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 activities: [WltHungActivity(executionCount: counter)]
-            )
-
-            // 3. Wait until the run is RUNNING AND the activity handler has
-            //    actually started executing (counter >= 1). The DB transitions
-            //    to RUNNING the moment claimTasks fires — before the Swift
-            //    handler begins. Checking only the DB state leaves a race where
-            //    worker1Task.cancel() fires before executionCount.increment(),
-            //    so counter stays 0 and worker 2 sleeps 60 s instead of returning.
-            let runDeadline = ContinuousClock.now + .seconds(10)
-            while ContinuousClock.now < runDeadline {
-                if let snap = try await client.fetchTaskResult(id: enq.taskID),
-                    snap.state == .running,
-                    counter.value >= 1  // handler has incremented past the gate
-                {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(50))
+            ) {
+                // 3. Wait until the run is RUNNING AND the activity handler has
+                //    actually started executing (counter >= 1). The DB transitions
+                //    to RUNNING the moment claimTasks fires — before the Swift
+                //    handler begins. Checking only the DB state leaves a race where
+                //    the worker shuts down before executionCount.increment(),
+                //    so counter stays 0 and worker 2 sleeps 60 s instead of returning.
+                try await awaitSnapshot(
+                    client: client,
+                    taskID: enq.taskID,
+                    where: { $0.state == .running && counter.value >= 1 },
+                    timeout: .seconds(10),
+                    label: "task RUNNING with counter >= 1"
+                )
+                // Return from closure — worker shuts down, leaving run in RUNNING state.
             }
-
-            // 4. Cancel worker 1. The worker catches CancellationError and
-            //    deliberately leaves the run in RUNNING state.
-            worker1Task.cancel()
+            // 4. Small delay to ensure the worker has fully stopped.
             try await Task.sleep(for: .milliseconds(300))
 
             // 5. Backdate the lease so the next sweep treats it as expired.
@@ -284,29 +279,28 @@ struct WorkerLifecycleTests {
                 input: "hi"
             )
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [WltEchoWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // After 1 second the task must still be PENDING — too early to claim.
+                try await Task.sleep(for: .seconds(1))
+                let earlySnap = try await client.fetchTaskResult(id: handle.taskID)
+                #expect(
+                    earlySnap?.state == .pending,
+                    "task must remain PENDING before delayUntil elapses"
+                )
 
-            // After 1 second the task must still be PENDING — too early to claim.
-            try await Task.sleep(for: .seconds(1))
-            let earlySnap = try await client.fetchTaskResult(id: handle.taskID)
-            #expect(
-                earlySnap?.state == .pending,
-                "task must remain PENDING before delayUntil elapses"
-            )
-
-            // After the delay elapses the worker picks it up and completes it.
-            let finalSnap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(10)
-            )
-            #expect(finalSnap.state == .completed)
+                // After the delay elapses the worker picks it up and completes it.
+                let finalSnap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(10)
+                )
+                #expect(finalSnap.state == .completed)
+            }
         }
     }
 
@@ -332,59 +326,58 @@ struct WorkerLifecycleTests {
     )
     func cancelWorkflowCascadesToChildren() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 concurrency: 4,
                 workflows: [WltCancellableWorkflow.self],
                 activities: [WltSlowActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                WltCancellableWorkflow.self,
-                options: .init(maxAttempts: 1),
-                input: .done
-            )
-
-            // Poll until both child activities are RUNNING in the DB.
-            var childRows: [TaskSummaryRow] = []
-            let runDeadline = ContinuousClock.now + .seconds(15)
-            while ContinuousClock.now < runDeadline {
-                let page = try await ManagementQueries.listChildTasks(
-                    on: client.postgres,
-                    namespaceID: "default",
-                    parentTaskID: handle.taskID,
-                    cursor: nil,
-                    limit: 10,
-                    logger: client.logger
+            ) {
+                let handle = try await client.startWorkflow(
+                    WltCancellableWorkflow.self,
+                    options: .init(maxAttempts: 1),
+                    input: .done
                 )
-                if page.items.filter({ $0.state == .running }).count >= 2 {
-                    childRows = page.items
-                    break
+
+                // Poll until both child activities are RUNNING in the DB.
+                var childRows: [TaskSummaryRow] = []
+                let runDeadline = ContinuousClock.now + .seconds(15)
+                while ContinuousClock.now < runDeadline {
+                    let page = try await ManagementQueries.listChildTasks(
+                        on: client.postgres,
+                        namespaceID: "default",
+                        parentTaskID: handle.taskID,
+                        cursor: nil,
+                        limit: 10,
+                        logger: client.logger
+                    )
+                    if page.items.filter({ $0.state == .running }).count >= 2 {
+                        childRows = page.items
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
                 }
-                try await Task.sleep(for: .milliseconds(100))
-            }
-            #expect(
-                childRows.filter({ $0.state == .running }).count >= 2,
-                "expected at least 2 running child activities before cancellation"
-            )
-
-            // Cancel the parent workflow — must cascade to all descendants.
-            try await client.cancelTask(id: handle.taskID)
-
-            // Parent must be CANCELLED.
-            let parentSnap = try await client.fetchTaskResult(id: handle.taskID)
-            #expect(parentSnap?.state == .cancelled)
-
-            // Both child activities must also be CANCELLED.
-            for child in childRows {
-                let childSnap = try await client.fetchTaskResult(id: child.id)
                 #expect(
-                    childSnap?.state == .cancelled,
-                    "child activity \(child.id) must be CANCELLED after parent cancellation"
+                    childRows.filter({ $0.state == .running }).count >= 2,
+                    "expected at least 2 running child activities before cancellation"
                 )
+
+                // Cancel the parent workflow — must cascade to all descendants.
+                try await client.cancelTask(id: handle.taskID)
+
+                // Parent must be CANCELLED.
+                let parentSnap = try await client.fetchTaskResult(id: handle.taskID)
+                #expect(parentSnap?.state == .cancelled)
+
+                // Both child activities must also be CANCELLED.
+                for child in childRows {
+                    let childSnap = try await client.fetchTaskResult(id: child.id)
+                    #expect(
+                        childSnap?.state == .cancelled,
+                        "child activity \(child.id) must be CANCELLED after parent cancellation"
+                    )
+                }
             }
         }
     }
@@ -468,16 +461,15 @@ struct WorkerLifecycleTests {
             )
 
             // Start a worker for namespace A — it must process the task.
-            let workerATask = startWorker(
+            try await withWorker(
                 postgres: clientA.postgres,
                 queueName: clientA.queueName,
                 logger: clientA.logger,
                 workflows: [WltEchoWorkflow.self]
-            )
-            defer { workerATask.cancel() }
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "HELLO")
+            ) {
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "HELLO")
+            }
 
             // Cleanup: drop namespace B's queue and namespace row.
             // withTestEnvironment handles all of namespace A's artefacts.
@@ -502,41 +494,40 @@ struct WorkerLifecycleTests {
     @Test("signal wakes a sleeping workflow and delivers payload", .tags(.integration))
     func signalWakesWorkflowAndDeliversPayload() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [WltSignalWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // 1. Enqueue — workflow will block in condition { !$0.received.isEmpty }
+                let result = try await client.startWorkflow(
+                    WltSignalWorkflow.self,
+                    input: .done
+                )
+                let taskID = result.taskID
 
-            // 1. Enqueue — workflow will block in condition { !$0.received.isEmpty }
-            let result = try await client.startWorkflow(
-                WltSignalWorkflow.self,
-                input: .done
-            )
-            let taskID = result.taskID
+                // 2. Confirm workflow is SLEEPING before signal arrives
+                try await Task.sleep(for: .milliseconds(500))
+                let earlySnap = try await client.fetchTaskResult(id: taskID)
+                #expect(earlySnap?.state != .completed, "workflow should not have completed before signal")
 
-            // 2. Confirm workflow is SLEEPING before signal arrives
-            try await Task.sleep(for: .milliseconds(500))
-            let earlySnap = try await client.fetchTaskResult(id: taskID)
-            #expect(earlySnap?.state != .completed, "workflow should not have completed before signal")
+                // 3. Send signal with payload
+                let handle = try await client.workflow(id: result.workflowID, as: WltSignalWorkflow.self)
+                try await handle!.signal(name: "unlock", payload: "hello")
 
-            // 3. Send signal with payload
-            let handle = try await client.workflow(id: result.workflowID, as: WltSignalWorkflow.self)
-            try await handle!.signal(name: "unlock", payload: "hello")
+                // 4. Workflow should now complete with the payload value
+                let terminal = try await awaitTerminal(
+                    client: client,
+                    taskID: taskID,
+                    timeout: .seconds(10)
+                )
+                #expect(terminal.state == .completed)
 
-            // 4. Workflow should now complete with the payload value
-            let terminal = try await awaitTerminal(
-                client: client,
-                taskID: taskID,
-                timeout: .seconds(10)
-            )
-            #expect(terminal.state == .completed)
-
-            // 5. Verify the payload was delivered and returned as the workflow result
-            if let decoded = try? terminal.decodeResult(as: String.self) {
-                #expect(decoded == "hello")
+                // 5. Verify the payload was delivered and returned as the workflow result
+                if let decoded = try? terminal.decodeResult(as: String.self) {
+                    #expect(decoded == "hello")
+                }
             }
         }
     }

@@ -74,33 +74,24 @@ struct SchedulerIntegrationTests {
             let schedulerTask = Task { try? await scheduler.run() }
             defer { schedulerTask.cancel() }
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SitSimpleWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // Wait until run_count >= 1 or the 5-second deadline expires.
+                try await awaitScheduleRunCount(
+                    client: client,
+                    scheduleName: "sit-fire-test",
+                    atLeast: 1,
+                    timeout: .seconds(5)
+                )
 
-            // Poll until run_count >= 1 or the 5-second deadline expires.
-            var runCount = 0
-            let deadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < deadline {
-                let summaries = try await client.listSchedules(queue: client.queueName)
-                runCount =
-                    summaries.first(where: { $0.name == "sit-fire-test" })?.runCount ?? 0
-                if runCount >= 1 { break }
-                try await Task.sleep(for: .milliseconds(200))
+                // Cleanup: delete the schedule row so it does not accumulate in
+                // the shared dev DB across test runs.
+                try? await client.deleteSchedule(id: scheduleID)
             }
-
-            #expect(
-                runCount >= 1,
-                "scheduler should have fired the schedule at least once within 5 seconds"
-            )
-
-            // Cleanup: delete the schedule row so it does not accumulate in
-            // the shared dev DB across test runs.
-            try? await client.deleteSchedule(id: scheduleID)
         }
     }
 
@@ -166,31 +157,23 @@ struct SchedulerIntegrationTests {
             let schedulerTask = Task { try? await scheduler.run() }
             defer { schedulerTask.cancel() }
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SitSimpleWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // Assertion 2: schedule fires within 5 seconds.
+                try await awaitScheduleRunCount(
+                    client: client,
+                    scheduleName: "sit-paststart-test",
+                    atLeast: 1,
+                    timeout: .seconds(5)
+                )
 
-            // Assertion 2: schedule fires within 5 seconds.
-            var runCount = 0
-            let deadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < deadline {
-                let list = try await client.listSchedules(queue: client.queueName)
-                runCount =
-                    list.first(where: { $0.name == "sit-paststart-test" })?.runCount ?? 0
-                if runCount >= 1 { break }
-                try await Task.sleep(for: .milliseconds(200))
+                // Cleanup.
+                try? await client.deleteSchedule(id: scheduleID)
             }
-            #expect(
-                runCount >= 1,
-                "scheduler should have fired the recovered missed slot within 5 seconds"
-            )
-
-            // Cleanup.
-            try? await client.deleteSchedule(id: scheduleID)
         }
     }
 
@@ -246,14 +229,12 @@ struct SchedulerIntegrationTests {
             defer { schedulerTask.cancel() }
 
             // Wait until the schedule has fired at least once.
-            let deadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < deadline {
-                let list = try await client.listSchedules(queue: client.queueName)
-                if (list.first(where: { $0.name == "sit-firedat-test" })?.runCount ?? 0) >= 1 {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(200))
-            }
+            try await awaitScheduleRunCount(
+                client: client,
+                scheduleName: "sit-firedat-test",
+                atLeast: 1,
+                timeout: .seconds(5)
+            )
             let fireEnded = Date.now  // wall-clock upper bound
 
             let postFireList = try await client.listSchedules(queue: client.queueName)
@@ -416,40 +397,34 @@ struct SchedulerIntegrationTests {
             let schedulerTask = Task { try? await scheduler.run() }
             defer { schedulerTask.cancel() }
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SitSimpleWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                try await awaitScheduleRunCount(
+                    client: client,
+                    scheduleName: schedName,
+                    atLeast: 1,
+                    timeout: .seconds(5)
+                )
 
-            var runCount = 0
-            let deadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < deadline {
-                runCount =
-                    (try await client.listSchedules(queue: client.queueName))
-                    .first(where: { $0.name == schedName })?.runCount ?? 0
-                if runCount >= 1 { break }
-                try await Task.sleep(for: .milliseconds(200))
-            }
-
-            #expect(runCount >= 1, "timetable schedule should fire at least once within 5 s")
-
-            // Verify the pattern stored in the DB is .timetable
-            let summaries = try await client.listSchedules(queue: client.queueName)
-            let stored = summaries.first(where: { $0.name == schedName })
-            if let stored {
-                if case .timetable(let desc) = stored.pattern {
-                    #expect(desc == "immediate (test)", "description should be preserved in DB")
+                // Verify the pattern stored in the DB is .timetable
+                let summaries = try await client.listSchedules(queue: client.queueName)
+                let stored = summaries.first(where: { $0.name == schedName })
+                if let stored {
+                    if case .timetable(let desc) = stored.pattern {
+                        #expect(desc == "immediate (test)", "description should be preserved in DB")
+                    } else {
+                        Issue.record("expected .timetable pattern, got \(stored.pattern)")
+                    }
                 } else {
-                    Issue.record("expected .timetable pattern, got \(stored.pattern)")
+                    Issue.record("schedule not found in listSchedules")
                 }
-            } else {
-                Issue.record("schedule not found in listSchedules")
-            }
 
-            try? await client.deleteSchedule(id: stored?.id ?? UUID())
+                try? await client.deleteSchedule(id: stored?.id ?? UUID())
+            }
         }
     }
 

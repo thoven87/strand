@@ -20,7 +20,7 @@ import Testing
                         var refund: RefundActivity
                     }
                     extension PaymentActivities: ActivityContainerProtocol {
-                        var activities: [any ActivityBox] { [charge, refund] }
+                        var activities: [any Activity] { [charge, refund] }
                     }
                     """
                 )
@@ -45,7 +45,7 @@ import Testing
                         var charge: ChargeActivity
                     }
                     extension PaymentActivities: ActivityContainerProtocol {
-                        var activities: [any ActivityBox] { [charge] }
+                        var activities: [any Activity] { [charge] }
                     }
                     """
                 )
@@ -77,7 +77,7 @@ import Testing
                                 try await _container.classify(input: input, context: context)
                             }
                         }
-                        var activities: [any ActivityBox] { [Classify(_container: self)] }
+                        var activities: [any Activity] { [Classify(_container: self)] }
                     }
                     """
                 )
@@ -109,7 +109,7 @@ import Testing
                                 try await _container.transform(input: input)
                             }
                         }
-                        var activities: [any ActivityBox] { [Transform(_container: self)] }
+                        var activities: [any Activity] { [Transform(_container: self)] }
                     }
                     """
                 )
@@ -143,7 +143,7 @@ import Testing
                                 try await _container.notify(input: input, context: context)
                             }
                         }
-                        var activities: [any ActivityBox] { [charge, Notify(_container: self)] }
+                        var activities: [any Activity] { [charge, Notify(_container: self)] }
                     }
                     """
                 )

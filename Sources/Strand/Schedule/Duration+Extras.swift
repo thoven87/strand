@@ -6,6 +6,16 @@ public import Foundation
 
 extension Duration {
 
+    /// The duration expressed as whole milliseconds, truncating sub-millisecond remainder.
+    ///
+    /// Derived from the `(seconds, attoseconds)` component pair so it works
+    /// correctly for all `Duration` values, including those constructed via
+    /// `.milliseconds(_:)`, `.seconds(_:)`, and arithmetic on existing durations.
+    var milliseconds: Int64 {
+        components.seconds * 1_000
+            + components.attoseconds / 1_000_000_000_000_000
+    }
+
     public static func minutes(_ minutes: Int) -> Duration {
         .seconds(minutes * 60)
     }

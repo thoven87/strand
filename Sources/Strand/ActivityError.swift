@@ -100,9 +100,9 @@ public struct ActivityFailure: Error, LocalizedError, Sendable {
     public let name: String
     /// The `localizedDescription` of the original error.
     public let message: String
-    /// Base64-encoded JSON of the original `Failure` value (if it was `Codable`).
+    /// JSON bytes of the original `Failure` value (if it was `Codable`).
     /// Use `decode(_:)` to recover the original typed error.
-    let payload: Data?
+    let payload: ByteBuffer?
 
     public var errorDescription: String? { "\(name): \(message)" }
 
@@ -119,22 +119,26 @@ public struct ActivityFailure: Error, LocalizedError, Sendable {
     /// }
     /// ```
     public func decode<F: Error & Decodable>(_ type: F.Type) -> F? {
-        guard let data = payload else { return nil }
-        let buf = ByteBuffer(bytes: data)
+        guard let buf = payload else { return nil }
         return try? JSON.decode(type, from: buf)
     }
 }
 
 extension ActivityFailure {
+    private struct _Payload: Decodable {
+        let name: String
+        let message: String
+        let payload: Data?  // synthesised Decodable decodes base64 string → Data automatically
+    }
+
     /// Deserialise an `ActivityFailure` from the raw JSON stored in
     /// `strand.runs.failure_reason`. Returns `nil` when the buffer is unreadable.
     package static func decode(from buffer: ByteBuffer) -> ActivityFailure? {
-        struct Payload: Decodable {
-            let name: String
-            let message: String
-            let payload: Data?
-        }
-        guard let p = try? JSON.decode(Payload.self, from: buffer) else { return nil }
-        return ActivityFailure(name: p.name, message: p.message, payload: p.payload)
+        guard let p = try? JSON.decode(_Payload.self, from: buffer) else { return nil }
+        return ActivityFailure(
+            name: p.name,
+            message: p.message,
+            payload: p.payload.map { ByteBuffer(bytes: $0) }
+        )
     }
 }

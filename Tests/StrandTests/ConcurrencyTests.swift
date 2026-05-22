@@ -63,58 +63,55 @@ struct ConcurrencyTests {
     @Test("fifteen concurrent workflows complete exactly once across three competing workers")
     func multipleWorkersDontDoubleClaim() async throws {
         try await withTestEnvironment { client in
-            let workerTask1 = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 concurrency: 4,
                 workflows: [CountingWorkflow.self]
-            )
-            let workerTask2 = startWorker(
-                postgres: client.postgres,
-                queueName: client.queueName,
-                logger: client.logger,
-                concurrency: 4,
-                workflows: [CountingWorkflow.self]
-            )
-            let workerTask3 = startWorker(
-                postgres: client.postgres,
-                queueName: client.queueName,
-                logger: client.logger,
-                concurrency: 4,
-                workflows: [CountingWorkflow.self]
-            )
-            defer {
-                workerTask1.cancel()
-                workerTask2.cancel()
-                workerTask3.cancel()
-            }
+            ) {
+                try await withWorker(
+                    postgres: client.postgres,
+                    queueName: client.queueName,
+                    logger: client.logger,
+                    concurrency: 4,
+                    workflows: [CountingWorkflow.self]
+                ) {
+                    try await withWorker(
+                        postgres: client.postgres,
+                        queueName: client.queueName,
+                        logger: client.logger,
+                        concurrency: 4,
+                        workflows: [CountingWorkflow.self]
+                    ) {
+                        // Enqueue 15 workflows with a small inter-submission delay so
+                        // concurrent connection pool usage stays well within limits.
+                        var handles: [WorkflowHandle<CountingWorkflow>] = []
+                        for i in 0..<15 {
+                            let handle = try await client.startWorkflow(
+                                CountingWorkflow.self,
+                                options: .init(),
+                                input: "job-\(i)"
+                            )
+                            handles.append(handle)
+                            try await Task.sleep(for: .milliseconds(50))
+                        }
 
-            // Enqueue 15 workflows with a small inter-submission delay so
-            // concurrent connection pool usage stays well within limits.
-            var handles: [WorkflowHandle<CountingWorkflow>] = []
-            for i in 0..<15 {
-                let handle = try await client.startWorkflow(
-                    CountingWorkflow.self,
-                    options: .init(),
-                    input: "job-\(i)"
-                )
-                handles.append(handle)
-                try await Task.sleep(for: .milliseconds(50))
-            }
+                        // Collect results sequentially. Each `result(timeout:)` call polls
+                        // with exponential back-off until the workflow reaches a terminal
+                        // state or the 30 s deadline is exceeded.
+                        for (i, handle) in handles.enumerated() {
+                            let result = try await handle.result(timeout: .seconds(30))
+                            // The workflow must echo its own input string verbatim.
+                            #expect(result == "job-\(i)")
+                        }
 
-            // Collect results sequentially. Each `result(timeout:)` call polls
-            // with exponential back-off until the workflow reaches a terminal
-            // state or the 30 s deadline is exceeded.
-            for (i, handle) in handles.enumerated() {
-                let result = try await handle.result(timeout: .seconds(30))
-                // The workflow must echo its own input string verbatim.
-                #expect(result == "job-\(i)")
+                        // Every workflow must have executed exactly once.
+                        // Any value > 15 indicates at least one double-claim.
+                        #expect(CountingWorkflow.executionCount.value == 15)
+                    }
+                }
             }
-
-            // Every workflow must have executed exactly once.
-            // Any value > 15 indicates at least one double-claim.
-            #expect(CountingWorkflow.executionCount.value == 15)
         }
     }
 }

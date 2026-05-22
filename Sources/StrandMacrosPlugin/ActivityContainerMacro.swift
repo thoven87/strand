@@ -88,7 +88,7 @@ public struct ActivityMacro: PeerMacro {
 ///             try await _container.classify(input: input, context: context)
 ///         }
 ///     }
-///     var activities: [any ActivityBox] {
+///     var activities: [any Activity] {
 ///         [Classify(_container: self)]
 ///     }
 /// }
@@ -210,13 +210,13 @@ public struct ActivityContainerMacro: ExtensionMacro {
             innerLines.append("    }")
         }
 
-        // Build the activities array: @ContainerActivity props come first (they
-        // are already `ActivityBox`), followed by @Activity method structs.
+        // Build the activities array: @ContainerActivity props come first,
+        // followed by @Activity method structs.
         let allItems =
             (propNames + activityMethods.map { "\($0.structName)(_container: self)" })
             .joined(separator: ", ")
 
-        innerLines.append("    var activities: [any ActivityBox] {")
+        innerLines.append("    var activities: [any Activity] {")
         innerLines.append("        [\(allItems)]")
         innerLines.append("    }")
 

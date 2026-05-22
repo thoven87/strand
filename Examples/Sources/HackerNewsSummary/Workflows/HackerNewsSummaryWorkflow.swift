@@ -12,7 +12,8 @@ import Strand
 /// Crash recovery: if the process dies after some stories are summarised,
 /// the next activation replays completed child workflows from checkpoints
 /// without re-running them.
-struct HackerNewsSummaryWorkflow: Workflow {
+@Workflow
+struct HackerNewsSummaryWorkflow {
     typealias Input = HNInput
     typealias Output = HNDailySummary
 

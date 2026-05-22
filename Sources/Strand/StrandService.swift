@@ -79,14 +79,13 @@ public struct StrandService: Service {
         /// Namespace this worker operates in. Default: `"default"`.
         public var namespace: String
         /// Workflow types processed by this worker.
-        public var workflows: [any WorkflowRegistrable.Type]
+        public var workflows: [any Workflow.Type]
         /// Activity containers — groups of activities sharing a common dependency
         /// (e.g. a database client or API key). Implement `ActivityContainerProtocol`
         /// to bundle related activities and inject shared resources once.
         public var activityContainers: [any ActivityContainerProtocol]
-        /// Individual activity instances. Any `Activity` satisfies
-        /// `ActivityBox` automatically; use this for standalone activities.
-        public var activities: [any ActivityBox]
+        /// Individual activity instances. use this for standalone activities.
+        public var activities: [any Activity]
         public var workflowConcurrency: Int
         public var activityConcurrency: Int
         public var pollInterval: Duration
@@ -97,9 +96,9 @@ public struct StrandService: Service {
         public init(
             name: String = "default",
             namespace: String = "default",
-            workflows: [any WorkflowRegistrable.Type] = [],
+            workflows: [any Workflow.Type] = [],
             activityContainers: [any ActivityContainerProtocol] = [],
-            activities: [any ActivityBox] = [],
+            activities: [any Activity] = [],
             workflowConcurrency: Int = 4,
             activityConcurrency: Int = 8,
             pollInterval: Duration = .seconds(5),

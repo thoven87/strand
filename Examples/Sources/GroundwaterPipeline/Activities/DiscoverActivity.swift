@@ -15,19 +15,19 @@ struct DiscoverActivity: Activity {
 
     let postgres: PostgresClient
 
+    private struct _CKANResponse: Decodable {
+        struct Result: Decodable { let total: Int }
+        let success: Bool
+        let result: Result
+    }
+
     func run(input: Input, context: ActivityContext) async throws -> Output {
-        // ── 1. Get row count from CKAN metadata API ────────────────────────────
+        // ── 1. Get row count from CKAN metadata API ───────────────────────────
         let url = URL(
             string: "\(CNRA.apiBase)?resource_id=\(CNRA.resourceID)&limit=0&include_total=true"
         )!
         let (data, _) = try await URLSession.shared.data(from: url)
-
-        struct CKANResponse: Decodable {
-            struct Result: Decodable { let total: Int }
-            let success: Bool
-            let result: Result
-        }
-        let resp = try JSONDecoder().decode(CKANResponse.self, from: data)
+        let resp = try JSONDecoder().decode(_CKANResponse.self, from: data)
         guard resp.success else {
             throw DiscoverError.apiFailure("CKAN API returned success=false")
         }

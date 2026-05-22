@@ -63,7 +63,12 @@ import Foundation
                         name: "hn-summarizer",
                         namespace: "hn-summary",
                         workflows: [SummarizeStoryWorkflow.self],
-                        activities: [FetchStoryActivity(), OllamaSummarizeActivity()],
+                        activityContainers: [
+                            SummarizationActivities(
+                                ollamaBaseURL: URL(string: "http://localhost:11434")!,
+                                model: "qwen3:latest"
+                            )
+                        ],
                         workflowConcurrency: 3,
                         activityConcurrency: 3
                     ),

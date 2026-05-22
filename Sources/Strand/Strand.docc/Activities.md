@@ -49,7 +49,7 @@ Activities that share dependencies can be grouped via ``ActivityContainerProtoco
 struct PaymentActivities: ActivityContainerProtocol {
     let stripe: StripeClient
 
-    var activities: [any ActivityBox] {
+    var activities: [any Activity] {
         [ChargeCardActivity(stripe: stripe),
          RefundCardActivity(stripe: stripe)]
     }

@@ -257,9 +257,9 @@ public struct StrandWorker: Service {
         options: WorkerOptions = .init(),
         notifier: StrandNotifier,
         metricsBuffer: AggregatedMetricsBuffer? = nil,
-        workflows: [any WorkflowRegistrable.Type] = [],
+        workflows: [any Workflow.Type] = [],
         activityContainers: [any ActivityContainerProtocol] = [],
-        activities: [any ActivityBox] = [],
+        activities: [any Activity] = [],
         logger: Logger = Logger(label: "dev.strand.worker"),
         metricsFactory: (any MetricsFactory)? = nil
     ) {
@@ -275,9 +275,9 @@ public struct StrandWorker: Service {
         // The lookup maps activity name → in-process runner closure (no DB row).
         let allActivities = activityContainers.flatMap { $0.activities } + activities
         var localLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer] = [:]
-        for box in allActivities {
-            let token = box._makeToken()
-            localLookup[token.name] = token.runLocal
+        // SE-0352: opens any Activity → A: Activity, capturing the concrete _runLocal.
+        for activity in allActivities {
+            _addActivityLocalLookup(activity, into: &localLookup)
         }
 
         let exec = _WorkerExec(
@@ -294,30 +294,16 @@ public struct StrandWorker: Service {
         var registrations: [AnyRegistration] = []
         registrations.reserveCapacity(workflows.count + allActivities.count)
 
+        // SE-0352: passing any Workflow.Type to the generic _registerWorkflow
+        // opens the existential, binding the concrete W.
+        // _WorkflowTaskCache<W> is then created inside that function scope.
         for wfType in workflows {
-            let token = wfType._makeToken()
-            let queue = token.preferredQueue ?? options.queue
-            registrations.append(
-                AnyRegistration(
-                    name: token.name,
-                    queueName: queue,
-                    run: { [token, exec] claimed, _ in try await token.activate(claimed, exec) }
-                )
-            )
+            _registerWorkflow(wfType, queue: options.queue, exec: exec, into: &registrations)
         }
 
-        for box in allActivities {
-            let token = box._makeToken()
-            let queue = token.preferredQueue ?? options.queue
-            registrations.append(
-                AnyRegistration(
-                    name: token.name,
-                    queueName: queue,
-                    run: { [token, exec] claimed, deadline in
-                        try await token.run(claimed, exec, deadline)
-                    }
-                )
-            )
+        // SE-0352: opens any Activity → A: Activity, capturing the concrete _run.
+        for activity in allActivities {
+            _addActivityRegistration(activity, queue: options.queue, exec: exec, into: &registrations)
         }
 
         self._registry = Registry(registrations)
@@ -560,9 +546,7 @@ public struct StrandWorker: Service {
                     // fire at different offsets) — jitter is harmless there too.
                     let jitter = options.notifyJitter
                     if jitter > .zero {
-                        let maxMs =
-                            jitter.components.seconds * 1_000
-                            + jitter.components.attoseconds / 1_000_000_000_000_000
+                        let maxMs = jitter.milliseconds
                         // try? so a graceful-shutdown CancellationError from
                         // cancelWhenGracefulShutdown doesn't propagate into the
                         // inner discarding group and kill in-flight runTasks.

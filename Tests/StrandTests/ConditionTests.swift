@@ -116,21 +116,20 @@ struct ConditionTests {
     @Test("condition already satisfied on entry returns without suspension")
     func conditionSatisfiedImmediately() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [AlwaysReadyWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                AlwaysReadyWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "done")
+            ) {
+                let handle = try await client.startWorkflow(
+                    AlwaysReadyWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "done")
+            }
         }
     }
 
@@ -141,33 +140,27 @@ struct ConditionTests {
     @Test("condition suspends workflow and unblocks when the signal satisfies the predicate")
     func conditionBlocksThenSignalUnblocks() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [PauseableWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    PauseableWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                PauseableWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
+                // Wait until the workflow enters condition suspension (WAITING state).
+                try await awaitSnapshot(handle, where: { $0.state == .waiting }, timeout: .seconds(5))
 
-            // Poll until the workflow enters condition suspension (WAITING state).
-            // A fixed sleep is not reliable on CI where DB round-trips can be
-            // 50 ms+ each, making the first activation exceed any fixed bound.
-            for _ in 0..<50 {
-                if let snap = try await handle.snapshot(), snap.state == .waiting { break }
-                try await Task.sleep(for: .milliseconds(100))
+                // Deliver the signal that sets `unpaused = true`.
+                try await handle.signal(name: "unpause")
+
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "unpaused")
             }
-
-            // Deliver the signal that sets `unpaused = true`.
-            try await handle.signal(name: "unpause")
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "unpaused")
         }
     }
 
@@ -178,35 +171,31 @@ struct ConditionTests {
     @Test("condition with timeout unblocks when signal arrives before the deadline")
     func conditionWithTimeoutSignalArrives() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ConditionTimeoutSignalWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    ConditionTimeoutSignalWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                ConditionTimeoutSignalWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
+                // Wait until the workflow enters condition suspension (SLEEPING/WAITING state).
+                try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .waiting || $0.state == .sleeping },
+                    timeout: .seconds(5)
+                )
 
-            // Poll until the workflow enters condition suspension (SLEEPING/WAITING state).
-            for _ in 0..<50 {
-                if let snap = try await handle.snapshot(),
-                    snap.state == .waiting || snap.state == .sleeping
-                {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(100))
+                // Send the signal — well within the 10 s deadline.
+                try await handle.signal(name: "unpause")
+
+                let result = try await handle.result(timeout: .seconds(15))
+                #expect(result == "unpaused")
             }
-
-            // Send the signal — well within the 10 s deadline.
-            try await handle.signal(name: "unpause")
-
-            let result = try await handle.result(timeout: .seconds(15))
-            #expect(result == "unpaused")
         }
     }
 
@@ -217,24 +206,23 @@ struct ConditionTests {
     @Test("condition with timeout returns false when deadline passes without a signal")
     func conditionWithTimeoutTimedOut() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ConditionTimeoutWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    ConditionTimeoutWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                ConditionTimeoutWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
-
-            // No signal sent — the 600 ms deadline will elapse, causing
-            // the workflow to catch StrandError.timeout and return "timed-out".
-            let result = try await handle.result(timeout: .seconds(15))
-            #expect(result == "timed-out")
+                // No signal sent — the 600 ms deadline will elapse, causing
+                // the workflow to catch StrandError.timeout and return "timed-out".
+                let result = try await handle.result(timeout: .seconds(15))
+                #expect(result == "timed-out")
+            }
         }
     }
 }

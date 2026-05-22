@@ -90,21 +90,20 @@ struct VersionTests {
     @Test("first encounter of version(changeID:) returns true and takes the new code path")
     func firstEncounterReturnsTrue() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [VersionedWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                VersionedWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "new-path")
+            ) {
+                let handle = try await client.startWorkflow(
+                    VersionedWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "new-path")
+            }
         }
     }
 
@@ -124,40 +123,35 @@ struct VersionTests {
     @Test("markVersion with value: false overrides the checkpoint and forces the old code path")
     func markVersionForcesOldPath() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [VersionedWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    VersionedWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                VersionedWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
+                // Wait until the workflow is confirmed SLEEPING before overwriting
+                // the checkpoint — ensures markVersion commits before the timer fires.
+                try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .sleeping },
+                    timeout: .seconds(5),
+                    label: "workflow SLEEPING"
+                )
+                try await client.markVersion(
+                    changeID: "v2-feature",
+                    value: false,
+                    taskID: handle.taskID
+                )
 
-            // Wait until the workflow is confirmed SLEEPING before overwriting
-            // the checkpoint. A fixed Task.sleep(100ms) is a timing race on slow
-            // CI machines: if the first activation hasn't run yet, markVersion
-            // writes false but the activation later overwrites it with true.
-            // Polling the actual state is safe regardless of machine speed.
-            let sleepDeadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < sleepDeadline {
-                if let snap = try await handle.snapshot(), snap.state == .sleeping {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(20))
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "old-path")
             }
-            try await client.markVersion(
-                changeID: "v2-feature",
-                value: false,
-                taskID: handle.taskID
-            )
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "old-path")
         }
     }
 
@@ -170,50 +164,45 @@ struct VersionTests {
     @Test("version checkpoint written before sleep survives worker restart")
     func versionCheckpointSurvivesWorkerRestart() async throws {
         try await withTestEnvironment { client in
-            // First worker runs the workflow until it enters the sleep.
-            let firstWorker = startWorker(
-                postgres: client.postgres,
-                queueName: client.queueName,
-                logger: client.logger,
-                workflows: [VersionBeforeSleepWorkflow.self]
-            )
-
             let handle = try await client.startWorkflow(
                 VersionBeforeSleepWorkflow.self,
                 options: .init(),
                 input: "start"
             )
 
-            // Wait until the workflow is SLEEPING (version checkpoint persisted,
-            // now suspended on the sleep timer).
-            let sleepDeadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < sleepDeadline {
-                if let snap = try await handle.snapshot(), snap.state == .sleeping {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(20))
+            // First worker runs the workflow until it enters the sleep.
+            try await withWorker(
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [VersionBeforeSleepWorkflow.self]
+            ) {
+                // Wait until the workflow is SLEEPING (version checkpoint persisted,
+                // now suspended on the sleep timer).
+                try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .sleeping },
+                    timeout: .seconds(5),
+                    label: "workflow SLEEPING"
+                )
+                // Return from closure — worker shuts down, leaving run in SLEEPING state.
             }
-
-            // Simulate a worker crash by cancelling the first worker.
-            // The run is now SLEEPING in the DB with a persisted version checkpoint.
-            firstWorker.cancel()
 
             // Start a fresh worker. It will do a fresh-path activation: load
             // version markers from DB, populate the version marker cache, then drain.
             // version(changeID:) must return the stored `true` from the cache,
             // not the default `true` from a new write — but the observable
             // result is the same. The important thing is the marker survives.
-            let secondWorker = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [VersionBeforeSleepWorkflow.self]
-            )
-            defer { secondWorker.cancel() }
-
-            let result = try await handle.result(timeout: .seconds(10))
-            // version checkpoint stored `true` before crash — new-path after recovery.
-            #expect(result == "new-path")
+            ) {
+                let result = try await handle.result(timeout: .seconds(10))
+                // version checkpoint stored `true` before crash — new-path after recovery.
+                #expect(result == "new-path")
+            }
         }
     }
 
@@ -223,22 +212,21 @@ struct VersionTests {
     @Test("multi-step: both version gates default to true and take the v3 path")
     func multiStepBothDefault() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [TwoVersionWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                TwoVersionWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            // Both default to true; v3 wins the cascading check.
-            #expect(result == "v3-path")
+            ) {
+                let handle = try await client.startWorkflow(
+                    TwoVersionWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                // Both default to true; v3 wins the cascading check.
+                #expect(result == "v3-path")
+            }
         }
     }
 
@@ -249,36 +237,34 @@ struct VersionTests {
     @Test("multi-step: marking only the v3 gate false takes the intermediate v2 path")
     func multiStepMarkV3False() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [TwoVersionWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    TwoVersionWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                TwoVersionWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
+                try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .sleeping },
+                    timeout: .seconds(5),
+                    label: "workflow SLEEPING"
+                )
 
-            let sleepDeadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < sleepDeadline {
-                if let snap = try await handle.snapshot(), snap.state == .sleeping {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(20))
+                try await client.markVersion(
+                    changeID: "multi-v3",
+                    value: false,
+                    taskID: handle.taskID
+                )
+
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "v2-path")
             }
-
-            try await client.markVersion(
-                changeID: "multi-v3",
-                value: false,
-                taskID: handle.taskID
-            )
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "v2-path")
         }
     }
 
@@ -289,41 +275,39 @@ struct VersionTests {
     @Test("multi-step: marking both gates false takes the original path")
     func multiStepBothFalse() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [TwoVersionWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    TwoVersionWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                TwoVersionWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
+                try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .sleeping },
+                    timeout: .seconds(5),
+                    label: "workflow SLEEPING"
+                )
 
-            let sleepDeadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < sleepDeadline {
-                if let snap = try await handle.snapshot(), snap.state == .sleeping {
-                    break
-                }
-                try await Task.sleep(for: .milliseconds(20))
+                try await client.markVersion(
+                    changeID: "multi-v2",
+                    value: false,
+                    taskID: handle.taskID
+                )
+                try await client.markVersion(
+                    changeID: "multi-v3",
+                    value: false,
+                    taskID: handle.taskID
+                )
+
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "original-path")
             }
-
-            try await client.markVersion(
-                changeID: "multi-v2",
-                value: false,
-                taskID: handle.taskID
-            )
-            try await client.markVersion(
-                changeID: "multi-v3",
-                value: false,
-                taskID: handle.taskID
-            )
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "original-path")
         }
     }
 }

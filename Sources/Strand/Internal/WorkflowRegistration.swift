@@ -12,23 +12,66 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// MARK: - Workflow._makeToken() default implementation
+// MARK: - Workflow registration via SE-0352 implicit existential opening
 //
-// Lives here (not Workflow.swift) because it closes over _WorkflowTaskCache<Self>
-// and WorkflowRegistration<Self>, both defined in this file.
-// The cache is created once per workflow TYPE at registration time and shared
-// across every activation of that type, enabling the cached-Task model.
-extension Workflow {
-    public static func _makeToken() -> _WorkflowToken {
-        let cache = _WorkflowTaskCache<Self>()
-        return _WorkflowToken(name: workflowName, preferredQueue: nil) { claimed, exec in
-            try await WorkflowRegistration<Self>().activate(
-                claimed: claimed,
-                exec: exec,
-                cache: cache
-            )
-        }
+// StrandWorker.init holds [any Workflow.Type]. Passing each element
+// to the generic function below causes Swift to open the existential and bind
+// the concrete Workflow type, allowing _WorkflowTaskCache<W> to be created
+// once per type at registration time — exactly the cached-Task model.
+// No protocol requirement needed; the public WorkflowRegistrable protocol
+// stays clean with only user-facing members.
+func _registerWorkflow<W: Workflow>(
+    _ type: W.Type,
+    queue: String,
+    exec: _WorkerExec,
+    into registrations: inout [AnyRegistration]
+) {
+    let cache = _WorkflowTaskCache<W>()
+    registrations.append(
+        AnyRegistration(
+            name: W.workflowName,
+            queueName: queue,
+            run: { claimed, _ in
+                try await WorkflowRegistration<W>().activate(
+                    claimed: claimed,
+                    exec: exec,
+                    cache: cache
+                )
+            }
+        )
+    )
+}
+
+// MARK: - Activity registration via SE-0352 implicit existential opening
+
+// StrandWorker.init holds [any Activity]. The two helpers below are called in
+// separate passes: localLookup is built before _WorkerExec exists (the closures
+// take exec as a parameter, not a capture); registrations are built after.
+
+func _addActivityLocalLookup<A: Activity>(
+    _ activity: A,
+    into localLookup: inout [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer]
+) {
+    localLookup[A.name] = { [activity] input, exec, parentID in
+        try await activity._runLocal(input: input, exec: exec, parentWorkflowID: parentID)
     }
+}
+
+func _addActivityRegistration<A: Activity>(
+    _ activity: A,
+    queue: String,
+    exec: _WorkerExec,
+    into registrations: inout [AnyRegistration]
+) {
+    registrations.append(
+        AnyRegistration(
+            name: A.name,
+            queueName: queue,
+            run: { [activity] claimed, deadline in
+                try await activity._run(claimed: claimed, exec: exec, fatalDeadline: deadline)
+            }
+        )
+    )
 }
 
 // MARK: - _WorkflowTaskCache

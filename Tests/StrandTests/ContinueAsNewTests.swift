@@ -77,34 +77,33 @@ struct ContinueAsNewTests {
     @Test("continueAsNew enqueues a fresh task that runs to completion")
     func basicContinueAsNew() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [InfiniteWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            // Start at generation 0 — will continueAsNew to generation 1.
-            // The second run (generation 1) returns 1.
-            // We can't use handle.result() on the original task since it
-            // continuedAsNew; instead we wait for a reasonable time and then
-            // verify via the task state.
-            let handle = try await client.startWorkflow(
-                InfiniteWorkflow.self,
-                options: .init(),
-                input: InfiniteInput(generation: 0)
-            )
-
-            // Allow time for both the original and the continued task to run.
-            try await Task.sleep(for: .seconds(3))
-
-            // The original task should be in a terminal state.
-            if let snap = try await client.fetchTaskResult(id: handle.taskID) {
-                #expect(
-                    snap.state == .completed || snap.state == .continuedAsNew,
-                    "original task should be terminal, got \(snap.state)"
+            ) {
+                // Start at generation 0 — will continueAsNew to generation 1.
+                // The second run (generation 1) returns 1.
+                // We can't use handle.result() on the original task since it
+                // continuedAsNew; instead we wait for a reasonable time and then
+                // verify via the task state.
+                let handle = try await client.startWorkflow(
+                    InfiniteWorkflow.self,
+                    options: .init(),
+                    input: InfiniteInput(generation: 0)
                 )
+
+                // Allow time for both the original and the continued task to run.
+                try await Task.sleep(for: .seconds(3))
+
+                // The original task should be in a terminal state.
+                if let snap = try await client.fetchTaskResult(id: handle.taskID) {
+                    #expect(
+                        snap.state == .completed || snap.state == .continuedAsNew,
+                        "original task should be terminal, got \(snap.state)"
+                    )
+                }
             }
         }
     }
@@ -119,29 +118,28 @@ struct ContinueAsNewTests {
     @Test("continueAsNew chains correctly and the final instance returns a result")
     func continueAsNewChain() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ContinueWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // Start the chain: count=0, limit=3.
+                // Generations: 0 (→CAN), 1 (→CAN), 2 (→CAN), 3 (returns 3).
+                _ = try await client.startWorkflow(
+                    ContinueWorkflow.self,
+                    options: .init(),
+                    input: ContinueInput(count: 0, limit: 3)
+                )
 
-            // Start the chain: count=0, limit=3.
-            // Generations: 0 (→CAN), 1 (→CAN), 2 (→CAN), 3 (returns 3).
-            _ = try await client.startWorkflow(
-                ContinueWorkflow.self,
-                options: .init(),
-                input: ContinueInput(count: 0, limit: 3)
-            )
+                // Give all four generations time to run.
+                try await Task.sleep(for: .seconds(5))
 
-            // Give all four generations time to run.
-            try await Task.sleep(for: .seconds(5))
-
-            // Verify by checking that at least one task for ContinueWorkflow
-            // is now COMPLETED (the terminal generation).
-            let queues = try await client.listQueues()
-            #expect(queues.contains(client.queueName))
+                // Verify by checking that at least one task for ContinueWorkflow
+                // is now COMPLETED (the terminal generation).
+                let queues = try await client.listQueues()
+                #expect(queues.contains(client.queueName))
+            }
         }
     }
 }
