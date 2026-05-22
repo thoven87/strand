@@ -11,21 +11,21 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.33.0"),
-        .package(url: "https://github.com/apple/swift-nio.git", from: "2.99.0"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.12.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.100.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.12.1"),
         .package(
             url: "https://github.com/swift-server/swift-service-lifecycle.git",
             from: "2.11.0"
         ),
-        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.22.0"),
-        .package(url: "https://github.com/apple/swift-metrics.git", from: "2.10.1"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.24.0"),
+        .package(url: "https://github.com/apple/swift-metrics.git", from: "2.11.0"),
         .package(url: "https://github.com/apple/swift-distributed-tracing.git", from: "1.4.1"),
         .package(
             url: "https://github.com/swift-otel/swift-otel-semantic-conventions.git",
-            from: "1.34.2"
+            from: "1.39.0"
         ),
-        .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),
-        .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.5.1"),
+        .package(url: "https://github.com/apple/swift-async-algorithms.git", from: "1.1.4"),
         .package(url: "https://github.com/adam-fowler/compress-nio.git", from: "1.4.2"),
         .package(url: "https://github.com/swift-extras/swift-extras-base64.git", from: "1.0.0"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "603.0.1"),
