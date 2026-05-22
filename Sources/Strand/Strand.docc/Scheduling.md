@@ -538,6 +538,9 @@ let scheduler = StrandScheduler(
 
 ### Reference
 - ``StrandScheduler``
+
+### Related
+- <doc:Timetables>
 - ``ScheduleOptions``
 - ``ScheduleAccuracy``
 - ``SchedulingMetadata``

@@ -1,7 +1,7 @@
 import Logging
 public import PostgresNIO
 public import ServiceLifecycle
-@_spi(Internal) public import Strand
+public import Strand
 import Synchronization
 
 #if canImport(FoundationEssentials)
@@ -146,8 +146,8 @@ public struct MetricsBroadcastListener: Service {
     }
 
     public func run() async throws {
-        logger.debug("metrics broadcast listener starting")
-        defer { logger.debug("metrics broadcast listener stopped") }
+        logger.info("metrics broadcast listener starting")
+        defer { logger.info("metrics broadcast listener stopped") }
 
         if let notifier {
             // Fast path: subscribe to the shared notifier stream.

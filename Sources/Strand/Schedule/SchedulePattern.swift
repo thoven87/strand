@@ -17,6 +17,13 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     case monthly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case yearly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case once(at: Date, offset: String = "PT0M", timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    /// A fully custom schedule driven by a ``StrandTimeTable`` implementation.
+    ///
+    /// The `description` string is stored in the database and shown in the
+    /// Loom schedule list.  The actual timetable logic lives in memory inside
+    /// the ``StrandScheduler`` — only the scheduler's registered
+    /// ``StrandTimeTable`` instance determines when the next fire time is.
+    case timetable(description: String)
 
     /// Calculate the next run time after the given date
     ///
@@ -154,6 +161,13 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
         case .once(let scheduledDate, _, _):
             return scheduledDate > date ? scheduledDate : nil
+
+        case .timetable:
+            // Timetable next-run computation requires the in-memory StrandTimeTable
+            // instance held by StrandScheduler — it cannot be derived from the
+            // serialised pattern alone.  Return nil here; the scheduler detects
+            // the .timetable case and delegates to the registered instance.
+            return nil
         }
     }
 
@@ -317,6 +331,9 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
                 "Yearly on \(monthNames[monthIdx]) \(dayOfMonth)\(suffix)"
                 + " at \(hhmm(timeMin / 60, timeMin % 60))\(tzSuffix(timezone))"
 
+        case .timetable(let desc):
+            return "Timetable: \(desc)"
+
         case .once(let date, _, let timezone):
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = timezone
@@ -348,6 +365,8 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             .yearly(let offset, _),
             .once(_, let offset, _):
             return offset != "PT0M" && offset != "PT0H" ? offset : nil
+        case .timetable:
+            return nil
         }
     }
 
@@ -362,6 +381,8 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             .yearly(_, let timezone),
             .once(_, _, let timezone):
             return timezone
+        case .timetable:
+            return TimeZone(identifier: "UTC")!
         }
     }
 
@@ -411,6 +432,8 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
         ):
             return lhsOffset == rhsOffset && lhsTimezone == rhsTimezone
 
+        case (.timetable(let d1), .timetable(let d2)):
+            return d1 == d2
         default:
             return false
         }
@@ -455,11 +478,17 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             hasher.combine(6)
             hasher.combine(offset)
             hasher.combine(timezone.identifier)
+        case .timetable(let description):
+            hasher.combine(7)
+            hasher.combine(description)
         }
     }
 
     /// Check if this schedule type supports partition offsets
-    public var supportsPartitionOffset: Bool { true }
+    public var supportsPartitionOffset: Bool {
+        if case .timetable = self { return false }
+        return true
+    }
 }
 
 // MARK: - Ergonomic schedule factories

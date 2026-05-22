@@ -352,6 +352,40 @@ package enum ScheduleQueries {
         return try col.next()!.decode(UUID.self, context: .default)
     }
 
+    /// Seeds `next_run_at` and activates a freshly-registered timetable schedule.
+    ///
+    /// Called by ``StrandScheduler/seedTimetableSchedules()`` after all static
+    /// schedule declarations have been applied.  The UPDATE is conditional on
+    /// `next_run_at IS NULL` so it is a no-op on restarts (existing values are
+    /// preserved) and only runs on first registration.
+    ///
+    /// - Parameters:
+    ///   - name:      Schedule name (unique within namespace + queue).
+    ///   - queue:     Queue the schedule is registered on.
+    ///   - nextRunAt: First fire time computed by the ``StrandTimeTable`` instance.
+    package static func activateTimetableSchedule(
+        on client: PostgresClient,
+        namespaceID: String,
+        name: String,
+        queue: String,
+        nextRunAt: Date,
+        logger: Logger
+    ) async throws {
+        try await client.query(
+            """
+            UPDATE strand.schedules
+            SET next_run_at = \(nextRunAt),
+                is_active   = TRUE,
+                updated_at  = NOW()
+            WHERE namespace_id = \(namespaceID)
+              AND queue        = \(queue)
+              AND name         = \(name)
+              AND next_run_at  IS NULL
+            """,
+            logger: logger
+        )
+    }
+
     package static func pauseSchedule(
         on client: PostgresClient,
         namespaceID: String,

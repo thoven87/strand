@@ -46,6 +46,7 @@ struct OrderWorkflow: Workflow {
 
 ### How-to guides
 - <doc:Scheduling>
+- <doc:Timetables>
 - <doc:SignalsAndEvents>
 - <doc:RetryStrategies>
 - <doc:VersioningGuide>

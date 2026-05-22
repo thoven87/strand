@@ -19,6 +19,7 @@ extension SchedulePattern {
         case .monthly: return "monthly"
         case .yearly: return "yearly"
         case .once: return "once"
+        case .timetable: return "timetable"
         }
     }
 }

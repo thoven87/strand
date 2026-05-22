@@ -107,7 +107,7 @@ public struct StrandPruner: Service {
     // MARK: - Service
 
     public func run() async throws {
-        logger.trace(
+        logger.info(
             "pruner starting",
             metadata: [
                 "strand.namespace": .string(namespaceID ?? "*"),
@@ -116,7 +116,7 @@ public struct StrandPruner: Service {
                 "strand.partition_interval": .string("\(options.partitionManagementInterval)"),
             ]
         )
-        defer { logger.trace("pruner stopped") }
+        defer { logger.info("pruner stopped") }
 
         // ── Startup: partition housekeeping before serving any traffic ────────
         //
