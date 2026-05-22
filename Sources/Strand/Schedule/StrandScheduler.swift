@@ -13,7 +13,9 @@ public import Foundation
 /// A static schedule definition passed to ``StrandScheduler`` at construction
 /// time and upserted to the database when the scheduler starts.
 ///
-/// Use the static factory methods to build schedules fluently:
+/// ## Pattern-based schedules
+///
+/// Use the `pattern:` overloads for cron, interval, and built-in patterns:
 ///
 /// ```swift
 /// let scheduler = StrandScheduler(
@@ -35,6 +37,39 @@ public import Foundation
 /// )
 /// ```
 ///
+/// ## Custom timetables
+///
+/// Use the `timetable:` overloads when the firing cadence can’t be expressed as
+/// a fixed cron or interval — for example, to skip bank holidays or fire only
+/// on quarter-end dates.  Implement ``StrandTimeTable`` and pass an instance:
+///
+/// ```swift
+/// struct WorkingDayTimetable: StrandTimeTable {
+///     func nextRunTime(after last: Date?, earliest: Date) async throws -> Date? {
+///         // advance earliest to the next Mon–Fri non-holiday
+///         var d = earliest
+///         while isWeekendOrHoliday(d) { d = nextDay(d) }
+///         return d
+///     }
+/// }
+///
+/// let scheduler = StrandScheduler(
+///     client: client,
+///     schedules: [
+///         .workflow(
+///             "daily-settlement",
+///             timetable: WorkingDayTimetable(),
+///             workflowType: SettlementWorkflow.self,
+///             input: SettlementInput()
+///         )
+///     ]
+/// )
+/// ```
+///
+/// The timetable instance lives entirely in memory; only its `description`
+/// string is persisted to the database.  Re-register the same implementation
+/// on every scheduler restart.
+///
 /// For schedules created at runtime (e.g. from an HTTP API), use
 /// ``StrandClient/schedule(name:pattern:workflowType:input:queue:startsAt:endsAt:options:)``
 /// directly — it is always a live database call.
@@ -45,8 +80,23 @@ public struct StrandSchedule: Sendable {
     // Private — callers only see the factory methods.
     private let _body: @Sendable (StrandClient) async throws -> Void
 
-    private init(_ body: @escaping @Sendable (StrandClient) async throws -> Void) {
+    /// Carries the timetable instance for ``StrandScheduler`` to extract
+    /// at init time.  Non-nil only for timetable-based schedules.
+    /// `package` so StrandScheduler (same module) can read it without
+    /// exposing the type to external callers.
+    package let _timetableEntry: _TimetableEntry?
+
+    package struct _TimetableEntry: Sendable {
+        let name: String
+        let table: any StrandTimeTable
+    }
+
+    private init(
+        _ body: @escaping @Sendable (StrandClient) async throws -> Void,
+        timetable: _TimetableEntry? = nil
+    ) {
         self._body = body
+        self._timetableEntry = timetable
     }
 
     /// Applies this schedule to the database using `client`.
@@ -85,7 +135,92 @@ public struct StrandSchedule: Sendable {
         }
     }
 
-    // MARK: Activity
+    // MARK: Workflow (timetable)
+
+    /// Declares a recurring workflow schedule driven by a custom
+    /// ``StrandTimeTable`` implementation.
+    ///
+    /// Use this overload when the firing times cannot be expressed as a cron
+    /// expression, interval, or built-in pattern — for example to skip bank
+    /// holidays, fire only on quarter-end business days, or follow an
+    /// irregular event calendar.
+    ///
+    /// The timetable instance is held in memory by the scheduler and is
+    /// **never serialised to the database**.  Only the `description` property
+    /// is stored (shown in the Loom schedule list).  Re-register the same
+    /// timetable implementation on every scheduler restart.
+    ///
+    /// ```swift
+    /// .workflow(
+    ///     "settlement",
+    ///     timetable: UKWorkingDayTimetable(year: 2026),
+    ///     workflowType: SettlementWorkflow.self,
+    ///     input: SettlementInput()
+    /// )
+    /// ```
+    public static func workflow<W: Workflow>(
+        _ name: String,
+        timetable: some StrandTimeTable,
+        workflowType: W.Type = W.self,
+        input: W.Input,
+        queue: String? = nil,
+        startsAt: Date? = nil,
+        endsAt: Date? = nil,
+        options: ScheduleOptions = .init()
+    ) -> StrandSchedule {
+        let tt = timetable  // capture value
+        return StrandSchedule(
+            { client in
+                // The client upserts the schedule row with next_run_at = nil.
+                // StrandScheduler.seedTimetableSchedules() seeds next_run_at
+                // (and sets is_active = true) after all _apply calls complete.
+                _ = try await client.schedule(
+                    name: name,
+                    pattern: .timetable(description: tt.description),
+                    workflowType: workflowType,
+                    input: input,
+                    queue: queue,
+                    startsAt: startsAt,
+                    endsAt: endsAt,
+                    options: options
+                )
+            },
+            timetable: _TimetableEntry(name: name, table: tt)
+        )
+    }
+
+    // MARK: Activity (timetable)
+
+    /// Declares a recurring activity schedule driven by a custom timetable.
+    public static func activity<A: Activity>(
+        _ name: String,
+        timetable: some StrandTimeTable,
+        activityType: A.Type,
+        input: A.Input,
+        queue: String? = nil,
+        startsAt: Date? = nil,
+        endsAt: Date? = nil,
+        options: ScheduleOptions = .init()
+    ) -> StrandSchedule {
+        let tt = timetable
+        return StrandSchedule(
+            { client in
+                _ = try await client.schedule(
+                    name: name,
+                    pattern: .timetable(description: tt.description),
+                    activityType: activityType,
+                    input: input,
+                    queue: queue,
+                    startsAt: startsAt,
+                    endsAt: endsAt,
+                    options: options
+                )
+            },
+            timetable: _TimetableEntry(name: name, table: tt)
+        )
+    }
+
+    // MARK: Activity (pattern)
 
     /// Declares a recurring activity schedule.
     ///
@@ -153,6 +288,9 @@ public struct StrandScheduler: Service {
     private let options: SchedulerOptions
     /// Static schedules upserted to the database at startup.
     private let schedules: [StrandSchedule]
+    /// In-memory timetable instances keyed by schedule name.
+    /// Populated from ``StrandSchedule/workflow(_:timetable:...)`` entries.
+    private let timetables: [String: any StrandTimeTable]
 
     public init(
         client: StrandClient,
@@ -162,6 +300,15 @@ public struct StrandScheduler: Service {
         self.client = client
         self.options = options
         self.schedules = schedules
+        // Extract every timetable entry so fire() can call nextRunTime without
+        // hitting the database.  This runs once at init, not on every poll.
+        var tt: [String: any StrandTimeTable] = [:]
+        for s in schedules {
+            if let entry = s._timetableEntry {
+                tt[entry.name] = entry.table
+            }
+        }
+        self.timetables = tt
     }
 
     public func run() async throws {
@@ -185,6 +332,16 @@ public struct StrandScheduler: Service {
             try await declaration._apply(to: client)
         }
 
+        // Seed next_run_at for timetable schedules whose rows were just upserted
+        // with next_run_at = null (the client layer doesn’t compute the first slot
+        // — only the scheduler has the in-memory StrandTimeTable instances).
+        //
+        // This is the guarantee that timetable schedules actually run:
+        //   • First registration  → seeds next_run_at + sets is_active = true.
+        //   • Restart             → no-op (UPDATE WHERE next_run_at IS NULL;
+        //                           the existing value from fire() is preserved).
+        await seedTimetableSchedules()
+
         let (stream, cont) = AsyncStream.makeStream(of: Void.self)
 
         try await withTaskCancellationOrGracefulShutdownHandler {
@@ -204,6 +361,39 @@ public struct StrandScheduler: Service {
     }
 
     // MARK: - Private
+
+    /// Seeds `next_run_at` for every registered timetable schedule that was
+    /// just upserted with `next_run_at = nil`.
+    ///
+    /// `activateTimetableSchedule` uses `WHERE next_run_at IS NULL` so this is
+    /// a no-op on restarts — the value written by ``fire(_:now:)`` after the
+    /// last execution is preserved unchanged.
+    private func seedTimetableSchedules() async {
+        let now = Date.now
+        for (name, tt) in timetables {
+            let earliest = now
+            guard let nextRun = tt.nextRunTime(after: nil, earliest: earliest) else {
+                client.logger.warning(
+                    "timetable schedule '\(name)' returned nil for initial nextRunTime — schedule will not fire"
+                )
+                continue
+            }
+            do {
+                try await ScheduleQueries.activateTimetableSchedule(
+                    on: client.postgres,
+                    namespaceID: client.namespaceID,
+                    name: name,
+                    queue: client.queueName,
+                    nextRunAt: nextRun,
+                    logger: client.logger
+                )
+            } catch {
+                client.logger.warning(
+                    "failed to seed next_run_at for timetable schedule '\(name)': \(error)"
+                )
+            }
+        }
+    }
 
     private func pollLoop() async throws {
         while true {
@@ -441,6 +631,10 @@ public struct StrandScheduler: Service {
         let logger = client.logger
         let pattern = try JSON.decode(SchedulePattern.self, from: row.patternBuffer)
 
+        // Resolve the in-memory timetable for custom-schedule rows.
+        // For pattern-based schedules this is always nil.
+        let timetable: (any StrandTimeTable)? = timetables[row.name]
+
         // ── Build the list of slots to fire ──────────────────────────────────────
         // .latest (default): only the single slot in row.scheduledAt.
         // .all:              every overdue slot from row.scheduledAt up to now.
@@ -449,6 +643,21 @@ public struct StrandScheduler: Service {
         // For .all and .last(n), _schedule set next_run_at to the OLDEST overdue
         // slot.  We iterate forward here so a single fire() call catches up the
         // full backlog in one pass instead of requiring one poll cycle per slot.
+        // ── Helper: next slot time, delegating to timetable when present ───────────
+        // Synchronous: nextRunTime must not perform I/O — data is pre-loaded or
+        // maintained in a background-refreshed cache by the timetable itself.
+        func nextSlotTime(after cursor: Date) -> Date? {
+            if let tt = timetable {
+                let earliest = cursor.addingTimeInterval(1)  // strictly after cursor
+                return tt.nextRunTime(after: cursor, earliest: earliest)
+            }
+            return try? ScheduleCalculator.nextRunTime(
+                for: pattern,
+                after: cursor,
+                timezone: pattern.timezone
+            )
+        }
+
         let slotsToFire: [Date]
         switch row.accuracy {
         case .latest:
@@ -463,13 +672,7 @@ public struct StrandScheduler: Service {
             var cursor = row.scheduledAt
             while cursor <= now && slots.count < options.maxCatchupSlots {
                 slots.append(cursor)
-                guard
-                    let next = try? ScheduleCalculator.nextRunTime(
-                        for: pattern,
-                        after: cursor,
-                        timezone: pattern.timezone
-                    )
-                else { break }
+                guard let next = nextSlotTime(after: cursor) else { break }
                 cursor = next
             }
             slotsToFire = slots
@@ -479,13 +682,7 @@ public struct StrandScheduler: Service {
             var cursor = row.scheduledAt
             while cursor <= now && slots.count < options.maxCatchupSlots {
                 slots.append(cursor)
-                guard
-                    let next = try? ScheduleCalculator.nextRunTime(
-                        for: pattern,
-                        after: cursor,
-                        timezone: pattern.timezone
-                    )
-                else { break }
+                guard let next = nextSlotTime(after: cursor) else { break }
                 cursor = next
             }
             // Fire in chronological order, keeping only the last n.
@@ -552,11 +749,27 @@ public struct StrandScheduler: Service {
 
         // ── Advance next_run_at past the last slot fired ──────────────────────────
         let lastSlot = slotsToFire.last!
-        var nextRunAt = try ScheduleCalculator.nextRunTime(
-            for: pattern,
-            after: lastSlot,
-            timezone: pattern.timezone
-        )
+        var nextRunAt: Date?
+        if let tt = timetable {
+            // For timetable schedules the earliest permissible next fire time is
+            // now (or startsAt if it's in the future) but always after lastSlot.
+            let earliest = max(now, lastSlot.addingTimeInterval(1))
+            let proposed = tt.nextRunTime(after: lastSlot, earliest: earliest)
+            if let proposed, proposed < earliest {
+                logger.warning(
+                    "timetable '\(row.name)' returned \(proposed) which is before earliest \(earliest) — discarding"
+                )
+                nextRunAt = nil
+            } else {
+                nextRunAt = proposed
+            }
+        } else {
+            nextRunAt = try ScheduleCalculator.nextRunTime(
+                for: pattern,
+                after: lastSlot,
+                timezone: pattern.timezone
+            )
+        }
         if let endsAt = row.endsAt, let next = nextRunAt, next >= endsAt {
             nextRunAt = nil
         }

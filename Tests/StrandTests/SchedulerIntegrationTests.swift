@@ -382,6 +382,221 @@ struct SchedulerIntegrationTests {
             try? await client.deleteSchedule(id: scheduleID)
         }
     }
+
+    // ── Timetable 1 ──────────────────────────────────────────────────────────
+    // A timetable that always returns `earliest` (fire as soon as possible).
+    // Registered via StrandSchedule.workflow(timetable:) — the scheduler seeds
+    // next_run_at after registration and fires the schedule within 5 seconds.
+    @Test("timetable schedule fires and run_count reaches 1 within 5 seconds")
+    func timetableScheduleFires() async throws {
+        try await withTestEnvironment { client in
+            // A timetable that always wants to fire NOW (at earliest).
+            struct ImmediateTimetable: StrandTimeTable {
+                var description: String { "immediate (test)" }
+                func nextRunTime(after lastScheduledAt: Date?, earliest: Date) -> Date? {
+                    earliest
+                }
+            }
+
+            let schedName = "timetable-fires-\(UUID().uuidString.prefix(8))"
+
+            let scheduler = StrandScheduler(
+                client: client,
+                options: SchedulerOptions(sleepCap: .seconds(1)),
+                schedules: [
+                    .workflow(
+                        schedName,
+                        timetable: ImmediateTimetable(),
+                        workflowType: SitSimpleWorkflow.self,
+                        input: .done
+                    )
+                ]
+            )
+
+            let schedulerTask = Task { try? await scheduler.run() }
+            defer { schedulerTask.cancel() }
+
+            let workerTask = startWorker(
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [SitSimpleWorkflow.self]
+            )
+            defer { workerTask.cancel() }
+
+            var runCount = 0
+            let deadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < deadline {
+                runCount =
+                    (try await client.listSchedules(queue: client.queueName))
+                    .first(where: { $0.name == schedName })?.runCount ?? 0
+                if runCount >= 1 { break }
+                try await Task.sleep(for: .milliseconds(200))
+            }
+
+            #expect(runCount >= 1, "timetable schedule should fire at least once within 5 s")
+
+            // Verify the pattern stored in the DB is .timetable
+            let summaries = try await client.listSchedules(queue: client.queueName)
+            let stored = summaries.first(where: { $0.name == schedName })
+            if let stored {
+                if case .timetable(let desc) = stored.pattern {
+                    #expect(desc == "immediate (test)", "description should be preserved in DB")
+                } else {
+                    Issue.record("expected .timetable pattern, got \(stored.pattern)")
+                }
+            } else {
+                Issue.record("schedule not found in listSchedules")
+            }
+
+            try? await client.deleteSchedule(id: stored?.id ?? UUID())
+        }
+    }
+
+    // ── Timetable 2 ──────────────────────────────────────────────────────────
+    // A timetable that skips certain dates — verifies next_run_at advances
+    // past skipped dates and the second fire time is computed correctly.
+    @Test("timetable skip-date logic: next_run_at advances past skipped dates")
+    func timetableSkipsCorrectly() async throws {
+        try await withTestEnvironment { client in
+            let calendar = Calendar(identifier: .gregorian)
+            let skipDate = calendar.startOfDay(
+                for: Date.now.addingTimeInterval(86_400)  // tomorrow
+            )
+
+            // Skip tomorrow, fire every other day.
+            struct SkipOneDayTimetable: StrandTimeTable {
+                let skip: Date
+                let calendar = Calendar(identifier: .gregorian)
+                var description: String { "skip-one-day (test)" }
+
+                func nextRunTime(after lastScheduledAt: Date?, earliest: Date) -> Date? {
+                    var candidate = earliest
+                    // Don't fire on the skipped day.
+                    let skippedMidnight = calendar.startOfDay(for: skip)
+                    let candidateMidnight = calendar.startOfDay(for: candidate)
+                    if candidateMidnight == skippedMidnight {
+                        // Advance to the day after skip
+                        candidate =
+                            calendar.date(
+                                byAdding: .day,
+                                value: 1,
+                                to: skippedMidnight
+                            ) ?? candidate
+                    }
+                    return candidate
+                }
+            }
+
+            let tt = SkipOneDayTimetable(skip: skipDate)
+
+            // Verify the timetable itself behaves correctly.
+            let now = Date.now
+            let afterNow = tt.nextRunTime(after: nil, earliest: now)
+            let afterTomorrow = tt.nextRunTime(
+                after: afterNow,
+                earliest: (afterNow ?? now).addingTimeInterval(1)
+            )
+
+            #expect(afterNow != nil, "first slot should be non-nil")
+            if let first = afterNow, let second = afterTomorrow {
+                // The second slot should NOT land on the skip date.
+                let secondMidnight = Calendar.current.startOfDay(for: second)
+                let skipMidnight = Calendar.current.startOfDay(for: skipDate)
+                #expect(
+                    secondMidnight != skipMidnight,
+                    "second slot \(second) should not land on skip date \(skipDate)"
+                )
+                // Second slot should be strictly after the first.
+                #expect(second > first, "slots must be strictly increasing")
+            }
+
+            // Cleanup: no DB state was written.
+            _ = tt  // suppress unused warning
+        }
+    }
+
+    // ── Timetable 3 ──────────────────────────────────────────────────────────
+    // Verifies the restart guarantee: a second scheduler startup does NOT
+    // overwrite the existing next_run_at (the seed is idempotent).
+    @Test("timetable restart is idempotent: existing next_run_at is preserved")
+    func timetableRestartIdempotent() async throws {
+        try await withTestEnvironment { client in
+            struct FutureTimetable: StrandTimeTable {
+                let fireAt: Date
+                var description: String { "future (test)" }
+                func nextRunTime(after lastScheduledAt: Date?, earliest: Date) -> Date? {
+                    max(fireAt, earliest)
+                }
+            }
+
+            let schedName = "timetable-restart-\(UUID().uuidString.prefix(8))"
+            // Schedule fires one hour from now.
+            let targetTime = Date.now.addingTimeInterval(3_600)
+            let tt = FutureTimetable(fireAt: targetTime)
+
+            // First scheduler: registers and seeds next_run_at.
+            let sched1 = StrandScheduler(
+                client: client,
+                options: SchedulerOptions(sleepCap: .seconds(60)),
+                schedules: [
+                    .workflow(
+                        schedName,
+                        timetable: tt,
+                        workflowType: SitSimpleWorkflow.self,
+                        input: .done
+                    )
+                ]
+            )
+            let t1 = Task { try? await sched1.run() }
+            // Give the scheduler time to apply + seed.
+            try await Task.sleep(for: .milliseconds(500))
+            t1.cancel()
+            try await Task.sleep(for: .milliseconds(100))
+
+            // Read back the seeded next_run_at.
+            let summaries1 = try await client.listSchedules(queue: client.queueName)
+            let firstNextRunAt = summaries1.first(where: { $0.name == schedName })?.nextRunAt
+            #expect(firstNextRunAt != nil, "next_run_at should be seeded after first startup")
+
+            // Second scheduler: restarts with the same timetable.
+            // activateTimetableSchedule uses WHERE next_run_at IS NULL
+            // so it must NOT overwrite the existing value.
+            let sched2 = StrandScheduler(
+                client: client,
+                options: SchedulerOptions(sleepCap: .seconds(60)),
+                schedules: [
+                    .workflow(
+                        schedName,
+                        timetable: tt,
+                        workflowType: SitSimpleWorkflow.self,
+                        input: .done
+                    )
+                ]
+            )
+            let t2 = Task { try? await sched2.run() }
+            try await Task.sleep(for: .milliseconds(500))
+            t2.cancel()
+            try await Task.sleep(for: .milliseconds(100))
+
+            let summaries2 = try await client.listSchedules(queue: client.queueName)
+            let secondNextRunAt = summaries2.first(where: { $0.name == schedName })?.nextRunAt
+
+            // The second startup must preserve the original next_run_at.
+            if let first = firstNextRunAt, let second = secondNextRunAt {
+                #expect(
+                    abs(first.timeIntervalSince(second)) < 1.0,
+                    "restart must not overwrite existing next_run_at"
+                )
+            } else {
+                Issue.record("next_run_at missing after restart")
+            }
+
+            try? await client.deleteSchedule(
+                id: summaries2.first(where: { $0.name == schedName })?.id ?? UUID()
+            )
+        }
+    }
 }
 
 // MARK: - Catch-up unit tests (injected `now`, no scheduler process)

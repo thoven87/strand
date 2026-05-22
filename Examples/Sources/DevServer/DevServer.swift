@@ -384,6 +384,19 @@ private func seedOnePodcast(client: StrandClient, logger: Logger) async {
     }
 }
 
+// MARK: - Seeder service
+private struct SeederService: Service {
+    let orders: StrandClient
+    let reports: StrandClient
+    let logger: Logger
+
+    func run() async throws {
+        logger.info("[seeder] starting")
+        defer { logger.info("[seeder] stopped") }
+        await runSeeder(orders: orders, reports: reports, logger: logger)
+    }
+}
+
 // MARK: - Entry point
 
 @main struct DevServer {
@@ -554,21 +567,20 @@ private func seedOnePodcast(client: StrandClient, logger: Logger) async {
         )
 
         let pruner = StrandPruner(postgres: postgres, logger: logger)
+        let seeder = SeederService(orders: ordersClient, reports: reportsClient, logger: logger)
 
-        app.addServices(observability)  // OTel must be first so spans are emitted correctly
-        app.addServices(postgres)
-        app.addServices(notifier)  // one LISTEN connection, fans out to workers + listener
-        app.addServices(ordersWorker)
-        app.addServices(reportsWorker)
-        app.addServices(pruner)  // prunes all namespaces, reads retention_days from DB
-        app.addServices(metricsListener)  // receives strand_metrics broadcasts→ updates cache
-        app.addServices(metricsLoop)  // broadcasts live counts every 5 s
+        app.addServices(observability)  // 1: OTel must start first; stops last
+        app.addServices(postgres)  // 2: connection pool; stops second-to-last
+        app.addServices(pruner)  // 3: stops AFTER workers (registered before them)
+        app.addServices(notifier)  // 4: one LISTEN connection, fans out to workers + listener
+        app.addServices(ordersWorker)  // 5: stops before notifier, pruner
+        app.addServices(reportsWorker)  // 6: stops before notifier, pruner
+        app.addServices(metricsListener)  // 7: receives strand_metrics broadcasts → updates cache
+        app.addServices(metricsLoop)  // 8: broadcasts live counts every 5 s
+        app.addServices(seeder)  // 9: stops FIRST — halts new task creation immediately
 
         app.beforeServerStarts {
             try await ordersClient.verifySchema()
-            // Seed demo data after schema is confirmed.  Runs as a Task so
-            // it doesn't hold up the HTTP server from accepting connections.
-            Task { await runSeeder(orders: ordersClient, reports: reportsClient, logger: logger) }
             logger.info("────────────────────────────────────────────────")
             logger.info("  Strand DevServer ready")
             logger.info("  API     →  http://localhost:8080/api/queues")

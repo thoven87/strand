@@ -42,6 +42,8 @@ public struct ScheduleCalculator {
             return Date(timeIntervalSince1970: epochBoundary)
         case .once(let runDate, _, _):
             return runDate <= executionTime ? runDate : nil
+        case .timetable:
+            return nil
         case .daily(let offset, let tz):
             // Parse offset to extract hour and minute; forward the pattern timezone
             // so day-boundary extraction uses UTC (or whatever the schedule specifies)
@@ -420,6 +422,8 @@ public struct ScheduleCalculator {
                 throw SchedulingError.invalidSchedule("One-time schedule must be in the future")
             }
             try validateOffset(offset)
+        case .timetable:
+            break  // timetable schedules are always valid (logic lives in the StrandTimeTable instance)
         }
 
         // Try to calculate a next run time to validate the schedule works
@@ -602,6 +606,9 @@ public struct ScheduleCalculator {
         case .cron(_, _, _), .once(_, _, _), .yearly(_, _):
             // For cron, once, and yearly schedules, use simple offset subtraction if available
             return partitionOffset.offset.subtract(from: executionTime, calendar: utcCalendar)
+        case .timetable:
+            // Timetable schedules don't have partition offset support; return execution time as-is.
+            return executionTime
         }
     }
 
@@ -629,9 +636,8 @@ public struct ScheduleCalculator {
             } else {
                 return ISO8601Duration(seconds: Int(seconds))
             }
-        case .cron(_, _, _), .once(_, _, _), .yearly(_, _):
-            return nil  // No default offset for cron/once/yearly schedules
-        // All schedules now have built-in offset support
+        case .cron(_, _, _), .once(_, _, _), .yearly(_, _), .timetable:
+            return nil  // No default offset for cron/once/yearly/timetable schedules
         }
     }
 }
