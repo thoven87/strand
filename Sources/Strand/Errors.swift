@@ -172,6 +172,25 @@ public protocol NonRetryableError: Error {}
 struct _TypedActivityFailure: Error, CustomStringConvertible {
     let reasonBuffer: ByteBuffer
 
+    // MARK: - Private Codable helpers
+
+    private struct _Reason: Decodable {
+        let name: String
+        let message: String
+    }
+
+    private struct _Payload: Encodable {
+        let name: String
+        let message: String
+        let non_retryable: Bool?
+        let payload: Data?  // synthesised Encodable base64-encodes Data automatically
+        let source: _Source?
+        struct _Source: Encodable {
+            let file_id: String
+            let line: Int
+        }
+    }
+
     /// Pre-encoded sentinel buffer for `init(name:message:payload:nonRetryable:source:)`
     /// fallback.  The fallback is unreachable in practice; the constant centralises the
     /// literal in the type rather than scattering it at call sites.
@@ -184,11 +203,7 @@ struct _TypedActivityFailure: Error, CustomStringConvertible {
     /// Without this, swift-distributed-tracing falls back to `String(describing:)`
     /// which emits the raw struct internals: `_TypedActivityFailure(reasonBuffer: [7b...])`.
     var description: String {
-        struct Reason: Decodable {
-            let name: String
-            let message: String
-        }
-        if let r = try? JSON.decode(Reason.self, from: reasonBuffer) {
+        if let r = try? JSON.decode(_Reason.self, from: reasonBuffer) {
             return "\(r.name): \(r.message)"
         }
         return "activity failed"
@@ -196,24 +211,13 @@ struct _TypedActivityFailure: Error, CustomStringConvertible {
 
     /// Builds the failure reason payload and encodes it as JSON.
     /// Falls back to a minimal JSON string if encoding itself fails.
-    init(name: String, message: String, payload: Data?, nonRetryable: Bool, source: (fileID: String, line: Int)? = nil) {
-        struct Payload: Encodable {
-            let name: String
-            let message: String
-            let non_retryable: Bool?
-            let payload: Data?
-            let source: SourcePayload?
-            struct SourcePayload: Encodable {
-                let file_id: String
-                let line: Int
-            }
-        }
-        let p = Payload(
+    init(name: String, message: String, payload: ByteBuffer?, nonRetryable: Bool, source: (fileID: String, line: Int)? = nil) {
+        let p = _Payload(
             name: name,
             message: message,
             non_retryable: nonRetryable ? true : nil,
-            payload: payload,
-            source: source.map { Payload.SourcePayload(file_id: $0.fileID, line: $0.line) }
+            payload: payload.map { Data($0.readableBytesView) },
+            source: source.map { _Payload._Source(file_id: $0.fileID, line: $0.line) }
         )
         // If encoding fails (essentially never) fall back to a static safe string.
         // We can't trust arbitrary content in `name` for manual JSON escaping,

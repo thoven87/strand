@@ -4,7 +4,8 @@ import Strand
 /// Runs on the `hn-summarizer` queue so concurrency is controlled at the
 /// worker level — set `activityConcurrency` on that worker to limit
 /// simultaneous Ollama calls.
-struct SummarizeStoryWorkflow: Workflow {
+@Workflow
+struct SummarizeStoryWorkflow {
     typealias Input = Int  // HN story ID
     typealias Output = StorySummary
 
@@ -14,7 +15,7 @@ struct SummarizeStoryWorkflow: Workflow {
     ) async throws -> StorySummary {
         // Step 1 — fetch story metadata from HN API
         let story = try await context.runActivity(
-            FetchStoryActivity.self,
+            SummarizationActivities.FetchStory.self,
             input: .init(storyID: input),
             options: ActivityOptions(maxAttempts: 3)
         )
@@ -33,7 +34,7 @@ struct SummarizeStoryWorkflow: Workflow {
 
         // Step 3 — summarise with Ollama
         let summary = try await context.runActivity(
-            OllamaSummarizeActivity.self,
+            SummarizationActivities.Summarize.self,
             input: .init(title: story.title, content: content),
             options: ActivityOptions(
                 maxAttempts: 2,

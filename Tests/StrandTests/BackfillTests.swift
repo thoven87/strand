@@ -32,66 +32,65 @@ struct BackfillTests {
             let queue = client.queueName
 
             // Start a worker to claim tasks that the scheduler enqueues
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: postgres,
                 queueName: queue,
                 logger: logger,
                 workflows: [BackfillTestWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // Start a scheduler with a very short sleep cap so it processes
+                // the backfill quickly without waiting for the full sleepCap
+                let schedulerClient = StrandClient(
+                    postgres: postgres,
+                    queue: queue,
+                    logger: logger
+                )
+                let scheduler = StrandScheduler(
+                    client: schedulerClient,
+                    options: SchedulerOptions(sleepCap: .milliseconds(200))
+                )
+                let schedulerTask = Task {
+                    try? await scheduler.run()
+                }
+                defer { schedulerTask.cancel() }
 
-            // Start a scheduler with a very short sleep cap so it processes
-            // the backfill quickly without waiting for the full sleepCap
-            let schedulerClient = StrandClient(
-                postgres: postgres,
-                queue: queue,
-                logger: logger
-            )
-            let scheduler = StrandScheduler(
-                client: schedulerClient,
-                options: SchedulerOptions(sleepCap: .milliseconds(200))
-            )
-            let schedulerTask = Task {
-                try? await scheduler.run()
+                // Give the scheduler time to start and register the namespace
+                try await Task.sleep(for: .milliseconds(400))
+
+                // Range: last 3 hours, 1-hour interval → 3 slots
+                let now = Date()
+                let rangeEnd = now
+                let rangeStart = Calendar(identifier: .gregorian).date(byAdding: .hour, value: -3, to: now)!
+                let range = rangeStart..<rangeEnd
+
+                let handle = try await client.createBackfill(
+                    BackfillTestWorkflow.self,
+                    input: "test",
+                    schedule: .interval(.hours(1)),
+                    range: range,
+                    options: BackfillOptions(concurrency: 3)
+                )
+
+                // Wait long enough for the scheduler's poll loop to process the backfill
+                try await Task.sleep(for: .seconds(2))
+
+                // Verify tasks were created with the correct backfill_id
+                let taskStream = try await postgres.query(
+                    "SELECT COUNT(*)::int FROM strand.tasks WHERE backfill_id = \(handle.id) AND namespace_id = 'default'",
+                    logger: logger
+                )
+                var taskCount = 0
+                for try await row in taskStream {
+                    var col = row.makeIterator()
+                    taskCount = try col.next()!.decode(Int.self, context: .default)
+                }
+                #expect(taskCount > 0, "Expected at least one task to be enqueued for the backfill")
+
+                // Verify the backfill row exists and is in a valid terminal or running state
+                let status = try await handle.status()
+                #expect(status.state == .running || status.state == .completed)
+                #expect(status.completedSlots >= 0)
             }
-            defer { schedulerTask.cancel() }
-
-            // Give the scheduler time to start and register the namespace
-            try await Task.sleep(for: .milliseconds(400))
-
-            // Range: last 3 hours, 1-hour interval → 3 slots
-            let now = Date()
-            let rangeEnd = now
-            let rangeStart = Calendar(identifier: .gregorian).date(byAdding: .hour, value: -3, to: now)!
-            let range = rangeStart..<rangeEnd
-
-            let handle = try await client.createBackfill(
-                BackfillTestWorkflow.self,
-                input: "test",
-                schedule: .interval(.hours(1)),
-                range: range,
-                options: BackfillOptions(concurrency: 3)
-            )
-
-            // Wait long enough for the scheduler's poll loop to process the backfill
-            try await Task.sleep(for: .seconds(2))
-
-            // Verify tasks were created with the correct backfill_id
-            let taskStream = try await postgres.query(
-                "SELECT COUNT(*)::int FROM strand.tasks WHERE backfill_id = \(handle.id) AND namespace_id = 'default'",
-                logger: logger
-            )
-            var taskCount = 0
-            for try await row in taskStream {
-                var col = row.makeIterator()
-                taskCount = try col.next()!.decode(Int.self, context: .default)
-            }
-            #expect(taskCount > 0, "Expected at least one task to be enqueued for the backfill")
-
-            // Verify the backfill row exists and is in a valid terminal or running state
-            let status = try await handle.status()
-            #expect(status.state == .running || status.state == .completed)
-            #expect(status.completedSlots >= 0)
         }
     }
 

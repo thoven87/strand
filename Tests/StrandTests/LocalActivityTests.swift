@@ -106,22 +106,21 @@ struct LocalActivityTests {
     @Test("local activity executes in-process and returns the correct result")
     func singleLocalActivity() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [LocalUpperWorkflow.self],
                 activities: [UppercaseActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                LocalUpperWorkflow.self,
-                options: .init(),
-                input: "hello"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "HELLO")
+            ) {
+                let handle = try await client.startWorkflow(
+                    LocalUpperWorkflow.self,
+                    options: .init(),
+                    input: "hello"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "HELLO")
+            }
         }
     }
 
@@ -131,23 +130,22 @@ struct LocalActivityTests {
     @Test("chained local activities execute sequentially in one activation")
     func chainedLocalActivities() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [LocalChainWorkflow.self],
                 activities: [UppercaseActivity(), AddOneActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                LocalChainWorkflow.self,
-                options: .init(),
-                input: "hi"
-            )
-            // "hi" → uppercase → "HI" (len 2) → AddOne → 3 → "HI(3)"
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "HI(3)")
+            ) {
+                let handle = try await client.startWorkflow(
+                    LocalChainWorkflow.self,
+                    options: .init(),
+                    input: "hi"
+                )
+                // "hi" → uppercase → "HI" (len 2) → AddOne → 3 → "HI(3)"
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "HI(3)")
+            }
         }
     }
 
@@ -159,31 +157,30 @@ struct LocalActivityTests {
     func mixedLocalAndRegularActivity() async throws {
         try await withTestEnvironment { client in
             try await confirmation("ReverseLocalActivity ran") { confirm in
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     workflows: [MixedWorkflow.self],
                     activities: [UppercaseActivity(), ReverseLocalActivity(onRan: { confirm() })]
-                )
-                defer { workerTask.cancel() }
-
-                let handle = try await client.startWorkflow(
-                    MixedWorkflow.self,
-                    options: .init(),
-                    input: "abc"
-                )
-                // "abc" → local uppercase → "ABC" → regular reverse → "CBA".
-                // awaitTerminal guarantees the activity completed before we return,
-                // so confirmation will see exactly 1 call to confirm().
-                let snap = try await awaitTerminal(
-                    client: client,
-                    taskID: handle.taskID,
-                    timeout: .seconds(30)
-                )
-                #expect(snap.state == .completed)
-                let result = try snap.decodeResult(as: String.self)
-                #expect(result == "CBA")
+                ) {
+                    let handle = try await client.startWorkflow(
+                        MixedWorkflow.self,
+                        options: .init(),
+                        input: "abc"
+                    )
+                    // "abc" → local uppercase → "ABC" → regular reverse → "CBA".
+                    // awaitTerminal guarantees the activity completed before we return,
+                    // so confirmation will see exactly 1 call to confirm().
+                    let snap = try await awaitTerminal(
+                        client: client,
+                        taskID: handle.taskID,
+                        timeout: .seconds(30)
+                    )
+                    #expect(snap.state == .completed)
+                    let result = try snap.decodeResult(as: String.self)
+                    #expect(result == "CBA")
+                }
             }
         }
     }
@@ -194,26 +191,25 @@ struct LocalActivityTests {
     @Test("a throwing local activity fails the whole activation")
     func failingLocalActivity() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [FailLocalWorkflow.self],
                 activities: [FailingLocalActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                FailLocalWorkflow.self,
-                options: .init(),
-                input: "trigger"
-            )
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(10)
-            )
-            #expect(snap.state == .failed)
+            ) {
+                let handle = try await client.startWorkflow(
+                    FailLocalWorkflow.self,
+                    options: .init(),
+                    input: "trigger"
+                )
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(10)
+                )
+                #expect(snap.state == .failed)
+            }
         }
     }
 }

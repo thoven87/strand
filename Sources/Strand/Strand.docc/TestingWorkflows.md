@@ -1,7 +1,20 @@
 # Testing workflows
 
-Strand provides integration test helpers in `TestHelpers.swift` that run against
-a real local Postgres instance.
+Strand ships a separate **``StrandTesting``** library with all the integration
+test helpers. Add it once to your test target in `Package.swift`:
+
+```swift
+.testTarget(
+    name: "MyAppTests",
+    dependencies: [
+        "MyApp",
+        .product(name: "StrandTesting", package: "strand")
+    ]
+)
+```
+
+Then import it in your test files. You do **not** need `@testable import Strand`
+unless you specifically need access to Strand internals.
 
 ## Integration tests
 
@@ -10,40 +23,33 @@ The queue and all its tasks are cleaned up automatically at the end of the block
 
 ```swift
 import Testing
-@testable import Strand
+import StrandTesting
 
 @Test("order workflow charges card and ships", .tags(.integration))
 func orderWorkflowChargesAndShips() async throws {
     try await withTestEnvironment { client in
-        // makePostgresClient reads env vars with local-dev defaults:
-        //   POSTGRES_HOST=localhost POSTGRES_PORT=5499
-        //   POSTGRES_USER=strand    POSTGRES_PASSWORD=strand
-        //   POSTGRES_DB=strand_dev
-        let postgres = makePostgresClient(logger: Logger(label: "test"))
-        let pgTask = Task { await postgres.run() }
-        defer { pgTask.cancel() }
-        try await Task.sleep(for: .milliseconds(100))
-
-        let workerTask = startWorker(
-            postgres: postgres,
+        // withWorker starts the worker, runs the body, then calls
+        // triggerGracefulShutdown() before returning — the worker is fully
+        // stopped before withTestEnvironment's cleanup deletes the queue.
+        try await withWorker(
+            postgres: client.postgres,
             queueName: client.queueName,
-            logger: Logger(label: "test.worker"),
+            logger: client.logger,
             workflows: [OrderWorkflow.self],
             activities: [ChargeCardActivity(), ShipOrderActivity()]
-        )
-        defer { workerTask.cancel() }
+        ) {
+            let handle = try await client.startWorkflow(
+                OrderWorkflow.self,
+                input: OrderInput(amount: 99_00, orderID: "ord-1")
+            )
 
-        let handle = try await client.startWorkflow(
-            OrderWorkflow.self,
-            input: OrderInput(amount: 99_00, orderID: "ord-1")
-        )
-
-        let snap = try await awaitTerminal(
-            client: client,
-            taskID: handle.taskID,
-            timeout: .seconds(10)
-        )
-        #expect(snap.state == .completed)
+            let snap = try await awaitTerminal(
+                client: client,
+                taskID: handle.taskID,
+                timeout: .seconds(10)
+            )
+            #expect(snap.state == .completed)
+        }
     }
 }
 ```
@@ -54,8 +60,10 @@ func orderWorkflowChargesAndShips() async throws {
 |---|---|---|
 | `withTestEnvironment(_:)` | `(StrandClient) async throws -> T` | Creates a unique queue, runs your test, deletes all artefacts |
 | `makePostgresClient(logger:)` | `(Logger) -> PostgresClient` | Builds a client from env vars with local-dev defaults |
-| `startWorker(postgres:queueName:logger:workflows:activities:)` | — | Launches a worker in a background `Task`; cancel to stop |
+| `withWorker(postgres:queueName:logger:workflows:activities:_:)` | `async throws -> T` | Runs a worker for the duration of the closure; gracefully shuts it down before returning |
 | `awaitTerminal(client:taskID:timeout:)` | `-> TaskResultSnapshot` | Polls until a task reaches a terminal state |
+| `awaitSnapshot(_:where:timeout:label:)` | `-> TaskResultSnapshot` | Polls until a snapshot satisfies a predicate (e.g. `state == .waiting`) |
+| `awaitScheduleRunCount(client:scheduleName:atLeast:timeout:)` | `async throws` | Polls until a schedule has fired at least N times |
 
 ## Tag-based filtering
 
@@ -100,17 +108,23 @@ Send signals directly from the test, then verify state changes:
 
 ```swift
 try await withTestEnvironment { client in
-    // ... start worker ...
-    let handle = try await client.startWorkflow(
-        ApprovalWorkflow.self,
-        input: ApprovalRequest(id: "req-1")
-    )
-    // Let the workflow reach the condition(...) suspension
-    try await Task.sleep(for: .milliseconds(200))
+    try await withWorker(
+        postgres: client.postgres,
+        queueName: client.queueName,
+        logger: client.logger,
+        workflows: [ApprovalWorkflow.self]
+    ) {
+        let handle = try await client.startWorkflow(
+            ApprovalWorkflow.self,
+            input: ApprovalRequest(id: "req-1")
+        )
+        // Wait until the workflow is suspended at condition(...), then send the signal.
+        try await awaitSnapshot(handle, where: { $0.state == .waiting })
 
-    try await handle.signal(name: "approve")
+        try await handle.signal(name: "approve")
 
-    let snap = try await awaitTerminal(client: client, taskID: handle.taskID)
-    #expect(snap.state == .completed)
+        let snap = try await awaitTerminal(client: client, taskID: handle.taskID)
+        #expect(snap.state == .completed)
+    }
 }
 ```

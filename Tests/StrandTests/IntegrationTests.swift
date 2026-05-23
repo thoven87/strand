@@ -22,7 +22,7 @@ private struct DeliberateFailure: Error, Codable, Sendable {
 //
 // All workflow and activity types are defined at file scope so they can be
 // referenced both inside test suites and passed directly as metatypes or
-// instances to startWorker (the new API).
+// instances to withWorker (the new API).
 
 // ── 1. Echo ─────────────────────────────────────────────────────────────────
 // Used by: basicCompletion, idempotencyKey tests.
@@ -332,68 +332,65 @@ struct TaskExecutionTests {
     @Test("basic workflow completes with the correct result")
     func basicCompletion() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [EchoWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                EchoWorkflow.self,
-                options: .init(),
-                input: "hello"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "HELLO")
+            ) {
+                let handle = try await client.startWorkflow(
+                    EchoWorkflow.self,
+                    options: .init(),
+                    input: "hello"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "HELLO")
+            }
         }
     }
 
     @Test("multi-step workflow returns the correct composed result")
     func multiStep() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [MathWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                MathWorkflow.self,
-                options: .init(),
-                input: 10
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            // 10 * 2 = 20, 20 + 1 = 21
-            #expect(result == 21)
+            ) {
+                let handle = try await client.startWorkflow(
+                    MathWorkflow.self,
+                    options: .init(),
+                    input: 10
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                // 10 * 2 = 20, 20 + 1 = 21
+                #expect(result == 21)
+            }
         }
     }
 
     @Test("checkpointed value is stable across retries (random(in:) returns same value on replay)")
     func stepIdempotency() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [IdempotentWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    IdempotentWorkflow.self,
+                    options: .init(maxAttempts: 2, retryStrategy: .constant(.zero)),
+                    input: "go"
+                )
+                let result = try await handle.result(timeout: .seconds(15))
 
-            let handle = try await client.startWorkflow(
-                IdempotentWorkflow.self,
-                options: .init(maxAttempts: 2, retryStrategy: .constant(.zero)),
-                input: "go"
-            )
-            let result = try await handle.result(timeout: .seconds(15))
-
-            // The result from attempt 2 must equal the value generated on attempt 1
-            // (read from the checkpoint cache, not regenerated).
-            #expect(result == IdempotentWorkflow.capturedValue.value)
-            #expect((1...1_000_000).contains(result))
+                // The result from attempt 2 must equal the value generated on attempt 1
+                // (read from the checkpoint cache, not regenerated).
+                #expect(result == IdempotentWorkflow.capturedValue.value)
+                #expect((1...1_000_000).contains(result))
+            }
         }
     }
 
@@ -431,22 +428,21 @@ struct TaskExecutionTests {
             try await handle.cancel()
 
             // Worker starts AFTER cancellation — it must not run the handler.
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [CancellableWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(5)
-            )
-            #expect(snap.state == .cancelled)
-            // Handler must not have run.
-            #expect(CancellableWorkflow.executionCount.value == before)
+            ) {
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(5)
+                )
+                #expect(snap.state == .cancelled)
+                // Handler must not have run.
+                #expect(CancellableWorkflow.executionCount.value == before)
+            }
         }
     }
 }
@@ -461,88 +457,79 @@ struct EventTests {
         try await withTestEnvironment { client in
             let eventName = "resume:\(UUID())"
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [EventWaitWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    EventWaitWorkflow.self,
+                    options: .init(),
+                    input: EventWaitInput(eventName: eventName)
+                )
 
-            let handle = try await client.startWorkflow(
-                EventWaitWorkflow.self,
-                options: .init(),
-                input: EventWaitInput(eventName: eventName)
-            )
+                // Wait until the workflow has registered its event_waits row (state = WAITING).
+                try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .waiting },
+                    timeout: .seconds(5),
+                    label: "workflow WAITING"
+                )
+                try await client.emitEvent(eventName, payload: EventPayload(msg: "from-test"))
 
-            // Wait until the workflow has registered its event_waits row (state = WAITING).
-            // A fixed sleep is fragile on slow CI runners — if the first activation
-            // hasn't finished by the time we emit, the event fires before the wait
-            // is registered and the workflow never resumes.
-            let waitDeadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < waitDeadline {
-                if let snap = try await handle.snapshot(), snap.state == .waiting { break }
-                try await Task.sleep(for: .milliseconds(50))
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == EventPayload(msg: "from-test"))
             }
-            try await client.emitEvent(eventName, payload: EventPayload(msg: "from-test"))
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == EventPayload(msg: "from-test"))
         }
     }
 
     @Test("waitForEvent matching: routes by nested payload predicate — 3-level keypath")
     func nestedPredicateRouting() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [NestedPredicateWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // Two concurrent instances each waiting for a different city.
+                let handleNYC = try await client.startWorkflow(
+                    NestedPredicateWorkflow.self,
+                    options: .init(),
+                    input: "NYC"
+                )
+                let handleLDN = try await client.startWorkflow(
+                    NestedPredicateWorkflow.self,
+                    options: .init(),
+                    input: "London"
+                )
 
-            // Two concurrent instances each waiting for a different city.
-            let handleNYC = try await client.startWorkflow(
-                NestedPredicateWorkflow.self,
-                options: .init(),
-                input: "NYC"
-            )
-            let handleLDN = try await client.startWorkflow(
-                NestedPredicateWorkflow.self,
-                options: .init(),
-                input: "London"
-            )
+                // Wait until both have registered their event_wait (state = WAITING).
+                try await awaitSnapshot(handleNYC, where: { $0.state == .waiting }, timeout: .seconds(5))
+                try await awaitSnapshot(handleLDN, where: { $0.state == .waiting }, timeout: .seconds(5))
 
-            // Wait until both have registered their event_wait (state = WAITING).
-            let deadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < deadline {
-                let s1 = try await handleNYC.snapshot()
-                let s2 = try await handleLDN.snapshot()
-                if s1?.state == .waiting && s2?.state == .waiting { break }
-                try await Task.sleep(for: .milliseconds(50))
+                // Emit London — the NYC workflow must NOT wake (predicate mismatch).
+                try await client.emit(
+                    CityEvent.self,
+                    payload: .init(order: .init(address: .init(city: "London")))
+                )
+                try await Task.sleep(for: .milliseconds(400))
+
+                let snapNYC = try await handleNYC.snapshot()
+                #expect(snapNYC?.state == .waiting, "NYC workflow should not wake on London event")
+
+                // Emit NYC — only the NYC workflow should wake.
+                try await client.emit(
+                    CityEvent.self,
+                    payload: .init(order: .init(address: .init(city: "NYC")))
+                )
+
+                let resultLDN = try await handleLDN.result(timeout: .seconds(10))
+                let resultNYC = try await handleNYC.result(timeout: .seconds(10))
+                #expect(resultLDN == "London")
+                #expect(resultNYC == "NYC")
             }
-
-            // Emit London — the NYC workflow must NOT wake (predicate mismatch).
-            try await client.emit(
-                CityEvent.self,
-                payload: .init(order: .init(address: .init(city: "London")))
-            )
-            try await Task.sleep(for: .milliseconds(400))
-
-            let snapNYC = try await handleNYC.snapshot()
-            #expect(snapNYC?.state == .waiting, "NYC workflow should not wake on London event")
-
-            // Emit NYC — only the NYC workflow should wake.
-            try await client.emit(
-                CityEvent.self,
-                payload: .init(order: .init(address: .init(city: "NYC")))
-            )
-
-            let resultLDN = try await handleLDN.result(timeout: .seconds(10))
-            let resultNYC = try await handleNYC.result(timeout: .seconds(10))
-            #expect(resultLDN == "London")
-            #expect(resultNYC == "NYC")
         }
     }
 
@@ -551,23 +538,22 @@ struct EventTests {
         try await withTestEnvironment { client in
             let eventName = "never:\(UUID())"
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [TimeoutEventWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    TimeoutEventWorkflow.self,
+                    options: .init(),
+                    input: TimeoutEventInput(eventName: eventName)
+                )
 
-            let handle = try await client.startWorkflow(
-                TimeoutEventWorkflow.self,
-                options: .init(),
-                input: TimeoutEventInput(eventName: eventName)
-            )
-
-            // Timeout is 1 s inside the workflow; allow 15 s total for the whole test.
-            let result = try await handle.result(timeout: .seconds(15))
-            #expect(result == "timed-out")
+                // Timeout is 1 s inside the workflow; allow 15 s total for the whole test.
+                let result = try await handle.result(timeout: .seconds(15))
+                #expect(result == "timed-out")
+            }
         }
     }
 }
@@ -589,28 +575,27 @@ struct SignalTests {
     @Test("signal sent while workflow sleeps is applied on the next activation")
     func workflowWithSignal() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SignalledWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    SignalledWorkflow.self,
+                    options: .init(),
+                    input: "start"
+                )
 
-            let handle = try await client.startWorkflow(
-                SignalledWorkflow.self,
-                options: .init(),
-                input: "start"
-            )
+                // Wait for the workflow to start and enter the sleep checkpoint.
+                try await Task.sleep(for: .milliseconds(200))
 
-            // Wait for the workflow to start and enter the sleep checkpoint.
-            try await Task.sleep(for: .milliseconds(200))
+                // Send signal while the workflow is sleeping.
+                try await handle.signal(name: "ack")
 
-            // Send signal while the workflow is sleeping.
-            try await handle.signal(name: "ack")
-
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "acked")
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "acked")
+            }
         }
     }
 }
@@ -623,22 +608,21 @@ struct ActivityTests {
     @Test("workflow calling runActivity receives the activity's result")
     func activityExecution() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ActivityWorkflow.self],
                 activities: [ReverseActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                ActivityWorkflow.self,
-                options: .init(),
-                input: "hello"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "olleh")
+            ) {
+                let handle = try await client.startWorkflow(
+                    ActivityWorkflow.self,
+                    options: .init(),
+                    input: "hello"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "olleh")
+            }
         }
     }
 
@@ -647,25 +631,24 @@ struct ActivityTests {
         try await withTestEnvironment { client in
             let before = FlakyActivity.executionCount.value
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ActivityRetryWorkflow.self],
                 activities: [FlakyActivity()]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    ActivityRetryWorkflow.self,
+                    options: .init(),
+                    input: "go"
+                )
+                let result = try await handle.result(timeout: .seconds(15))
 
-            let handle = try await client.startWorkflow(
-                ActivityRetryWorkflow.self,
-                options: .init(),
-                input: "go"
-            )
-            let result = try await handle.result(timeout: .seconds(15))
-
-            #expect(result == "recovered")
-            // The activity body ran twice: once to fail, once to succeed.
-            #expect(FlakyActivity.executionCount.value - before == 2)
+                #expect(result == "recovered")
+                // The activity body ran twice: once to fail, once to succeed.
+                #expect(FlakyActivity.executionCount.value - before == 2)
+            }
         }
     }
 }
@@ -678,21 +661,20 @@ struct SleepTests {
     @Test("context.sleep suspends the workflow and it resumes correctly")
     func sleepSuspendsAndResumes() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SleepWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                SleepWorkflow.self,
-                options: .init(),
-                input: "go"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "woke-up")
+            ) {
+                let handle = try await client.startWorkflow(
+                    SleepWorkflow.self,
+                    options: .init(),
+                    input: "go"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "woke-up")
+            }
         }
     }
 }
@@ -742,25 +724,24 @@ struct LeaseExpiryTests {
             )
 
             // Real worker picks up the retry run.
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [LeaseExpiryWorkflow.self]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(10)
+                )
+                #expect(snap.state == .completed)
+                // Handler must have run exactly once (on the retry, not the phantom claim).
+                #expect(LeaseExpiryWorkflow.executionCount.value - before == 1)
 
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(10)
-            )
-            #expect(snap.state == .completed)
-            // Handler must have run exactly once (on the retry, not the phantom claim).
-            #expect(LeaseExpiryWorkflow.executionCount.value - before == 1)
-
-            let decoded = try snap.decodeResult(as: String.self)
-            #expect(decoded == "completed-by-retry")
+                let decoded = try snap.decodeResult(as: String.self)
+                #expect(decoded == "completed-by-retry")
+            }
         }
     }
 }
@@ -781,40 +762,38 @@ struct StandaloneActivityTests {
     @Test("client.runActivity dispatches without a parent workflow and returns the result")
     func standaloneRun() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 activities: [StandaloneGreetActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let result = try await client.runActivity(
-                StandaloneGreetActivity.self,
-                input: "world"
-            )
-            #expect(result == "Hello standalone, world!")
+            ) {
+                let result = try await client.runActivity(
+                    StandaloneGreetActivity.self,
+                    input: "world"
+                )
+                #expect(result == "Hello standalone, world!")
+            }
         }
     }
 
     @Test("client.enqueueActivity returns an EnqueueResult with a stable taskID")
     func standaloneEnqueue() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 activities: [StandaloneGreetActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            let enq = try await client.enqueueActivity(
-                StandaloneGreetActivity.self,
-                input: "strand"
-            )
-            let snap = try await awaitTerminal(client: client, taskID: enq.taskID)
-            #expect(snap.state == .completed)
-            #expect(try snap.decodeResult(as: String.self) == "Hello standalone, strand!")
+            ) {
+                let enq = try await client.enqueueActivity(
+                    StandaloneGreetActivity.self,
+                    input: "strand"
+                )
+                let snap = try await awaitTerminal(client: client, taskID: enq.taskID)
+                #expect(snap.state == .completed)
+                #expect(try snap.decodeResult(as: String.self) == "Hello standalone, strand!")
+            }
         }
     }
 
@@ -835,28 +814,27 @@ struct StandaloneActivityTests {
                 options: .init(priority: .high)
             )
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 activities: [StandaloneGreetActivity()]
-            )
-            defer { workerTask.cancel() }
-
-            // High priority should complete before low priority
-            let highSnap = try await awaitTerminal(
-                client: client,
-                taskID: high.taskID,
-                timeout: .seconds(5)
-            )
-            let lowSnap = try await awaitTerminal(
-                client: client,
-                taskID: low.taskID,
-                timeout: .seconds(5)
-            )
-            #expect(highSnap.state == .completed)
-            #expect(lowSnap.state == .completed)
-            // Both tasks completed; priority ordering is enforced by the claim query.
+            ) {
+                // High priority should complete before low priority
+                let highSnap = try await awaitTerminal(
+                    client: client,
+                    taskID: high.taskID,
+                    timeout: .seconds(5)
+                )
+                let lowSnap = try await awaitTerminal(
+                    client: client,
+                    taskID: low.taskID,
+                    timeout: .seconds(5)
+                )
+                #expect(highSnap.state == .completed)
+                #expect(lowSnap.state == .completed)
+                // Both tasks completed; priority ordering is enforced by the claim query.
+            }
         }
     }
 }
@@ -909,30 +887,29 @@ struct ParallelActivityTests {
     @Test("two runActivity calls in async let execute in parallel and both complete")
     func parallelRunActivity() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [ParallelWorkflow.self],
                 activities: [DoubleActivity(), TripleActivity()]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    ParallelWorkflow.self,
+                    options: .init(),
+                    input: "hello"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
 
-            let handle = try await client.startWorkflow(
-                ParallelWorkflow.self,
-                options: .init(),
-                input: "hello"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
+                // Both activities ran exactly once
+                #expect(DoubleActivity.counter.value == 1)
+                #expect(TripleActivity.counter.value == 1)
 
-            // Both activities ran exactly once
-            #expect(DoubleActivity.counter.value == 1)
-            #expect(TripleActivity.counter.value == 1)
-
-            // Results are both present (order may vary)
-            #expect(result.contains("HELLO"))
-            #expect(result.contains("hello!!!"))
-            #expect(result.count == 2)
+                // Results are both present (order may vary)
+                #expect(result.contains("HELLO"))
+                #expect(result.contains("hello!!!"))
+                #expect(result.count == 2)
+            }
         }
     }
 }

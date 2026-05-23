@@ -144,7 +144,7 @@ struct ChildWorkflowTests {
     @Test("parentClosePolicy .requestCancel delivers cooperative cancel signal and child returns gracefully")
     func parentClosePolicyRequestCancelDeliversSignal() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
@@ -152,56 +152,55 @@ struct ChildWorkflowTests {
                     WaitForCancelableChildWorkflow.self,
                     RequestCancelChildWorkflow.self,
                 ]
-            )
-            defer { workerTask.cancel() }
-
-            // 1. Start the parent workflow.
-            let parentHandle = try await client.startWorkflow(
-                WaitForCancelableChildWorkflow.self,
-                options: .init(maxAttempts: 1),
-                input: StrandVoid()
-            )
-
-            // 2. Wait until the child task appears in the DB (parent has run at
-            //    least one activation and enqueued the child).
-            var childTaskID: UUID? = nil
-            for _ in 0..<50 {
-                let page = try await ManagementQueries.listChildTasks(
-                    on: client.postgres,
-                    namespaceID: "default",
-                    parentTaskID: parentHandle.taskID,
-                    cursor: nil,
-                    limit: 10,
-                    logger: client.logger
+            ) {
+                // 1. Start the parent workflow.
+                let parentHandle = try await client.startWorkflow(
+                    WaitForCancelableChildWorkflow.self,
+                    options: .init(maxAttempts: 1),
+                    input: StrandVoid()
                 )
-                if let child = page.items.first {
-                    childTaskID = child.id
-                    break
+
+                // 2. Wait until the child task appears in the DB (parent has run at
+                //    least one activation and enqueued the child).
+                var childTaskID: UUID? = nil
+                for _ in 0..<50 {
+                    let page = try await ManagementQueries.listChildTasks(
+                        on: client.postgres,
+                        namespaceID: "default",
+                        parentTaskID: parentHandle.taskID,
+                        cursor: nil,
+                        limit: 10,
+                        logger: client.logger
+                    )
+                    if let child = page.items.first {
+                        childTaskID = child.id
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(200))
                 }
-                try await Task.sleep(for: .milliseconds(200))
-            }
-            guard let childTaskID else {
-                Issue.record("child task never appeared in DB — parent did not start the child")
-                return
-            }
+                guard let childTaskID else {
+                    Issue.record("child task never appeared in DB — parent did not start the child")
+                    return
+                }
 
-            // 3. Cancel the parent. `cancelDescendants` runs atomically inside
-            //    `cancelTask`, delivering the cooperative cancel signal to the child
-            //    and waking its WAITING run to PENDING.
-            try await client.cancelTask(id: parentHandle.taskID)
+                // 3. Cancel the parent. `cancelDescendants` runs atomically inside
+                //    `cancelTask`, delivering the cooperative cancel signal to the child
+                //    and waking its WAITING run to PENDING.
+                try await client.cancelTask(id: parentHandle.taskID)
 
-            // 4. Await the child's result. The child sees `isCancelRequested = true`,
-            //    its condition is satisfied, and it returns "cancelled" cooperatively.
-            let childResult = try await client.awaitTaskResult(
-                id: childTaskID,
-                as: String.self,
-                options: .init(timeout: .seconds(15))
-            )
-            #expect(childResult == "cancelled")
+                // 4. Await the child's result. The child sees `isCancelRequested = true`,
+                //    its condition is satisfied, and it returns "cancelled" cooperatively.
+                let childResult = try await client.awaitTaskResult(
+                    id: childTaskID,
+                    as: String.self,
+                    options: .init(timeout: .seconds(15))
+                )
+                #expect(childResult == "cancelled")
+            }
         }
     }
 
-    // ── 1 ───────────────────────────────────────────────────────────────────
+    // ── 1 ───────────────────────────────────────────────────────────────────────────
     // A single worker serves both the parent orchestrator and the child workflow
     // because they share the same queue. The worker claims the parent first,
     // which enqueues AddTenWorkflow, suspends to SLEEPING, and releases its slot.
@@ -210,21 +209,20 @@ struct ChildWorkflowTests {
     @Test("child workflow on the same queue adds ten and returns the correct result")
     func childWorkflowOnSameQueue() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SameQueueParentWorkflow.self, AddTenWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                SameQueueParentWorkflow.self,
-                options: .init(),
-                input: 7
-            )
-            let result = try await handle.result(timeout: .seconds(15))
-            #expect(result == 17)
+            ) {
+                let handle = try await client.startWorkflow(
+                    SameQueueParentWorkflow.self,
+                    options: .init(),
+                    input: 7
+                )
+                let result = try await handle.result(timeout: .seconds(15))
+                #expect(result == 17)
+            }
         }
     }
 
@@ -249,38 +247,30 @@ struct ChildWorkflowTests {
                 "t\(UUID().uuidString.replacing("-", with: "").prefix(12).lowercased())"
             try await client.createQueue(childQueue)
 
-            var workerTask1: Task<Void, Never>? = nil
-            var workerTask2: Task<Void, Never>? = nil
             do {
-                // Parent worker: handles CrossQueueParentWorkflow on the test queue.
-                workerTask1 = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     workflows: [CrossQueueParentWorkflow.self]
-                )
-                // Child worker: handles AddTenWorkflow on the dedicated child queue.
-                workerTask2 = startWorker(
-                    postgres: client.postgres,
-                    queueName: childQueue,
-                    logger: client.logger,
-                    workflows: [AddTenWorkflow.self]
-                )
-
-                let handle = try await client.startWorkflow(
-                    CrossQueueParentWorkflow.self,
-                    options: .init(),
-                    input: ChildQueueInput(value: 5, childQueue: childQueue)
-                )
-                let result = try await handle.result(timeout: .seconds(20))
-                #expect(result == 15)
-
-                workerTask1?.cancel()
-                workerTask2?.cancel()
+                ) {
+                    try await withWorker(
+                        postgres: client.postgres,
+                        queueName: childQueue,
+                        logger: client.logger,
+                        workflows: [AddTenWorkflow.self]
+                    ) {
+                        let handle = try await client.startWorkflow(
+                            CrossQueueParentWorkflow.self,
+                            options: .init(),
+                            input: ChildQueueInput(value: 5, childQueue: childQueue)
+                        )
+                        let result = try await handle.result(timeout: .seconds(20))
+                        #expect(result == 15)
+                    }
+                }
                 try? await client.dropQueue(childQueue)
             } catch {
-                workerTask1?.cancel()
-                workerTask2?.cancel()
                 try? await client.dropQueue(childQueue)
                 throw error
             }

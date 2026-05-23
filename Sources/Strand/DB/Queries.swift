@@ -569,10 +569,10 @@ enum Queries {
             // Idempotency-hit tasks are excluded — their run already has the correct
             // available_at from the original enqueue.  See applyRateLimitSlots for
             // the full algorithm.
-            var rlQueues:       [String] = []
-            var rlSlotKeys:     [String] = []
-            var rlRunIDs:       [UUID]   = []
-            var rlIntervalMses: [Int]    = []
+            var rlQueues: [String] = []
+            var rlSlotKeys: [String] = []
+            var rlRunIDs: [UUID] = []
+            var rlIntervalMses: [Int] = []
             for child in newChildren where child.rateLimitIntervalMs != nil {
                 rlQueues.append(child.queue)
                 rlSlotKeys.append(child.rateLimitKey ?? child.taskName)
@@ -2278,7 +2278,7 @@ enum Queries {
                 // Atomically re-check and fail this specific run.
                 // FOR UPDATE ensures a concurrent worker that just claimed it sees
                 // a RUNNING state — the next UPDATE will find 0 rows and skip it,
-                // matching Temporal's stale-attempt guard.
+                // preventing a double-fail race on the same run.
                 let lockStream = try await conn.query(
                     """
                     SELECT r.state, t.retry_strategy, t.deadline_at

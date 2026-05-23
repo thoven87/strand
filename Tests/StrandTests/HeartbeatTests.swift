@@ -170,39 +170,38 @@ struct HeartbeatTests {
             let logger = client.logger
             let queue = client.queueName
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: postgres,
                 queueName: queue,
                 logger: logger,
                 workflows: [ProgressWorkflow.self],
                 activities: [ProgressActivity(observer: observer)]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    ProgressWorkflow.self,
+                    input: ProgressInput(totalItems: 10, failAfter: 5)
+                )
 
-            let handle = try await client.startWorkflow(
-                ProgressWorkflow.self,
-                input: ProgressInput(totalItems: 10, failAfter: 5)
-            )
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(15)
+                )
 
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(15)
-            )
+                // Workflow must complete (attempt 2 processes items 6-10 successfully).
+                #expect(snap.state == .completed)
+                let output = try #require(snap.resultJSON.flatMap { try? JSON.decode(Int.self, from: ByteBuffer(string: $0)) })
+                #expect(output == 10)
 
-            // Workflow must complete (attempt 2 processes items 6-10 successfully).
-            #expect(snap.state == .completed)
-            let output = try #require(snap.resultJSON.flatMap { try? JSON.decode(Int.self, from: ByteBuffer(string: $0)) })
-            #expect(output == 10)
+                // Attempt 1 must have seen nil (first attempt, no prior heartbeat).
+                #expect(observer.detailsOnAttempt1 == nil)
 
-            // Attempt 1 must have seen nil (first attempt, no prior heartbeat).
-            #expect(observer.detailsOnAttempt1 == nil)
+                // Attempt 2 must have seen 5 (the last heartbeat written on attempt 1).
+                #expect(observer.detailsOnAttempt2 == 5)
 
-            // Attempt 2 must have seen 5 (the last heartbeat written on attempt 1).
-            #expect(observer.detailsOnAttempt2 == 5)
-
-            // Sanity: the last heartbeat recorded by attempt 1 was indeed 5.
-            #expect(observer.lastHeartbeatStored == 5)
+                // Sanity: the last heartbeat recorded by attempt 1 was indeed 5.
+                #expect(observer.lastHeartbeatStored == 5)
+            }
         }
     }
 
@@ -220,31 +219,30 @@ struct HeartbeatTests {
             let logger = client.logger
             let queue = client.queueName
 
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: postgres,
                 queueName: queue,
                 logger: logger,
                 workflows: [LivenessWorkflow.self],
                 activities: [LivenessHeartbeatActivity(observer: observer)]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    LivenessWorkflow.self,
+                    input: ProgressInput(totalItems: 10, failAfter: 3)
+                )
 
-            let handle = try await client.startWorkflow(
-                LivenessWorkflow.self,
-                input: ProgressInput(totalItems: 10, failAfter: 3)
-            )
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(15)
+                )
 
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(15)
-            )
+                #expect(snap.state == .completed)
 
-            #expect(snap.state == .completed)
-
-            // Attempt 2 must still see 3 even though a no-arg heartbeat() was
-            // called after each heartbeat(processed).
-            #expect(observer.detailsOnAttempt2 == 3)
+                // Attempt 2 must still see 3 even though a no-arg heartbeat() was
+                // called after each heartbeat(processed).
+                #expect(observer.detailsOnAttempt2 == 3)
+            }
         }
     }
 }

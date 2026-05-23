@@ -27,7 +27,7 @@ during any stage, the pipeline resumes from the last completed step on restart.
 **Key patterns:**
 - Parallel quality gates (`async let` fan-out of lint + tests + security scan)
 - Automatic retry — unit tests fail on attempt 1, pass on attempt 2
-- Signal-based deployment approval gate (`context.condition` + ``WorkflowSignalDefinition``)
+- Signal-based deployment approval gate (`context.condition` + ``WorkflowSignal``)
 
 ```swift
 // Stage 2: lint, tests, and security scan run simultaneously.
@@ -64,7 +64,7 @@ workloads where each entity gets its own durable workflow.
 **Key patterns:**
 - `context.sleep(for:)` between sensor polling cycles
 - Per-entity child workflows fanned out with `async let`
-- In-flight threshold updates via `WorkflowSignalDefinition`
+- In-flight threshold updates via `WorkflowSignal`
 
 ```swift
 // Each room runs independently — a crash in one room's monitor

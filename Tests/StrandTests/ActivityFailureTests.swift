@@ -97,26 +97,25 @@ struct ActivityFailureTests {
     @Test("activity that exhausts all attempts is caught by workflow and workflow completes")
     func activityCaughtAndWorkflowCompletes() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [CatchingActivityFailureWorkflow.self],
                 activities: [AlwaysFailingActivity()]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                let handle = try await client.startWorkflow(
+                    CatchingActivityFailureWorkflow.self,
+                    options: .init(),
+                    input: "go"
+                )
 
-            let handle = try await client.startWorkflow(
-                CatchingActivityFailureWorkflow.self,
-                options: .init(),
-                input: "go"
-            )
+                // If the regression were still present the workflow would hang
+                // in SLEEPING and handle.result() would throw StrandError.timeout.
+                let result = try await handle.result(timeout: .seconds(15))
 
-            // If the regression were still present the workflow would hang
-            // in SLEEPING and handle.result() would throw StrandError.timeout.
-            let result = try await handle.result(timeout: .seconds(15))
-
-            #expect(result == "compensated")
+                #expect(result == "compensated")
+            }
         }
     }
 
@@ -125,32 +124,31 @@ struct ActivityFailureTests {
     @Test("activity that exhausts all attempts propagates as ActivityError when uncaught")
     func activityUncaughtCausesWorkflowToFail() async throws {
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [PropagatingActivityFailureWorkflow.self],
                 activities: [AlwaysFailingActivity()]
-            )
-            defer { workerTask.cancel() }
+            ) {
+                // maxAttempts: 1 on the workflow prevents multiple workflow-level
+                // retries so the test reaches .failed quickly.
+                let handle = try await client.startWorkflow(
+                    PropagatingActivityFailureWorkflow.self,
+                    options: .init(maxAttempts: 1),
+                    input: "go"
+                )
 
-            // maxAttempts: 1 on the workflow prevents multiple workflow-level
-            // retries so the test reaches .failed quickly.
-            let handle = try await client.startWorkflow(
-                PropagatingActivityFailureWorkflow.self,
-                options: .init(maxAttempts: 1),
-                input: "go"
-            )
+                // If the regression were still present the workflow would hang in
+                // SLEEPING and awaitTerminal would throw StrandTestError (timeout).
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(15)
+                )
 
-            // If the regression were still present the workflow would hang in
-            // SLEEPING and awaitTerminal would throw IntegrationError (timeout).
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(15)
-            )
-
-            #expect(snap.state == .failed)
+                #expect(snap.state == .failed)
+            }
         }
     }
 }

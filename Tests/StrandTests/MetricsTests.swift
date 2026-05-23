@@ -198,22 +198,21 @@ struct MetricsTests {
         let metrics = TestMetricsFactory()
 
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SimpleWorkflow.self],
                 metricsFactory: metrics
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                SimpleWorkflow.self,
-                options: .init(),
-                input: "ping"
-            )
-            let result = try await handle.result(timeout: .seconds(10))
-            #expect(result == "ping-ok")
+            ) {
+                let handle = try await client.startWorkflow(
+                    SimpleWorkflow.self,
+                    options: .init(),
+                    input: "ping"
+                )
+                let result = try await handle.result(timeout: .seconds(10))
+                #expect(result == "ping-ok")
+            }
         }
 
         #expect(metrics.counterValue(for: StrandMetrics.tasksClaimed) >= 1)
@@ -236,26 +235,25 @@ struct MetricsTests {
         }
 
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [FailingWorkflow.self],
                 metricsFactory: metrics
-            )
-            defer { workerTask.cancel() }
-
-            let handle = try await client.startWorkflow(
-                FailingWorkflow.self,
-                options: .init(),
-                input: "x"
-            )
-            let snap = try await awaitTerminal(
-                client: client,
-                taskID: handle.taskID,
-                timeout: .seconds(10)
-            )
-            #expect(snap.state == .failed)
+            ) {
+                let handle = try await client.startWorkflow(
+                    FailingWorkflow.self,
+                    options: .init(),
+                    input: "x"
+                )
+                let snap = try await awaitTerminal(
+                    client: client,
+                    taskID: handle.taskID,
+                    timeout: .seconds(10)
+                )
+                #expect(snap.state == .failed)
+            }
         }
 
         #expect(metrics.counterValue(for: StrandMetrics.tasksFailed) >= 1)
@@ -269,25 +267,24 @@ struct MetricsTests {
 
         try await withTestEnvironment { client in
             try await confirmation("SimpleActivity ran") { confirm in
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     workflows: [ActivityWorkflowM.self],
                     activities: [SimpleActivity(onRan: { confirm() })],
                     metricsFactory: metrics
-                )
-                defer { workerTask.cancel() }
-
-                let handle = try await client.startWorkflow(
-                    ActivityWorkflowM.self,
-                    options: .init(),
-                    input: "hello"
-                )
-                // handle.result() only returns after the activity completed,
-                // so confirmation sees exactly 1 confirm() call.
-                let result = try await handle.result(timeout: .seconds(30))
-                #expect(result == "HELLO")
+                ) {
+                    let handle = try await client.startWorkflow(
+                        ActivityWorkflowM.self,
+                        options: .init(),
+                        input: "hello"
+                    )
+                    // handle.result() only returns after the activity completed,
+                    // so confirmation sees exactly 1 confirm() call.
+                    let result = try await handle.result(timeout: .seconds(30))
+                    #expect(result == "HELLO")
+                }
             }
         }
 
@@ -312,19 +309,19 @@ struct TracingTests {
 
         // ── Workflow span ─────────────────────────────────────────────────────
         try await withTestEnvironment { client in
-            let workerTask = startWorker(
+            try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
                 logger: client.logger,
                 workflows: [SimpleWorkflow.self]
-            )
-            defer { workerTask.cancel() }
-            let handle = try await client.startWorkflow(
-                SimpleWorkflow.self,
-                options: .init(),
-                input: "trace-test"
-            )
-            _ = try await handle.result(timeout: .seconds(10))
+            ) {
+                let handle = try await client.startWorkflow(
+                    SimpleWorkflow.self,
+                    options: .init(),
+                    input: "trace-test"
+                )
+                _ = try await handle.result(timeout: .seconds(10))
+            }
         }
 
         let wfSpan = tracer.span(named: "SimpleWorkflow")
@@ -347,20 +344,20 @@ struct TracingTests {
         // ── Activity span ─────────────────────────────────────────────────────
         try await withTestEnvironment { client in
             try await confirmation("SimpleActivity ran") { confirm in
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     workflows: [ActivityWorkflowM.self],
                     activities: [SimpleActivity(onRan: { confirm() })]
-                )
-                defer { workerTask.cancel() }
-                let handle = try await client.startWorkflow(
-                    ActivityWorkflowM.self,
-                    options: .init(),
-                    input: "span-test"
-                )
-                _ = try await awaitTerminal(client: client, taskID: handle.taskID, timeout: .seconds(30))
+                ) {
+                    let handle = try await client.startWorkflow(
+                        ActivityWorkflowM.self,
+                        options: .init(),
+                        input: "span-test"
+                    )
+                    _ = try await awaitTerminal(client: client, taskID: handle.taskID, timeout: .seconds(30))
+                }
             }
         }
 

@@ -152,15 +152,15 @@ struct FairnessTests {
                     confirmed()
                     allDone.trigger()
                 }
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     concurrency: 1,
                     activities: [activity]
-                )
-                defer { workerTask.cancel() }
-                try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(10))
+                ) {
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(10))
+                }
             }
 
             // Both heavy-frontier and light-frontier are claimed in the first poll.
@@ -224,15 +224,15 @@ struct FairnessTests {
                     confirmed()
                     allDone.trigger()
                 }
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     concurrency: 1,
                     activities: [activity]
-                )
-                defer { workerTask.cancel() }
-                try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(10))
+                ) {
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(10))
+                }
             }
 
             let seq = log.value
@@ -287,16 +287,16 @@ struct FairnessTests {
                     confirmed()
                     allDone.trigger()
                 }
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
                     concurrency: 1,
                     workflows: [FairnessTrackingWorkflow.self],
                     activities: [activity]
-                )
-                defer { workerTask.cancel() }
-                try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(15))
+                ) {
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(15))
+                }
             }
 
             // The light-tenant workflow's activity must appear in the first few slots.
@@ -341,7 +341,7 @@ struct FairnessTests {
                     confirmed()
                     allDone.trigger()
                 }
-                let workerTask = startWorker(
+                try await withWorker(
                     postgres: client.postgres,
                     queueName: client.queueName,
                     logger: client.logger,
@@ -351,9 +351,9 @@ struct FairnessTests {
                         FairnessTrackingWorkflow.self,
                     ],
                     activities: [activity]
-                )
-                defer { workerTask.cancel() }
-                try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(20))
+                ) {
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(20))
+                }
             }
 
             // All 21 child workflows are enqueued atomically by enqueueChildTasksBatch,

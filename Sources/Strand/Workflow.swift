@@ -12,21 +12,6 @@ public import Foundation
 // Type-erased closures the worker stores per registered handler.
 // Underscore-prefixed: infrastructure details; never call these directly.
 
-/// Opaque workflow activation token. Do not construct or call directly.
-public struct _WorkflowToken: Sendable {
-    let name: String
-    let preferredQueue: String?
-    let activate: @Sendable (ClaimedTask, _WorkerExec) async throws -> ByteBuffer?
-}
-
-/// Opaque activity execution token. Do not construct or call directly.
-public struct _ActivityToken: Sendable {
-    let name: String
-    let preferredQueue: String?
-    let run: @Sendable (ClaimedTask, _WorkerExec, TaskDeadline) async throws -> ByteBuffer
-    let runLocal: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer
-}
-
 // MARK: - WorkflowRegistrable
 
 /// Marker protocol that enables workflow types in the `workflows:` array.
@@ -37,9 +22,6 @@ public protocol WorkflowRegistrable: Sendable {
     /// The task name used for DB dispatch. Defaults to the Swift type name.
     static var workflowName: String { get }
 
-    /// Infrastructure used by ``StrandWorker``. Do not call or implement manually;
-    /// a default is provided via `extension Workflow`.
-    static func _makeToken() -> _WorkflowToken
 }
 
 extension WorkflowRegistrable {
@@ -242,8 +224,8 @@ extension WorkflowEvent {
 public struct EventPredicate<Target>: Sendable {
     /// Dot-separated path components, e.g. `["order", "id"]`.
     let pathComponents: [String]
-    /// JSON-encoded bytes of the expected value (e.g. `"\"abc-123\""` for a String).
-    let valueBytes: [UInt8]
+    /// JSON-encoded value buffer (e.g. `"\"abc-123\""` for a String).
+    let valueBytes: ByteBuffer
 
     /// Creates a predicate with an explicit dot-path string.
     ///
@@ -254,38 +236,39 @@ public struct EventPredicate<Target>: Sendable {
     /// EventPredicate<MyPayload>(path: "order.merchantID", equals: input.merchantID)
     /// ```
     public init<V: Codable & Sendable>(path: String, equals value: V) {
-        self.pathComponents = path.components(separatedBy: ".")
-            .filter { !$0.isEmpty }
-        self.valueBytes =
-            (try? JSON.encode(value))
-            .map { Array($0.readableBytesView) } ?? []
+        self.pathComponents = path.components(separatedBy: ".").filter { !$0.isEmpty }
+        self.valueBytes = (try? JSON.encode(value)) ?? ByteBuffer()
     }
 
-    internal init(pathComponents: [String], valueBytes: [UInt8]) {
+    internal init(pathComponents: [String], valueBytes: ByteBuffer) {
         self.pathComponents = pathComponents
         self.valueBytes = valueBytes
     }
 
-    /// Serializes the predicate to a JSONB-compatible nested JSON byte array.
+    /// Serialises the predicate to a JSONB-compatible `ByteBuffer`.
     ///
     /// `["order", "id"]` + value `"abc-123"` → `{"order":{"id":"abc-123"}}`
     ///
-    /// Built from inside out using the already-encoded `valueBytes` — no
-    /// `JSONSerialization` round-trip needed, works with `FoundationEssentials`.
-    func toJSONBytes() throws -> [UInt8] {
+    /// Single allocation: opens all braces left-to-right, writes the value,
+    /// then closes all braces — O(N) byte copies regardless of nesting depth.
+    func toPredicateBuffer() throws -> ByteBuffer {
         guard !pathComponents.isEmpty else { throw EventPredicateError.invalidValue }
-        // JSON.encode(String) produces a quoted key, e.g. "order" → `"order"`.
-        // Wrap one level at a time from the innermost component outward.
-        var result = valueBytes
-        for component in pathComponents.reversed() {
+        var buf = JSON.allocator.buffer(
+            capacity: valueBytes.readableBytes + pathComponents.count * 8
+        )
+        // Write {"key": for each path component left-to-right.
+        for component in pathComponents {
             guard let keyBuf = try? JSON.encode(component) else {
                 throw EventPredicateError.invalidValue
             }
-            result =
-                [UInt8(ascii: "{")] + Array(keyBuf.readableBytesView)
-                + [UInt8(ascii: ":")] + result + [UInt8(ascii: "}")]
+            buf.writeInteger(UInt8(ascii: "{"))
+            buf.writeImmutableBuffer(keyBuf)
+            buf.writeInteger(UInt8(ascii: ":"))
         }
-        return result
+        // Write the encoded value then close all braces.
+        buf.writeImmutableBuffer(valueBytes)
+        for _ in pathComponents { buf.writeInteger(UInt8(ascii: "}")) }
+        return buf
     }
 }
 
@@ -313,14 +296,11 @@ public func == <Root, Value: Codable & Sendable>(
 ) -> EventPredicate<Root> {
     // String(describing: \Foo.bar.baz) → "\Foo.bar.baz" in Swift 5.9+
     // Drop the first component ("\TypeName") to get the property path.
-    let raw = String(describing: lhs)
-    var parts = raw.components(separatedBy: ".")
-    if let first = parts.first, first.hasPrefix("\\") {
-        parts = Array(parts.dropFirst())
-    }
+    var parts = String(describing: lhs).components(separatedBy: ".")
+    if parts.first?.hasPrefix("\\") == true { parts.removeFirst() }
     let components = parts.filter { !$0.isEmpty }
-    let bytes = (try? JSON.encode(rhs)).map { Array($0.readableBytesView) } ?? []
-    return EventPredicate(pathComponents: components, valueBytes: bytes)
+    let valueBytes = (try? JSON.encode(rhs)) ?? ByteBuffer()
+    return EventPredicate(pathComponents: components, valueBytes: valueBytes)
 }
 
 // MARK: - WorkflowSignal
@@ -484,21 +464,6 @@ public enum _StrandCoder {
     }
 }
 
-// MARK: - ActivityBox
-
-/// Marker protocol that enables activity instances in the `activities:` array.
-///
-/// Every type conforming to ``Activity`` automatically satisfies this
-/// protocol. You never need to implement it manually.
-public protocol ActivityBox: Sendable {
-    /// The registered activity name — shown in logs and the dashboard.
-    var activityName: String { get }
-
-    /// Infrastructure used by ``StrandWorker``. Do not call or implement manually;
-    /// a default is provided via `extension Activity`.
-    func _makeToken() -> _ActivityToken
-}
-
 // MARK: - ActivityContainerProtocol
 
 /// Groups related activities that share common dependencies (e.g. an HTTP client).
@@ -507,14 +472,14 @@ public protocol ActivityBox: Sendable {
 /// struct PaymentActivities: ActivityContainerProtocol {
 ///     let stripe: StripeClient
 ///
-///     var activities: [any ActivityBox] {
+///     var activities: [any Activity] {
 ///         [ChargeCardActivity(stripe: stripe),
 ///          RefundCardActivity(stripe: stripe)]
 ///     }
 /// }
 /// ```
 public protocol ActivityContainerProtocol: Sendable {
-    var activities: [any ActivityBox] { get }
+    var activities: [any Activity] { get }
 }
 
 // MARK: - ArcBox

@@ -14,7 +14,7 @@ the workflow.
 | `context.sleep(for:)` | Between each sensor polling cycle — releases the worker slot |
 | Per-entity child workflows | One `RoomMonitorWorkflow` per room, all `async let` in parallel |
 | In-flight state update via signal | `UpdateThresholds` signal arrives mid-run, new limits apply next cycle |
-| `WorkflowSignalDefinition` | Typed `handle.signal(name:payload:)` |
+| `WorkflowSignal` | Typed `handle.signal(name:payload:)` |
 | Durability under crash | Kill mid-cycle; each room monitor resumes from its last completed cycle |
 
 ---

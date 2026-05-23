@@ -13,7 +13,7 @@ on restart — no work is lost, no stage runs twice.
 | Parallel activity fan-out | Lint + unit tests + security scan run simultaneously via `async let` |
 | Automatic retry | `UnitTestActivity` fails on attempt 1, passes on attempt 2 |
 | Signal-based approval gate | `context.condition` suspends until an `approve` signal arrives |
-| `WorkflowSignalDefinition` | Typed `handle.signal(CIPipelineWorkflow.Approve.self, payload:)` |
+| `WorkflowSignal` | Typed `handle.signal(CIPipelineWorkflow.Approve.self, payload:)` |
 | Durability under crash | Kill the process at any stage; restart resumes from the last checkpoint |
 
 ---
