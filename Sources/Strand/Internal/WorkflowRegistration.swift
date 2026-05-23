@@ -291,6 +291,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         let activation = _WorkflowActivation<W>(
             taskUUID: claimed.taskID,
             runUUID: claimed.runID,
+            runVersion: claimed.version,
             taskName: claimed.taskName,
             queueName: exec.queue,
             attempt: claimed.attempt,

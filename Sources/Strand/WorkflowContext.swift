@@ -123,6 +123,10 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
 
     let taskUUID: UUID
     let runUUID: UUID
+    /// Optimistic-concurrency version of the run row when this activation was claimed.
+    /// Passed to `scheduleRun` and `awaitEvent` so stale activations cannot transition
+    /// a re-claimed run to the wrong state.
+    let runVersion: Int
     let taskName: String
     let queueName: String
     let attempt: Int
@@ -190,6 +194,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     init(
         taskUUID: UUID,
         runUUID: UUID,
+        runVersion: Int,
         taskName: String,
         queueName: String,
         attempt: Int,
@@ -211,6 +216,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     ) {
         self.taskUUID = taskUUID
         self.runUUID = runUUID
+        self.runVersion = runVersion
         self.taskName = taskName
         self.queueName = queueName
         self.attempt = attempt
@@ -278,18 +284,6 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
             logger: logger
         )
         cacheCheckpoint(seqNum: seqNum, name: name, buffer: buffer)
-    }
-
-    /// Transitions the run to SLEEPING at `wakeAt` via a DB update.
-    func scheduleRun(wakeAt: Date) async throws {
-        try await Queries.scheduleRun(
-            on: postgres,
-            namespaceID: namespace,
-            runID: runUUID,
-            taskID: taskUUID,
-            wakeAt: wakeAt,
-            logger: logger
-        )
     }
 
     /// Extends the worker claim lease by `seconds` seconds.

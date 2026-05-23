@@ -446,6 +446,14 @@ CREATE INDEX IF NOT EXISTS strand_runs_lease_idx
     ON strand.runs (namespace_id, queue, lease_expires_at)
     WHERE state = 'RUNNING'::text AND lease_expires_at IS NOT NULL;
 
+-- Supports shutdownWorker: UPDATE strand.runs SET lease_expires_at = NOW()
+-- WHERE worker_id = $1 AND namespace_id = $2 AND state = 'RUNNING'.
+-- Without this, shutdown scans the entire partition to find each worker's
+-- in-flight runs — observed at 1+ s on dev DBs with 500k+ historical rows.
+CREATE INDEX IF NOT EXISTS strand_runs_worker_idx
+    ON strand.runs (namespace_id, worker_id)
+    WHERE state = 'RUNNING'::text;
+
 -- Supports cancelDescendants (run_terminate CTE), resetChildTasks (del_old_runs),
 -- and cancelTasksBatch when cancelling non-terminal runs by task_id.
 -- Without this index those CTEs perform a full sequential scan across all

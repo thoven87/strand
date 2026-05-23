@@ -154,6 +154,7 @@ public func withTestEnvironment<T: Sendable>(
             DELETE FROM strand.schedules   WHERE queue = q;
             DELETE FROM strand.events      WHERE queue = q;
             DELETE FROM strand.event_waits WHERE queue = q;
+            DELETE FROM strand.runs        WHERE task_id IN (SELECT id FROM strand.tasks WHERE queue = q);
             DELETE FROM strand.tasks       WHERE queue = q;
             DELETE FROM strand.queues      WHERE name  = q;
           END LOOP;
@@ -177,6 +178,13 @@ public func withTestEnvironment<T: Sendable>(
             )
             try await postgres.query(
                 "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
+                logger: logger
+            )
+            // strand.runs has no FK cascade to strand.tasks, so orphaned run rows
+            // accumulate and cause full seq-scans in shutdownWorker. Delete runs
+            // before tasks (tasks deletion order doesn't matter — no FK between them).
+            try await postgres.query(
+                "DELETE FROM strand.runs WHERE task_id IN (SELECT id FROM strand.tasks WHERE queue = \(queueName))",
                 logger: logger
             )
             try await postgres.query(

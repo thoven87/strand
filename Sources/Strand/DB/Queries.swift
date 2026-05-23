@@ -1048,11 +1048,28 @@ enum Queries {
         return queues
     }
 
-    /// Marks a run as failed and schedules a retry if attempts remain.
+    /// Transitions a RUNNING run to FAILED, then either schedules the next
+    /// retry attempt (if `maxAttempts` and `deadline_at` allow) or permanently
+    /// marks the task FAILED and signals the parent workflow.
+    ///
+    /// Steps executed inside a single transaction:
+    /// 1. Read the task’s retry policy, attempt counter, and hard deadline.
+    /// 2. CAS the run to FAILED — `AND version = $version` ensures only the
+    ///    worker that claimed this exact execution can fail it. A stale
+    ///    `runTask` whose run was swept back to PENDING and re-claimed by
+    ///    another worker finds 0 rows here and returns silently.
+    /// 3. Delete any dangling `event_waits` rows for this run.
+    /// 4. Update the OTel trace span to FAILED.
+    /// 5. If retries remain and no hard deadline has passed: compute the
+    ///    back-off delay, create a new PENDING run for attempt N+1, and
+    ///    transition the task row to PENDING so it becomes claimable.
+    /// 6. Otherwise: mark the task permanently FAILED and call
+    ///    `emitTaskCompletionSignal` to wake the parent workflow.
     static func failRun(
         on client: PostgresClient,
         namespaceID: String,
         runID: UUID,
+        version: Int,
         reasonBuffer: ByteBuffer,
         logger: Logger
     ) async throws {
@@ -1076,10 +1093,9 @@ enum Queries {
             let retryStrategyBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
             let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
-            // Guard: only fail if this run is still running.
-            // If another worker already processed it, bail out silently.
+            // Step 2 — CAS: only transitions the run that this worker claimed.
             let failStream = try await conn.query(
-                "UPDATE strand.runs SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = \(TaskState.running) RETURNING id",
+                "UPDATE strand.runs SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version) RETURNING id",
                 logger: logger
             )
             guard try await failStream.first(where: { _ in true }) != nil else { return }
@@ -1241,6 +1257,7 @@ enum Queries {
         on client: PostgresClient,
         namespaceID: String,
         runID: UUID,
+        version: Int,
         taskID: UUID,
         wakeAt: Date,
         logger: Logger
@@ -1251,12 +1268,16 @@ enum Queries {
                 UPDATE strand.runs
                 SET state = \(TaskState.sleeping), available_at = \(wakeAt),
                     lease_expires_at = NULL
-                WHERE id = \(runID) AND namespace_id = \(namespaceID)
+                WHERE id        = \(runID)
+                  AND state     = \(TaskState.running)
+                  AND version   = \(version)
+                  AND namespace_id = \(namespaceID)
                   AND created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
                 RETURNING id
             )
             UPDATE strand.tasks SET state = \(TaskState.sleeping)
             WHERE id = \(taskID) AND namespace_id = \(namespaceID)
+              AND EXISTS (SELECT 1 FROM r)
             """,
             logger: logger
         )
@@ -1882,6 +1903,7 @@ enum Queries {
         queue: String,
         taskID: UUID,
         runID: UUID,
+        version: Int,
         seqNum: Int,
         eventName: String,
         timeoutSeconds: Int?,
@@ -1925,10 +1947,13 @@ enum Queries {
                         SET state = \(TaskState.sleeping), available_at = \(timeoutAt),
                             wake_event = \(eventName), event_payload = NULL,
                             lease_expires_at = NULL
-                        WHERE id = \(runID)
+                        WHERE id      = \(runID)
+                          AND state   = \(TaskState.running)
+                          AND version = \(version)
                         RETURNING id
                     )
                     UPDATE strand.tasks SET state = \(TaskState.sleeping) WHERE id = \(taskID)
+                      AND EXISTS (SELECT 1 FROM r)
                     """,
                     logger: logger
                 )
@@ -1940,10 +1965,13 @@ enum Queries {
                         SET state = \(TaskState.waiting),
                             wake_event = \(eventName), event_payload = NULL,
                             lease_expires_at = NULL
-                        WHERE id = \(runID)
+                        WHERE id      = \(runID)
+                          AND state   = \(TaskState.running)
+                          AND version = \(version)
                         RETURNING id
                     )
                     UPDATE strand.tasks SET state = \(TaskState.waiting) WHERE id = \(taskID)
+                      AND EXISTS (SELECT 1 FROM r)
                     """,
                     logger: logger
                 )
@@ -2424,6 +2452,7 @@ enum Queries {
                 WHERE worker_id    = \(workerID)
                   AND namespace_id = \(namespaceID)
                   AND state        = \(TaskState.running)
+                  AND created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
             )
             DELETE FROM strand.workers
             WHERE id           = \(workerID)
