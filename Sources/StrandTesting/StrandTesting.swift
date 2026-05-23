@@ -154,6 +154,7 @@ public func withTestEnvironment<T: Sendable>(
             DELETE FROM strand.schedules   WHERE queue = q;
             DELETE FROM strand.events      WHERE queue = q;
             DELETE FROM strand.event_waits WHERE queue = q;
+            DELETE FROM strand.runs        WHERE task_id IN (SELECT id FROM strand.tasks WHERE queue = q);
             DELETE FROM strand.tasks       WHERE queue = q;
             DELETE FROM strand.queues      WHERE name  = q;
           END LOOP;
@@ -177,6 +178,13 @@ public func withTestEnvironment<T: Sendable>(
             )
             try await postgres.query(
                 "DELETE FROM strand.event_waits WHERE queue = \(queueName)",
+                logger: logger
+            )
+            // strand.runs has no FK cascade to strand.tasks, so orphaned run rows
+            // accumulate and cause full seq-scans in shutdownWorker. Delete runs
+            // before tasks (tasks deletion order doesn't matter — no FK between them).
+            try await postgres.query(
+                "DELETE FROM strand.runs WHERE task_id IN (SELECT id FROM strand.tasks WHERE queue = \(queueName))",
                 logger: logger
             )
             try await postgres.query(
@@ -392,6 +400,47 @@ public func awaitScheduleRunCount(
     }
     throw StrandTestError(
         "schedule '\(scheduleName)' did not fire \(minCount) time(s) within \(timeout)"
+    )
+}
+
+// MARK: - awaitAnyTask
+
+/// Polls `listTasks` until at least one task named `taskName` in the client's
+/// queue has reached `state`, or throws ``StrandTestError`` on `timeout`.
+///
+/// Useful when `continueAsNew` creates independent new tasks whose IDs are
+/// unknown at test time — poll by name and target state instead of task ID.
+///
+/// ```swift
+/// // Wait for the terminal ContinueWorkflow generation to complete
+/// try await awaitAnyTask(client: client, taskName: "ContinueWorkflow",
+///                        state: .completed, timeout: .seconds(15))
+/// ```
+public func awaitAnyTask(
+    client: StrandClient,
+    taskName: String,
+    state: TaskState,
+    timeout: Duration = .seconds(10),
+    label: String? = nil
+) async throws {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        let stream = try await client.postgres.query(
+            """
+            SELECT 1 FROM strand.tasks
+            WHERE namespace_id = \(client.namespaceID)
+              AND queue        = \(client.queueName)
+              AND name         = \(taskName)
+              AND state        = \(state)
+            LIMIT 1
+            """,
+            logger: client.logger
+        )
+        if (try await stream.first(where: { _ in true })) != nil { return }
+        try await Task.sleep(for: .milliseconds(200))
+    }
+    throw StrandTestError(
+        label ?? "no '\(taskName)' task reached state '\(state.rawValue)' within \(timeout)"
     )
 }
 

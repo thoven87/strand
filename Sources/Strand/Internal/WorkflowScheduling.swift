@@ -461,7 +461,9 @@ extension WorkflowRegistration {
                                                    THEN NOW()
                                                    ELSE \(wakeAt) END,
                                 lease_expires_at = NULL
-                            WHERE id = \(claimed.runID)
+                            WHERE id      = \(claimed.runID)
+                              AND state   = \(TaskState.running)
+                              AND version = \(claimed.version)
                             RETURNING state
                         )
                         UPDATE strand.tasks
@@ -617,7 +619,9 @@ extension WorkflowRegistration {
                                                            ELSE \(eventName) END,
                                         event_payload = NULL,
                                         lease_expires_at = NULL
-                                    WHERE id = \(runID)
+                                    WHERE id      = \(runID)
+                                      AND state   = \(TaskState.running)
+                                      AND version = \(claimed.version)
                                     RETURNING state
                                 )
                                 UPDATE strand.tasks

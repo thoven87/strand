@@ -726,6 +726,7 @@ public struct StrandWorker: Service {
                     on: postgres,
                     namespaceID: namespace,
                     runID: claimed.runID,
+                    version: claimed.version,
                     taskID: claimed.taskID,
                     wakeAt: wakeAt,
                     logger: taskLogger
@@ -1049,6 +1050,7 @@ public struct StrandWorker: Service {
                 on: postgres,
                 namespaceID: namespace,
                 runID: claimed.runID,
+                version: claimed.version,
                 reasonBuffer: reasonBuffer,
                 logger: logger
             )
