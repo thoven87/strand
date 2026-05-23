@@ -403,6 +403,47 @@ public func awaitScheduleRunCount(
     )
 }
 
+// MARK: - awaitAnyTask
+
+/// Polls `listTasks` until at least one task named `taskName` in the client's
+/// queue has reached `state`, or throws ``StrandTestError`` on `timeout`.
+///
+/// Useful when `continueAsNew` creates independent new tasks whose IDs are
+/// unknown at test time — poll by name and target state instead of task ID.
+///
+/// ```swift
+/// // Wait for the terminal ContinueWorkflow generation to complete
+/// try await awaitAnyTask(client: client, taskName: "ContinueWorkflow",
+///                        state: .completed, timeout: .seconds(15))
+/// ```
+public func awaitAnyTask(
+    client: StrandClient,
+    taskName: String,
+    state: TaskState,
+    timeout: Duration = .seconds(10),
+    label: String? = nil
+) async throws {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        let stream = try await client.postgres.query(
+            """
+            SELECT 1 FROM strand.tasks
+            WHERE namespace_id = \(client.namespaceID)
+              AND queue        = \(client.queueName)
+              AND name         = \(taskName)
+              AND state        = \(state)
+            LIMIT 1
+            """,
+            logger: client.logger
+        )
+        if (try await stream.first(where: { _ in true })) != nil { return }
+        try await Task.sleep(for: .milliseconds(200))
+    }
+    throw StrandTestError(
+        label ?? "no '\(taskName)' task reached state '\(state.rawValue)' within \(timeout)"
+    )
+}
+
 // MARK: - awaitTerminal
 
 /// Polls until `taskID` reaches a terminal state (completed / failed / cancelled)

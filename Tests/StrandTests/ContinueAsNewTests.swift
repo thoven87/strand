@@ -72,8 +72,8 @@ struct ContinueAsNewTests {
 
     // ── 1 ───────────────────────────────────────────────────────────────────
     // A workflow that calls continueAsNew once produces a new PENDING task and
-    // marks the old one COMPLETED (or CONTINUED_AS_NEW). The new task is then
-    // claimed by the worker and runs to completion.
+    // marks the old one CONTINUED_AS_NEW. The new task is then claimed by the
+    // worker and runs to completion.
     @Test("continueAsNew enqueues a fresh task that runs to completion")
     func basicContinueAsNew() async throws {
         try await withTestEnvironment { client in
@@ -83,27 +83,27 @@ struct ContinueAsNewTests {
                 logger: client.logger,
                 workflows: [InfiniteWorkflow.self]
             ) {
-                // Start at generation 0 — will continueAsNew to generation 1.
-                // The second run (generation 1) returns 1.
-                // We can't use handle.result() on the original task since it
-                // continuedAsNew; instead we wait for a reasonable time and then
-                // verify via the task state.
                 let handle = try await client.startWorkflow(
                     InfiniteWorkflow.self,
                     options: .init(),
                     input: InfiniteInput(generation: 0)
                 )
 
-                // Allow time for both the original and the continued task to run.
-                try await Task.sleep(for: .seconds(3))
-
-                // The original task should be in a terminal state.
-                if let snap = try await client.fetchTaskResult(id: handle.taskID) {
-                    #expect(
-                        snap.state == .completed || snap.state == .continuedAsNew,
-                        "original task should be terminal, got \(snap.state)"
-                    )
-                }
+                // Wait for the original task to reach a terminal state.
+                // `continueAsNew` transitions it to CONTINUED_AS_NEW, not COMPLETED.
+                // We cannot call handle.result() because the handle points to a
+                // continued task — instead use awaitSnapshot with the full set of
+                // terminal states.
+                let snap = try await awaitSnapshot(
+                    handle,
+                    where: { [.completed, .continuedAsNew, .failed, .cancelled].contains($0.state) },
+                    timeout: .seconds(10),
+                    label: "InfiniteWorkflow generation-0 terminal state"
+                )
+                #expect(
+                    snap.state == .completed || snap.state == .continuedAsNew,
+                    "original task should be COMPLETED or CONTINUED_AS_NEW, got \(snap.state)"
+                )
             }
         }
     }
@@ -126,19 +126,33 @@ struct ContinueAsNewTests {
             ) {
                 // Start the chain: count=0, limit=3.
                 // Generations: 0 (→CAN), 1 (→CAN), 2 (→CAN), 3 (returns 3).
-                _ = try await client.startWorkflow(
+                let handle = try await client.startWorkflow(
                     ContinueWorkflow.self,
                     options: .init(),
                     input: ContinueInput(count: 0, limit: 3)
                 )
 
-                // Give all four generations time to run.
-                try await Task.sleep(for: .seconds(5))
+                // Step 1: wait for generation 0 to become CONTINUED_AS_NEW.
+                // continueAsNew on a root workflow creates an independent new task;
+                // the original handle transitions to CONTINUED_AS_NEW, not COMPLETED.
+                _ = try await awaitSnapshot(
+                    handle,
+                    where: { $0.state == .continuedAsNew || $0.state == .completed },
+                    timeout: .seconds(10),
+                    label: "ContinueWorkflow generation-0 continued"
+                )
 
-                // Verify by checking that at least one task for ContinueWorkflow
-                // is now COMPLETED (the terminal generation).
-                let queues = try await client.listQueues()
-                #expect(queues.contains(client.queueName))
+                // Step 2: wait for the terminal generation (count == 3) to COMPLETE.
+                // continueAsNew creates independent tasks with no parent-child link,
+                // so we don't have a direct handle to the final generation — use
+                // awaitAnyTask to poll by name and state instead.
+                try await awaitAnyTask(
+                    client: client,
+                    taskName: "ContinueWorkflow",
+                    state: .completed,
+                    timeout: .seconds(15),
+                    label: "terminal ContinueWorkflow generation (count == 3)"
+                )
             }
         }
     }

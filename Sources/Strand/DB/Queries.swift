@@ -3045,7 +3045,7 @@ enum Queries {
             WITH
             ins_completion AS (
                 INSERT INTO strand.task_completions (namespace_id, task_id, state, result)
-                VALUES (\(namespaceID), \(taskID), \(state.rawValue), \(resultBuffer))
+                VALUES (\(namespaceID), \(taskID), \(state), \(resultBuffer))
                 ON CONFLICT (task_id) DO NOTHING
             ),
             flag_running AS (
