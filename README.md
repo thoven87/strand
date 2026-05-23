@@ -9,14 +9,15 @@
 No separate coordination service. No Redis. No Cassandra. Just Swift workers and Postgres.
 
 ```swift
-struct OrderWorkflow: Workflow {
-    typealias Input  = OrderInput
-    typealias Output = ShipResult
+@Workflow
+struct OrderWorkflow {
+    struct Input:  Codable, Sendable { let amount: Int; let orderID: String }
+    struct Output: Codable, Sendable { let trackingNumber: String }
 
     mutating func run(
         context: WorkflowContext<Self>,
-        input: OrderInput
-    ) async throws -> ShipResult {
+        input: Input
+    ) async throws -> Output {
         let charge = try await context.runActivity(
             ChargeCardActivity.self,
             input: .init(amount: input.amount)
@@ -78,68 +79,124 @@ psql "postgresql://strand:strand@localhost:5499/strand_dev" -f strand.sql
 ### 3. Run
 
 ```swift
-import Strand
+import Logging
+import PostgresNIO
 import ServiceLifecycle
+import Strand
 
-let postgres = PostgresClient(configuration: .init(
-    host: "localhost", port: 5499,
-    username: "strand", password: "strand",
-    database: "strand_dev", tls: .disable
-))
-let client = StrandClient(postgres: postgres, queue: "default")
-let worker = StrandWorker(
+var logger = Logger(label: "my-app")
+
+let postgres = PostgresClient(
+    configuration: .init(
+        host: "localhost", port: 5499,
+        username: "strand", password: "strand",
+        database: "strand_dev", tls: .disable
+    ),
+    backgroundLogger: logger
+)
+
+var strand = StrandService(
     postgres: postgres,
-    options: WorkerOptions(queue: "default"),
-    workflows: [OrderWorkflow.self],
-    activities: [ChargeCardActivity(), ShipOrderActivity()]
-)
-let group = ServiceGroup(configuration: .init(
-    services: [.init(service: postgres), .init(service: worker)],
-    gracefulShutdownSignals: [.sigterm, .sigint]
-))
-
-// Start a workflow — returns a handle you can poll for the result:
-let handle = try await client.startWorkflow(
-    OrderWorkflow.self,
-    input: OrderInput(amount: 99_00, orderID: "ord-1")
+    options: .init(
+        queues: [
+            .init(
+                name: "default",
+                workflows: [OrderWorkflow.self],
+                activities: [ChargeCardActivity(), ShipOrderActivity()]
+            )
+        ]
+    )
 )
 
+// Trigger a workflow from anywhere — returns a handle you can await:
+let client = strand.client(queue: "default")
+Task {
+    let handle = try await client.startWorkflow(
+        OrderWorkflow.self,
+        input: OrderWorkflow.OrderInput(amount: 99_00, orderID: "ord-1")
+    )
+    let result = try await handle.result()
+    print(result)
+}
+
+let group = ServiceGroup(
+    services: [postgres, strand],
+    gracefulShutdownSignals: [.sigterm, .sigint],
+    logger: logger
+)
 try await group.run()
 ```
 
 ## Scheduling
 
-Declare recurring schedules directly on ``StrandScheduler`` — they are upserted
-to the database when the service starts:
+Declare recurring schedules on `StrandService` — they are upserted to the database
+when the service starts:
 
 ```swift
-let scheduler = StrandScheduler(
-    client: client,
-    schedules: [
-        .workflow(
-            "daily-report",
-            pattern: .daily(offset: "PT9H"),          // 09:00 UTC every day
-            workflowType: DailyReportWorkflow.self,
-            input: ReportInput()
-        ),
-        .workflow(
-            "market-open",
-            pattern: .cron("30 8 * * 1-5",
-                           timezone: TimeZone(identifier: "America/New_York")!),
-            workflowType: MarketOpenWorkflow.self,
-            input: StrandVoid()
-        ),
-    ]
+var strand = StrandService(
+    postgres: postgres,
+    options: .init(
+        queues: [
+            .init(
+                name: "default",
+                workflows: [DailyReportWorkflow.self, MarketOpenWorkflow.self]
+            )
+        ],
+        scheduler: .init()
+    )
 )
 
-let group = ServiceGroup(configuration: .init(
-    services: [
-        .init(service: postgres),
-        .init(service: worker),
-        .init(service: scheduler),
-    ],
-    gracefulShutdownSignals: [.sigterm, .sigint]
-))
+strand.addSchedule(
+    .workflow(
+        "daily-report",
+        pattern: .daily(offset: "PT9H"),          // 09:00 UTC every day
+        workflowType: DailyReportWorkflow.self,
+        input: ReportInput()
+    )
+)
+strand.addSchedule(
+    .workflow(
+        "market-open",
+        pattern: .cron("30 8 * * 1-5",
+                       timezone: TimeZone(identifier: "America/New_York")!),
+        workflowType: MarketOpenWorkflow.self,
+        input: StrandVoid()
+    )
+)
+
+// Custom timetable — fire on any calendar logic you can express in Swift
+struct UKBankHolidayFreeSchedule: StrandTimeTable {
+    let holidays: Set<DateComponents>   // loaded at init time
+    var description: String { "UK working days, 09:00 London" }
+
+    func nextRunTime(after _: Date?, earliest: Date) -> Date? {
+        var greg = Calendar(identifier: .gregorian)
+        greg.timeZone = TimeZone(identifier: "Europe/London")!
+        var candidate = greg.startOfDay(for: earliest)
+        while !isWorkingDay(candidate, calendar: greg) {
+            candidate = greg.date(byAdding: .day, value: 1, to: candidate)!
+        }
+        var comps = greg.dateComponents(in: greg.timeZone, from: candidate)
+        comps.hour = 9; comps.minute = 0; comps.second = 0
+        return greg.date(from: comps)
+    }
+    // ...
+}
+
+strand.addSchedule(
+    .workflow(
+        "daily-settlement",
+        timetable: UKBankHolidayFreeSchedule(holidays: holidays),
+        workflowType: SettlementWorkflow.self,
+        input: StrandVoid()
+    )
+)
+
+let group = ServiceGroup(
+    services: [postgres, strand],
+    gracefulShutdownSignals: [.sigterm, .sigint],
+    logger: logger
+)
 try await group.run()
 ```
 
@@ -156,28 +213,17 @@ See [`Examples/`](Examples/) for complete runnable examples:
 
 | Example | What it shows |
 |---|---|
-| `Greeting` | Minimal activity + workflow |
-| `MultipleActivities` | Sequential and parallel activities |
-| `Schedule` | Cron and interval scheduling |
-| `ChildWorkflows` | Fan-out orchestration |
+| [`HackerNewsSummary`](Examples/Sources/HackerNewsSummary) | Multi-child fan-out with Ollama summarisation; `@ActivityContainer` |
+| [`GroundwaterPipeline`](Examples/Sources/GroundwaterPipeline) | 6.2 M-row data pipeline, parallel download, Ollama trend analysis |
+| [`CIPipeline`](Examples/Sources/CIPipeline) | DAG-style CI workflow with human-in-the-loop approval signal |
+| [`SmartBuilding`](Examples/Sources/SmartBuilding) | IoT sensor aggregation, multi-tenant, scheduled reports |
+| [`DevServer`](Examples/Sources/DevServer) | Local dev server with seeded workflows and the Loom dashboard |
 
 ## Requirements
 
 - Swift 6.3+
-- PostgreSQL 15+
-
-## Dependencies
-
-| Package | Version |
-|---|---|
-| [PostgresNIO](https://github.com/vapor/postgres-nio) | 1.32.2 |
-| [Hummingbird](https://github.com/hummingbird-project/hummingbird) | 2.22.0 |
-| [swift-service-lifecycle](https://github.com/swift-server/swift-service-lifecycle) | 2.11.0 |
-| [swift-log](https://github.com/apple/swift-log) | 1.12.0 |
-| [swift-metrics](https://github.com/apple/swift-metrics) | 2.10.1 |
-| [swift-distributed-tracing](https://github.com/apple/swift-distributed-tracing) | 1.4.1 |
-| [swift-collections](https://github.com/apple/swift-collections) | 1.0.0+ |
-| [swift-nio](https://github.com/apple/swift-nio) | 2.77+ |
+- PostgreSQL 17+
+- Runs on Linux and macOS — any platform supported by [SwiftNIO](https://github.com/apple/swift-nio) and [PostgresNIO](https://github.com/vapor/postgres-nio)
 
 ## License
 
