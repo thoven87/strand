@@ -281,6 +281,45 @@ public func withWorker<T: Sendable>(
     }
 }
 
+// MARK: - withScheduler
+
+/// Runs a ``StrandScheduler`` for the duration of `work`, then gracefully shuts
+/// it down before returning — same lifecycle guarantee as ``withWorker``.
+///
+/// ```swift
+/// try await withTestEnvironment { client in
+///     let scheduler = StrandScheduler(client: client, ...)
+///     try await withScheduler(scheduler, logger: client.logger) {
+///         try await awaitScheduleRunCount(client: client, scheduleName: "my-schedule")
+///     }
+/// }
+/// ```
+@discardableResult
+public func withScheduler<T: Sendable>(
+    _ scheduler: StrandScheduler,
+    logger: Logger,
+    _ work: @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        let serviceGroup = ServiceGroup(
+            configuration: .init(
+                services: [scheduler],
+                gracefulShutdownSignals: [],
+                logger: logger
+            )
+        )
+        group.addTask { try await serviceGroup.run() }
+        do {
+            let result = try await work()
+            await serviceGroup.triggerGracefulShutdown()
+            return result
+        } catch {
+            await serviceGroup.triggerGracefulShutdown()
+            throw error
+        }
+    }
+}
+
 // MARK: - awaitSnapshot
 
 /// Polls `fetchTaskResult` until the snapshot satisfies `predicate`, or
