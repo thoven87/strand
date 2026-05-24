@@ -28,7 +28,7 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
     ///
     /// When `WorkflowOptions.id` is set explicitly that value is used.
     /// When omitted Strand generates `"<WorkflowName>-<epochMs>"` — e.g.
-    /// `"MissionControlWorkflow-1746218580123"` — which is stored as the
+    /// `"OrderWorkflow-1746218580123"` — which is stored as the
     /// `idempotency_key` so `StrandClient.workflow(id:)` can locate the run.
     public let workflowID: String
 

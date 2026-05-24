@@ -103,6 +103,7 @@ public struct StrandClient: Sendable {
         options: ActivityOptions = .init()
     ) async throws -> EnqueueResult {
         let rlParams = options.rateLimit.map { $0.slotParams(for: A.name) }
+        let resolvedID = options.id ?? A.generateActivityID()
         return try await _enqueue(
             queue: options.queue ?? queueName,
             taskName: A.name,
@@ -112,7 +113,7 @@ public struct StrandClient: Sendable {
             retryStrategy: options.retryStrategy ?? self.options.defaultRetryStrategy,
             cancellation: options.cancellation,
             headers: options.headers,
-            idempotencyKey: options.id,
+            idempotencyKey: resolvedID,
             priority: options.priority,
             delayUntil: options.delayUntil,
             maxDuration: options.maxDuration,

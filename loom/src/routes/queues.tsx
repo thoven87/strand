@@ -1,9 +1,14 @@
-import { useMemo } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
+import {
+    useQuery,
+    useMutation,
+    useQueryClient,
+    keepPreviousData,
+} from "@tanstack/react-query";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams } from "@tanstack/react-router";
 import { getQueues, pauseQueue, resumeQueue } from "@/api/queues";
-import { getMetrics } from "@/api/metrics";
 import { qk } from "@/lib/queryKeys";
 import { Pause, Play } from "lucide-react";
 import type { Queue } from "@/api/types";
@@ -24,35 +29,35 @@ function fmtRate(ratePerSec: number | null | undefined): string {
 // ── QueueBar ──────────────────────────────────────────────────────────────────
 
 function QueueBar({ stats }: { stats: Queue["stats"] }) {
+    // Live states only — COMPLETED/CANCELLED are not included in queue stats.
     const total =
         stats.pending +
         stats.running +
         stats.sleeping +
-        stats.completed +
-        stats.failed +
-        stats.cancelled;
+        stats.waiting +
+        stats.failedRecent;
 
     if (total === 0)
         return (
-            <span className="text-xs text-muted-foreground">No tasks yet</span>
+            <span className="text-xs text-muted-foreground">
+                No active tasks
+            </span>
         );
 
     const segments = [
         { count: stats.running, cls: "bg-yellow-400" },
         { count: stats.pending, cls: "bg-blue-400" },
         { count: stats.sleeping, cls: "bg-indigo-400" },
-        { count: stats.failed, cls: "bg-red-400" },
-        { count: stats.cancelled, cls: "bg-orange-400" },
-        { count: stats.completed, cls: "bg-green-400" },
+        { count: stats.waiting, cls: "bg-purple-400" },
+        { count: stats.failedRecent, cls: "bg-red-400" },
     ].filter((s) => s.count > 0);
 
     const items = [
         { label: "Running", count: stats.running, dot: "bg-yellow-400" },
         { label: "Pending", count: stats.pending, dot: "bg-blue-400" },
         { label: "Sleeping", count: stats.sleeping, dot: "bg-indigo-400" },
-        { label: "Failed", count: stats.failed, dot: "bg-red-400" },
-        { label: "Cancelled", count: stats.cancelled, dot: "bg-orange-400" },
-        { label: "Completed", count: stats.completed, dot: "bg-green-400" },
+        { label: "Waiting", count: stats.waiting, dot: "bg-purple-400" },
+        { label: "Failed (24h)", count: stats.failedRecent, dot: "bg-red-400" },
     ].filter((i) => i.count > 0);
 
     return (
@@ -90,6 +95,7 @@ export function QueuesPage() {
     usePageTitle("Queues");
     const { namespace } = useParams({ strict: false }) as { namespace: string };
     const qc = useQueryClient();
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
 
     const {
         data: queues = [],
@@ -98,28 +104,9 @@ export function QueuesPage() {
     } = useQuery({
         queryKey: qk.queues.list(namespace),
         queryFn: () => getQueues(namespace),
-        refetchInterval: 10_000,
+        refetchInterval: intervalMs,
+        placeholderData: keepPreviousData,
     });
-
-    // Metrics — per-queue throughput from the broadcast DDSketch cache.
-    const { data: metricsData } = useQuery({
-        queryKey: qk.metrics.get(namespace),
-        queryFn: () => getMetrics(namespace),
-        staleTime: 10_000,
-        refetchInterval: 10_000,
-    });
-
-    // Aggregate ratePerSec across all (taskName, state) rows for each queue.
-    const queueRates = useMemo(() => {
-        if (!metricsData?.taskTimings) return {} as Record<string, number>;
-        const map: Record<string, number> = {};
-        for (const t of metricsData.taskTimings) {
-            if (t.ratePerSec != null && t.ratePerSec > 0) {
-                map[t.queue] = (map[t.queue] ?? 0) + t.ratePerSec;
-            }
-        }
-        return map;
-    }, [metricsData?.taskTimings]);
 
     const pauseMut = useMutation({
         mutationFn: (name: string) => pauseQueue(namespace, name),
@@ -135,9 +122,17 @@ export function QueuesPage() {
 
     return (
         <div className="px-6 py-5">
-            <h1 className="text-base font-semibold text-foreground mb-4">
-                Queues
-            </h1>
+            <div className="flex items-center justify-between mb-4">
+                <div>
+                    <h1 className="text-base font-semibold text-foreground">
+                        Queues
+                    </h1>
+                </div>
+                <AutoRefreshControl
+                    intervalMs={intervalMs}
+                    setIntervalMs={setIntervalMs}
+                />
+            </div>
 
             {isLoading && (
                 <p className="text-sm text-muted-foreground">Loading…</p>
@@ -172,9 +167,9 @@ export function QueuesPage() {
                                         Paused
                                     </span>
                                 )}
-                                {(queueRates[q.name] ?? 0) > 0 && (
+                                {(q.throughputPerSec ?? 0) > 0 && (
                                     <span className="text-[11px] text-muted-foreground bg-secondary/20 rounded px-1.5 py-0.5">
-                                        {fmtRate(queueRates[q.name])}
+                                        {fmtRate(q.throughputPerSec)}
                                     </span>
                                 )}
                             </div>
@@ -186,11 +181,9 @@ export function QueuesPage() {
                                         q.stats.pending +
                                         q.stats.running +
                                         q.stats.sleeping +
-                                        q.stats.completed +
-                                        q.stats.failed +
-                                        q.stats.cancelled
+                                        q.stats.waiting
                                     ).toLocaleString()}{" "}
-                                    tasks
+                                    active
                                 </span>
                                 {q.isPaused ? (
                                     <button

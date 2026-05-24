@@ -56,7 +56,7 @@ struct TaskRoutes {
                 limit: min(limit, 2_000),
                 logger: self.client.logger
             )
-            return pairs.map { ["name": $0.name, "kind": $0.kind.rawValue] }
+            return pairs.map { ["name": $0.name, "kind": $0.kind.rawValue, "queue": $0.queue] }
         }
 
         // GET /api/:namespace/task-definitions/:name/activity?days=7
@@ -64,7 +64,7 @@ struct TaskRoutes {
         // Used by the sparkline on the Tasks definitions page.
         router.get("task-definitions/:name/activity") { req, ctx -> [DailyRunCountResponse] in
             let name = try ctx.parameters.require("name")
-            let days = req.uri.queryParameters.get("days").flatMap(Int.init) ?? 7
+            let days = req.uri.queryParameters.get("days").flatMap(Int.init) ?? 1
             let rows = try await ManagementQueries.taskDefinitionActivity(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,

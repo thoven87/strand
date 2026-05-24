@@ -137,6 +137,12 @@ extension RunSummaryRow {
 }
 
 /// Queue stats row returned by ``ManagementQueries/listQueueStats``.
+/// Live operational counts for one queue.
+///
+/// `completed` and `cancelled` are intentionally omitted — counting all terminal
+/// tasks from all time requires a full-table scan that makes the endpoint slow
+/// at scale. Historical throughput / error-rate data lives in the metrics endpoint
+/// where it is served from a broadcast cache.
 package struct QueueStatsRow: Sendable {
     package let name: String
     package let createdAt: Date
@@ -146,25 +152,22 @@ package struct QueueStatsRow: Sendable {
     package let sleeping: Int
     /// Workflows suspended waiting for an activity, child workflow, or named event.
     package let waiting: Int
-    package let completed: Int
-    package let failed: Int
-    package let cancelled: Int
+    /// Tasks that failed in the last 24 hours (bounded to keep the query fast).
+    package let failedRecent: Int
     package let isPaused: Bool
 }
 
 extension QueueStatsRow {
     package init(row: PostgresRow) throws {
         var col = row.makeIterator()
-        name = try col.next()!.decode(String.self, context: .default)
-        createdAt = try col.next()!.decode(Date.self, context: .default)
-        pending = try col.next()!.decode(Int.self, context: .default)
-        running = try col.next()!.decode(Int.self, context: .default)
-        sleeping = try col.next()!.decode(Int.self, context: .default)
-        waiting = try col.next()!.decode(Int.self, context: .default)
-        completed = try col.next()!.decode(Int.self, context: .default)
-        failed = try col.next()!.decode(Int.self, context: .default)
-        cancelled = try col.next()!.decode(Int.self, context: .default)
-        isPaused = try col.next()!.decode(Bool.self, context: .default)
+        name         = try col.next()!.decode(String.self, context: .default)
+        createdAt    = try col.next()!.decode(Date.self, context: .default)
+        isPaused     = try col.next()!.decode(Bool.self, context: .default)
+        pending      = try col.next()!.decode(Int.self, context: .default)
+        running      = try col.next()!.decode(Int.self, context: .default)
+        sleeping     = try col.next()!.decode(Int.self, context: .default)
+        waiting      = try col.next()!.decode(Int.self, context: .default)
+        failedRecent = try col.next()!.decode(Int.self, context: .default)
     }
 }
 
@@ -256,7 +259,11 @@ package enum ManagementQueries {
 
     // MARK: - Queue stats
 
-    /// All queues with per-state task counts (for the queue list view).
+    /// All queues with live per-state task counts (for the queue list view).
+    ///
+    /// Uses correlated index-only subqueries per live state via
+    /// `strand_tasks_ns_queue_state_idx`. Terminal states are omitted;
+    /// recent failures (last 24 h) use `strand_tasks_failed_idx`.
     package static func listQueueStats(
         on client: PostgresClient,
         namespaceID: String,
@@ -268,22 +275,30 @@ package enum ManagementQueries {
             SELECT
               q.name,
               q.created_at,
-              COUNT(t.id) FILTER (WHERE t.state = 'PENDING')    AS pending,
-              COUNT(t.id) FILTER (WHERE t.state = 'RUNNING')    AS running,
-              COUNT(t.id) FILTER (WHERE t.state = 'SLEEPING')   AS sleeping,
-              COUNT(t.id) FILTER (WHERE t.state = 'WAITING')    AS waiting,
-              COUNT(t.id) FILTER (WHERE t.state = 'COMPLETED')  AS completed,
-              COUNT(t.id) FILTER (WHERE t.state = 'FAILED')     AS failed,
-              COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')  AS cancelled,
-              q.is_paused
+              q.is_paused,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.pending)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS pending,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.running)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS running,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.sleeping)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS sleeping,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.waiting)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS waiting,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.failed)
+                 AND created_at >= NOW() - INTERVAL '24 hours'
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS failed_recent
             FROM strand.queues q
-            -- When rootOnly=true, only join root tasks (parent_task_id IS NULL)
-            -- so the stats bar counts the same population as the task list.
-            LEFT JOIN strand.tasks t ON t.queue = q.name
-                                    AND t.namespace_id = q.namespace_id
-                                    AND (NOT \(rootOnly) OR t.parent_task_id IS NULL)
             WHERE q.namespace_id = \(namespaceID)
-            GROUP BY q.name, q.created_at, q.is_paused
             ORDER BY q.name
             """,
             logger: logger
@@ -293,7 +308,7 @@ package enum ManagementQueries {
         return rows
     }
 
-    /// Stats for a single queue.
+    /// Stats for a single queue (same index-only subquery strategy as `listQueueStats`).
     package static func queueStats(
         on client: PostgresClient,
         namespaceID: String,
@@ -306,22 +321,30 @@ package enum ManagementQueries {
             SELECT
               q.name,
               q.created_at,
-              COUNT(t.id) FILTER (WHERE t.state = 'PENDING')    AS pending,
-              COUNT(t.id) FILTER (WHERE t.state = 'RUNNING')    AS running,
-              COUNT(t.id) FILTER (WHERE t.state = 'SLEEPING')   AS sleeping,
-              COUNT(t.id) FILTER (WHERE t.state = 'WAITING')    AS waiting,
-              COUNT(t.id) FILTER (WHERE t.state = 'COMPLETED')  AS completed,
-              COUNT(t.id) FILTER (WHERE t.state = 'FAILED')     AS failed,
-              COUNT(t.id) FILTER (WHERE t.state = 'CANCELLED')  AS cancelled,
-              q.is_paused
+              q.is_paused,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.pending)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS pending,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.running)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS running,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.sleeping)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS sleeping,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.waiting)
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS waiting,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = q.namespace_id AND queue = q.name
+                 AND state = \(TaskState.failed)
+                 AND created_at >= NOW() - INTERVAL '24 hours'
+                 AND (NOT \(rootOnly) OR parent_task_id IS NULL)) AS failed_recent
             FROM strand.queues q
-            -- When rootOnly=true, only join root tasks (parent_task_id IS NULL)
-            -- so the stats bar counts the same population as the task list.
-            LEFT JOIN strand.tasks t ON t.queue = q.name
-                                    AND t.namespace_id = q.namespace_id
-                                    AND (NOT \(rootOnly) OR t.parent_task_id IS NULL)
             WHERE q.name = \(queue) AND q.namespace_id = \(namespaceID)
-            GROUP BY q.name, q.created_at, q.is_paused
             """,
             logger: logger
         )
@@ -759,10 +782,10 @@ package enum ManagementQueries {
                 WHERE namespace_id = \(namespaceID)
                   AND (\(queue)::text IS NULL OR queue = \(queue))
                   AND (
-                        (state = 'COMPLETED'        AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
-                     OR (state = 'CONTINUED_AS_NEW'  AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
-                     OR (state = 'CANCELLED'         AND cancelled_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
-                     OR (state = 'FAILED'            AND created_at   < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                        (state = \(TaskState.completed)      AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = \(TaskState.continuedAsNew)  AND completed_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = \(TaskState.cancelled)       AND cancelled_at < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
+                     OR (state = \(TaskState.failed)          AND created_at   < NOW() - \(effectiveAgeSeconds) * INTERVAL '1 second')
                   )
                   AND (
                       -- Root task — safe to prune independently.
@@ -776,7 +799,7 @@ package enum ManagementQueries {
                       OR EXISTS (
                           SELECT 1 FROM strand.tasks parent
                           WHERE parent.id = t.parent_task_id
-                            AND parent.state IN ('COMPLETED', 'CONTINUED_AS_NEW', 'FAILED', 'CANCELLED')
+                            AND parent.state IN (\(TaskState.completed), \(TaskState.continuedAsNew), \(TaskState.failed), \(TaskState.cancelled))
                       )
                   )
                 LIMIT \(limit)
@@ -941,16 +964,16 @@ extension ManagementQueries {
               name,
               kind,
               COUNT(*)                                                                            AS total,
-              COUNT(*) FILTER (WHERE state = 'RUNNING')                                         AS running,
-              COUNT(*) FILTER (WHERE state IN ('PENDING','SLEEPING','WAITING'))                  AS queued,
-              COUNT(*) FILTER (WHERE state = 'FAILED')                                          AS failed,
+              COUNT(*) FILTER (WHERE state = \(TaskState.running))                                          AS running,
+              COUNT(*) FILTER (WHERE state IN (\(TaskState.pending), \(TaskState.sleeping), \(TaskState.waiting))) AS queued,
+              COUNT(*) FILTER (WHERE state = \(TaskState.failed))                                           AS failed,
               MAX(created_at)                                                                    AS last_seen_at,
               -- Postgres 14+ changed EXTRACT() to return NUMERIC for interval args.
               -- Cast to float8 immediately so AVG(float8) = float8, which
               -- PostgresNIO decodes as Swift Double.
               AVG(
                 EXTRACT(EPOCH FROM (completed_at - created_at))::float8 * 1000
-              ) FILTER (WHERE state = 'COMPLETED' AND completed_at IS NOT NULL)                 AS avg_duration_ms
+              ) FILTER (WHERE state = \(TaskState.completed) AND completed_at IS NOT NULL)      AS avg_duration_ms
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
               AND (\(kind)::text IS NULL OR kind = \(kind))
@@ -1035,7 +1058,9 @@ package struct WorkerTaskRow: Sendable {
     package let taskName: String
     package let kind: TaskKind
     package let queue: String
-    package let taskState: TaskState
+    /// Run-level state (from `strand.runs`). Each retry on the same worker is a
+    /// separate row with its own state — use this, not the task's overall state.
+    package let runState: TaskState
     package let attempt: Int
     package let startedAt: Date?
     package let finishedAt: Date?
@@ -1049,7 +1074,7 @@ extension WorkerTaskRow {
         taskName = try col.next()!.decode(String.self, context: .default)
         kind = try col.next()!.decode(TaskKind.self, context: .default)
         queue = try col.next()!.decode(String.self, context: .default)
-        taskState = try col.next()!.decode(TaskState.self, context: .default)
+        runState = try col.next()!.decode(TaskState.self, context: .default)
         attempt = try col.next()!.decode(Int.self, context: .default)
         startedAt = try col.next()!.decode(Date?.self, context: .default)
         finishedAt = try col.next()!.decode(Date?.self, context: .default)
@@ -1079,7 +1104,7 @@ extension ManagementQueries {
             SELECT
                 DATE_TRUNC('day', created_at) AS date,
                 COUNT(*)::int                                              AS total,
-                COUNT(*) FILTER (WHERE state = 'FAILED')::int             AS failed
+                COUNT(*) FILTER (WHERE state = \(TaskState.failed))::int  AS failed
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
               AND name = \(name)
@@ -1126,15 +1151,24 @@ extension ManagementQueries {
             LEFT JOIN (
               SELECT
                 worker_id,
-                COUNT(*) FILTER (WHERE state IN ('COMPLETED','FAILED','CANCELLED')
-                                   AND finished_at > NOW() - INTERVAL '5 minutes') AS completed_recently,
-                MAX(lease_expires_at) FILTER (WHERE state = 'RUNNING') AS lease_expires_at
-              FROM strand.runs
-              WHERE namespace_id = \(namespaceID)
-                AND worker_id IS NOT NULL
-                AND (state = 'RUNNING'
-                  OR (state IN ('COMPLETED','FAILED','CANCELLED')
-                      AND finished_at > NOW() - INTERVAL '5 minutes'))
+                COUNT(*) FILTER (WHERE state IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))) AS completed_recently,
+                MAX(lease_expires_at) FILTER (WHERE state = \(TaskState.running)) AS lease_expires_at
+              FROM (
+                -- RUNNING arm: strand_runs_worker_idx (namespace_id, worker_id) WHERE state='RUNNING'
+                SELECT worker_id, lease_expires_at, state
+                FROM strand.runs
+                WHERE namespace_id = \(namespaceID)
+                  AND state = \(TaskState.running)
+                  AND worker_id IS NOT NULL
+                UNION ALL
+                -- Recent-terminal arm: strand_runs_finished_idx (namespace_id, finished_at DESC)
+                SELECT worker_id, NULL::timestamptz AS lease_expires_at, state
+                FROM strand.runs
+                WHERE namespace_id = \(namespaceID)
+                  AND state IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                  AND finished_at > NOW() - INTERVAL '5 minutes'
+                  AND worker_id IS NOT NULL
+              ) combined
               GROUP BY worker_id
             ) r ON r.worker_id = w.id
             WHERE w.namespace_id = \(namespaceID)
@@ -1155,59 +1189,72 @@ extension ManagementQueries {
         workerID: String,
         logger: Logger
     ) async throws -> (summary: WorkerRow?, recentTasks: [WorkerTaskRow]) {
-        // Summary — same shape as listWorkers but filtered to one worker.
-        let summaryStream = try await client.query(
-            """
-            SELECT
-              w.id              AS worker_id,
-              w.queue,
-              w.concurrency,
-              w.running         AS running_tasks,
-              COALESCE(r.completed_recently, 0) AS completed_recently,
-              w.started_at,
-              w.updated_at      AS last_seen_at,
-              r.lease_expires_at,
-              w.sdk_version
-            FROM strand.workers w
-            LEFT JOIN (
-              SELECT
-                worker_id,
-                COUNT(*) FILTER (WHERE state IN ('COMPLETED','FAILED','CANCELLED')
-                                   AND finished_at > NOW() - INTERVAL '5 minutes') AS completed_recently,
-                MAX(lease_expires_at) FILTER (WHERE state = 'RUNNING') AS lease_expires_at
-              FROM strand.runs
-              WHERE namespace_id = \(namespaceID)
-                AND worker_id    = \(workerID)
-                AND (state = 'RUNNING'
-                  OR (state IN ('COMPLETED','FAILED','CANCELLED')
-                      AND finished_at > NOW() - INTERVAL '5 minutes'))
-              GROUP BY worker_id
-            ) r ON r.worker_id = w.id
-            WHERE w.namespace_id = \(namespaceID)
-              AND w.id           = \(workerID)
-            """,
-            logger: logger
-        )
-        let summary = try await summaryStream.first(where: { _ in true }).map {
-            try WorkerRow(row: $0)
-        }
+        // Run both queries concurrently — they are fully independent.
+        async let summaryResult: WorkerRow? = {
 
-        // Recent task runs — join tasks so we have name/kind/queue/state.
-        let taskStream = try await client.query(
-            """
-            SELECT t.id, t.name, t.kind, t.queue, t.state,
-                   r.attempt, r.started_at, r.finished_at, r.failure_reason
-            FROM strand.runs r
-            JOIN strand.tasks t ON t.id = r.task_id
-            WHERE r.namespace_id = \(namespaceID)
-              AND r.worker_id    = \(workerID)
-            ORDER BY r.started_at DESC NULLS LAST
-            LIMIT 50
-            """,
-            logger: logger
-        )
-        var tasks: [WorkerTaskRow] = []
-        for try await row in taskStream { tasks.append(try WorkerTaskRow(row: row)) }
+            let stream = try await client.query(
+                """
+                SELECT
+                  w.id              AS worker_id,
+                  w.queue,
+                  w.concurrency,
+                  w.running         AS running_tasks,
+                  COALESCE(r.completed_recently, 0) AS completed_recently,
+                  w.started_at,
+                  w.updated_at      AS last_seen_at,
+                  r.lease_expires_at,
+                  w.sdk_version
+                FROM strand.workers w
+                LEFT JOIN (
+                  SELECT
+                    worker_id,
+                    COUNT(*) FILTER (WHERE state IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))) AS completed_recently,
+                    MAX(lease_expires_at) FILTER (WHERE state = \(TaskState.running)) AS lease_expires_at
+                  FROM (
+                    SELECT worker_id, lease_expires_at, state
+                    FROM strand.runs
+                    WHERE namespace_id = \(namespaceID)
+                      AND state = \(TaskState.running)
+                      AND worker_id    = \(workerID)
+                    UNION ALL
+                    SELECT worker_id, NULL::timestamptz, state
+                    FROM strand.runs
+                    WHERE namespace_id = \(namespaceID)
+                      AND state IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                      AND finished_at > NOW() - INTERVAL '5 minutes'
+                      AND worker_id    = \(workerID)
+                  ) combined
+                  GROUP BY worker_id
+                ) r ON r.worker_id = w.id
+                WHERE w.namespace_id = \(namespaceID)
+                  AND w.id           = \(workerID)
+                """,
+                logger: logger
+            )
+            return try await stream.first(where: { _ in true }).map { try WorkerRow(row: $0) }
+        }()
+
+        // 50 most recent runs for this worker, newest first.
+        async let tasksResult: [WorkerTaskRow] = {
+            let stream = try await client.query(
+                """
+                SELECT t.id, t.name, t.kind, t.queue, r.state,
+                       r.attempt, r.started_at, r.finished_at, r.failure_reason
+                FROM strand.runs r
+                JOIN strand.tasks t ON t.id = r.task_id
+                WHERE r.namespace_id = \(namespaceID)
+                  AND r.worker_id    = \(workerID)
+                ORDER BY r.started_at DESC NULLS LAST
+                LIMIT 50
+                """,
+                logger: logger
+            )
+            var rows: [WorkerTaskRow] = []
+            for try await row in stream { rows.append(try WorkerTaskRow(row: row)) }
+            return rows
+        }()
+
+        let (summary, tasks) = try await (summaryResult, tasksResult)
         return (summary: summary, recentTasks: tasks)
     }
 }
@@ -1226,23 +1273,43 @@ extension ManagementQueries {
         namespaceID: String,
         limit: Int,
         logger: Logger
-    ) async throws -> [(name: String, kind: TaskKind)] {
+    ) async throws -> [(name: String, kind: TaskKind, queue: String)] {
+        // Recursive CTE loose index scan: each step jumps to the next distinct
+        // name via strand_tasks_ns_name_idx instead of scanning all rows.
+        // `queue` is not in the index so each step fetches one heap row —
+        // N_distinct heap fetches total, not N_total.
         let stream = try await client.query(
             """
-            SELECT DISTINCT ON (name) name, kind
-            FROM strand.tasks
-            WHERE namespace_id = \(namespaceID)
-            ORDER BY name, kind
+            WITH RECURSIVE distinct_kinds AS (
+                (SELECT name, kind, queue
+                 FROM strand.tasks
+                 WHERE namespace_id = \(namespaceID)
+                 ORDER BY name, kind
+                 LIMIT 1)
+                UNION ALL
+                SELECT t.name, t.kind, t.queue
+                FROM distinct_kinds d,
+                LATERAL (
+                    SELECT name, kind, queue
+                    FROM strand.tasks
+                    WHERE namespace_id = \(namespaceID)
+                      AND name > d.name
+                    ORDER BY name, kind
+                    LIMIT 1
+                ) t
+            )
+            SELECT name, kind, queue FROM distinct_kinds
             LIMIT \(limit)
             """,
             logger: logger
         )
-        var results: [(name: String, kind: TaskKind)] = []
+        var results: [(name: String, kind: TaskKind, queue: String)] = []
         for try await row in stream {
             var col = row.makeIterator()
             let name = try col.next()!.decode(String.self, context: .default)
             let kind = try col.next()!.decode(TaskKind.self, context: .default)
-            results.append((name: name, kind: kind))
+            let queue = try col.next()!.decode(String.self, context: .default)
+            results.append((name: name, kind: kind, queue: queue))
         }
         return results
     }
@@ -1322,58 +1389,57 @@ extension ManagementQueries {
         let safeLimit = min(max(limit, 1), 500)  // clamp: 1 … 500
         let cutoff = Date(timeIntervalSinceNow: -Double(hours) * 3600)
 
-        let stream = try await client.query(
-            """
-            SELECT
-              name AS task_name,
-              COUNT(*)::integer AS count,
-              PERCENTILE_CONT(0.50) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
-              ) AS p50_ms,
-              PERCENTILE_CONT(0.95) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
-              ) AS p95_ms,
-              PERCENTILE_CONT(0.99) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
-              ) AS p99_ms,
-              MIN(EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000) AS min_ms,
-              MAX(EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000) AS max_ms
-            FROM strand.trace_spans
-            WHERE namespace_id = \(namespaceID)
-              AND kind IN ('WORKFLOW', 'ACTIVITY')
-              AND state = 'COMPLETED'
-              AND started_at IS NOT NULL
-              AND finished_at IS NOT NULL
-              AND finished_at >= \(cutoff)
-            GROUP BY name
-            ORDER BY count DESC
-            LIMIT \(safeLimit)
-            """,
-            logger: logger
-        )
-        var rows: [OLAPLatencyRow] = []
-        for try await row in stream {
-            var col = row.makeIterator()
-            let taskName = try col.next()!.decode(String.self, context: .default)
-            let count = try col.next()!.decode(Int.self, context: .default)
-            let p50 = try col.next()!.decode(Double?.self, context: .default)
-            let p95 = try col.next()!.decode(Double?.self, context: .default)
-            let p99 = try col.next()!.decode(Double?.self, context: .default)
-            let minMs = try col.next()!.decode(Double?.self, context: .default)
-            let maxMs = try col.next()!.decode(Double?.self, context: .default)
-            rows.append(
-                OLAPLatencyRow(
-                    taskName: taskName,
-                    count: count,
-                    p50Ms: p50,
-                    p95Ms: p95,
-                    p99Ms: p99,
-                    minMs: minMs,
-                    maxMs: maxMs
-                )
+        return try await client.withTransaction(logger: logger) { conn in
+            // PERCENTILE_CONT × 3 over ~52 k rows triggers an external-merge disk sort
+            // at the default work_mem. SET LOCAL keeps this to the current transaction.
+            try await conn.query("SET LOCAL work_mem = '32MB'", logger: logger)
+            let stream = try await conn.query(
+                """
+                SELECT
+                  name AS task_name,
+                  COUNT(*)::integer AS count,
+                  PERCENTILE_CONT(0.50) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                  ) AS p50_ms,
+                  PERCENTILE_CONT(0.95) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                  ) AS p95_ms,
+                  PERCENTILE_CONT(0.99) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000
+                  ) AS p99_ms,
+                  MIN(EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000) AS min_ms,
+                  MAX(EXTRACT(EPOCH FROM (finished_at - started_at))::double precision * 1000) AS max_ms
+                FROM strand.trace_spans
+                WHERE namespace_id = \(namespaceID)
+                  AND kind IN ('WORKFLOW', 'ACTIVITY')
+                  AND state = 'COMPLETED'
+                  AND started_at IS NOT NULL
+                  AND finished_at IS NOT NULL
+                  AND finished_at >= \(cutoff)
+                GROUP BY name
+                ORDER BY count DESC
+                LIMIT \(safeLimit)
+                """,
+                logger: logger
             )
+            var rows: [OLAPLatencyRow] = []
+            for try await row in stream {
+                var col = row.makeIterator()
+                let taskName = try col.next()!.decode(String.self, context: .default)
+                let count = try col.next()!.decode(Int.self, context: .default)
+                let p50 = try col.next()!.decode(Double?.self, context: .default)
+                let p95 = try col.next()!.decode(Double?.self, context: .default)
+                let p99 = try col.next()!.decode(Double?.self, context: .default)
+                let minMs = try col.next()!.decode(Double?.self, context: .default)
+                let maxMs = try col.next()!.decode(Double?.self, context: .default)
+                rows.append(OLAPLatencyRow(
+                    taskName: taskName, count: count,
+                    p50Ms: p50, p95Ms: p95, p99Ms: p99,
+                    minMs: minMs, maxMs: maxMs
+                ))
+            }
+            return rows
         }
-        return rows
     }
 
     /// Time-bucketed p50/p95 latency from `strand.trace_spans`.
@@ -1481,17 +1547,189 @@ extension ManagementQueries {
                     """
             }
         }
-        let stream = try await client.query(query, logger: logger)
-        var rows: [OLAPBucketRow] = []
-        for try await row in stream {
-            var col = row.makeIterator()
-            let bucket = try col.next()!.decode(Date.self, context: .default)
-            let name = try col.next()!.decode(String.self, context: .default)
-            let count = try col.next()!.decode(Int.self, context: .default)
-            let p50 = try col.next()!.decode(Double?.self, context: .default)
-            let p95 = try col.next()!.decode(Double?.self, context: .default)
-            rows.append(OLAPBucketRow(bucket: bucket, taskName: name, count: count, p50Ms: p50, p95Ms: p95))
+        return try await client.withTransaction(logger: logger) { conn in
+            try await conn.query("SET LOCAL work_mem = '32MB'", logger: logger)
+            let stream = try await conn.query(query, logger: logger)
+            var rows: [OLAPBucketRow] = []
+            for try await row in stream {
+                var col = row.makeIterator()
+                let bucket = try col.next()!.decode(Date.self, context: .default)
+                let name = try col.next()!.decode(String.self, context: .default)
+                let count = try col.next()!.decode(Int.self, context: .default)
+                let p50 = try col.next()!.decode(Double?.self, context: .default)
+                let p95 = try col.next()!.decode(Double?.self, context: .default)
+                rows.append(OLAPBucketRow(bucket: bucket, taskName: name, count: count, p50Ms: p50, p95Ms: p95))
+            }
+            return rows
         }
-        return rows
+    }
+}
+
+// MARK: - Metrics summary queries
+
+/// Simple (bucket: Date, count: Int) pair returned by throughput and error-rate queries.
+package struct MetricsThroughputBucket: Sendable {
+    package let bucket: Date
+    package let count: Int
+}
+
+extension ManagementQueries {
+
+    /// Terminal task counts (COMPLETED / FAILED / CANCELLED) for the given time window.
+    /// Used by `GET /api/:namespace/metrics` — designed to run concurrently with
+    /// `metricsThroughput` and `metricsErrorRate` via `async let`.
+    ///
+    /// `avg_ms` is intentionally absent — the DDSketch broadcast provides a more
+    /// accurate weighted estimate when warm; the DB average requires a full heap
+    /// scan of COMPLETED rows to fetch `created_at`, which is not in the index.
+    package static func metricsSummary(
+        on client: PostgresClient,
+        namespaceID: String,
+        since cutoff: Date,
+        logger: Logger
+    ) async throws -> (completed: Int, failed: Int, cancelled: Int) {
+        let stream = try await client.query(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = \(namespaceID)
+                 AND state = \(TaskState.completed)
+                 AND completed_at >= \(cutoff)) AS completed,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = \(namespaceID)
+                 AND state = \(TaskState.failed)
+                 AND created_at >= \(cutoff)) AS failed,
+              (SELECT COUNT(*) FROM strand.tasks
+               WHERE namespace_id = \(namespaceID)
+                 AND state = \(TaskState.cancelled)
+                 AND cancelled_at >= \(cutoff)) AS cancelled
+            """,
+            logger: logger
+        )
+        guard let row = try await stream.first(where: { _ in true }) else {
+            return (0, 0, 0)
+        }
+        var col = row.makeIterator()
+        let completed = try col.next()!.decode(Int.self, context: .default)
+        let failed    = try col.next()!.decode(Int.self, context: .default)
+        let cancelled = try col.next()!.decode(Int.self, context: .default)
+        return (completed, failed, cancelled)
+    }
+
+    /// Completed-task counts bucketed by hour (`useDaily = false`) or day (`useDaily = true`).
+    ///
+    /// Uses `generate_series` + correlated subqueries against
+    /// `strand_tasks_throughput_hour_idx` / `strand_tasks_throughput_day_idx`.
+    /// One index equality scan per calendar bucket; always emits every bucket
+    /// including zero-count ones (no gaps in chart output).
+    package static func metricsThroughput(
+        on client: PostgresClient,
+        namespaceID: String,
+        since cutoff: Date,
+        useDaily: Bool,
+        logger: Logger
+    ) async throws -> [MetricsThroughputBucket] {
+
+        func decode(_ stream: PostgresRowSequence) async throws -> [MetricsThroughputBucket] {
+            var rows: [MetricsThroughputBucket] = []
+            for try await row in stream {
+                var col = row.makeIterator()
+                let bucket = try col.next()!.decode(Date.self, context: .default)
+                let count  = try col.next()!.decode(Int.self,  context: .default)
+                rows.append(MetricsThroughputBucket(bucket: bucket, count: count))
+            }
+            return rows
+        }
+        if useDaily {
+            // Daily buckets via strand_tasks_throughput_day_idx.
+            return try await decode(client.query(
+                """
+                SELECT
+                    gs AS bucket,
+                    (SELECT COUNT(*)
+                     FROM strand.tasks
+                     WHERE namespace_id = \(namespaceID)
+                       AND state = \(TaskState.completed)
+                       AND date_trunc('day', completed_at, 'UTC') = gs
+                       AND completed_at >= \(cutoff)
+                    ) AS cnt
+                FROM generate_series(
+                    date_trunc('day', \(cutoff), 'UTC'),
+                    date_trunc('day', NOW(), 'UTC'),
+                    INTERVAL '1 day'
+                ) AS gs
+                ORDER BY gs
+                """,
+                logger: logger
+            ))
+        } else {
+            // Hourly buckets via strand_tasks_throughput_hour_idx.
+            return try await decode(client.query(
+                """
+                SELECT
+                    gs AS bucket,
+                    (SELECT COUNT(*)
+                     FROM strand.tasks
+                     WHERE namespace_id = \(namespaceID)
+                       AND state = \(TaskState.completed)
+                       AND date_trunc('hour', completed_at, 'UTC') = gs
+                       AND completed_at >= \(cutoff)
+                    ) AS cnt
+                FROM generate_series(
+                    date_trunc('hour', \(cutoff), 'UTC'),
+                    date_trunc('hour', NOW(), 'UTC'),
+                    INTERVAL '1 hour'
+                ) AS gs
+                ORDER BY gs
+                """,
+                logger: logger
+            ))
+        }
+    }
+
+    /// Failed-task counts bucketed by hour or day.
+    /// Uses `strand_tasks_failed_idx` — fast because FAILED tasks are typically few.
+    package static func metricsErrorRate(
+        on client: PostgresClient,
+        namespaceID: String,
+        since cutoff: Date,
+        useDaily: Bool,
+        logger: Logger
+    ) async throws -> [MetricsThroughputBucket] {
+        func decode(_ stream: PostgresRowSequence) async throws -> [MetricsThroughputBucket] {
+            var rows: [MetricsThroughputBucket] = []
+            for try await row in stream {
+                var col = row.makeIterator()
+                let bucket = try col.next()!.decode(Date.self, context: .default)
+                let count  = try col.next()!.decode(Int.self,  context: .default)
+                rows.append(MetricsThroughputBucket(bucket: bucket, count: count))
+            }
+            return rows
+        }
+        if useDaily {
+            return try await decode(client.query(
+                """
+                SELECT date_trunc('day', created_at) AS bucket, COUNT(*) AS cnt
+                FROM strand.tasks
+                WHERE namespace_id = \(namespaceID)
+                  AND state = \(TaskState.failed)
+                  AND created_at >= \(cutoff)
+                GROUP BY 1 ORDER BY 1
+                """,
+                logger: logger
+            ))
+        } else {
+            return try await decode(client.query(
+                """
+                SELECT date_trunc('hour', created_at) AS bucket, COUNT(*) AS cnt
+                FROM strand.tasks
+                WHERE namespace_id = \(namespaceID)
+                  AND state = \(TaskState.failed)
+                  AND created_at >= \(cutoff)
+                GROUP BY 1 ORDER BY 1
+                """,
+                logger: logger
+            ))
+        }
     }
 }

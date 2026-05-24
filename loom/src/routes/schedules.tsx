@@ -1,6 +1,13 @@
 import { useState } from "react";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { Search } from "lucide-react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+    useQuery,
+    useMutation,
+    useQueryClient,
+    keepPreviousData,
+} from "@tanstack/react-query";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams } from "@tanstack/react-router";
 import {
@@ -32,6 +39,7 @@ export function SchedulesPage() {
         afterName: string;
     } | null>(null);
     const [allSchedules, setAllSchedules] = useState<ScheduleEntry[]>([]);
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
     const [query, setQuery] = useState("");
     const PAGE_SIZE = 200;
 
@@ -47,7 +55,8 @@ export function SchedulesPage() {
                 afterQueue: cursor?.afterQueue,
                 afterName: cursor?.afterName,
             }),
-        refetchInterval: cursor ? false : 30_000,
+        refetchInterval: cursor ? false : intervalMs,
+        placeholderData: keepPreviousData,
     });
 
     // Append new pages to the accumulated list
@@ -79,9 +88,17 @@ export function SchedulesPage() {
 
     return (
         <div className="px-6 py-5">
-            <h1 className="text-base font-semibold text-foreground mb-4">
-                Schedules
-            </h1>
+            <div className="flex items-center justify-between mb-4">
+                <div>
+                    <h1 className="text-base font-semibold text-foreground">
+                        Schedules
+                    </h1>
+                </div>
+                <AutoRefreshControl
+                    intervalMs={intervalMs}
+                    setIntervalMs={setIntervalMs}
+                />
+            </div>
 
             {isLoading && (
                 <p className="text-sm text-muted-foreground">Loading…</p>

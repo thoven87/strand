@@ -557,6 +557,16 @@ extension Activity {
     public static var defaultMaxAttempts: Int? { nil }
     public static var defaultTimeout: Duration? { nil }
 
+    /// Auto-generated idempotency key used by `StrandClient.enqueueActivity`
+    /// when `ActivityOptions.id` is not supplied.
+    ///
+    /// Format: `"<ActivityName>-<epochMs>"` —
+    /// e.g. `"ChargeCardActivity-1746218580123"`.
+    static func generateActivityID() -> String {
+        let ms = Int(Date.now.timeIntervalSince1970 * 1000)
+        return "\(name)-\(ms)"
+    }
+
 }
 
 extension Activity {

@@ -1,6 +1,8 @@
 import { useState, useMemo } from "react";
 import { usePageTitle } from "@/lib/usePageTitle";
-import { useQuery } from "@tanstack/react-query";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import {
     Link,
     useNavigate,
@@ -47,9 +49,7 @@ const ZERO_STATS: QueueStats = {
     running: 0,
     sleeping: 0,
     waiting: 0,
-    completed: 0,
-    failed: 0,
-    cancelled: 0,
+    failedRecent: 0,
 };
 
 // ── sub-components ─────────────────────────────────────────────────────────
@@ -88,43 +88,51 @@ const KINDS: { label: string; value: TaskKind | undefined }[] = [
 ];
 
 // State config: label, count key, accent colour classes for the count badge
-const STATE_CONFIG = [
+// countKey maps a filter state to the matching field on QueueStats.
+// COMPLETED and CANCELLED are null because they were removed from QueueStats
+// (counting all-time terminal tasks requires a full table scan).
+// The filter pills still work for those states; they just show no live count.
+const STATE_CONFIG: ReadonlyArray<{
+    state: string;
+    countKey: keyof import("@/api/types").QueueStats | null;
+    accent: string;
+}> = [
     {
         state: "RUNNING",
-        countKey: "running" as const,
+        countKey: "running",
         accent: "bg-yellow-500/20 text-yellow-300",
     },
     {
         state: "PENDING",
-        countKey: "pending" as const,
+        countKey: "pending",
         accent: "bg-blue-500/15   text-blue-400",
     },
     {
         state: "SLEEPING",
-        countKey: "sleeping" as const,
+        countKey: "sleeping",
         accent: "bg-slate-500/20  text-slate-300",
     },
     {
         state: "WAITING",
-        countKey: "waiting" as const,
+        countKey: "waiting",
         accent: "bg-violet-500/20 text-violet-300",
     },
     {
         state: "COMPLETED",
-        countKey: "completed" as const,
+        countKey: null,
         accent: "bg-green-500/15  text-green-400",
     },
     {
         state: "FAILED",
-        countKey: "failed" as const,
+        countKey: "failedRecent",
         accent: "bg-red-500/20    text-red-400",
     },
     {
         state: "CANCELLED",
-        countKey: "cancelled" as const,
+        countKey: null,
         accent: "bg-slate-500/15  text-slate-400",
     },
-] as const;
+];
 
 function StatePill({
     label,
@@ -209,6 +217,7 @@ export function RunsPage() {
     const [cursor, setCursor] = useState<string | undefined>(undefined);
     const [history, setHistory] = useState<string[]>([]);
     const [rootOnly, setRootOnly] = useState(true); // default true: hides child activities
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
 
     function setFilters(updates: Record<string, string | undefined>) {
         setCursor(undefined);
@@ -254,7 +263,7 @@ export function RunsPage() {
         queryKey: [...qk.queues.list(namespace), rootOnly],
         queryFn: () =>
             getQueues(namespace, { rootOnly: rootOnly || undefined }),
-        refetchInterval: 10_000,
+        refetchInterval: intervalMs,
     });
 
     const { data, isLoading, error } = useQuery({
@@ -278,16 +287,22 @@ export function RunsPage() {
                 cursor,
                 limit: 50,
             }),
-        refetchInterval: (q) => {
-            const items = q.state.data?.items;
-            const hasActive = items?.some(
-                (t) =>
-                    t.state === "RUNNING" ||
-                    t.state === "PENDING" ||
-                    t.state === "SLEEPING",
-            );
-            return hasActive ? 4_000 : 15_000;
-        },
+        placeholderData: keepPreviousData,
+        refetchInterval:
+            intervalMs === false
+                ? false
+                : (q) => {
+                      const items = q.state.data?.items;
+                      const hasActive = items?.some(
+                          (t) =>
+                              t.state === "RUNNING" ||
+                              t.state === "PENDING" ||
+                              t.state === "SLEEPING",
+                      );
+                      return hasActive
+                          ? Math.min(intervalMs, 4_000)
+                          : intervalMs;
+                  },
     });
 
     // ── Derive per-state counts from queue stats ────────────────────────────
@@ -304,9 +319,7 @@ export function RunsPage() {
                 running: acc.running + q.stats.running,
                 sleeping: acc.sleeping + q.stats.sleeping,
                 waiting: acc.waiting + q.stats.waiting,
-                completed: acc.completed + q.stats.completed,
-                failed: acc.failed + q.stats.failed,
-                cancelled: acc.cancelled + q.stats.cancelled,
+                failedRecent: acc.failedRecent + q.stats.failedRecent,
             }),
             { ...ZERO_STATS },
         );
@@ -365,6 +378,11 @@ export function RunsPage() {
                         </option>
                     ))}
                 </Select>
+
+                <AutoRefreshControl
+                    intervalMs={intervalMs}
+                    setIntervalMs={setIntervalMs}
+                />
             </div>
 
             {/* ── Filter bar: kind pills + state-count badges ───────────────── */}
@@ -395,7 +413,7 @@ export function RunsPage() {
                     <StatePill
                         key={state}
                         label={state}
-                        count={stateCounts[countKey]}
+                        count={countKey != null ? stateCounts[countKey] : 0}
                         active={stateFilter === state}
                         accent={accent}
                         onClick={() =>

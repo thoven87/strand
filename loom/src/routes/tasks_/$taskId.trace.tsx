@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { usePageTitle } from "@/lib/usePageTitle";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+    useQuery,
+    useMutation,
+    useQueryClient,
+    keepPreviousData,
+} from "@tanstack/react-query";
 import {
     Link,
     useNavigate,
@@ -14,6 +19,8 @@ import { StatusBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RelativeTime } from "@/components/RelativeTime";
 import { qk } from "@/lib/queryKeys";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { ArrowLeft, RefreshCw, XCircle, GitBranch } from "lucide-react";
 import type { RetryOptions, TaskState } from "@/api/types";
 
@@ -35,6 +42,7 @@ export function TaskTracePage() {
     const search = useSearch({ strict: false }) as { queue?: string };
     const queue = search.queue ?? "";
     const qc = useQueryClient();
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
 
     // Fetch task metadata for the header bar.
     const { data: task } = useQuery({
@@ -42,7 +50,7 @@ export function TaskTracePage() {
         queryFn: () => getTask(namespace, queue, taskId),
         refetchInterval: (q) => {
             const d = q.state.data;
-            return d && isTerminal(d.state) ? false : 3_000;
+            return d && isTerminal(d.state) ? intervalMs : 3_000;
         },
     });
     usePageTitle(`Trace · ${task?.name ?? "\u2026"}`);
@@ -51,7 +59,8 @@ export function TaskTracePage() {
     const { data: traceSpans, isLoading: traceLoading } = useQuery({
         queryKey: qk.tasks.trace(namespace, taskId),
         queryFn: () => getTaskTrace(namespace, taskId),
-        refetchInterval: task && isTerminal(task.state) ? false : 5_000,
+        refetchInterval: task && isTerminal(task.state) ? intervalMs : 5_000,
+        placeholderData: keepPreviousData,
     });
 
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
@@ -150,6 +159,10 @@ export function TaskTracePage() {
 
                 {/* Actions pushed to the right */}
                 <div className="ml-auto flex items-center gap-2 shrink-0">
+                    <AutoRefreshControl
+                        intervalMs={intervalMs}
+                        setIntervalMs={setIntervalMs}
+                    />
                     {task && !terminal && (
                         <Button
                             variant="outline"

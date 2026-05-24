@@ -26,6 +26,9 @@ struct QueueResponse: Codable, Sendable {
     let createdAt: Date
     let isPaused: Bool
     let stats: StatsBody
+    /// Completed+failed tasks per second in the most recent broadcast cycle.
+    /// `nil` when the broadcast cache is cold or no `AggregatedMetricsBuffer` is wired.
+    let throughputPerSec: Double?
 
     struct StatsBody: Codable, Sendable {
         let pending: Int
@@ -34,23 +37,22 @@ struct QueueResponse: Codable, Sendable {
         let sleeping: Int
         /// Workflows suspended waiting for an activity, child workflow, or named event.
         let waiting: Int
-        let completed: Int
-        let failed: Int
-        let cancelled: Int
+        /// Tasks that failed in the last 24 hours.
+        let failedRecent: Int
+        // COMPLETED and CANCELLED omitted — terminal states are not live counts.
     }
 
-    init(from row: QueueStatsRow) {
+    init(from row: QueueStatsRow, throughputPerSec: Double? = nil) {
         name = row.name
         createdAt = row.createdAt
         isPaused = row.isPaused
+        self.throughputPerSec = throughputPerSec
         stats = StatsBody(
             pending: row.pending,
             running: row.running,
             sleeping: row.sleeping,
             waiting: row.waiting,
-            completed: row.completed,
-            failed: row.failed,
-            cancelled: row.cancelled
+            failedRecent: row.failedRecent
         )
     }
 }
@@ -388,6 +390,9 @@ struct WorkerTaskResponse: Codable, Sendable {
     let taskName: String
     let kind: String
     let queue: String
+    /// Run-level state for this specific attempt (from `strand.runs`).
+    /// A task with N retries on the same worker appears as N rows; each row
+    /// carries the state of that run, not the task's overall current state.
     let state: String
     let attempt: Int
     let startedAt: Date?
@@ -400,7 +405,7 @@ struct WorkerTaskResponse: Codable, Sendable {
         taskName = row.taskName
         kind = row.kind.rawValue
         queue = row.queue
-        state = row.taskState.rawValue
+        state = row.runState.rawValue   // run-level, not task-level
         attempt = row.attempt
         startedAt = row.startedAt
         finishedAt = row.finishedAt

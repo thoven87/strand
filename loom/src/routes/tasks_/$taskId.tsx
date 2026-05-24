@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { usePageTitle } from "@/lib/usePageTitle";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+    useQuery,
+    useMutation,
+    useQueryClient,
+    keepPreviousData,
+} from "@tanstack/react-query";
 import {
     Link,
     useNavigate,
@@ -25,6 +30,8 @@ import {
 } from "@/api/workflows";
 
 import { qk } from "@/lib/queryKeys";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { StatusBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RelativeTime } from "@/components/RelativeTime";
@@ -1010,6 +1017,7 @@ export function TaskDetailPage() {
     const prevId = search.prevId;
     const nextId = search.nextId;
     const qc = useQueryClient();
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
 
     const {
         data: task,
@@ -1020,15 +1028,18 @@ export function TaskDetailPage() {
         queryFn: () => getTask(namespace, queue, taskId),
         refetchInterval: (q) => {
             const d = q.state.data;
-            return d && isTerminal(d.state) ? false : 3_000;
+            // While active: always poll fast (3s) regardless of user preference
+            // While terminal: honour the user's interval (may be "off")
+            return d && isTerminal(d.state) ? intervalMs : 3_000;
         },
+        placeholderData: keepPreviousData,
     });
     usePageTitle(task?.name ?? "Task");
 
     const { data: runs = [] } = useQuery({
         queryKey: qk.runs.list(namespace, queue, taskId),
         queryFn: () => getRuns(namespace, queue, taskId),
-        refetchInterval: task && isTerminal(task.state) ? false : 3_000,
+        refetchInterval: task && isTerminal(task.state) ? intervalMs : 3_000,
     });
 
     // Event trigger — set when this task was woken from a waitForEvent suspension
@@ -1277,6 +1288,10 @@ export function TaskDetailPage() {
 
                 {/* Actions */}
                 <div className="flex items-center gap-2 flex-wrap shrink-0">
+                    <AutoRefreshControl
+                        intervalMs={intervalMs}
+                        setIntervalMs={setIntervalMs}
+                    />
                     {isWorkflow && (
                         <Link
                             to="/$namespace/tasks/$taskId/trace"

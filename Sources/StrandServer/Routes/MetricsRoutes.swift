@@ -122,119 +122,29 @@ struct MetricsRoutes {
                 }
             }
 
-            // ── Terminal counts + avg duration (last 24 h) ──────────────────────────
-            //
-            // Always queried from the DB: the 24 h window is bounded and each
-            // state uses its own partial index so these are fast regardless of
-            // total table size:
-            //   COMPLETED → completed_at  strand_tasks_completed_at_idx
-            //   FAILED    → created_at    strand_tasks_failed_idx
-            //   CANCELLED → cancelled_at  strand_tasks_cancelled_at_idx
-            let summaryStream = try await self.postgres.query(
-                """
-                SELECT
-                  (SELECT COUNT(*) FROM strand.tasks
-                   WHERE namespace_id = \(ns)
-                     AND state = 'COMPLETED'
-                     AND completed_at >= \(cutoff)) AS completed,
+            // ── Terminal counts + hourly charts — three concurrent DB queries ─────────────
+            async let summaryTask = ManagementQueries.metricsSummary(
+                on: self.postgres, namespaceID: ns, since: cutoff, logger: self.logger)
+            async let throughputTask = ManagementQueries.metricsThroughput(
+                on: self.postgres, namespaceID: ns, since: cutoff, useDaily: useDaily,
+                logger: self.logger)
+            async let errorTask = ManagementQueries.metricsErrorRate(
+                on: self.postgres, namespaceID: ns, since: cutoff, useDaily: useDaily,
+                logger: self.logger)
 
-                  (SELECT COUNT(*) FROM strand.tasks
-                   WHERE namespace_id = \(ns)
-                     AND state = 'FAILED'
-                     AND created_at >= \(cutoff)) AS failed,
+            let (summaryTuple, throughputBuckets, errorBuckets) =
+                try await (summaryTask, throughputTask, errorTask)
 
-                  (SELECT COUNT(*) FROM strand.tasks
-                   WHERE namespace_id = \(ns)
-                     AND state = 'CANCELLED'
-                     AND cancelled_at >= \(cutoff)) AS cancelled,
-
-                  (SELECT AVG(EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)::bigint
-                   FROM strand.tasks
-                   WHERE namespace_id = \(ns)
-                     AND state = 'COMPLETED'
-                     AND completed_at >= \(cutoff)) AS avg_ms
-                """,
-                logger: self.logger
-            )
-
-            var completed = 0
-            var failed = 0
-            var cancelled = 0
+            let completed  = summaryTuple.completed
+            let failed     = summaryTuple.failed
+            let cancelled  = summaryTuple.cancelled
             var avgDurationMs: Int? = nil
-            if let row = try await summaryStream.first(where: { _ in true }) {
-                var col = row.makeIterator()
-                completed = try col.next()!.decode(Int.self, context: .default)
-                failed = try col.next()!.decode(Int.self, context: .default)
-                cancelled = try col.next()!.decode(Int.self, context: .default)
-                avgDurationMs = try col.next()!.decode(Int?.self, context: .default)
-            }
 
-            // ── Hourly throughput (completed tasks) ───────────────────────────────────────
-            //
-            // Bucket by completed_at (not created_at) so the partial index is
-            // usable and so the bucket represents when tasks *finished*, not
-            // when they were enqueued.
-            let throughputQuery: PostgresQuery
-            if useDaily {
-                throughputQuery = """
-                    SELECT date_trunc('day', completed_at) AS bucket, COUNT(*) AS cnt
-                    FROM strand.tasks
-                    WHERE namespace_id = \(ns)
-                      AND state = 'COMPLETED'
-                      AND completed_at >= \(cutoff)
-                    GROUP BY 1 ORDER BY 1
-                    """
-            } else {
-                throughputQuery = """
-                    SELECT date_trunc('hour', completed_at) AS bucket, COUNT(*) AS cnt
-                    FROM strand.tasks
-                    WHERE namespace_id = \(ns)
-                      AND state = 'COMPLETED'
-                      AND completed_at >= \(cutoff)
-                    GROUP BY 1 ORDER BY 1
-                    """
+            let throughput = throughputBuckets.map {
+                MetricsResponse.Bucket(hour: $0.bucket.ISO8601Format(), count: $0.count)
             }
-            let throughputStream = try await self.postgres.query(throughputQuery, logger: self.logger)
-            var throughput: [MetricsResponse.Bucket] = []
-            for try await row in throughputStream {
-                var col = row.makeIterator()
-                let hour = try col.next()!.decode(Date.self, context: .default)
-                let cnt = try col.next()!.decode(Int.self, context: .default)
-                throughput.append(.init(hour: hour.ISO8601Format(), count: cnt))
-            }
-
-            // ── Hourly error rate (failed tasks) ────────────────────────────────────────────
-            //
-            // FAILED tasks have no failed_at column so created_at is used;
-            // strand_tasks_failed_idx covers (namespace_id, queue, created_at DESC)
-            // WHERE state = 'FAILED' so this is index-bound.
-            let errorQuery: PostgresQuery
-            if useDaily {
-                errorQuery = """
-                    SELECT date_trunc('day', created_at) AS bucket, COUNT(*) AS cnt
-                    FROM strand.tasks
-                    WHERE namespace_id = \(ns)
-                      AND state = 'FAILED'
-                      AND created_at >= \(cutoff)
-                    GROUP BY 1 ORDER BY 1
-                    """
-            } else {
-                errorQuery = """
-                    SELECT date_trunc('hour', created_at) AS bucket, COUNT(*) AS cnt
-                    FROM strand.tasks
-                    WHERE namespace_id = \(ns)
-                      AND state = 'FAILED'
-                      AND created_at >= \(cutoff)
-                    GROUP BY 1 ORDER BY 1
-                    """
-            }
-            let errorStream = try await self.postgres.query(errorQuery, logger: self.logger)
-            var errors: [MetricsResponse.Bucket] = []
-            for try await row in errorStream {
-                var col = row.makeIterator()
-                let hour = try col.next()!.decode(Date.self, context: .default)
-                let cnt = try col.next()!.decode(Int.self, context: .default)
-                errors.append(.init(hour: hour.ISO8601Format(), count: cnt))
+            let errors = errorBuckets.map {
+                MetricsResponse.Bucket(hour: $0.bucket.ISO8601Format(), count: $0.count)
             }
 
             // ── DDSketch percentiles ────────────────────────────────────────────────────────

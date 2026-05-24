@@ -1,4 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams } from "@tanstack/react-router";
 import { api } from "@/api/client";
@@ -21,6 +23,7 @@ interface Worker {
 export function WorkersPage() {
     usePageTitle("Workers");
     const { namespace } = useParams({ strict: false }) as { namespace: string };
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
     const { data: workers = [], isLoading } = useQuery({
         queryKey: ["workers", namespace],
         queryFn: () =>
@@ -28,17 +31,26 @@ export function WorkersPage() {
                 .get<Worker[]>(`/api/${namespace}/workers`)
                 .then((r) => r.data)
                 .catch(() => [] as Worker[]),
-        refetchInterval: 5_000,
+        refetchInterval: intervalMs,
+        placeholderData: keepPreviousData,
     });
 
     return (
         <div className="px-6 py-5">
-            <h1 className="text-base font-semibold text-foreground mb-1">
-                Workers
-            </h1>
-            <p className="text-xs text-muted-foreground mb-4">
-                Workers active in the last 5 minutes. Refreshes every 5 s.
-            </p>
+            <div className="flex items-center justify-between mb-4">
+                <div>
+                    <h1 className="text-base font-semibold text-foreground">
+                        Workers
+                    </h1>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                        Workers active in the last 5 minutes.
+                    </p>
+                </div>
+                <AutoRefreshControl
+                    intervalMs={intervalMs}
+                    setIntervalMs={setIntervalMs}
+                />
+            </div>
 
             {isLoading && (
                 <p className="text-sm text-muted-foreground">Loading…</p>
