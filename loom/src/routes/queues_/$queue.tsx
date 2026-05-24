@@ -35,21 +35,7 @@ const STATE_CONFIG = [
         key: "waiting" as const,
         accent: "bg-violet-500/20 text-violet-300",
     },
-    {
-        state: "COMPLETED",
-        key: "completed" as const,
-        accent: "bg-green-500/15  text-green-400",
-    },
-    {
-        state: "FAILED",
-        key: "failed" as const,
-        accent: "bg-red-500/20    text-red-400",
-    },
-    {
-        state: "CANCELLED",
-        key: "cancelled" as const,
-        accent: "bg-slate-500/15  text-slate-400",
-    },
+    // COMPLETED and CANCELLED omitted from queue stats — not live counts.
 ] as const;
 
 function StatePill({
@@ -90,16 +76,13 @@ function StatePill({
 
 function QueueBar({ stats }: { stats: Queue["stats"] }) {
     const total =
-        stats.pending +
-        stats.running +
-        stats.sleeping +
-        stats.completed +
-        stats.failed +
-        stats.cancelled;
+        stats.pending + stats.running + stats.sleeping + stats.waiting;
 
     if (total === 0)
         return (
-            <span className="text-xs text-muted-foreground">No tasks yet</span>
+            <span className="text-xs text-muted-foreground">
+                No active tasks
+            </span>
         );
 
     const segments = [
@@ -107,9 +90,6 @@ function QueueBar({ stats }: { stats: Queue["stats"] }) {
         { count: stats.pending, cls: "bg-blue-400" },
         { count: stats.sleeping, cls: "bg-indigo-400" },
         { count: stats.waiting, cls: "bg-violet-400" },
-        { count: stats.failed, cls: "bg-red-400" },
-        { count: stats.cancelled, cls: "bg-orange-400" },
-        { count: stats.completed, cls: "bg-green-400" },
     ].filter((s) => s.count > 0);
 
     // Legend is intentionally omitted — the StatePill filter bar below shows

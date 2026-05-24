@@ -822,7 +822,7 @@ enum Queries {
                     worker_id  = \(workerID),
                     attempt    = c.attempt
                 FROM claimed c
-                WHERE strand.trace_spans.id = c.task_id::text
+                WHERE strand.trace_spans.id = UPPER(c.task_id::text)
             )
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,

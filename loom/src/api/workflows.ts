@@ -122,6 +122,7 @@ export const getTaskDefinitionActivity = (
 export interface TaskKindEntry {
     name: string;
     kind: "WORKFLOW" | "ACTIVITY";
+    queue: string;
 }
 
 export const getTaskKinds = (

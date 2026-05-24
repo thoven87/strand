@@ -15,6 +15,7 @@ interface WorkerTask {
     taskName: string;
     kind: string;
     queue: string;
+    /** Run-level state (from strand.runs) — each retry is a separate row. */
     state: string;
     attempt: number;
     startedAt: string | null;
@@ -166,23 +167,58 @@ export function WorkerDetailPage() {
 
     const { data, isLoading, error } = useQuery({
         queryKey: ["worker-detail", namespace, workerID],
+        // 204 No Content means the worker is no longer active. Hummingbird returns
+        // 204 for nil optional responses; Axios sets r.data = "" (empty string).
+        // Normalise to null here so TanStack Query stores null, not "", and
+        // null?.recentTasks chains safely short-circuit instead of crashing.
         queryFn: () =>
             api
                 .get<WorkerDetail | null>(
                     `/api/${namespace}/workers/${encodeURIComponent(workerID)}`,
                 )
-                .then((r) => r.data),
+                .then((r) =>
+                    r.status === 204 || !r.data || typeof r.data !== "object"
+                        ? null
+                        : r.data,
+                ),
         refetchInterval: 5_000,
     });
 
-    const activeTasks =
-        data?.recentTasks.filter((t) => t.state === "RUNNING") ?? [];
-    const recentTasks =
-        data?.recentTasks.filter((t) => t.state !== "RUNNING") ?? [];
+    // null means the server returned 204 — worker is gone, not an error.
+    const isGone = !isLoading && data === null;
+
+    const activeTasks = (data?.recentTasks ?? []).filter(
+        (t) => t.state === "RUNNING",
+    );
+    const recentTasks = (data?.recentTasks ?? []).filter(
+        (t) => t.state !== "RUNNING",
+    );
+
+    if (isGone) {
+        return (
+            <div className="px-6 py-16 flex flex-col items-center gap-3 text-center">
+                <Server size={32} className="text-muted-foreground/40" />
+                <p className="text-sm font-medium text-foreground">
+                    Worker no longer active
+                </p>
+                <p className="text-xs text-muted-foreground max-w-xs">
+                    <span className="font-mono">{shortName}</span> has stopped
+                    or restarted. It will reappear when it reconnects.
+                </p>
+                <Link
+                    to="/$namespace/workers"
+                    params={{ namespace }}
+                    className="mt-2 text-xs text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+                >
+                    Back to Workers
+                </Link>
+            </div>
+        );
+    }
 
     return (
         <div className="px-6 py-5 space-y-5">
-            {/* ── Header ──────────────────────────────────────────────────────── */}
+            {/* ── Header ────────────────────────────────────────────────────────────────── */}
             <div>
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2 font-mono">
                     <Link
@@ -238,19 +274,8 @@ export function WorkerDetailPage() {
             {isLoading && (
                 <p className="text-sm text-muted-foreground">Loading…</p>
             )}
-            {error && (
+            {!!error && !isGone && (
                 <p className="text-sm text-red-400">Failed to load worker.</p>
-            )}
-            {/* null = worker existed but has no activity in the last 24 h */}
-            {!isLoading && !error && data === null && (
-                <div className="rounded-lg border border-border bg-card/40 px-4 py-8 text-center">
-                    <p className="text-sm text-muted-foreground">
-                        This worker has no recent activity (last 24 h).
-                    </p>
-                    <p className="text-xs text-muted-foreground/60 mt-1">
-                        It may have stopped or been replaced by a new process.
-                    </p>
-                </div>
             )}
 
             {data && (
@@ -343,7 +368,7 @@ export function WorkerDetailPage() {
                                     <tbody>
                                         {activeTasks.map((t) => (
                                             <ActiveTaskRow
-                                                key={t.taskID}
+                                                key={`${t.taskID}-${t.attempt}`}
                                                 t={t}
                                                 namespace={namespace}
                                             />

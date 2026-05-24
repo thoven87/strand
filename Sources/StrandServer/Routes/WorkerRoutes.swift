@@ -52,9 +52,8 @@ struct WorkerRoutes {
 
         // GET /api/:namespace/workers/:workerID
         // workerID is URL-encoded (e.g. "host%3Apid" for "host:pid").
-        // Returns nil (200 null) rather than 404 when the worker is no longer
-        // active — consistent with WorkflowStateResponse? and other optional
-        // routes in Strand. Workers can disappear between list and detail.
+        // Returns 204 No Content (nil) when the worker is no longer active —
+        // workers can disappear between list and detail (process restart/timeout).
         router.get("workers/:workerID") { _, ctx -> WorkerDetailResponse? in
             // ctx.parameters returns the raw path segment — percent-encoded.
             // Decode so "host%3Apid" becomes the actual DB value "host:pid".

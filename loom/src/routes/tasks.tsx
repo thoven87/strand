@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { usePageTitle } from "@/lib/usePageTitle";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { Zap, Search } from "lucide-react";
 import {
@@ -88,13 +90,15 @@ function KindBadge({ kind }: { kind: TaskKind }) {
 export function TasksPage() {
     usePageTitle("Tasks");
     const { namespace } = useParams({ strict: false }) as { namespace: string };
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
     const [triggerTarget, setTriggerTarget] = useState<string | null>(null);
     const [query, setQuery] = useState("");
 
     const { data: definitions = [], isLoading } = useQuery({
         queryKey: [...qk.schedules.list(namespace), "task-definitions"],
         queryFn: () => listTaskDefinitions(namespace),
-        refetchInterval: 30_000,
+        refetchInterval: intervalMs,
+        placeholderData: keepPreviousData,
     });
 
     return (
@@ -109,6 +113,10 @@ export function TasksPage() {
                         activities.
                     </p>
                 </div>
+                <AutoRefreshControl
+                    intervalMs={intervalMs}
+                    setIntervalMs={setIntervalMs}
+                />
             </div>
 
             {isLoading && (

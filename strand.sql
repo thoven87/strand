@@ -336,6 +336,35 @@ CREATE INDEX IF NOT EXISTS strand_tasks_failed_idx
     ON strand.tasks (namespace_id, queue, created_at DESC)
     WHERE state = 'FAILED';
 
+-- task-kinds endpoint: loose index scan (recursive CTE) uses this to jump
+-- directly between distinct task names, reading O(N_distinct) rows instead
+-- of O(total_rows). No partial predicate — must cover activities (child tasks)
+-- as well as root workflows.
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_name_idx
+    ON strand.tasks (namespace_id, name, kind);
+
+-- Dashboard task-definitions view: covering partial index eliminates the seq-scan
+-- of all tasks in the namespace. Both listTaskDefinitions (GROUP BY name, kind) and
+-- taskDefinitionActivity (range scan by name + created_at) use this index.
+-- Partial predicate (parent_task_id IS NULL) keeps index size proportional to root
+-- tasks only — activities (parent_task_id IS NOT NULL) are excluded.
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_defn_idx
+    ON strand.tasks (namespace_id, name, kind, state, created_at, completed_at)
+    WHERE parent_task_id IS NULL;
+
+-- Throughput chart: function-based indexes on date_trunc('hour'/'day', completed_at, 'UTC').
+-- The 3-arg form is IMMUTABLE (PG14+); queries use the identical expression so the planner
+-- matches the index key. INCLUDE (completed_at) enables Index Only Scans.
+CREATE INDEX IF NOT EXISTS strand_tasks_throughput_hour_idx
+    ON strand.tasks (namespace_id, date_trunc('hour', completed_at, 'UTC'))
+    INCLUDE (completed_at)
+    WHERE state = 'COMPLETED' AND completed_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS strand_tasks_throughput_day_idx
+    ON strand.tasks (namespace_id, date_trunc('day', completed_at, 'UTC'))
+    INCLUDE (completed_at)
+    WHERE state = 'COMPLETED' AND completed_at IS NOT NULL;
+
 -- ── Storage / autovacuum tuning ───────────────────────────────────────────────
 --
 -- fillfactor = 85: reserves 15 % of each heap page for in-place rewrites.
@@ -460,6 +489,22 @@ CREATE INDEX IF NOT EXISTS strand_runs_worker_idx
 -- monthly partitions — observed at 1264 ms on workflows with many descendants.
 CREATE INDEX IF NOT EXISTS strand_runs_task_idx
     ON strand.runs (task_id);
+
+-- Workers detail page — recent task list.
+-- Enables a point scan on (namespace_id, worker_id) sorted by started_at DESC so
+-- the top-50 recent runs are fetched without touching the rest of the partition.
+-- Also used by the RUNNING arm of the listWorkers UNION ALL subquery.
+CREATE INDEX IF NOT EXISTS strand_runs_worker_started_idx
+    ON strand.runs (namespace_id, worker_id, started_at DESC)
+    WHERE worker_id IS NOT NULL;
+
+-- Workers list page — 5-minute completed-recently window.
+-- The listWorkers query splits into a UNION ALL: RUNNING arm uses
+-- strand_runs_worker_idx; terminal arm uses this index to restrict the scan
+-- to rows finished in the last 5 minutes instead of scanning the full partition.
+CREATE INDEX IF NOT EXISTS strand_runs_finished_idx
+    ON strand.runs (namespace_id, finished_at DESC)
+    WHERE state IN ('COMPLETED','FAILED','CANCELLED') AND worker_id IS NOT NULL;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Checkpoints — sideEffect() / replay cache within a workflow activation.
@@ -846,8 +891,11 @@ CREATE INDEX IF NOT EXISTS strand_trace_spans_root_idx
 
 -- OLAP latency queries: PERCENTILE_CONT per task name over a time window
 -- Powers: GET /api/:namespace/metrics/latency
+-- INCLUDE (name, started_at) enables Index Only Scan for the latency query:
+-- the GroupAggregate reads name + both timestamps from the index without heap fetches.
 CREATE INDEX IF NOT EXISTS strand_trace_spans_latency_idx
     ON strand.trace_spans (namespace_id, finished_at DESC)
+    INCLUDE (name, started_at)
     WHERE kind IN ('WORKFLOW', 'ACTIVITY')
       AND state = 'COMPLETED'
       AND started_at IS NOT NULL

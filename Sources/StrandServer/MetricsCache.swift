@@ -85,6 +85,26 @@ public final class MetricsCache: Sendable {
         }
     }
 
+    /// Tasks/sec for a single queue from the cached broadcast.
+    /// Returns `nil` when the cache is cold, the queue is absent from the broadcast,
+    /// or no `AggregatedMetricsBuffer` is wired into `StrandMetricsLoop`.
+    public func throughputPerSec(forQueue queue: String, namespace: String) -> Double? {
+        current(forNamespace: namespace)?
+            .queues.first(where: { $0.queue == queue })
+            .flatMap(\.throughputPerSec)
+    }
+
+    /// Tasks/sec for every queue in `namespace`, keyed by queue name.
+    /// Empty when the cache is cold. Only queues present in the last broadcast are included.
+    public func queueThroughputRates(namespace: String) -> [String: Double] {
+        guard let queues = current(forNamespace: namespace)?.queues else { return [:] }
+        return queues.reduce(into: [:]) { result, snapshot in
+            if let rate = snapshot.throughputPerSec {
+                result[snapshot.queue] = rate
+            }
+        }
+    }
+
     /// Returns the most recently received broadcast across all namespaces if younger than ``ttl``.
     /// Used by callers that do not filter by namespace.
     public func current() -> StrandMetricsBroadcast? {

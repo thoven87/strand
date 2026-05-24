@@ -19,9 +19,9 @@ export interface QueueStats {
     sleeping: number;
     /** Workflows suspended waiting for an activity, child workflow, or named event. */
     waiting: number;
-    completed: number;
-    failed: number;
-    cancelled: number;
+    /** Tasks that failed in the last 24 hours. */
+    failedRecent: number;
+    // COMPLETED and CANCELLED are not included — use the metrics endpoint for historical counts.
 }
 
 export interface Queue {
@@ -29,6 +29,8 @@ export interface Queue {
     createdAt: string;
     stats: QueueStats;
     isPaused: boolean;
+    /** Tasks/sec from the broadcast DDSketch cache. null when cache is cold. */
+    throughputPerSec: number | null;
 }
 
 // ─── Tasks ─────────────────────────────────────────────────────────────────

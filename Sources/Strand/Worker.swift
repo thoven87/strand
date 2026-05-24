@@ -1112,6 +1112,16 @@ final class FailureReason: Codable, Sendable {
     let message: String
     let cause: FailureReason?
     let source: SourceLocation?
+    /// When `true`, `failRun` fails the workflow permanently without consuming the retry
+    /// budget.  Set when an activity exhausted its own retries (`ActivityError` with
+    /// `.maximumAttemptsReached`) or when any `NonRetryableError` propagates uncaught.
+    /// Catch the error in the workflow handler and re-throw a plain error to opt out.
+    let nonRetryable: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case name, message, cause, source
+        case nonRetryable = "non_retryable"
+    }
 
     struct SourceLocation: Codable, Sendable {
         let fileID: String
@@ -1148,6 +1158,13 @@ final class FailureReason: Codable, Sendable {
             source = nil
             cause = FailureReason.makeCause(from: error)
         }
+        let root = (error as? CallSiteAnnotatedError)?.underlying ?? error
+        nonRetryable = FailureReason.isNonRetryable(root) ? true : nil
+    }
+
+    private static func isNonRetryable(_ error: any Error) -> Bool {
+        if let ae = error as? ActivityError, ae.retryState == .maximumAttemptsReached { return true }
+        return error is any NonRetryableError
     }
 
     /// Recursively extracts a cause for errors that carry an underlying error.

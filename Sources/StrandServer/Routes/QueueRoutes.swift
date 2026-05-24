@@ -5,6 +5,9 @@ import Strand
 struct QueueRoutes {
     let client: StrandClient
     let postgres: PostgresClient
+    /// Optional broadcast-cache for per-queue `throughputPerSec`.
+    /// When warm, populates `QueueResponse.throughputPerSec` with zero extra DB queries.
+    let metricsCache: MetricsCache?
 
     private struct CreateQueueBody: Decodable { let name: String }
 
@@ -18,7 +21,8 @@ struct QueueRoutes {
                 rootOnly: rootOnly,
                 logger: self.client.logger
             )
-            return rows.map(QueueResponse.init)
+            let rates = self.metricsCache?.queueThroughputRates(namespace: ctx.namespaceID) ?? [:]
+            return rows.map { QueueResponse(from: $0, throughputPerSec: rates[$0.name]) }
         }
 
         router.post("queues") { req, ctx -> SimpleResponse in
@@ -41,7 +45,8 @@ struct QueueRoutes {
             else {
                 throw HTTPError(.notFound, message: "Queue '\(queue)' not found")
             }
-            return QueueResponse(from: row)
+            let rate = self.metricsCache?.throughputPerSec(forQueue: queue, namespace: ctx.namespaceID)
+            return QueueResponse(from: row, throughputPerSec: rate)
         }
 
         router.delete("queues/:queue") { _, ctx -> SimpleResponse in

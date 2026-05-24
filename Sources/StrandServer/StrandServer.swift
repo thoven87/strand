@@ -109,7 +109,7 @@ public struct StrandServer: Service {
                 NamespaceMiddleware(defaultNamespace: client.namespaceID)
             }
 
-        QueueRoutes(client: client, postgres: postgres).register(on: nsGroup)
+        QueueRoutes(client: client, postgres: postgres, metricsCache: metricsCache).register(on: nsGroup)
         TaskRoutes(client: client, postgres: postgres).register(on: nsGroup)
         RunRoutes(postgres: postgres, logger: client.logger).register(on: nsGroup)
         EventRoutes(client: client, postgres: postgres).register(on: nsGroup)

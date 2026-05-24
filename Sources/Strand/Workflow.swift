@@ -29,16 +29,16 @@ extension WorkflowRegistrable {
     /// Called by `StrandClient.startWorkflow` when `WorkflowOptions.id` is nil.
     /// Users customise the workflow ID by passing `WorkflowOptions(id: "my-id")`.
     ///
-    /// Format: `"<WorkflowName>-<epochMs>-<randomHex4>"` —
-    /// e.g. `"OrderWorkflow-1746218580123-a3f2"`.
+    /// Format: `"<WorkflowName>-<epochMs>"` —
+    /// e.g. `"OrderWorkflow-1746218580123"`.
     ///
-    /// The epoch-millisecond component keeps IDs time-ordered and human-scannable.
-    /// The 4-hex-char random suffix (16 bits, 65536 values) prevents collisions
-    /// when multiple workflows of the same type start within the same millisecond.
+    /// The epoch-millisecond suffix keeps IDs time-ordered and human-scannable.
+    /// Millisecond precision is sufficient for distinct workflow instances; if you
+    /// need strict uniqueness within the same millisecond supply an explicit
+    /// `WorkflowOptions(id:)` instead.
     static func generateWorkflowID() -> String {
         let ms = Int(Date.now.timeIntervalSince1970 * 1000)
-        let rnd = String(format: "%04x", UInt16.random(in: .min ... .max))
-        return "\(workflowName)-\(ms)-\(rnd)"
+        return "\(workflowName)-\(ms)"
     }
 }
 
