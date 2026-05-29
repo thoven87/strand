@@ -84,6 +84,51 @@ package enum TraceSpanQueries {
         )
     }
 
+    // MARK: - Batch root span insert
+
+    /// Batch-insert root task spans in a single round-trip using `unnest`.
+    ///
+    /// Use this when enqueueing directly from `StrandClient` (no parent task).
+    /// `root_task_id` is set to `task_id` directly — no correlated subquery needed.
+    /// All items share the same `kind`, `name`, `state`, `maxAttempts`, and `queuedAt`.
+    package static func insertRootSpansBatch(
+        on conn: PostgresConnection,
+        items: [(spanID: String, taskID: UUID)],
+        namespaceID: String,
+        kind: WorkflowSpanKind,
+        name: String,
+        state: WorkflowSpanState,
+        maxAttempts: Int?,
+        queuedAt: Date,
+        logger: Logger
+    ) async throws {
+        guard !items.isEmpty else { return }
+        let spanIDs = items.map { $0.spanID }
+        let taskIDs = items.map { $0.taskID }
+        try await conn.query(
+            """
+            INSERT INTO strand.trace_spans
+                (id, namespace_id, root_task_id, task_id, parent_id,
+                 kind, name, state, attempt, worker_id, max_attempts,
+                 queued_at, started_at, finished_at, error)
+            SELECT
+                u.span_id, \(namespaceID), u.task_id, u.task_id, NULL,
+                \(kind), \(name), \(state),
+                0, NULL, \(maxAttempts),
+                \(queuedAt), NULL, NULL, NULL
+            FROM unnest(\(spanIDs), \(taskIDs)) AS u(span_id, task_id)
+            ON CONFLICT (id) DO UPDATE
+                SET state       = EXCLUDED.state,
+                    attempt     = GREATEST(EXCLUDED.attempt, strand.trace_spans.attempt),
+                    worker_id   = COALESCE(EXCLUDED.worker_id,   strand.trace_spans.worker_id),
+                    started_at  = COALESCE(EXCLUDED.started_at,  strand.trace_spans.started_at),
+                    finished_at = COALESCE(EXCLUDED.finished_at, strand.trace_spans.finished_at),
+                    error       = COALESCE(EXCLUDED.error,       strand.trace_spans.error)
+            """,
+            logger: logger
+        )
+    }
+
     // MARK: - History-event span derivation
 
     /// Derive SLEEP, WAIT, CONDITION, SIGNAL, UPDATE, and EMIT spans from

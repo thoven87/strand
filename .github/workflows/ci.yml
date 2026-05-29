@@ -58,5 +58,8 @@ jobs:
               env:
                   PGPASSWORD: strand
               run: psql -h psql -U strand -d strand_dev -f strand.sql
-            - name: Test
-              run: swift test
+            - name: Build
+              run: swift build --build-tests --configuration debug -Xswiftc -enable-testing -Xswiftc -warnings-as-errors -Xcc -Werror --sanitize address --disable-xctest
+            - name: Run Tests
+              run: |
+                  swift test --skip-build --configuration debug --disable-xctest

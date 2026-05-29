@@ -396,6 +396,252 @@ enum Queries {
         let rateLimitKey: String?
     }
 
+    // MARK: - BatchEnqueueItem
+
+    /// Per-item data for ``enqueueBatch``. All other options are shared across the batch.
+    struct BatchEnqueueItem: Sendable {
+        /// Pre-generated UUIDv7; used as new-row probe.
+        let taskID: UUID
+        /// Pre-generated UUIDv7 for the first run row.
+        let runID: UUID
+        let paramsBuffer: ByteBuffer
+        let idempotencyKey: String
+    }
+
+    // MARK: - enqueueBatch
+
+    /// Batch-enqueue N tasks of the same type in O(1) Postgres round-trips.
+    ///
+    /// Unlike N × `enqueueTask` (~7N round-trips), `enqueueBatch` uses multi-row
+    /// VALUES INSERTs and a single `pg_notify` regardless of N.
+    ///
+    /// - Returns: `[EnqueueRow]` in the same order as `items`.
+    ///   Idempotency-key conflicts return the existing task/run IDs (`created: false`).
+    @discardableResult
+    static func enqueueBatch(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        taskName: String,
+        items: [BatchEnqueueItem],
+        headersBuffer: ByteBuffer?,
+        retryStrategyBuffer: ByteBuffer,
+        maxAttempts: Int?,
+        cancellationBuffer: ByteBuffer?,
+        priority: TaskPriority,
+        scheduledAt: Date?,
+        timeoutSeconds: Int?,
+        heartbeatTimeoutSeconds: Int?,
+        scheduleToStartTimeoutSeconds: Int?,
+        deadlineAt: Date?,
+        fairnessKey: String?,
+        fairnessWeight: Double,
+        kind: TaskKind,
+        rateLimitKey: String?,
+        rateLimitIntervalMs: Int?,
+        logger: Logger
+    ) async throws -> [EnqueueRow] {
+        guard !items.isEmpty else { return [] }
+
+        return try await client.withTransaction(logger: logger) { conn in
+            // ── 1. Register the queue (idempotent) ──────────────────────────────────────
+            try await createQueue(on: conn, namespaceID: namespaceID, name: queue, logger: logger)
+
+            // ── 2. Insert all task rows — one multi-row VALUES statement ──────────────────
+            // Built via PostgresQuery.StringInterpolation so every field, including
+            // nullable BYTEAs (headers, retry_strategy, cancellation), is bound as an
+            // individual typed parameter — one round-trip for all N tasks.
+            var taskInterp = PostgresQuery.StringInterpolation(
+                literalCapacity: 300 + items.count * 256,
+                interpolationCount: items.count * 20
+            )
+            taskInterp.appendLiteral(
+                "INSERT INTO strand.tasks "
+                    + "(namespace_id, id, queue, name, params, headers, "
+                    + "retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, "
+                    + "schedule_to_start_timeout_seconds, cancellation, idempotency_key, priority, "
+                    + "fairness_key, fairness_weight, state, kind, deadline_at) VALUES "
+            )
+            for (i, item) in items.enumerated() {
+                if i > 0 { taskInterp.appendLiteral(", ") }
+                taskInterp.appendLiteral("(")
+                taskInterp.appendInterpolation(namespaceID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(item.taskID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(queue)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(taskName)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(item.paramsBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(headersBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(retryStrategyBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(maxAttempts)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(timeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(heartbeatTimeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(scheduleToStartTimeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(cancellationBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(item.idempotencyKey)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(priority)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(fairnessKey)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(fairnessWeight)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(TaskState.pending)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(kind)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(deadlineAt)
+                taskInterp.appendLiteral(")")
+            }
+            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING RETURNING id")
+            // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
+            // silently discards conflicts, so only genuinely new task IDs are returned.
+            // No separate SELECT round-trip needed.
+            var newIDSet: Set<UUID> = []
+            for try await row in try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger) {
+                var col = row.makeIterator()
+                newIDSet.insert(try col.next()!.decode(UUID.self, context: .default))
+            }
+
+            // ── 4. Insert runs for genuinely new tasks ────────────────────────────
+            let newItems = items.filter { newIDSet.contains($0.taskID) }
+            if !newItems.isEmpty {
+                var runInterp = PostgresQuery.StringInterpolation(
+                    literalCapacity: 220 + newItems.count * 160,
+                    interpolationCount: newItems.count * 9
+                )
+                runInterp.appendLiteral(
+                    "INSERT INTO strand.runs "
+                        + "(namespace_id, id, task_id, queue, attempt, state, "
+                        + "available_at, priority, fairness_key, fairness_weight, kind) VALUES "
+                )
+                for (i, item) in newItems.enumerated() {
+                    if i > 0 { runInterp.appendLiteral(", ") }
+                    runInterp.appendLiteral("(")
+                    runInterp.appendInterpolation(namespaceID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(item.runID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(item.taskID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(queue)
+                    runInterp.appendLiteral(", 1, ")
+                    try runInterp.appendInterpolation(TaskState.pending)
+                    runInterp.appendLiteral(", COALESCE(")
+                    runInterp.appendInterpolation(scheduledAt)
+                    runInterp.appendLiteral(", NOW()), ")
+                    try runInterp.appendInterpolation(priority)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(fairnessKey)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(fairnessWeight)
+                    runInterp.appendLiteral(", ")
+                    try runInterp.appendInterpolation(kind)
+                    runInterp.appendLiteral(")")
+                }
+                try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
+            }
+
+            // ── 5. Batch-insert root spans for new tasks ──────────────────────────
+            if !newItems.isEmpty {
+                let spanItems = newItems.map { (spanID: $0.taskID.uuidString, taskID: $0.taskID) }
+                try await TraceSpanQueries.insertRootSpansBatch(
+                    on: conn,
+                    items: spanItems,
+                    namespaceID: namespaceID,
+                    kind: kind == .workflow ? .workflow : .activity,
+                    name: taskName,
+                    state: .waiting,
+                    maxAttempts: maxAttempts,
+                    queuedAt: scheduledAt ?? Date(),
+                    logger: logger
+                )
+            }
+
+            // ── 6. Rate-limit slot allocation ───────────────────────────────────────────
+            if let intervalMs = rateLimitIntervalMs, !newItems.isEmpty {
+                let rlQueues = Array(repeating: queue, count: newItems.count)
+                let rlSlotKeys = Array(repeating: rateLimitKey ?? taskName, count: newItems.count)
+                let rlRunIDs = newItems.map { $0.runID }
+                let rlIntervalMses = Array(repeating: intervalMs, count: newItems.count)
+                try await applyRateLimitSlots(
+                    on: conn,
+                    namespaceID: namespaceID,
+                    queues: rlQueues,
+                    slotKeys: rlSlotKeys,
+                    runIDs: rlRunIDs,
+                    intervalMses: rlIntervalMses,
+                    logger: logger
+                )
+            }
+
+            // ── 7. Notify workers ───────────────────────────────────────────────────────────
+            if !newIDSet.isEmpty {
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            }
+
+            // ── 8. Resolve idempotency hits ─────────────────────────────────────────────────
+            // Build a lookup table: idempotency_key → EnqueueRow.
+            // New tasks: use the pre-generated IDs directly.
+            // Idempotency hits: query the DB for the existing task/run IDs.
+            var idKeyToRow: [String: EnqueueRow] = [:]
+            for item in newItems {
+                idKeyToRow[item.idempotencyKey] = EnqueueRow(
+                    taskID: item.taskID, runID: item.runID, attempt: 1, created: true
+                )
+            }
+            let hitItems = items.filter { !newIDSet.contains($0.taskID) }
+            if !hitItems.isEmpty {
+                let hitKeys = hitItems.map { $0.idempotencyKey }
+                let hitStream = try await conn.query(
+                    """
+                    SELECT DISTINCT ON (t.idempotency_key) t.id, r.id, r.attempt, t.idempotency_key
+                    FROM strand.tasks t
+                    JOIN strand.runs r ON r.task_id = t.id
+                    WHERE t.namespace_id    = \(namespaceID)
+                      AND t.queue           = \(queue)
+                      AND t.idempotency_key = ANY(\(hitKeys))
+                    ORDER BY t.idempotency_key, r.attempt DESC
+                    """,
+                    logger: logger
+                )
+                for try await hitRow in hitStream {
+                    var col = hitRow.makeIterator()
+                    let eTaskID = try col.next()!.decode(UUID.self, context: .default)
+                    let eRunID = try col.next()!.decode(UUID.self, context: .default)
+                    let eAttempt = try col.next()!.decode(Int.self, context: .default)
+                    let eKey = try col.next()!.decode(String.self, context: .default)
+                    idKeyToRow[eKey] = EnqueueRow(
+                        taskID: eTaskID, runID: eRunID, attempt: eAttempt, created: false
+                    )
+                }
+            }
+
+            // ── 9. Assemble result in original order ───────────────────────────────────
+            return try items.map { item in
+                guard let enqRow = idKeyToRow[item.idempotencyKey] else {
+                    throw StrandError.database(
+                        underlying: QueryError(
+                            "enqueueBatch: no row for idempotency_key \(item.idempotencyKey)"
+                        )
+                    )
+                }
+                return enqRow
+            }
+        }
+    }
+
     // MARK: - enqueueChildTasksBatch
 
     /// Batch-enqueue every child task (activity or child workflow) spawned by one workflow
@@ -491,19 +737,11 @@ enum Queries {
                 taskInterp.appendInterpolation(child.deadlineAt)
                 taskInterp.appendLiteral(")")
             }
-            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING")
-            try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger)
-
-            // ── 3. Identify which tasks were genuinely inserted ──────────────────────
-            // A generated taskID present in the DB means the INSERT succeeded (new row).
-            // An absent generated taskID means the conflict clause fired (idempotency hit).
-            let generatedIDs = children.map { $0.taskID }
-            let newIDsStream = try await conn.query(
-                "SELECT id FROM strand.tasks WHERE namespace_id = \(namespaceID) AND id = ANY(\(generatedIDs))",
-                logger: logger
-            )
+            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING RETURNING id")
+            // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
+            // silently discards conflicts, so only genuinely new task IDs are returned.
             var newIDSet: Set<UUID> = []
-            for try await row in newIDsStream {
+            for try await row in try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger) {
                 var col = row.makeIterator()
                 newIDSet.insert(try col.next()!.decode(UUID.self, context: .default))
             }
