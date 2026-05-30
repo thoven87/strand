@@ -164,6 +164,69 @@ func strandErrorMessage(_ error: any Error) -> String {
 /// ```
 public protocol NonRetryableError: Error {}
 
+// MARK: - RetryAfterError
+
+/// Conforming errors carry a server-side retry delay that overrides the task's
+/// configured `RetryStrategy` backoff **for the next attempt only**.
+///
+/// Use this when the failure contains authoritative retry guidance — for example,
+/// a `Retry-After` HTTP header from a rate-limited API — that should take
+/// precedence over the local exponential backoff schedule:
+///
+/// ```swift
+/// struct RateLimitError: Error, RetryAfterError {
+///     let retryAfter: Duration
+///     var nextRetryDelay: Duration { retryAfter }
+/// }
+///
+/// // In an activity:
+/// func run(input: Input, context: ActivityContext) async throws -> Output {
+///     let response = try await apiClient.fetch(input.url)
+///     if response.statusCode == 429 {
+///         let seconds = Int(response.headers["Retry-After"] ?? "60") ?? 60
+///         throw RateLimitError(retryAfter: .seconds(seconds))
+///     }
+///     // ...
+/// }
+/// ```
+///
+/// Unlike `NonRetryableError`, conforming does **not** consume the retry budget.
+/// The task is retried on the normal schedule except that `nextRetryDelay`
+/// replaces the backoff computation for the single upcoming retry.
+/// Subsequent retries (if any) return to the configured `RetryStrategy`.
+public protocol RetryAfterError: Error {
+    /// The duration to wait before the next retry attempt.
+    var nextRetryDelay: Duration { get }
+}
+
+/// Ready-made ``RetryAfterError`` for one-liners at the throw site.
+///
+/// Use this when you don't want to define a dedicated error type:
+///
+/// ```swift
+/// if response.statusCode == 429 {
+///     let delay = Int(response.headers["Retry-After"] ?? "60") ?? 60
+///     throw RetryAfterDelay(.seconds(delay), "GitHub rate-limited")
+/// }
+/// ```
+///
+/// For strongly-typed errors (recommended when you need to `catch` the specific
+/// case in a workflow), define your own type that conforms to ``RetryAfterError``
+/// instead.
+public struct RetryAfterDelay: Error, RetryAfterError, CustomStringConvertible, Sendable {
+    public let nextRetryDelay: Duration
+    public let description:    String
+
+    /// - Parameters:
+    ///   - delay:   How long to wait before the next attempt.
+    ///   - message: Human-readable reason stored in the failure record.
+    ///              Defaults to `"Retry after \(delay)"` when omitted.
+    public init(_ delay: Duration, _ message: String? = nil) {
+        self.nextRetryDelay = delay
+        self.description    = message ?? "Retry after \(delay)"
+    }
+}
+
 // MARK: - Internal failure signals
 
 /// Pre-encoded activity failure reason thrown from `Activity._run`.
@@ -182,12 +245,20 @@ struct _TypedActivityFailure: Error, CustomStringConvertible {
     private struct _Payload: Encodable {
         let name: String
         let message: String
-        let non_retryable: Bool?
+        let nonRetryable: Bool?
         let payload: Data?  // synthesised Encodable base64-encodes Data automatically
         let source: _Source?
+        enum CodingKeys: String, CodingKey {
+            case name, message, payload, source
+            case nonRetryable = "non_retryable"
+        }
         struct _Source: Encodable {
-            let file_id: String
+            let fileId: String
             let line: Int
+            enum CodingKeys: String, CodingKey {
+                case fileId = "file_id"
+                case line
+            }
         }
     }
 
@@ -215,9 +286,9 @@ struct _TypedActivityFailure: Error, CustomStringConvertible {
         let p = _Payload(
             name: name,
             message: message,
-            non_retryable: nonRetryable ? true : nil,
+            nonRetryable: nonRetryable ? true : nil,
             payload: payload.map { Data($0.readableBytesView) },
-            source: source.map { _Payload._Source(file_id: $0.fileID, line: $0.line) }
+            source: source.map { _Payload._Source(fileId: $0.fileID, line: $0.line) }
         )
         // If encoding fails (essentially never) fall back to a static safe string.
         // We can't trust arbitrary content in `name` for manual JSON escaping,

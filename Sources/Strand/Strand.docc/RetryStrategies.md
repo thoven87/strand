@@ -114,6 +114,51 @@ options: ActivityOptions(
 )
 ```
 
+## Server-directed retry delay
+
+Some failures carry authoritative retry guidance — for example, an HTTP `429`
+response with a `Retry-After` header specifying exactly how long the server
+needs before it will accept the request again. Hardcoding that into your
+`RetryStrategy` is impractical because the duration changes per response.
+
+Conform your error to ``RetryAfterError`` and Strand will use `nextRetryDelay`
+instead of the configured backoff **for the single upcoming retry**. All
+subsequent retries resume the normal `RetryStrategy`:
+
+```swift
+// Strongly-typed — preferred when you need to catch the specific case:
+struct RateLimitError: Error, RetryAfterError {
+    let retryAfter: Duration
+    var nextRetryDelay: Duration { retryAfter }
+}
+
+func run(input: Input, context: ActivityContext) async throws -> Output {
+    let response = try await apiClient.fetch(input.url)
+    if response.statusCode == 429 {
+        let seconds = Int(response.headers["Retry-After"] ?? "60") ?? 60
+        throw RateLimitError(retryAfter: .seconds(seconds))
+    }
+    return try decode(response.body)
+}
+```
+
+For quick one-liners where a dedicated type isn't needed, use the built-in
+``RetryAfterDelay``:
+
+```swift
+if response.statusCode == 429 {
+    let seconds = Int(response.headers["Retry-After"] ?? "60") ?? 60
+    throw RetryAfterDelay(.seconds(seconds), "GitHub rate-limited")
+}
+```
+
+Both approaches produce a ``SLEEPING`` run that wakes at exactly the
+server-specified time rather than the next backoff step.
+
+> Important: `RetryAfterError` **does not** consume the retry budget. The
+> task is retried as normal — only the delay for the next attempt changes.
+> To stop retrying entirely, additionally conform to ``NonRetryableError``.
+
 ## Worker-level defaults
 
 Set defaults applied to every task claimed by a worker via ``StrandOptions``:
