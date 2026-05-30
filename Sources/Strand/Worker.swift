@@ -1117,10 +1117,16 @@ final class FailureReason: Codable, Sendable {
     /// `.maximumAttemptsReached`) or when any `NonRetryableError` propagates uncaught.
     /// Catch the error in the workflow handler and re-throw a plain error to opt out.
     let nonRetryable: Bool?
+    /// Seconds to wait before the next retry, overriding the task's `RetryStrategy`.
+    /// Populated from errors conforming to `RetryAfterError` (e.g. HTTP 429 with a
+    /// `Retry-After` header).  Only the *next* retry is affected; subsequent retries
+    /// return to the configured strategy.
+    let nextRetryDelaySeconds: Double?
 
     enum CodingKeys: String, CodingKey {
         case name, message, cause, source
-        case nonRetryable = "non_retryable"
+        case nonRetryable          = "non_retryable"
+        case nextRetryDelaySeconds = "next_retry_delay_seconds"
     }
 
     struct SourceLocation: Codable, Sendable {
@@ -1160,6 +1166,15 @@ final class FailureReason: Codable, Sendable {
         }
         let root = (error as? CallSiteAnnotatedError)?.underlying ?? error
         nonRetryable = FailureReason.isNonRetryable(root) ? true : nil
+        // Capture a server-specified retry delay if the error carries one.
+        // Consistent with the rest of the codebase: only whole seconds matter
+        // for retry scheduling, attoseconds are irrelevant.
+        if let rae = root as? any RetryAfterError {
+            let secs = Double(rae.nextRetryDelay.components.seconds)
+            nextRetryDelaySeconds = secs > 0 ? secs : nil
+        } else {
+            nextRetryDelaySeconds = nil
+        }
     }
 
     private static func isNonRetryable(_ error: any Error) -> Bool {

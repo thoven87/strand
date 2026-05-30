@@ -940,9 +940,16 @@ enum Queries {
         if taskWasCancelled { throw InternalError.cancelled }
     }
 
-    private struct _NRFlag: Decodable { let non_retryable: Bool? }
+    private struct _NRFlag: Decodable {
+        let nonRetryable: Bool?
+        enum CodingKeys: String, CodingKey { case nonRetryable = "non_retryable" }
+    }
     private struct _ErrorType: Decodable { let name: String? }
     private struct _FailureMessage: Decodable { let message: String? }
+    private struct _NextRetryDelay: Decodable {
+        let nextRetryDelaySeconds: Double?
+        enum CodingKeys: String, CodingKey { case nextRetryDelaySeconds = "next_retry_delay_seconds" }
+    }
 
     /// Recursively processes all non-terminal descendants of `parentTaskID` when the parent
     /// workflow permanently fails.
@@ -1120,7 +1127,7 @@ enum Queries {
             // ── Check 0: non_retryable flag (from NonRetryableError protocol) ──────────
             // Activities whose Failure type conforms to NonRetryableError encode
             // `non_retryable: true` in the failure payload. Skip retry immediately.
-            if (try? JSON.decode(_NRFlag.self, from: reasonBuffer))?.non_retryable == true {
+            if (try? JSON.decode(_NRFlag.self, from: reasonBuffer))?.nonRetryable == true {
                 try await conn.query(
                     "UPDATE strand.tasks SET state = \(TaskState.failed), attempt = \(attempt) WHERE id = \(taskID) AND namespace_id = \(namespaceID)",
                     logger: logger
@@ -1213,7 +1220,13 @@ enum Queries {
                 }
                 return
             }
-            let delay = retryDelay(strategy: retryStrategyBuf, attempt: attempt)
+            // Use a per-error override if the thrown error conforms to RetryAfterError
+            // (e.g. HTTP 429 with a Retry-After header).  Falls back to the configured
+            // RetryStrategy when no override is present.
+            let overrideDelay = (try? JSON.decode(_NextRetryDelay.self, from: reasonBuffer))
+                .flatMap { $0.nextRetryDelaySeconds }
+                .flatMap { $0 > 0 ? $0 : nil }
+            let delay = overrideDelay ?? retryDelay(strategy: retryStrategyBuf, attempt: attempt)
             let wakeAt = Date.now.addingTimeInterval(delay)
             let newState: TaskState = delay > 0 ? .sleeping : .pending
             let newRunID = UUID.v7()
