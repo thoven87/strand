@@ -121,6 +121,8 @@ export interface Run {
     startedAt: string | null;
     finishedAt: string | null;
     leaseExpiresAt: string | null;
+    /** When the run becomes claimable again after a backoff. Set on SLEEPING runs. */
+    availableAt: string | null;
     createdAt: string;
     failureReason: string | null; // raw JSON string
 }

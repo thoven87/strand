@@ -1052,6 +1052,7 @@ public struct StrandWorker: Service {
                 runID: claimed.runID,
                 version: claimed.version,
                 reasonBuffer: reasonBuffer,
+                failedAt: taskStartWall,
                 logger: logger
             )
         } catch {
@@ -1125,7 +1126,7 @@ final class FailureReason: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case name, message, cause, source
-        case nonRetryable          = "non_retryable"
+        case nonRetryable = "non_retryable"
         case nextRetryDelaySeconds = "next_retry_delay_seconds"
     }
 

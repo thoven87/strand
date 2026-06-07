@@ -835,6 +835,15 @@ function RunRow({
                             <FailureReasonView raw={run.failureReason} />
                         </div>
                     )}
+                    {/* Next retry — shown only for SLEEPING runs with a scheduled availableAt */}
+                    {run.state === "SLEEPING" && run.availableAt && (
+                        <div className="px-3 pt-2 pb-1 flex items-center justify-between">
+                            <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground shrink-0">
+                                Next retry
+                            </p>
+                            <RelativeTime iso={run.availableAt} />
+                        </div>
+                    )}
                     <RunCheckpoints
                         namespace={namespace}
                         queue={queue}

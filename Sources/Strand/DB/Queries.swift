@@ -661,61 +661,67 @@ enum Queries {
             // ── 8. Atomic completion-check + parent-run state transition ─────────────
             //
             // State decision:
-            //   • ALL batch children completed (completedCount == result.count)
-            //     → PENDING: delete orphaned event_waits, wake immediately.
-            //   • SOME children still running (completedCount < result.count)
-            //     → WAITING: park until emitTaskCompletionSignal fires for each one.
+            //   • ALL batch children completed → PENDING: delete orphaned event_waits, wake.
+            //   • SOME children still running  → WAITING: park until emitTaskCompletionSignal fires.
             //
-            // The condition is completedCount == result.count (not > 0) because
-            // a partial completion must keep the run WAITING. Transitioning to
-            // PENDING while sibling children are still running would cause
-            // RUNNING → PENDING → RUNNING loops on every subsequent completion.
+            // The completion count and del_orphans must share the same READ COMMITTED snapshot.
+            // Idempotency-hit children can complete while this transaction is open; if del_orphans
+            // used a newer snapshot than the count check it could delete all event_waits while
+            // allDone was still false — leaving the parent WAITING with no event_waits and no
+            // future notifications (permanently stuck).  A single MATERIALIZED CTE closes the gap.
             //
             // Guard: AND state != SLEEPING
-            //   Prevents overwriting a SLEEPING state that .awaitEvent (waitForEvent /
-            //   sleep) already set in the same applyScheduleCommands loop. Without this
-            //   guard, replay activations that emit both .scheduleActivity (fast-pathed
-            //   completed activities) AND .awaitEvent would have the named-event sleep
-            //   immediately overwritten by PENDING.
+            //   Prevents overwriting a SLEEPING state that .awaitEvent / sleep already set
+            //   in the same applyScheduleCommands loop.
             let childTaskIDs = result.map { $0.taskID }
-            let completedStream = try await conn.query(
-                "SELECT COUNT(*) FROM strand.task_completions WHERE task_id = ANY(\(childTaskIDs))",
-                logger: logger
-            )
-            var completedCount = 0
-            for try await row in completedStream {
-                var col = row.makeIterator()
-                completedCount = try col.next()!.decode(Int.self, context: .default)
-            }
-
-            let allDone = completedCount == result.count
-            let newState = allDone ? TaskState.pending : TaskState.waiting
-            try await conn.query(
+            let totalChildren = result.count
+            let transitionStream = try await conn.query(
                 """
                 WITH
+                completed AS MATERIALIZED (
+                    -- Read task_completions ONCE; result is shared by del_orphans and all_done
+                    -- so both use the identical committed snapshot — eliminating the TOCTOU race.
+                    SELECT task_id
+                    FROM strand.task_completions
+                    WHERE task_id = ANY(\(childTaskIDs))
+                ),
                 del_orphans AS (
                     -- Remove event_waits for children that already have completions.
-                    -- Runs in same snapshot as the state UPDATE, so no lost-delete race.
                     DELETE FROM strand.event_waits ew
-                    USING strand.task_completions tc
+                    USING completed c
                     WHERE ew.run_id        = \(parentRunID)
-                      AND ew.child_task_id = tc.task_id
-                      AND tc.task_id       = ANY(\(childTaskIDs))
+                      AND ew.child_task_id = c.task_id
+                ),
+                all_done AS (
+                    SELECT (SELECT COUNT(*) FROM completed) = \(totalChildren) AS v
                 ),
                 r AS (
                     UPDATE strand.runs
-                    SET state        = \(newState),
-                        available_at = CASE WHEN \(allDone) THEN NOW() ELSE available_at END,
+                    SET state        = CASE WHEN (SELECT v FROM all_done)
+                                           THEN \(TaskState.pending)
+                                           ELSE \(TaskState.waiting) END,
+                        available_at = CASE WHEN (SELECT v FROM all_done) THEN NOW() ELSE available_at END,
                         lease_expires_at = NULL
                     WHERE id    = \(parentRunID)
                       AND state != \(TaskState.sleeping)  -- do not overwrite named-event / timer sleep
                     RETURNING id
+                ),
+                task_upd AS (
+                    UPDATE strand.tasks
+                    SET state = CASE WHEN (SELECT v FROM all_done)
+                                     THEN \(TaskState.pending)
+                                     ELSE \(TaskState.waiting) END
+                    FROM r WHERE strand.tasks.id = \(parentTaskID)
                 )
-                UPDATE strand.tasks SET state = \(newState)
-                FROM r WHERE strand.tasks.id = \(parentTaskID)
+                SELECT (SELECT v FROM all_done)
                 """,
                 logger: logger
             )
+            var allDone = false
+            for try await row in transitionStream {
+                var col = row.makeIterator()
+                allDone = try col.next()!.decode(Bool.self, context: .default)
+            }
             if allDone {
                 try await conn.notifyWorkers(namespace: namespaceID, queue: parentQueue, logger: logger)
             }
@@ -738,18 +744,55 @@ enum Queries {
     ) async throws -> [ClaimedTask] {
         let stream = try await client.query(
             """
-            WITH candidate AS (
+            WITH
+            -- Ensure the sketch row exists for this (namespace, queue) pair.
+            -- First-use on a new queue: INSERT creates it with all-zero counters.
+            -- Subsequent calls: ON CONFLICT DO NOTHING leaves existing counters untouched.
+            init_sketch AS (
+                INSERT INTO strand.fairness_sketch (namespace_id, queue)
+                VALUES (\(namespaceID), \(queue))
+                ON CONFLICT (namespace_id, queue) DO NOTHING
+            ),
+            -- Read the current counters once.  MATERIALIZED forces Postgres to evaluate
+            -- this CTE exactly once and cache the result — the correlated subquery in
+            -- candidate reads from this cache rather than re-scanning the table per row.
+            sketch AS MATERIALIZED (
+                SELECT counters FROM strand.fairness_sketch
+                WHERE namespace_id = \(namespaceID) AND queue = \(queue)
+            ),
+            candidate AS (
                 -- Fairness-key dispatch:
                 --   • Tasks WITH a fairness_key: only the highest-priority/oldest run per key
                 --     is eligible (FIFO within each group).
                 --   • Tasks WITHOUT a fairness_key: always eligible.
-                -- Both sets then compete via weighted-random ordering so no key starves others.
+                -- Both sets then compete via stride scheduling (count-min sketch) so no
+                -- key starves others and weighted throughput is deterministically proportional.
                 --
                 -- The correlated NOT EXISTS is an index seek via strand_runs_fairness_idx
                 -- on (namespace_id, queue, fairness_key, available_at, priority, id)
                 -- WHERE state IN ('PENDING','SLEEPING') AND fairness_key IS NOT NULL.
                 -- Cost is O(1) per candidate row regardless of queue depth.
-                SELECT r.id, t.timeout_seconds FROM strand.runs r
+                SELECT r.id, t.timeout_seconds, r.fairness_key, r.fairness_weight,
+                       -- Count-min sketch estimate of accumulated pass for this fairness key.
+                       -- Pass value = sum of (stride = 1000/weight) across all prior dispatches
+                       -- of this key.  The key with the SMALLEST pass is dispatched next —
+                       -- deterministic stride scheduling replaces probabilistic random()/weight.
+                       -- Unfaired tasks (NULL key) always get pass=0 so they compete on priority
+                       -- and age without any stride penalty.
+                       CASE
+                           WHEN r.fairness_key IS NULL THEN 0.0
+                           ELSE (
+                               SELECT LEAST(
+                                   s.counters[0*1024 + (abs(hashtextextended(r.fairness_key, 0::BIGINT)) % 1024) + 1],
+                                   s.counters[1*1024 + (abs(hashtextextended(r.fairness_key, 1::BIGINT)) % 1024) + 1],
+                                   s.counters[2*1024 + (abs(hashtextextended(r.fairness_key, 2::BIGINT)) % 1024) + 1],
+                                   s.counters[3*1024 + (abs(hashtextextended(r.fairness_key, 3::BIGINT)) % 1024) + 1]
+                               )
+                               FROM sketch s
+                               LIMIT 1
+                           )
+                       END AS pass_value
+                FROM strand.runs r
                 JOIN strand.tasks t ON t.id = r.task_id
                 WHERE r.queue = \(queue)
                   AND r.namespace_id = \(namespaceID)
@@ -774,19 +817,13 @@ enum Queries {
                             )
                       )
                   )
-                -- Sticky affinity: within the same priority band, prefer runs this
-                -- worker last processed. The cached handler Task is more likely to
-                -- be in memory on that worker, avoiding a fresh-path replay.
-                -- Fairness-weighted random is the primary ordering within a priority
-                -- band: dividing by fairness_weight means higher-weight keys are
-                -- statistically first, providing the starve-free frontier guarantee.
-                -- Sticky affinity (prefer runs last processed by this worker) is a
-                -- secondary tiebreaker that must come AFTER fairness-weighted random
-                -- so it cannot override the fairness guarantee. In practice random()
-                -- produces unique values so sticky rarely fires here; its main benefit
-                -- is reducing cache misses when the candidate pool has no fairness keys.
+                -- Stride ordering: smallest pass_value (least recently dispatched relative to
+                -- its weight) runs first.  This gives deterministic proportional throughput
+                -- over any observation window — weight=5 key gets dispatched 5× more often
+                -- than weight=1 regardless of arrival order or randomness.
+                -- Sticky affinity is a secondary tiebreaker; it must not override stride.
                 ORDER BY r.priority ASC,
-                         (random() / GREATEST(r.fairness_weight, 0.001)) ASC,
+                         pass_value ASC,
                          CASE WHEN r.worker_id = \(workerID) THEN 0 ELSE 1 END ASC,
                          r.available_at,
                          r.id
@@ -801,7 +838,8 @@ enum Queries {
                     lease_expires_at = NOW() + COALESCE(NULLIF(c.timeout_seconds, 0), \(claimTimeoutSeconds)) * INTERVAL '1 second',
                     started_at       = COALESCE(r.started_at, NOW())
                 FROM candidate c WHERE r.id = c.id
-                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload, r.available_at, r.heartbeat_details
+                RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload,
+                          r.available_at, r.heartbeat_details, c.fairness_key, c.fairness_weight
             ),
             task_upd AS (
                 UPDATE strand.tasks t
@@ -823,6 +861,20 @@ enum Queries {
                     attempt    = c.attempt
                 FROM claimed c
                 WHERE strand.trace_spans.id = UPPER(c.task_id::text)
+            ),
+            -- Advance the count-min sketch pass counters for every claimed fairness key.
+            -- stride(key) = 1000 / weight, so a weight=5 key advances 5× slower than
+            -- weight=1, meaning it wins the minimum-pass comparison 5× more often —
+            -- exactly the weighted-fair-share property we want.
+            -- Running inside the same CTE chain keeps the advance atomic with the claim.
+            advance AS (
+                SELECT strand.fairness_advance(
+                    \(namespaceID),
+                    \(queue),
+                    array_agg(c.fairness_key)    FILTER (WHERE c.fairness_key IS NOT NULL),
+                    array_agg(c.fairness_weight) FILTER (WHERE c.fairness_key IS NOT NULL)
+                )
+                FROM claimed c
             )
             SELECT c.id, c.task_id, c.attempt, c.version,
                    t.name, t.params, t.retry_strategy, t.max_attempts, t.headers,
@@ -830,7 +882,9 @@ enum Queries {
                    t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
                    t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at,
                    t.first_task_id, t.cancel_requested
-            FROM claimed c JOIN strand.tasks t ON t.id = c.task_id
+            FROM claimed c
+            JOIN strand.tasks t ON t.id = c.task_id,
+            advance   -- cross-join forces advance CTE to execute even when claimed is non-empty
             ORDER BY c.id
             """,
             logger: logger
@@ -1072,12 +1126,21 @@ enum Queries {
     ///    transition the task row to PENDING so it becomes claimable.
     /// 6. Otherwise: mark the task permanently FAILED and call
     ///    `emitTaskCompletionSignal` to wake the parent workflow.
+    ///
+    /// - Parameter failedAt: The wall-clock time at which the failure occurred.
+    ///   Defaults to `Date()` (now) for callers that do not track a prior start
+    ///   time. Pass the task's actual start time (`taskStartWall` in `failAndRecord`)
+    ///   so that the retry `available_at` is computed as
+    ///   `failure_time + delay` rather than `wake_time + delay`. Without this,
+    ///   an OS sleep between the throw and the DB commit (e.g. laptop lid closed)
+    ///   can push `available_at` hours into the future.
     static func failRun(
         on client: PostgresClient,
         namespaceID: String,
         runID: UUID,
         version: Int,
         reasonBuffer: ByteBuffer,
+        failedAt: Date = Date(),
         logger: Logger
     ) async throws {
         try await client.withTransaction(logger: logger) { conn in
@@ -1227,7 +1290,7 @@ enum Queries {
                 .flatMap { $0.nextRetryDelaySeconds }
                 .flatMap { $0 > 0 ? $0 : nil }
             let delay = overrideDelay ?? retryDelay(strategy: retryStrategyBuf, attempt: attempt)
-            let wakeAt = Date.now.addingTimeInterval(delay)
+            let wakeAt = failedAt.addingTimeInterval(delay)
             let newState: TaskState = delay > 0 ? .sleeping : .pending
             let newRunID = UUID.v7()
             try await conn.query(
@@ -3102,6 +3165,16 @@ enum Queries {
     /// this is the only code path that makes WAITING → PENDING transitions.
     /// `FOR UPDATE SKIP LOCKED` lets multiple workers process different runs in
     /// parallel without contention.
+    ///
+    /// Two predicates are OR-ed to catch all stuck-WAITING cases:
+    ///   1. event_waits JOIN task_completions — child completed while parent was already
+    ///      WAITING; the normal path.  emitTaskCompletionSignal sends pg_notify to
+    ///      trigger this eagerly, but the poll loop also calls this as a safety net.
+    ///   2. has_buffered_completion = TRUE — a child completed while the parent was
+    ///      RUNNING (flag_running set the flag) but the subsequent activation left the
+    ///      run WAITING with the flag still set.  This should be impossible under
+    ///      normal row-locking semantics, but serves as defence-in-depth for any
+    ///      edge case not yet anticipated.
     static func wakeCompletedWaiting(
         on client: PostgresClient,
         namespaceID: String,
@@ -3112,9 +3185,9 @@ enum Queries {
             """
             WITH
             to_wake AS (
-                -- WAITING runs that have at least one event_wait child already in
-                -- task_completions — the child completed but the parent was not
-                -- immediately transitioned (e.g. was RUNNING at completion time).
+                -- WAITING runs that are ready to progress:
+                --   a) at least one event_wait child is already in task_completions, OR
+                --   b) has_buffered_completion is set (safety-net for any residual edge case).
                 -- EXISTS is used instead of JOIN so that FOR UPDATE works without
                 -- a DISTINCT clause (Postgres forbids FOR UPDATE + DISTINCT).
                 SELECT r.id AS run_id, r.task_id
@@ -3123,12 +3196,15 @@ enum Queries {
                   AND  r.queue        = \(queue)
                   AND  r.state        = \(TaskState.waiting)
                   AND  r.created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
-                  AND  EXISTS (
-                      SELECT 1
-                      FROM   strand.event_waits ew
-                      JOIN   strand.task_completions tc ON tc.task_id = ew.child_task_id
-                      WHERE  ew.run_id        = r.id
-                        AND  ew.child_task_id IS NOT NULL
+                  AND  (
+                      r.has_buffered_completion
+                      OR EXISTS (
+                          SELECT 1
+                          FROM   strand.event_waits ew
+                          JOIN   strand.task_completions tc ON tc.task_id = ew.child_task_id
+                          WHERE  ew.run_id        = r.id
+                            AND  ew.child_task_id IS NOT NULL
+                      )
                   )
                 ORDER BY r.id
                 LIMIT 50

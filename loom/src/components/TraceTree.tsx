@@ -160,12 +160,18 @@ function hasAnyLiveSpan(spans: TraceSpan[]): boolean {
     );
 }
 
-/** True for spans that count as "errors" for the Errors-only filter. */
+/** True for spans that count as "errors" for the Errors-only filter.
+ *
+ * TIMED_OUT on WAIT / SLEEP / CONDITION spans is intentional control flow
+ * (SLA elapsed → the workflow took the timeout branch).  Only TIMED_OUT on
+ * ACTIVITY or WORKFLOW spans represents a genuine deadline failure.
+ */
 function isErrorSpan(span: TraceSpan): boolean {
     return (
         span.state === "FAILED" ||
         span.state === "CRASHED" ||
-        span.state === "TIMED_OUT" ||
+        (span.state === "TIMED_OUT" &&
+            (span.kind === "ACTIVITY" || span.kind === "WORKFLOW")) ||
         (span.kind === "LOG" && span.logLevel === "ERROR")
     );
 }
@@ -414,8 +420,8 @@ function logDotClass(logLevel?: "INFO" | "WARN" | "ERROR" | "DEBUG"): string {
 }
 
 function minimapBarClass(state: SpanState): string {
-    if (state === "FAILED" || state === "CRASHED" || state === "TIMED_OUT")
-        return "bg-red-400";
+    if (state === "FAILED" || state === "CRASHED") return "bg-red-400";
+    if (state === "TIMED_OUT") return "bg-orange-400"; // SLA exit — orange, not red
     if (state === "RUNNING") return "bg-yellow-400";
     if (state === "COMPLETED") return "bg-green-400";
     return "bg-muted-foreground/40";
@@ -786,14 +792,17 @@ export function TraceTree({
         [visibleRangeMs],
     );
 
-    // End-tick color: green for clean traces, red if any root span failed.
+    // End-tick color: green for clean traces, red if any span hard-failed.
+    // TIMED_OUT on WAIT/SLEEP/CONDITION is intentional SLA control flow and
+    // should not turn the trace red — only ACTIVITY/WORKFLOW timeouts do.
     const rootFailed = useMemo(
         () =>
             spans.some(
                 (s) =>
                     s.state === "FAILED" ||
                     s.state === "CRASHED" ||
-                    s.state === "TIMED_OUT",
+                    (s.state === "TIMED_OUT" &&
+                        (s.kind === "ACTIVITY" || s.kind === "WORKFLOW")),
             ),
         [spans],
     );
@@ -1518,12 +1527,12 @@ export function TraceTree({
                                                 label={
                                                     selected.state ===
                                                         "FAILED" ||
-                                                    selected.state ===
-                                                        "CRASHED" ||
-                                                    selected.state ===
-                                                        "TIMED_OUT"
+                                                    selected.state === "CRASHED"
                                                         ? "Failed"
-                                                        : "Completed"
+                                                        : selected.state ===
+                                                            "TIMED_OUT"
+                                                          ? "Timed out"
+                                                          : "Completed"
                                                 }
                                                 iso={selected.completedAt}
                                                 prev={

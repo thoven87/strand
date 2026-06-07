@@ -365,6 +365,23 @@ public struct StrandPruner: Service {
                 }
             }
 
+        // Clean up fairness_sketch rows for queues that have been deleted.
+        // UNLOGGED tables cannot hold foreign keys to logged tables, so
+        // cascade-delete is not available — we sweep manually here instead.
+        // A sketch row whose queue no longer exists in strand.queues is
+        // safe to delete: no claims will ever reference that queue again.
+        try await conn.query(
+            """
+            DELETE FROM strand.fairness_sketch s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM strand.queues q
+                WHERE q.namespace_id = s.namespace_id
+                  AND q.name         = s.queue
+            )
+            """,
+            logger: logger
+        )
+
             // Explicitly release the advisory lock so other instances can
             // become leader on the next cycle (rather than waiting for the
             // connection to be returned to the pool).
