@@ -160,10 +160,20 @@ struct ChildWorkflowTests {
                     input: StrandVoid()
                 )
 
-                // 2. Wait until the child task appears in the DB (parent has run at
-                //    least one activation and enqueued the child).
+                // 2. Wait until the child is in WAITING state — meaning it has run its
+                //    first activation and is parked inside waitForCancellation().
+                //
+                //    It is not sufficient to wait until the child merely EXISTS (PENDING).
+                //    If cancelTask fires while the child is still PENDING, cancelDescendants
+                //    can't find a WAITING/SLEEPING run to wake, so request_cancel_wake
+                //    returns zero rows and no pg_notify is sent.  The child would still
+                //    complete (cancel_requested = TRUE causes the condition to fire on the
+                //    first activation), but under full-suite Postgres load the worker may
+                //    not claim the PENDING child within the test's timeout window.
+                //
+                //    Waiting for WAITING guarantees request_cancel_wake always finds a match.
                 var childTaskID: UUID? = nil
-                for _ in 0..<50 {
+                for _ in 0..<100 {  // up to 20 s (100 × 200 ms)
                     let page = try await ManagementQueries.listChildTasks(
                         on: client.postgres,
                         namespaceID: "default",
@@ -172,14 +182,14 @@ struct ChildWorkflowTests {
                         limit: 10,
                         logger: client.logger
                     )
-                    if let child = page.items.first {
+                    if let child = page.items.first, child.state == .waiting {
                         childTaskID = child.id
                         break
                     }
                     try await Task.sleep(for: .milliseconds(200))
                 }
                 guard let childTaskID else {
-                    Issue.record("child task never appeared in DB — parent did not start the child")
+                    Issue.record("child task never reached WAITING state — parent did not start the child or it completed before parking")
                     return
                 }
 
@@ -193,7 +203,7 @@ struct ChildWorkflowTests {
                 let childResult = try await client.awaitTaskResult(
                     id: childTaskID,
                     as: String.self,
-                    options: .init(timeout: .seconds(15))
+                    options: .init(timeout: .seconds(30))
                 )
                 #expect(childResult == "cancelled")
             }
