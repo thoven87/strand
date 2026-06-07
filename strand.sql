@@ -1052,6 +1052,113 @@ CREATE TABLE IF NOT EXISTS strand.rate_limit_slots (
     CONSTRAINT strand_rate_limit_slots_pkey PRIMARY KEY (namespace_id, queue, slot_key)
 );
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Count-min sketch for stride-based fairness scheduling
+--
+-- Stores a fixed-size 4×1024 = 4096-cell FLOAT8 array per (namespace, queue).
+-- Each cell accumulates the pass counter (stride = 1000 / weight) for all
+-- fairness keys that hash to it.  The estimate for a key is the MIN across the
+-- four hash rows, which is always an over-estimate — never under-counts.
+--
+-- Replaces weighted-random (random() / weight) with deterministic stride
+-- scheduling: the key with the smallest accumulated pass value runs next,
+-- giving exactly weight-proportional throughput over any observation window.
+--
+-- UNLOGGED: counter state resets on a crash, same trade-off as any in-process
+-- counter.  Workers on the same queue share one row, so fairness accounting is
+-- consistent across all workers — eliminating per-worker drift.
+--
+-- Memory: 4096 × 8 bytes = 32 KB per (namespace, queue) regardless of key count.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE UNLOGGED TABLE IF NOT EXISTS strand.fairness_sketch (
+    namespace_id TEXT     NOT NULL,
+    queue        TEXT     NOT NULL,
+    -- 4 hash rows × 1024 columns.  Row i occupies indices [i*1024+1 .. i*1024+1024].
+    -- All cells initialised to 0; grow monotonically as tasks are dispatched.
+    counters     FLOAT8[] NOT NULL
+                 DEFAULT array_fill(0.0::FLOAT8, ARRAY[4096]),
+    PRIMARY KEY (namespace_id, queue)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- strand.fairness_advance — advance pass counters for claimed fairness keys
+--
+-- Called inside the claimTasks CTE after the claim is recorded.  Loads the
+-- sketch array into memory, increments the four cells for each claimed key,
+-- then writes back in a single UPDATE — O(claimed × 4) array writes.
+--
+-- stride(key) = 1000 / weight.  After N dispatches of a key with weight W,
+-- its pass value is N × 1000/W.  The key with the smallest pass is always
+-- next, so throughput ratios converge to exactly weight₁ : weight₂ : …
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION strand.fairness_advance(
+    p_namespace TEXT,
+    p_queue     TEXT,
+    p_keys      TEXT[],
+    p_weights   FLOAT8[]
+) RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE
+    c_width     CONSTANT INT    := 1024;
+    c_stride    CONSTANT FLOAT8 := 1000.0;
+    c_threshold CONSTANT FLOAT8 := 1e11;  -- normalise when any cell exceeds this
+    v_counters FLOAT8[];
+    v_max      FLOAT8;
+    v_min      FLOAT8;
+    i          INT;
+    j          INT;
+    idx        INT;
+BEGIN
+    IF p_keys IS NULL OR array_length(p_keys, 1) IS NULL THEN
+        RETURN;  -- nothing to advance (no faired tasks were claimed)
+    END IF;
+
+    -- Ensure the sketch row exists (first-use on this queue).
+    INSERT INTO strand.fairness_sketch (namespace_id, queue)
+    VALUES (p_namespace, p_queue)
+    ON CONFLICT (namespace_id, queue) DO NOTHING;
+
+    -- Lock the row and load counters into memory.
+    SELECT counters INTO v_counters
+    FROM strand.fairness_sketch
+    WHERE namespace_id = p_namespace AND queue = p_queue
+    FOR UPDATE;
+
+    -- Advance each key's four cells by its stride.
+    FOR i IN 1..array_length(p_keys, 1) LOOP
+        CONTINUE WHEN p_keys[i] IS NULL;
+        FOR j IN 0..3 LOOP
+            idx := j * c_width
+                 + (abs(hashtextextended(p_keys[i], j::BIGINT)) % c_width)
+                 + 1;
+            v_counters[idx] := v_counters[idx]
+                              + c_stride / GREATEST(p_weights[i], 0.001);
+        END LOOP;
+    END LOOP;
+
+    -- Lazy normalisation: subtract the minimum non-zero cell value from all
+    -- cells (flooring at 0) when any cell exceeds the threshold.  Preserves
+    -- relative ordering so stride dispatch is unaffected.  Keys that return
+    -- after a long absence are reset to 0, giving them a fair fresh start.
+    SELECT MAX(v), MIN(v) INTO v_max, v_min
+    FROM unnest(v_counters) AS t(v)
+    WHERE v > 0;
+
+    IF v_max > c_threshold AND v_min IS NOT NULL THEN
+        v_counters := ARRAY(
+            SELECT GREATEST(v - v_min, 0.0)
+            FROM unnest(v_counters) AS t(v)
+        );
+    END IF;
+
+    -- Write the updated (and possibly normalised) counters back.
+    UPDATE strand.fairness_sketch
+    SET counters = v_counters
+    WHERE namespace_id = p_namespace AND queue = p_queue;
+END;
+$$;
+
 -- ───────────────────────────────────────────────────────────────────────────────
 -- Count estimate — fast approximate row counts for large tables.
 --

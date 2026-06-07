@@ -168,7 +168,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // running on this worker, not just the one that timed out. That would
         // orphan workflows B, C, … whenever workflow A hits its claim timeout.
         //
-        // evictOne() cancels only this workflow’s handler Task and removes it
+        // evictOne() cancels only this workflow's handler Task and removes it
         // from the cache. The next attempt (failRun creates attempt N+1) will
         // then take the fresh path (_activate) and rebuild from checkpoints
         // rather than trying to resumeActivation on a cancelled handler.
@@ -176,8 +176,24 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // Worker shutdown: each concurrent activation fires evictOne for its own
         // taskID independently — net result is identical to cancelAll, just
         // scoped correctly.
+        //
+        // Error eviction: if _activate throws (e.g. a DB error inside
+        // applyScheduleCommands), the inner do-catch also evicts.  Without this,
+        // the handler Task stays parked on continuations for activities that were
+        // never durably committed (rolled-back transaction), so the next retry's
+        // resumeActivation finds no completed children, the handler can't advance,
+        // step 7 produces WAITING with zero event_waits, and the workflow is
+        // permanently stuck until a worker restart clears the in-memory cache.
+        // evictOne is idempotent — safe to call from both paths simultaneously.
         try await withTaskCancellationHandler {
-            try await _activate(claimed: claimed, exec: exec, cache: cache)
+            do {
+                return try await _activate(claimed: claimed, exec: exec, cache: cache)
+            } catch {
+                // Cancel + remove the handler Task so the next activation takes the
+                // fresh path and replays the handler from scratch via checkpoints.
+                cache.evictOne(claimed.taskID)
+                throw error
+            }
         } onCancel: {
             cache.evictOne(claimed.taskID)
         }
@@ -334,6 +350,29 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             }
         }
 
+        // Leak guard: if we exit this function without handing the handler Task off
+        // to the cache (via applyScheduleCommands → cache.set), the Task would be
+        // orphaned — parked on CheckedContinuations that are never resumed — keeping
+        // executor, stateBox, activation, and all captured state alive until the
+        // process exits.
+        //
+        // Two throw points exist after Task creation:
+        //   • runLocalActivities (below)
+        //   • applyScheduleCommands (step 7)
+        //
+        // Setting handlerTaskHandedOff = true just before the final return ensures the
+        // defer is a no-op on the success path.  For terminal handlers (completed,
+        // failed, continueAsNew) applyScheduleCommands calls teardownHandler before
+        // returning, so cancel/drain below are no-ops; still safe to call twice.
+        var handlerTaskHandedOff = false
+        defer {
+            if !handlerTaskHandedOff {
+                handlerTask.cancel()
+                executor.cancelPending()
+                executor.drain()
+            }
+        }
+
         // Deliver cooperative cancel: if this workflow's parent closed with
         // parentClosePolicy = .requestCancel, set the activation flag (readable
         // from condition predicates in the worker-task context) AND cancel the
@@ -370,7 +409,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         )
 
         // ── 7. Apply commands, handle result, suspend or complete ─────────────────
-        return try await applyScheduleCommands(
+        let result = try await applyScheduleCommands(
             commands: executor.pendingCommands,
             executor: executor,
             claimed: claimed,
@@ -383,6 +422,10 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             historySeq: &historySeq,
             claimTimeoutSecs: claimTimeoutSecs
         )
+        // Mark as handed off so the defer skips cleanup.
+        // Must be set before returning so the defer sees it.
+        handlerTaskHandedOff = true
+        return result
     }
 
     // MARK: - Cached re-activation

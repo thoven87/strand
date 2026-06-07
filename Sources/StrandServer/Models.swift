@@ -160,6 +160,7 @@ struct RunResponse: Codable, Sendable {
     let finishedAt: Date?
     let leaseExpiresAt: Date?
     let createdAt: Date
+    let availableAt: Date
     let failureReason: String?  // raw JSON
 
     init(from row: RunSummaryRow) {
@@ -172,6 +173,7 @@ struct RunResponse: Codable, Sendable {
         finishedAt = row.finishedAt
         leaseExpiresAt = row.leaseExpiresAt
         createdAt = row.createdAt
+        availableAt = row.availableAt
         failureReason = row.failureBuffer.map { String(buffer: $0) }
     }
 }
@@ -405,7 +407,7 @@ struct WorkerTaskResponse: Codable, Sendable {
         taskName = row.taskName
         kind = row.kind.rawValue
         queue = row.queue
-        state = row.runState.rawValue   // run-level, not task-level
+        state = row.runState.rawValue  // run-level, not task-level
         attempt = row.attempt
         startedAt = row.startedAt
         finishedAt = row.finishedAt

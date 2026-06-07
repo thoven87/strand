@@ -294,6 +294,14 @@ public enum TaskState: String, Sendable, Codable {
     /// The workflow called `context.continueAsNew(input:)` — a new task was
     /// enqueued with a fresh input and this task's execution is complete.
     case continuedAsNew = "CONTINUED_AS_NEW"
+
+    /// `true` for states from which a task will never transition again.
+    public var isTerminal: Bool {
+        switch self {
+        case .completed, .failed, .cancelled, .continuedAsNew: return true
+        case .pending, .running, .sleeping, .waiting:          return false
+        }
+    }
 }
 
 extension ScheduleAccuracy: PostgresCodable {
@@ -436,8 +444,12 @@ public struct TaskResultSnapshot: Sendable, Codable {
     public let resultJSON: String?
     public let failure: TaskFailure?
 
-    /// Decodes the result JSON into `T`. Internal — use `awaitTaskResult(id:as:)` instead.
-    func decodeResult<T: Decodable>(as type: T.Type = T.self) throws -> T {
+    /// Decodes the result JSON into `T`.
+    ///
+    /// Prefer `StrandClient.awaitTaskResult(id:as:)` for the common async-polling
+    /// pattern. Use this method when you already hold a `TaskResultSnapshot` and
+    /// want to decode it synchronously without an additional network round-trip.
+    public func decodeResult<T: Decodable>(as type: T.Type = T.self) throws -> T {
         guard let json = resultJSON else {
             throw StrandError.serialization(underlying: MissingResultError())
         }
