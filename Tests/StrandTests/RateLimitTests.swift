@@ -83,31 +83,38 @@ struct RateLimitTests {
 
     // ── 1 ────────────────────────────────────────────────────────────────────────
     // Enqueuing three standalone activities with the same global key (nil) and a
-    // 1-per-second limit must allocate distinct, consecutive slots:
-    //   run 1 → available_at ≈ NOW        (no delay)
-    //   run 2 → available_at ≈ NOW + 1 s
-    //   run 3 → available_at ≈ NOW + 2 s
+    // 1-per-10-second limit must allocate distinct, consecutive slots:
+    //   run 1 → available_at ≈ NOW          (no delay)
+    //   run 2 → available_at ≈ NOW + 10 s
+    //   run 3 → available_at ≈ NOW + 20 s
+    //
+    // A 10-second interval is used deliberately: the slot-allocation SQL contains
+    // GREATEST(stored_cursor, NOW()), which resets the cursor to NOW when the
+    // stored slot has already elapsed.  With a 1-second interval the GREATEST reset
+    // can trigger on a loaded machine if a subsequent enqueue takes just over 1 s
+    // to acquire a DB connection.  At 10 s the reset window is wide enough that
+    // it cannot be triggered by normal back-to-back async calls.
     //
     // This test inspects the DB directly so it doesn't need to wait for
     // execution and is fast regardless of worker speed.
-    @Test("global key: three consecutive enqueues get 1-second-apart slots")
+    @Test("global key: three consecutive enqueues get 10-second-apart slots")
     func globalKeySlotStagger() async throws {
         try await withTestEnvironment { client in
             let before = Date.now
             let e1 = try await client.enqueueActivity(
                 EchoActivity.self,
                 input: .init(value: "x"),
-                options: .init(rateLimit: .init(limit: 1, period: .seconds(1)))
+                options: .init(rateLimit: .init(limit: 1, period: .seconds(10)))
             )
             let e2 = try await client.enqueueActivity(
                 EchoActivity.self,
                 input: .init(value: "y"),
-                options: .init(rateLimit: .init(limit: 1, period: .seconds(1)))
+                options: .init(rateLimit: .init(limit: 1, period: .seconds(10)))
             )
             let e3 = try await client.enqueueActivity(
                 EchoActivity.self,
                 input: .init(value: "z"),
-                options: .init(rateLimit: .init(limit: 1, period: .seconds(1)))
+                options: .init(rateLimit: .init(limit: 1, period: .seconds(10)))
             )
             let after = Date.now
 
@@ -122,24 +129,24 @@ struct RateLimitTests {
             let at3 = try #require(dates[e3.taskID])
 
             // Run 1: slot = first available → must be immediately claimable
-            // (≤ 200 ms after enqueue).
+            // (≤ 500 ms after enqueue, allowing for clock skew between Swift and Postgres).
             #expect(
-                at1 <= after.addingTimeInterval(0.2),
+                at1 <= after.addingTimeInterval(0.5),
                 "run 1 should be immediately available, got \(at1)"
             )
 
-            // Run 2: slot is 1 s after run 1's slot.
+            // Run 2: slot is ~10 s after run 1's slot.
             let gap12 = at2.timeIntervalSince(at1)
             #expect(
-                gap12 >= 0.9 && gap12 <= 1.1,
-                "gap between run 1 and run 2 should be ~1 s, got \(gap12)"
+                gap12 >= 9.0 && gap12 <= 11.0,
+                "gap between run 1 and run 2 should be ~10 s, got \(gap12)"
             )
 
-            // Run 3: slot is 1 s after run 2's slot.
+            // Run 3: slot is ~10 s after run 2's slot.
             let gap23 = at3.timeIntervalSince(at2)
             #expect(
-                gap23 >= 0.9 && gap23 <= 1.1,
-                "gap between run 2 and run 3 should be ~1 s, got \(gap23)"
+                gap23 >= 9.0 && gap23 <= 11.0,
+                "gap between run 2 and run 3 should be ~10 s, got \(gap23)"
             )
 
             // Sanity: slots are strictly ordered.
