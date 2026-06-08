@@ -117,6 +117,7 @@ package struct RunSummaryRow: Sendable {
     package let finishedAt: Date?
     package let leaseExpiresAt: Date?
     package let createdAt: Date
+    package let availableAt: Date
     package let failureBuffer: ByteBuffer?  // raw JSON BYTEA
 }
 
@@ -132,6 +133,7 @@ extension RunSummaryRow {
         finishedAt = try col.next()!.decode(Date?.self, context: .default)
         leaseExpiresAt = try col.next()!.decode(Date?.self, context: .default)
         createdAt = try col.next()!.decode(Date.self, context: .default)
+        availableAt = try col.next()!.decode(Date.self, context: .default)
         failureBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
     }
 }
@@ -160,13 +162,13 @@ package struct QueueStatsRow: Sendable {
 extension QueueStatsRow {
     package init(row: PostgresRow) throws {
         var col = row.makeIterator()
-        name         = try col.next()!.decode(String.self, context: .default)
-        createdAt    = try col.next()!.decode(Date.self, context: .default)
-        isPaused     = try col.next()!.decode(Bool.self, context: .default)
-        pending      = try col.next()!.decode(Int.self, context: .default)
-        running      = try col.next()!.decode(Int.self, context: .default)
-        sleeping     = try col.next()!.decode(Int.self, context: .default)
-        waiting      = try col.next()!.decode(Int.self, context: .default)
+        name = try col.next()!.decode(String.self, context: .default)
+        createdAt = try col.next()!.decode(Date.self, context: .default)
+        isPaused = try col.next()!.decode(Bool.self, context: .default)
+        pending = try col.next()!.decode(Int.self, context: .default)
+        running = try col.next()!.decode(Int.self, context: .default)
+        sleeping = try col.next()!.decode(Int.self, context: .default)
+        waiting = try col.next()!.decode(Int.self, context: .default)
         failedRecent = try col.next()!.decode(Int.self, context: .default)
     }
 }
@@ -429,7 +431,7 @@ package enum ManagementQueries {
         let stream = try await client.query(
             """
             SELECT id, attempt, state, worker_id, sdk_version,
-                   started_at, finished_at, lease_expires_at, created_at, failure_reason
+                   started_at, finished_at, lease_expires_at, created_at, available_at, failure_reason
             FROM strand.runs
             WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)
             ORDER BY attempt DESC
@@ -1432,11 +1434,17 @@ extension ManagementQueries {
                 let p99 = try col.next()!.decode(Double?.self, context: .default)
                 let minMs = try col.next()!.decode(Double?.self, context: .default)
                 let maxMs = try col.next()!.decode(Double?.self, context: .default)
-                rows.append(OLAPLatencyRow(
-                    taskName: taskName, count: count,
-                    p50Ms: p50, p95Ms: p95, p99Ms: p99,
-                    minMs: minMs, maxMs: maxMs
-                ))
+                rows.append(
+                    OLAPLatencyRow(
+                        taskName: taskName,
+                        count: count,
+                        p50Ms: p50,
+                        p95Ms: p95,
+                        p99Ms: p99,
+                        minMs: minMs,
+                        maxMs: maxMs
+                    )
+                )
             }
             return rows
         }
@@ -1611,7 +1619,7 @@ extension ManagementQueries {
         }
         var col = row.makeIterator()
         let completed = try col.next()!.decode(Int.self, context: .default)
-        let failed    = try col.next()!.decode(Int.self, context: .default)
+        let failed = try col.next()!.decode(Int.self, context: .default)
         let cancelled = try col.next()!.decode(Int.self, context: .default)
         return (completed, failed, cancelled)
     }
@@ -1635,55 +1643,59 @@ extension ManagementQueries {
             for try await row in stream {
                 var col = row.makeIterator()
                 let bucket = try col.next()!.decode(Date.self, context: .default)
-                let count  = try col.next()!.decode(Int.self,  context: .default)
+                let count = try col.next()!.decode(Int.self, context: .default)
                 rows.append(MetricsThroughputBucket(bucket: bucket, count: count))
             }
             return rows
         }
         if useDaily {
             // Daily buckets via strand_tasks_throughput_day_idx.
-            return try await decode(client.query(
-                """
-                SELECT
-                    gs AS bucket,
-                    (SELECT COUNT(*)
-                     FROM strand.tasks
-                     WHERE namespace_id = \(namespaceID)
-                       AND state = \(TaskState.completed)
-                       AND date_trunc('day', completed_at, 'UTC') = gs
-                       AND completed_at >= \(cutoff)
-                    ) AS cnt
-                FROM generate_series(
-                    date_trunc('day', \(cutoff), 'UTC'),
-                    date_trunc('day', NOW(), 'UTC'),
-                    INTERVAL '1 day'
-                ) AS gs
-                ORDER BY gs
-                """,
-                logger: logger
-            ))
+            return try await decode(
+                client.query(
+                    """
+                    SELECT
+                        gs AS bucket,
+                        (SELECT COUNT(*)
+                         FROM strand.tasks
+                         WHERE namespace_id = \(namespaceID)
+                           AND state = \(TaskState.completed)
+                           AND date_trunc('day', completed_at, 'UTC') = gs
+                           AND completed_at >= \(cutoff)
+                        ) AS cnt
+                    FROM generate_series(
+                        date_trunc('day', \(cutoff), 'UTC'),
+                        date_trunc('day', NOW(), 'UTC'),
+                        INTERVAL '1 day'
+                    ) AS gs
+                    ORDER BY gs
+                    """,
+                    logger: logger
+                )
+            )
         } else {
             // Hourly buckets via strand_tasks_throughput_hour_idx.
-            return try await decode(client.query(
-                """
-                SELECT
-                    gs AS bucket,
-                    (SELECT COUNT(*)
-                     FROM strand.tasks
-                     WHERE namespace_id = \(namespaceID)
-                       AND state = \(TaskState.completed)
-                       AND date_trunc('hour', completed_at, 'UTC') = gs
-                       AND completed_at >= \(cutoff)
-                    ) AS cnt
-                FROM generate_series(
-                    date_trunc('hour', \(cutoff), 'UTC'),
-                    date_trunc('hour', NOW(), 'UTC'),
-                    INTERVAL '1 hour'
-                ) AS gs
-                ORDER BY gs
-                """,
-                logger: logger
-            ))
+            return try await decode(
+                client.query(
+                    """
+                    SELECT
+                        gs AS bucket,
+                        (SELECT COUNT(*)
+                         FROM strand.tasks
+                         WHERE namespace_id = \(namespaceID)
+                           AND state = \(TaskState.completed)
+                           AND date_trunc('hour', completed_at, 'UTC') = gs
+                           AND completed_at >= \(cutoff)
+                        ) AS cnt
+                    FROM generate_series(
+                        date_trunc('hour', \(cutoff), 'UTC'),
+                        date_trunc('hour', NOW(), 'UTC'),
+                        INTERVAL '1 hour'
+                    ) AS gs
+                    ORDER BY gs
+                    """,
+                    logger: logger
+                )
+            )
         }
     }
 
@@ -1701,35 +1713,39 @@ extension ManagementQueries {
             for try await row in stream {
                 var col = row.makeIterator()
                 let bucket = try col.next()!.decode(Date.self, context: .default)
-                let count  = try col.next()!.decode(Int.self,  context: .default)
+                let count = try col.next()!.decode(Int.self, context: .default)
                 rows.append(MetricsThroughputBucket(bucket: bucket, count: count))
             }
             return rows
         }
         if useDaily {
-            return try await decode(client.query(
-                """
-                SELECT date_trunc('day', created_at) AS bucket, COUNT(*) AS cnt
-                FROM strand.tasks
-                WHERE namespace_id = \(namespaceID)
-                  AND state = \(TaskState.failed)
-                  AND created_at >= \(cutoff)
-                GROUP BY 1 ORDER BY 1
-                """,
-                logger: logger
-            ))
+            return try await decode(
+                client.query(
+                    """
+                    SELECT date_trunc('day', created_at) AS bucket, COUNT(*) AS cnt
+                    FROM strand.tasks
+                    WHERE namespace_id = \(namespaceID)
+                      AND state = \(TaskState.failed)
+                      AND created_at >= \(cutoff)
+                    GROUP BY 1 ORDER BY 1
+                    """,
+                    logger: logger
+                )
+            )
         } else {
-            return try await decode(client.query(
-                """
-                SELECT date_trunc('hour', created_at) AS bucket, COUNT(*) AS cnt
-                FROM strand.tasks
-                WHERE namespace_id = \(namespaceID)
-                  AND state = \(TaskState.failed)
-                  AND created_at >= \(cutoff)
-                GROUP BY 1 ORDER BY 1
-                """,
-                logger: logger
-            ))
+            return try await decode(
+                client.query(
+                    """
+                    SELECT date_trunc('hour', created_at) AS bucket, COUNT(*) AS cnt
+                    FROM strand.tasks
+                    WHERE namespace_id = \(namespaceID)
+                      AND state = \(TaskState.failed)
+                      AND created_at >= \(cutoff)
+                    GROUP BY 1 ORDER BY 1
+                    """,
+                    logger: logger
+                )
+            )
         }
     }
 }
