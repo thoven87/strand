@@ -231,6 +231,11 @@ public struct StrandWorker: Service {
     /// `Sendable` handler registry — a class reference whose `let` store is
     /// data-race free by construction (written once in `init`, never mutated).
     private let _registry: Registry
+    /// Cleanup closures for workflow-type handler-Task caches.
+    /// One entry per registered workflow type; empty for pure-activity workers.
+    /// Called at the end of `run()` to cancel any Tasks still parked in the
+    /// cache (workflows in WAITING/SLEEPING state at shutdown).
+    private let _cacheCleaners: [@Sendable () -> Void]
     /// Shared LISTEN/NOTIFY hub.  The worker subscribes to `strand_tasks`
     /// via the notifier's `AsyncStream` — no separate Postgres connection
     /// is opened.  The notifier must declare ``StrandChannels/tasks`` in its
@@ -293,12 +298,15 @@ public struct StrandWorker: Service {
         // as a `let` constant — no Mutex or nonisolated(unsafe) required.
         var registrations: [AnyRegistration] = []
         registrations.reserveCapacity(workflows.count + allActivities.count)
+        // One cleanup closure per workflow type — activities don't need one.
+        var cacheCleaners: [@Sendable () -> Void] = []
+        cacheCleaners.reserveCapacity(workflows.count)
 
         // SE-0352: passing any Workflow.Type to the generic _registerWorkflow
         // opens the existential, binding the concrete W.
         // _WorkflowTaskCache<W> is then created inside that function scope.
         for wfType in workflows {
-            _registerWorkflow(wfType, queue: options.queue, exec: exec, into: &registrations)
+            _registerWorkflow(wfType, queue: options.queue, exec: exec, into: &registrations, cleaners: &cacheCleaners)
         }
 
         // SE-0352: opens any Activity → A: Activity, capturing the concrete _run.
@@ -307,6 +315,7 @@ public struct StrandWorker: Service {
         }
 
         self._registry = Registry(registrations)
+        self._cacheCleaners = cacheCleaners
     }
 
     // MARK: - Service
@@ -446,6 +455,10 @@ public struct StrandWorker: Service {
         } onCancelOrGracefulShutdown: {
             cont.finish()  // unblocks the shutdown task in the group above
         }
+
+        // Cancel and drain workflow handler Tasks still parked in the cache
+        // (workflows that were WAITING/SLEEPING when shutdown fired).
+        _cacheCleaners.forEach { $0() }
     }
 
     // MARK: - Poll loop
@@ -604,12 +617,11 @@ public struct StrandWorker: Service {
             // Re-check after the sleep — shutdown may have fired mid-interval.
             guard !Task.isShuttingDownGracefully && !Task.isCancelled else { break }
             do {
-                try await Queries.sweepExpiredLeases(
-                    on: postgres,
-                    namespaceID: namespace,
-                    queue: queueName,
-                    logger: logger
-                )
+                try await postgres.withConnection { conn in
+                    try await Queries.sweepExpiredLeases(on: conn, namespaceID: namespace, queue: queueName, logger: logger)
+                }
+                // sweepStartTimeoutActivities creates per-item transactions internally;
+                // it cannot be nested inside the outer withConnection above.
                 try await Queries.sweepStartTimeoutActivities(
                     on: postgres,
                     namespaceID: namespace,
@@ -646,26 +658,28 @@ public struct StrandWorker: Service {
                 try await Task.sleep(for: self.options.pollInterval)
             }
             notifySignal.signal()
-            // Upsert heartbeat row with current running count.
+            // Upsert heartbeat row and sweep stale peers on one shared connection.
             // try? so a transient DB blip doesn't abort the worker.
-            try? await Queries.upsertWorker(
-                on: postgres,
-                workerID: workerID,
-                namespaceID: namespace,
-                queue: options.queue,
-                concurrency: options.workflowConcurrency + options.activityConcurrency,
-                running: running.value,
-                sdkVersion: StrandVersion.current,
-                logger: logger
-            )
-            // Sweep stale worker rows left by crashed peers
-            // (threshold: 3× pollInterval, floor 30 s).
             let stalenessSeconds = Int(max(30, options.pollInterval.components.seconds * 3))
-            try? await Queries.sweepStaleWorkers(
-                on: postgres,
-                olderThanSeconds: stalenessSeconds,
-                logger: logger
-            )
+            try? await postgres.withConnection { conn in
+                try await Queries.upsertWorker(
+                    on: conn,
+                    workerID: workerID,
+                    namespaceID: namespace,
+                    queue: options.queue,
+                    concurrency: options.workflowConcurrency + options.activityConcurrency,
+                    running: running.value,
+                    sdkVersion: StrandVersion.current,
+                    logger: logger
+                )
+                // Sweep stale worker rows left by crashed peers
+                // (threshold: 3× pollInterval, floor 30 s).
+                try await Queries.sweepStaleWorkers(
+                    on: conn,
+                    olderThanSeconds: stalenessSeconds,
+                    logger: logger
+                )
+            }
         }
     }
 
@@ -1067,20 +1081,14 @@ public struct StrandWorker: Service {
 // MARK: - Registry
 
 /// Immutable handler registry built once at `StrandWorker.init` time.
-///
-/// Receives all registrations through its initialiser so the store can be
-/// a `let` constant.  A `let [String: AnyRegistration]` on a `final class`
-/// is `Sendable` by definition — no `Mutex`, no `nonisolated(unsafe)`,
-/// no escape hatch needed.
+/// A `let` store on a `final class` is `Sendable` by definition.
 final class Registry: Sendable {
     private let store: [String: AnyRegistration]
-
     init(_ registrations: [AnyRegistration]) {
         var s = [String: AnyRegistration](minimumCapacity: registrations.count)
         for r in registrations { s[r.name] = r }
         store = s
     }
-
     func lookup(_ name: String) -> AnyRegistration? {
         store[name]
     }

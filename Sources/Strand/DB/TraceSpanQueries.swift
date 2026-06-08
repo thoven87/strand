@@ -129,6 +129,76 @@ package enum TraceSpanQueries {
         )
     }
 
+    // MARK: - Batch child span insert
+
+    /// Batch-insert child task spans in a single round-trip using a multi-row VALUES INSERT.
+    ///
+    /// Unlike `insertRootSpansBatch`, child spans share a parent and may carry per-item
+    /// `kind`, `name`, `maxAttempts`, and `queuedAt`. `root_task_id` is resolved once from
+    /// the parent span via a WITH CTE — no per-row correlated subquery needed.
+    package static func insertChildSpansBatch(
+        on conn: PostgresConnection,
+        items: [(spanID: String, taskID: UUID, kind: WorkflowSpanKind, name: String, maxAttempts: Int?, queuedAt: Date)],
+        namespaceID: String,
+        parentSpanID: String,
+        state: WorkflowSpanState,
+        logger: Logger
+    ) async throws {
+        guard !items.isEmpty else { return }
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 400 + items.count * 200,
+            interpolationCount: items.count * 8 + 4
+        )
+        // Resolve root_task_id once from the parent span — shared by all child rows.
+        interp.appendLiteral(
+            "WITH parent_root AS (\n"
+                + "    SELECT COALESCE(root_task_id, task_id) AS root_task_id\n"
+                + "    FROM strand.trace_spans WHERE id = "
+        )
+        interp.appendInterpolation(parentSpanID)
+        interp.appendLiteral(
+            " LIMIT 1\n"
+                + ")\n"
+                + "INSERT INTO strand.trace_spans\n"
+                + "    (id, namespace_id, root_task_id, task_id, parent_id,\n"
+                + "     kind, name, state, attempt, worker_id, max_attempts,\n"
+                + "     queued_at, started_at, finished_at, error)\n"
+                + "VALUES\n"
+        )
+        for (i, item) in items.enumerated() {
+            if i > 0 { interp.appendLiteral(",\n") }
+            interp.appendLiteral("    (")
+            interp.appendInterpolation(item.spanID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", (SELECT root_task_id FROM parent_root), ")
+            interp.appendInterpolation(item.taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(parentSpanID)
+            interp.appendLiteral(", ")
+            try interp.appendInterpolation(item.kind)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(item.name)
+            interp.appendLiteral(", ")
+            try interp.appendInterpolation(state)
+            interp.appendLiteral(", 0, NULL, ")
+            interp.appendInterpolation(item.maxAttempts)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(item.queuedAt)
+            interp.appendLiteral(", NULL, NULL, NULL)")
+        }
+        interp.appendLiteral(
+            "\nON CONFLICT (id) DO UPDATE\n"
+                + "    SET state       = EXCLUDED.state,\n"
+                + "        attempt     = GREATEST(EXCLUDED.attempt, strand.trace_spans.attempt),\n"
+                + "        worker_id   = COALESCE(EXCLUDED.worker_id,   strand.trace_spans.worker_id),\n"
+                + "        started_at  = COALESCE(EXCLUDED.started_at,  strand.trace_spans.started_at),\n"
+                + "        finished_at = COALESCE(EXCLUDED.finished_at, strand.trace_spans.finished_at),\n"
+                + "        error       = COALESCE(EXCLUDED.error,       strand.trace_spans.error)"
+        )
+        try await conn.query(PostgresQuery(stringInterpolation: interp), logger: logger)
+    }
+
     // MARK: - History-event span derivation
 
     /// Derive SLEEP, WAIT, CONDITION, SIGNAL, UPDATE, and EMIT spans from

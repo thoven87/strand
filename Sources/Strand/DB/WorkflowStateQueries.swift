@@ -40,12 +40,12 @@ package enum WorkflowStateQueries {
     /// workflow's **first activation**. The caller is responsible for
     /// constructing a default instance in that case.
     package static func loadState(
-        on postgres: PostgresClient,
+        on conn: PostgresConnection,
         taskID: UUID,
         namespaceID: String,
         logger: Logger
     ) async throws -> ByteBuffer? {
-        let stream = try await postgres.query(
+        let stream = try await conn.query(
             """
             SELECT state
             FROM   strand.workflow_state
@@ -54,13 +54,18 @@ package enum WorkflowStateQueries {
             """,
             logger: logger
         )
-        guard let row = try await stream.first(where: { _ in true }) else {
-            return nil
-        }
+        guard let row = try await stream.first(where: { _ in true }) else { return nil }
         var col = row.makeIterator()
-        // state is BYTEA NOT NULL, but we return ByteBuffer so callers get a
-        // meaningful value rather than forcing an unwrap at call sites.
         return try col.next()!.decode(ByteBuffer.self, context: .default)
+    }
+
+    package static func loadState(
+        on postgres: PostgresClient,
+        taskID: UUID,
+        namespaceID: String,
+        logger: Logger
+    ) async throws -> ByteBuffer? {
+        try await postgres.withConnection { try await loadState(on: $0, taskID: taskID, namespaceID: namespaceID, logger: logger) }
     }
 
     // MARK: - saveState
@@ -71,13 +76,13 @@ package enum WorkflowStateQueries {
     /// stale writes (e.g. if two activations somehow race — which the lease
     /// mechanism prevents, but this is a defence-in-depth measure).
     package static func saveState(
-        on postgres: PostgresClient,
+        on conn: PostgresConnection,
         taskID: UUID,
         namespaceID: String,
         stateBuffer: ByteBuffer,
         logger: Logger
     ) async throws {
-        try await postgres.query(
+        try await conn.query(
             """
             INSERT INTO strand.workflow_state
                         (namespace_id, task_id, state, state_seq, updated_at)
@@ -89,6 +94,18 @@ package enum WorkflowStateQueries {
             """,
             logger: logger
         )
+    }
+
+    package static func saveState(
+        on postgres: PostgresClient,
+        taskID: UUID,
+        namespaceID: String,
+        stateBuffer: ByteBuffer,
+        logger: Logger
+    ) async throws {
+        try await postgres.withConnection { conn in
+            try await saveState(on: conn, taskID: taskID, namespaceID: namespaceID, stateBuffer: stateBuffer, logger: logger)
+        }
     }
 
     // MARK: - loadPendingSignals
@@ -145,41 +162,65 @@ package enum WorkflowStateQueries {
     /// Safe to call with an empty `ids` slice — returns immediately without
     /// hitting the database.
     package static func deleteSignals(
-        on postgres: PostgresClient,
+        on conn: PostgresConnection,
         ids: [UUID],
         logger: Logger
     ) async throws {
         guard !ids.isEmpty else { return }
-        try await postgres.query(
+        try await conn.query(
             "DELETE FROM strand.workflow_signals WHERE id = ANY(\(ids))",
             logger: logger
         )
     }
 
-    // MARK: - writeUpdateResult / findUpdateResult
+    // MARK: - batchWriteUpdateResults / findUpdateResult
 
-    /// Writes a workflow update result (or error) to `strand.workflow_updates`.
-    ///
-    /// Called by the worker after `handleUpdate` returns. ON CONFLICT DO NOTHING
-    /// ensures idempotency on re-activation.
-    package static func writeUpdateResult(
-        on postgres: PostgresClient,
+    /// Writes all update results and errors in a single multi-row INSERT.
+    package static func batchWriteUpdateResults(
+        on conn: PostgresConnection,
         namespaceID: String,
         taskID: UUID,
-        correlationID: String,
-        result: ByteBuffer?,
-        error: String?,
+        results: [(correlationID: String, result: ByteBuffer)],
+        errors: [(correlationID: String, error: String)],
         logger: Logger
     ) async throws {
-        try await postgres.query(
-            """
-            INSERT INTO strand.workflow_updates
-                (namespace_id, task_id, correlation_id, result, error)
-            VALUES (\(namespaceID), \(taskID), \(correlationID), \(result), \(error))
-            ON CONFLICT (namespace_id, correlation_id) DO NOTHING
-            """,
-            logger: logger
+        guard !results.isEmpty || !errors.isEmpty else { return }
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 120 + (results.count + errors.count) * 80,
+            interpolationCount: (results.count + errors.count) * 5
         )
+        interp.appendLiteral(
+            "INSERT INTO strand.workflow_updates (namespace_id, task_id, correlation_id, result, error) VALUES "
+        )
+        var first = true
+        for (correlationID, result) in results {
+            if !first { interp.appendLiteral(", ") }
+            first = false
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(correlationID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(result)
+            interp.appendLiteral(", NULL)")
+        }
+        for (correlationID, error) in errors {
+            if !first { interp.appendLiteral(", ") }
+            first = false
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(correlationID)
+            interp.appendLiteral(", NULL, ")
+            interp.appendInterpolation(error)
+            interp.appendLiteral(")")
+        }
+        interp.appendLiteral(" ON CONFLICT (namespace_id, correlation_id) DO NOTHING")
+        try await conn.query(PostgresQuery(stringInterpolation: interp), logger: logger)
     }
 
     /// Polls `strand.workflow_updates` for a result row matching `correlationID`.
@@ -245,7 +286,7 @@ package enum WorkflowStateQueries {
     /// decimal integer string. The prefix is stripped and parsed to recover the integer
     /// key used by the executor's `preloadedResults` / `preloadedNonCompletions` maps.
     package static func loadCompletedChildActivities(
-        on postgres: PostgresClient,
+        on conn: PostgresConnection,
         parentTaskID: UUID,
         logger: Logger
     ) async throws -> [(
@@ -255,7 +296,7 @@ package enum WorkflowStateQueries {
     )] {
         let prefix = "\(parentTaskID):"
         let prefixPattern = prefix + "%"
-        let stream = try await postgres.query(
+        let stream = try await conn.query(
             """
             SELECT t.idempotency_key, tc.result, tc.state,
                    r.failure_reason, t.kind, t.name,
@@ -308,23 +349,42 @@ package enum WorkflowStateQueries {
         return completions
     }
 
+    package static func loadCompletedChildActivities(
+        on postgres: PostgresClient,
+        parentTaskID: UUID,
+        logger: Logger
+    ) async throws -> [(
+        seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
+        state: TaskState, kind: TaskKind, name: String,
+        startedAt: Date?, runAttempt: Int, workerID: String?
+    )] {
+        try await postgres.withConnection { try await loadCompletedChildActivities(on: $0, parentTaskID: parentTaskID, logger: logger) }
+    }
+
     // MARK: - nextHistorySeq
 
     /// Returns the next available sequence number for this workflow's history.
     /// Call once at activation start; increment the returned value for each event.
     package static func nextHistorySeq(
-        on postgres: PostgresClient,
+        on conn: PostgresConnection,
         taskID: UUID,
         logger: Logger
     ) async throws -> Int {
-        let stream = try await postgres.query(
+        let stream = try await conn.query(
             "SELECT COALESCE(MAX(seq), 0) FROM strand.workflow_history WHERE task_id = \(taskID)",
             logger: logger
         )
         guard let row = try await stream.first(where: { _ in true }) else { return 1 }
         var col = row.makeIterator()
-        let max = try col.next()!.decode(Int.self, context: .default)
-        return max + 1
+        return try col.next()!.decode(Int.self, context: .default) + 1
+    }
+
+    package static func nextHistorySeq(
+        on postgres: PostgresClient,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> Int {
+        try await postgres.withConnection { try await nextHistorySeq(on: $0, taskID: taskID, logger: logger) }
     }
 
     // MARK: - appendHistory
@@ -818,12 +878,12 @@ extension WorkflowStateQueries {
 
     /// Returns all version markers for a workflow task, ordered by marked_at DESC.
     package static func listVersionMarkers(
-        on postgres: PostgresClient,
+        on conn: PostgresConnection,
         namespaceID: String,
         taskID: UUID,
         logger: Logger
     ) async throws -> [VersionMarkerRow] {
-        let stream = try await postgres.query(
+        let stream = try await conn.query(
             """
             SELECT change_id, value, marked_at
             FROM strand.workflow_version_markers
@@ -842,6 +902,15 @@ extension WorkflowStateQueries {
             rows.append(VersionMarkerRow(changeID: changeID, value: value, markedAt: markedAt))
         }
         return rows
+    }
+
+    package static func listVersionMarkers(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> [VersionMarkerRow] {
+        try await postgres.withConnection { try await listVersionMarkers(on: $0, namespaceID: namespaceID, taskID: taskID, logger: logger) }
     }
 
     /// Returns the migration status for a version gate across all workflows in a namespace.

@@ -79,6 +79,10 @@ package enum StrandChannels {
     /// and ``MetricsBroadcastListener`` in the dashboard server listens.
     package static let metrics = "strand_metrics"
 
+    /// Channel on which activity stream chunks are broadcast.
+    /// Payload format: see `_StreamPayload` in `StrandStreamNotifier.swift`.
+    package static let stream = "strand_stream"
+
     // MARK: - Payload type
 
     /// A typed NOTIFY payload carrying a `(namespace, queue)` pair.

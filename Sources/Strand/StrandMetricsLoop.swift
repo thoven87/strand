@@ -186,7 +186,8 @@ public struct StrandMetricsLoop: Service {
         previousCounts: inout [String: Int],
         smoothedRates: inout [String: Double]
     ) async throws {
-        let queues = try await client.listQueues()
+        // listQueues + task counts in one round-trip — see allQueueCounts.
+        let (queues, counts) = try await allQueueCounts(prev: previousCounts)
         guard !queues.isEmpty else { return }
 
         // ── Interval ─────────────────────────────────────────────────────────
@@ -231,18 +232,15 @@ public struct StrandMetricsLoop: Service {
             }
         }
 
-        // ── Queue count snapshots (async DB queries) ──────────────────────────
         var snapshots: [StrandMetricsBroadcast.QueueSnapshot] = []
 
         for queue in queues {
-            async let pending = countState(.pending, queue: queue, prev: previousCounts)
-            async let running = countState(.running, queue: queue, prev: previousCounts)
-            async let sleeping = countState(.sleeping, queue: queue, prev: previousCounts)
-            async let waiting = countState(.waiting, queue: queue, prev: previousCounts)
+            let p = counts["\(queue)/\(TaskState.pending.rawValue)", default: 0]
+            let r = counts["\(queue)/\(TaskState.running.rawValue)", default: 0]
+            let sl = counts["\(queue)/\(TaskState.sleeping.rawValue)", default: 0]
+            let w = counts["\(queue)/\(TaskState.waiting.rawValue)", default: 0]
 
-            let (p, r, sl, w) = try await (pending, running, sleeping, waiting)
-
-            // Update the previous-counts table for next cycle.
+            // Update previous-counts for next cycle.
             previousCounts["\(queue)/\(TaskState.pending.rawValue)"] = p
             previousCounts["\(queue)/\(TaskState.running.rawValue)"] = r
             previousCounts["\(queue)/\(TaskState.sleeping.rawValue)"] = sl
@@ -255,10 +253,6 @@ public struct StrandMetricsLoop: Service {
                     running: r,
                     sleeping: sl,
                     waiting: w,
-                    // nil when no metricsBuffer is wired.
-                    // Uses the EWMA-smoothed rate (α=0.25, ~15 s effective window)
-                    // rather than the raw per-cycle count so low-throughput jobs
-                    // don't flicker between 0/s and a spike every few cycles.
                     throughputPerSec: metricsBuffer != nil
                         ? smoothedRates[queue, default: 0]
                         : nil
@@ -338,45 +332,96 @@ public struct StrandMetricsLoop: Service {
         )
     }
 
-    /// Returns the count for the given state/queue, choosing between exact
-    /// COUNT(*) and the planner estimate based on the previous measurement.
-    private func countState(
-        _ state: TaskState,
-        queue: String,
+    /// Returns the registered queue list and their PENDING/RUNNING/SLEEPING/WAITING
+    /// task counts in one round-trip.
+    ///
+    /// Uses `strand.queues` as the authoritative queue list (LEFT JOIN) so
+    /// queues with zero tasks in all states still appear in the result.
+    /// The adaptive exact/estimate split is preserved: queues whose previous
+    /// maximum count was below `estimateThreshold` use an exact `COUNT(*)`,
+    /// others use the planner estimate to avoid full table scans.
+    private func allQueueCounts(
         prev: [String: Int]
-    ) async throws -> Int {
-        let previous = prev["\(queue)/\(state.rawValue)", default: 0]
+    ) async throws -> (queues: [String], counts: [String: Int]) {
+        let tracked: [TaskState] = [.pending, .running, .sleeping, .waiting]
 
-        if previous < options.estimateThreshold {
-            return try await exactCount(state: state, queue: queue)
-        } else {
-            return try await estimatedCount(state: state, queue: queue)
+        // We don't know queue names yet, so classify after the query using
+        // previousCounts from the last cycle. On the first cycle all queues
+        // go to the exact path (prev is empty → maxPrev = 0 < threshold).
+        // We'll split into exact/estimate after we've discovered the queues,
+        // but since we need the split BEFORE the query, we use the names from
+        // the previous cycle stored in `prev` keys ("queue/STATE" format).
+        var seenQueues: Set<String> = []
+        for key in prev.keys {
+            if let slash = key.firstIndex(of: "/") {
+                seenQueues.insert(String(key[key.startIndex..<slash]))
+            }
         }
-    }
+        var exactQueues: [String] = []
+        var estimateQueues: [String] = []
+        for queue in seenQueues {
+            let maxPrev = tracked.map { prev["\(queue)/\($0.rawValue)", default: 0] }.max() ?? 0
+            if maxPrev < options.estimateThreshold { exactQueues.append(queue) } else { estimateQueues.append(queue) }
+        }
+        // New queues (not yet in prev) always use exact counts.
+        // They are included via the LEFT JOIN from strand.queues below.
 
-    private func exactCount(state: TaskState, queue: String) async throws -> Int {
         let stream = try await client.postgres.query(
             """
-            SELECT COUNT(*)::integer
-            FROM strand.tasks
-            WHERE namespace_id = \(client.namespaceID)
-              AND queue = \(queue)
-              AND state = \(state)
+            WITH
+            all_queues AS (
+                SELECT name AS queue
+                FROM   strand.queues
+                WHERE  namespace_id = \(client.namespaceID)
+                ORDER  BY name
+            ),
+            task_counts AS (
+                -- Exact COUNT(*) for low-volume queues (or any queue not yet seen)
+                SELECT queue, state::text, COUNT(*)::integer AS cnt
+                FROM   strand.tasks
+                WHERE  namespace_id = \(client.namespaceID)
+                  AND  state        IN (\(TaskState.pending), \(TaskState.running),
+                                       \(TaskState.sleeping), \(TaskState.waiting))
+                  AND  queue        NOT IN (SELECT UNNEST(\(estimateQueues)))
+                GROUP  BY queue, state
+
+                UNION ALL
+
+                -- Planner estimate for high-volume queues (avoids full scan)
+                SELECT q.queue, s.state,
+                       strand.count_estimate(\(client.namespaceID), q.queue, s.state)::integer
+                FROM   UNNEST(\(estimateQueues)) AS q(queue)
+                       CROSS JOIN UNNEST(ARRAY[\(TaskState.pending)::text,  \(TaskState.running)::text,
+                                              \(TaskState.sleeping)::text, \(TaskState.waiting)::text]) AS s(state)
+            )
+            -- Queue list first (row_type='Q'), counts second ('C').
+            -- Ordering puts 'Q' rows before 'C' so the caller can collect
+            -- queue names in a first pass if needed; in practice both are
+            -- iterated in a single pass and disambiguated by row_type.
+            SELECT 'Q'::text AS row_type, q.queue, NULL::text AS state, NULL::integer AS cnt
+            FROM   all_queues q
+            UNION ALL
+            SELECT 'C', tc.queue, tc.state, tc.cnt
+            FROM   task_counts tc
+            ORDER  BY row_type, queue, state
             """,
             logger: client.logger
         )
-        guard let row = try await stream.first(where: { _ in true }) else { return 0 }
-        var col = row.makeIterator()
-        return try col.next()!.decode(Int.self, context: .default)
-    }
 
-    private func estimatedCount(state: TaskState, queue: String) async throws -> Int {
-        let stream = try await client.postgres.query(
-            "SELECT strand.count_estimate(\(client.namespaceID), \(queue), \(state))",
-            logger: client.logger
-        )
-        guard let row = try await stream.first(where: { _ in true }) else { return 0 }
-        var col = row.makeIterator()
-        return (try col.next()!.decode(Int?.self, context: .default)) ?? 0
+        var queues: [String] = []
+        var counts: [String: Int] = [:]
+        for try await row in stream {
+            var col = row.makeIterator()
+            let rowType = try col.next()!.decode(String.self, context: .default)
+            let queue = try col.next()!.decode(String.self, context: .default)
+            let state = try col.next()!.decode(String?.self, context: .default)
+            let cnt = try col.next()!.decode(Int?.self, context: .default)
+            if rowType == "Q" {
+                queues.append(queue)
+            } else if let st = state, let n = cnt {
+                counts["\(queue)/\(st)"] = n
+            }
+        }
+        return (queues: queues, counts: counts)
     }
 }

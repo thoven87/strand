@@ -598,7 +598,10 @@ enum Queries {
             var idKeyToRow: [String: EnqueueRow] = [:]
             for item in newItems {
                 idKeyToRow[item.idempotencyKey] = EnqueueRow(
-                    taskID: item.taskID, runID: item.runID, attempt: 1, created: true
+                    taskID: item.taskID,
+                    runID: item.runID,
+                    attempt: 1,
+                    created: true
                 )
             }
             let hitItems = items.filter { !newIDSet.contains($0.taskID) }
@@ -623,7 +626,10 @@ enum Queries {
                     let eAttempt = try col.next()!.decode(Int.self, context: .default)
                     let eKey = try col.next()!.decode(String.self, context: .default)
                     idKeyToRow[eKey] = EnqueueRow(
-                        taskID: eTaskID, runID: eRunID, attempt: eAttempt, created: false
+                        taskID: eTaskID,
+                        runID: eRunID,
+                        attempt: eAttempt,
+                        created: false
                     )
                 }
             }
@@ -784,22 +790,25 @@ enum Queries {
                 }
                 try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
                 // Write-through to trace_spans — atomic with the batch enqueue transaction.
-                // If any write fails the whole transaction rolls back and the caller retries.
-                for child in newChildren {
-                    try await TraceSpanQueries.upsertTaskSpan(
-                        on: conn,
-                        id: child.taskID.uuidString,
-                        namespaceID: namespaceID,
-                        taskID: child.taskID,
-                        parentID: parentTaskID.uuidString,
-                        kind: child.kind == .workflow ? .workflow : .activity,
-                        name: child.taskName,
-                        state: .waiting,
-                        maxAttempts: child.maxAttempts,
-                        queuedAt: child.scheduledAt ?? Date(),
-                        logger: logger
+                // Single round-trip for all N children via insertChildSpansBatch.
+                let spanItems = newChildren.map {
+                    (
+                        spanID: $0.taskID.uuidString,
+                        taskID: $0.taskID,
+                        kind: $0.kind == .workflow ? WorkflowSpanKind.workflow : .activity,
+                        name: $0.taskName,
+                        maxAttempts: $0.maxAttempts,
+                        queuedAt: $0.scheduledAt ?? Date()
                     )
                 }
+                try await TraceSpanQueries.insertChildSpansBatch(
+                    on: conn,
+                    items: spanItems,
+                    namespaceID: namespaceID,
+                    parentSpanID: parentTaskID.uuidString,
+                    state: .waiting,
+                    logger: logger
+                )
             }
 
             // ── 4b. Rate-limit slot allocation ──────────────────────────────────────────
@@ -1185,6 +1194,8 @@ enum Queries {
             // CAS on version — if another worker already wrote a completion, bail out.
             // The tasks update is gated on the runs CAS via the CTE: if r is empty
             // (CAS failed), the WHERE subquery returns NULL and no task row is touched.
+            // del_waits and trace_upd are gated on (SELECT COUNT(*) FROM r) > 0 so they
+            // are no-ops when the CAS fails — one round-trip for all three operations.
             let casStream = try await conn.query(
                 """
                 WITH r AS (
@@ -1193,31 +1204,29 @@ enum Queries {
                     WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version)
                       AND namespace_id = \(namespaceID)
                     RETURNING task_id
+                ),
+                task_upd AS (
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.completed), completed_at = NOW(), result = \(resultBuffer)
+                    WHERE id = (SELECT task_id FROM r)
+                    RETURNING id
+                ),
+                del_waits AS (
+                    DELETE FROM strand.event_waits
+                    WHERE run_id = \(runID) AND (SELECT COUNT(*) FROM r) > 0
+                ),
+                trace_upd AS (
+                    UPDATE strand.trace_spans
+                    SET state       = \(WorkflowSpanState.completed),
+                        finished_at = NOW()
+                    WHERE id = UPPER((SELECT task_id::text FROM r))
+                      AND (SELECT COUNT(*) FROM r) > 0
                 )
-                UPDATE strand.tasks
-                SET state = \(TaskState.completed), completed_at = NOW(), result = \(resultBuffer)
-                WHERE id = (SELECT task_id FROM r)
-                RETURNING id
+                SELECT id FROM task_upd
                 """,
                 logger: logger
             )
             guard try await casStream.first(where: { _ in true }) != nil else { return }
-            try await conn.query(
-                "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
-                logger: logger
-            )
-            // Write-through to trace_spans — atomic with the completion transaction.
-            // If this fails the whole transaction rolls back; the run stays RUNNING,
-            // lease expires, sweep re-queues, activation retries with consistent data.
-            try await conn.query(
-                """
-                UPDATE strand.trace_spans
-                SET state       = \(WorkflowSpanState.completed),
-                    finished_at = NOW()
-                WHERE id = \(taskID.uuidString)
-                """,
-                logger: logger
-            )
             try await emitTaskCompletionSignal(
                 conn: conn,
                 namespaceID: namespaceID,
@@ -1384,7 +1393,7 @@ enum Queries {
         try await client.withTransaction(logger: logger) { conn in
             let infoStream = try await conn.query(
                 """
-                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.deadline_at, t.kind
+                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.deadline_at, t.kind, r.queue
                 FROM   strand.runs r
                 JOIN   strand.tasks t ON t.id = r.task_id
                 WHERE  r.id           = \(runID)
@@ -1401,29 +1410,34 @@ enum Queries {
             let retryStrategyBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
             let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
-            // Step 2 — CAS: only transitions the run that this worker claimed.
-            let failStream = try await conn.query(
-                "UPDATE strand.runs SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version) RETURNING id",
-                logger: logger
-            )
-            guard try await failStream.first(where: { _ in true }) != nil else { return }
-            try await conn.query(
-                "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
-                logger: logger
-            )
-            // Write-through to trace_spans — atomic with the failure transaction.
-            // If a retry is scheduled, claimTasks will later overwrite this with state='RUNNING'.
+            let queue = try col.next()!.decode(String.self, context: .default)
+            // Step 2 — CAS + event-wait cleanup + trace update in a single round-trip.
+            // del_waits and trace_upd are gated on CAS success via (SELECT COUNT(*) FROM fail_run) > 0.
             let _spanError: String? = (try? JSON.decode(_FailureMessage.self, from: reasonBuffer))?.message
-            try await conn.query(
+            let failStream = try await conn.query(
                 """
-                UPDATE strand.trace_spans
-                SET state       = \(WorkflowSpanState.failed),
-                    finished_at = NOW(),
-                    error       = \(_spanError)
-                WHERE id        = \(taskID.uuidString)
+                WITH fail_run AS (
+                    UPDATE strand.runs
+                    SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW()
+                    WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version)
+                    RETURNING id
+                ),
+                del_waits AS (
+                    DELETE FROM strand.event_waits
+                    WHERE run_id = \(runID) AND (SELECT COUNT(*) FROM fail_run) > 0
+                ),
+                trace_upd AS (
+                    UPDATE strand.trace_spans
+                    SET state       = \(WorkflowSpanState.failed),
+                        finished_at = NOW(),
+                        error       = \(_spanError)
+                    WHERE id = \(taskID.uuidString) AND (SELECT COUNT(*) FROM fail_run) > 0
+                )
+                SELECT id FROM fail_run
                 """,
                 logger: logger
             )
+            guard try await failStream.first(where: { _ in true }) != nil else { return }
 
             // ── Check 0: non_retryable flag (from NonRetryableError protocol) ──────────
             // Activities whose Failure type conforms to NonRetryableError encode
@@ -1553,15 +1567,7 @@ enum Queries {
             )
             // Only notify when the retry is immediately runnable (no sleep delay).
             if newState == .pending {
-                let qStream = try await conn.query(
-                    "SELECT queue FROM strand.runs WHERE id = \(runID)",
-                    logger: logger
-                )
-                if let qRow = try await qStream.first(where: { _ in true }) {
-                    var qCol = qRow.makeIterator()
-                    let q = try qCol.next()!.decode(String.self, context: .default)
-                    try await conn.notifyWorkers(namespace: namespaceID, queue: q, logger: logger)
-                }
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             }
         }
     }
@@ -2009,11 +2015,11 @@ enum Queries {
     /// correctly reconstructs deterministic values (uuid(), random()) even when
     /// `failRun` has created a new run_id for a workflow retry.
     static func getCheckpointStates(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         taskID: UUID,
         logger: Logger
     ) async throws -> [CheckpointRow] {
-        let stream = try await client.query(
+        let stream = try await conn.query(
             """
             SELECT seq_num, name, state
             FROM strand.checkpoints
@@ -2025,6 +2031,14 @@ enum Queries {
         var rows: [CheckpointRow] = []
         for try await row in stream { rows.append(try CheckpointRow(row: row)) }
         return rows
+    }
+
+    static func getCheckpointStates(
+        on client: PostgresClient,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> [CheckpointRow] {
+        try await client.withConnection { try await getCheckpointStates(on: $0, taskID: taskID, logger: logger) }
     }
 
     /// Upserts a step checkpoint keyed by `(task_id, seq_num)`; optionally extends the claim lease.
@@ -2512,7 +2526,7 @@ enum Queries {
     /// *same worker* is still running the task and is genuinely stuck —
     /// it goes through ``failRun`` and does increment the attempt counter.
     static func sweepExpiredLeases(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         namespaceID: String,
         queue: String,
         logger: Logger
@@ -2520,7 +2534,7 @@ enum Queries {
         // Select expired runs and re-queue them atomically.
         // `FOR UPDATE SKIP LOCKED` ensures two concurrent sweepers on the
         // same queue never double-process the same run.
-        let stream = try await client.query(
+        let stream = try await conn.query(
             """
             WITH expired AS (
                 SELECT r.id AS run_id, r.task_id
@@ -2559,7 +2573,7 @@ enum Queries {
                 "re-queued \(count) run(s) with expired lease—worker was likely restarted",
                 metadata: ["queue": "\(queue)"]
             )
-            try await client.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
         }
     }
 
@@ -2705,7 +2719,7 @@ enum Queries {
     /// Upserts a worker heartbeat row into `strand.workers`.
     /// Called on startup (running=0) and on every heartbeat tick (with current running count).
     static func upsertWorker(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         workerID: String,
         namespaceID: String,
         queue: String,
@@ -2714,7 +2728,7 @@ enum Queries {
         sdkVersion: String,
         logger: Logger
     ) async throws {
-        try await client.query(
+        try await conn.query(
             """
             INSERT INTO strand.workers (id, namespace_id, queue, concurrency, running, sdk_version, started_at, updated_at)
             VALUES (\(workerID), \(namespaceID), \(queue), \(concurrency), \(running), \(sdkVersion), NOW(), NOW())
@@ -2727,6 +2741,30 @@ enum Queries {
             """,
             logger: logger
         )
+    }
+
+    static func upsertWorker(
+        on client: PostgresClient,
+        workerID: String,
+        namespaceID: String,
+        queue: String,
+        concurrency: Int,
+        running: Int,
+        sdkVersion: String,
+        logger: Logger
+    ) async throws {
+        try await client.withConnection { conn in
+            try await upsertWorker(
+                on: conn,
+                workerID: workerID,
+                namespaceID: namespaceID,
+                queue: queue,
+                concurrency: concurrency,
+                running: running,
+                sdkVersion: sdkVersion,
+                logger: logger
+            )
+        }
     }
 
     /// Deletes a worker row — called on clean shutdown.
@@ -2780,11 +2818,11 @@ enum Queries {
     /// Removes worker rows whose `updated_at` is older than `olderThanSeconds`.
     /// Called on each heartbeat tick so stale entries from crashed workers are cleaned up.
     static func sweepStaleWorkers(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         olderThanSeconds: Int,
         logger: Logger
     ) async throws {
-        try await client.query(
+        try await conn.query(
             "DELETE FROM strand.workers WHERE updated_at < NOW() - \(olderThanSeconds) * INTERVAL '1 second'",
             logger: logger
         )

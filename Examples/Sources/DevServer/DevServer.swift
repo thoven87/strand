@@ -105,7 +105,7 @@ private func makePostgres(logger: Logger) -> PostgresClient {
     let pass = env["POSTGRES_PASSWORD"] ?? "strand"
     let db = env["POSTGRES_DB"] ?? "strand_dev"
 
-    var config = PostgresClient.Configuration(
+    let config = PostgresClient.Configuration(
         host: host,
         port: port,
         username: user,
@@ -113,12 +113,6 @@ private func makePostgres(logger: Logger) -> PostgresClient {
         database: db,
         tls: .disable
     )
-    // Pool sizing: Σ(activityConcurrency) + Σ(workflowConcurrency)
-    //            + N workers × 3 (listenLoop + poll + lease)
-    //            + headroom for HTTP handlers + notifier
-    // ordersWorker (16+8) + reportsWorker (8+4) + 2×3 + 8 HTTP + 1 notifier = 51
-    // Add headroom for podcast fan-outs (up to 8 parallel TranscribeSegment)
-    config.options.maximumConnections = 60
     return PostgresClient(configuration: config, backgroundLogger: logger)
 }
 
@@ -301,21 +295,23 @@ private func seedOne(orders: StrandClient, logger: Logger) async {
 }
 
 private func seedBilling(client: StrandClient, logger: Logger) async {
-    let users: [(Int, String, String)] = [
-        (1001, "alice@example.com", "billing@example.com"),
-        (1042, "bob@example.com", "billing@example.com"),
-        (2087, "carol@example.com", "billing@example.com"),
-        (3314, "dave@example.com", "billing@example.com"),
+    // Approvals are handled by BillingReviewService, which polls event_waits
+    // and emits once the workflow actually reaches waitForEvent — no timing races.
+    let users: [(id: Int, email: String, admin: String)] = [
+        (1001, "alice@example.com", "billing@example.com"),  // → signal-approved by reviewer
+        (1042, "bob@example.com", "billing@example.com"),  // → 35-second SLA timeout
+        (2087, "carol@example.com", "billing@example.com"),  // → signal-approved by reviewer
+        (3314, "dave@example.com", "billing@example.com"),  // → 35-second SLA timeout
     ]
-    for (userID, email, admin) in users {
+    for user in users {
         do {
             _ = try await client.startWorkflow(
                 MonthlyBillingWorkflow.self,
-                input: BillingInput(userID: userID, userEmail: email, adminEmail: admin)
+                input: BillingInput(userID: user.id, userEmail: user.email, adminEmail: user.admin)
             )
-            logger.info("[seeder] billing userID=\(userID) enqueued")
+            logger.info("[seeder] billing userID=\(user.id) enqueued")
         } catch {
-            logger.warning("[seeder] billing userID=\(userID): \(error)")
+            logger.warning("[seeder] billing userID=\(user.id): \(error)")
         }
     }
 }
@@ -521,7 +517,7 @@ private struct SeederService: Service {
                 ProcessOrderActivities()
             ],
             activities: [
-                CalculateInvoiceActivity(),
+                CalculateInvoiceActivity(postgres: postgres),
                 ChargeCreditCardActivity(),
                 GeneratePDFActivity(),
                 SendEmailActivity(),
@@ -568,6 +564,14 @@ private struct SeederService: Service {
 
         let pruner = StrandPruner(postgres: postgres, logger: logger)
         let seeder = SeederService(orders: ordersClient, reports: reportsClient, logger: logger)
+        // Polls event_waits for billing workflows parked on waitForEvent("billing_approved")
+        // and emits targeted approval events.  Runs independently of the seeder so it
+        // fires only after each workflow actually reaches that step — no timing races.
+        let billingReviewer = BillingReviewService(
+            postgres: postgres,
+            client: ordersClient,
+            logger: logger
+        )
 
         app.addServices(observability)  // 1: OTel must start first; stops last
         app.addServices(postgres)  // 2: connection pool; stops second-to-last
@@ -577,10 +581,36 @@ private struct SeederService: Service {
         app.addServices(reportsWorker)  // 6: stops before notifier, pruner
         app.addServices(metricsListener)  // 7: receives strand_metrics broadcasts → updates cache
         app.addServices(metricsLoop)  // 8: broadcasts live counts every 5 s
-        app.addServices(seeder)  // 9: stops FIRST — halts new task creation immediately
+        app.addServices(billingReviewer)  // 9: emits billing_approved when workflows are waiting
+        app.addServices(seeder)  // 10: stops FIRST — halts new task creation immediately
 
         app.beforeServerStarts {
             try await ordersClient.verifySchema()
+            // demo schema: application-level tables for the DevServer examples.
+            // Kept separate from the strand schema (engine internals) and public
+            // so it is clear what belongs to the demo vs. the workflow engine.
+            _ = try await postgres.query(
+                "CREATE SCHEMA IF NOT EXISTS demo",
+                logger: logger
+            )
+            // billing_reviews is owned by the billing domain, not by Strand.
+            // CalculateInvoiceActivity writes to it; BillingReviewService reads
+            // from it — neither ever touches strand.event_waits or other engine tables.
+            _ = try await postgres.query(
+                """
+                CREATE TABLE IF NOT EXISTS demo.billing_reviews (
+                    invoice_id   TEXT             PRIMARY KEY,
+                    user_id      INTEGER          NOT NULL,
+                    amount       DOUBLE PRECISION NOT NULL,
+                    status       TEXT             NOT NULL DEFAULT 'PENDING',
+                    reviewer     TEXT,
+                    reviewed_at  TIMESTAMPTZ,
+                    created_at   TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+                )
+                """,
+                logger: logger
+            )
+
             logger.info("────────────────────────────────────────────────")
             logger.info("  Strand DevServer ready")
             logger.info("  API     →  http://localhost:8080/api/queues")
