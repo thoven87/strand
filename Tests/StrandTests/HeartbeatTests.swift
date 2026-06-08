@@ -152,7 +152,7 @@ private struct LivenessWorkflow: Workflow {
 
 // MARK: - Suite
 
-@Suite("Integration — Activity heartbeat details")
+@Suite("Integration — Activity heartbeat details", .tags(.integration), .serialized)
 struct HeartbeatTests {
 
     /// Core scenario: heartbeat(_:) stores progress; retry reads it back and resumes.

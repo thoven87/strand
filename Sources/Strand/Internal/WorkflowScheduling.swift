@@ -913,11 +913,9 @@ extension WorkflowRegistration {
             && scheduleCommands.isEmpty
             && !executor.hasUnsatisfiedConditions
         {
-            // Steps 7+7B are merged with checkpoints+history into one transaction so
-            // the run stays RUNNING in Postgres until all writes are durable.
-            // In Postgres READ COMMITTED, each statement in a transaction gets a fresh
-            // snapshot, so step 7B below can see concurrent task_completions commits that
-            // step 7 missed — same correctness guarantee as the old two-statement approach.
+            // Steps 7+7B share one transaction so the run stays RUNNING until
+            // all writes are durable. READ COMMITTED gives step 7B a fresh snapshot
+            // so it sees task_completions commits that step 7 missed.
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
                 // ── flushWrites content ───────────────────────────────────────────────
                 if !pendingCheckpoints.isEmpty {

@@ -295,11 +295,11 @@ public enum TaskState: String, Sendable, Codable {
     /// enqueued with a fresh input and this task's execution is complete.
     case continuedAsNew = "CONTINUED_AS_NEW"
 
-    /// `true` for states from which a task will never transition again.
+    /// Returns `true` for states from which a task will never transition again.
     public var isTerminal: Bool {
         switch self {
         case .completed, .failed, .cancelled, .continuedAsNew: return true
-        case .pending, .running, .sleeping, .waiting:          return false
+        case .pending, .running, .sleeping, .waiting: return false
         }
     }
 }

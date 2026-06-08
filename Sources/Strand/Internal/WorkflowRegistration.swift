@@ -13,18 +13,12 @@ import Foundation
 #endif
 
 // MARK: - Workflow registration via SE-0352 implicit existential opening
-//
-// StrandWorker.init holds [any Workflow.Type]. Passing each element
-// to the generic function below causes Swift to open the existential and bind
-// the concrete Workflow type, allowing _WorkflowTaskCache<W> to be created
-// once per type at registration time — exactly the cached-Task model.
-// No protocol requirement needed; the public WorkflowRegistrable protocol
-// stays clean with only user-facing members.
 func _registerWorkflow<W: Workflow>(
     _ type: W.Type,
     queue: String,
     exec: _WorkerExec,
-    into registrations: inout [AnyRegistration]
+    into registrations: inout [AnyRegistration],
+    cleaners: inout [@Sendable () -> Void]
 ) {
     let cache = _WorkflowTaskCache<W>()
     registrations.append(
@@ -40,6 +34,7 @@ func _registerWorkflow<W: Workflow>(
             }
         )
     )
+    cleaners.append { cache.cancelAll() }
 }
 
 // MARK: - Activity registration via SE-0352 implicit existential opening
@@ -83,8 +78,6 @@ func _addActivityRegistration<A: Activity>(
 /// between activations, consuming no thread. On re-activation the worker delivers
 /// real results via the Resume API and calls `drain()` to continue from where
 /// the handler paused.
-///
-/// `@unchecked Sendable`: access to the dictionary is serialised by the `Mutex`;
 /// access to the cached executor is serialised by Postgres
 /// (`FOR UPDATE SKIP LOCKED` prevents two workers from claiming the same run).
 final class _WorkflowTaskCache<W: Workflow>: Sendable {
@@ -212,6 +205,11 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── Fresh path: first activation (or after a crash / cache miss) ─────────
 
+        // ── Fresh path reads ───────────────────────────────────────────────────
+        // Sequential: at most one pool connection in use at a time per activation.
+        // DO NOT use async let — parallel reads consume workflowConcurrency × N
+        // connections simultaneously and exhaust the pool at production scale.
+
         // ── 1. Checkpoint cache ───────────────────────────────────────────────────
         let checkpointRows = try await Queries.getCheckpointStates(
             on: exec.postgres,
@@ -225,7 +223,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             checkpointNameCache[row.seqNum] = row.name
         }
 
-        // ── 1b. Version marker cache ─────────────────────────────────────────────
+        // ── 1b. Version marker cache ─────────────────────────────────────────
         let versionMarkerRows = try await WorkflowStateQueries.listVersionMarkers(
             on: exec.postgres,
             namespaceID: exec.namespace,
@@ -235,7 +233,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         var versionMarkerCache: [String: Bool] = [:]
         for row in versionMarkerRows { versionMarkerCache[row.changeID] = row.value }
 
-        // ── 2. Workflow state ────────────────────────────────────────────────────
+        // ── 2. Workflow state ────────────────────────────────────────────────
         let storedStateBuf = try await WorkflowStateQueries.loadState(
             on: exec.postgres,
             taskID: claimed.taskID,
@@ -453,7 +451,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         let handlerTask = cached.task
         let claimTimeoutSecs = Int(exec.options.claimTimeout.components.seconds)
 
-        // ── History sequence ──────────────────────────────────────────────────
+        // ── History sequence — same sequential-read policy as _activate ─────────
         var historySeq = try await WorkflowStateQueries.nextHistorySeq(
             on: exec.postgres,
             taskID: claimed.taskID,
@@ -464,7 +462,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // ctx.historyEventCount reflects accumulated events across all prior activations.
         cached.activation.historyEventCount = historyEventCount
 
-        // ── External checkpoint refresh ──────────────────────────────────────────────
+        // ── External checkpoint refresh ──────────────────────────────────────────
         // `client.markVersion` writes checkpoints directly to the DB without sending
         // a signal. It is only meaningful during a workflow sleep (timer wait), so we
         // only scan for external writes when the run was NOT woken by a child-workflow
@@ -494,7 +492,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             }
         }
 
-        // ── Signals ────────────────────────────────────────────────────
+        // ── Signals ───────────────────────────────────────────────
         try await applyAndPersistSignals(to: &stateBox.value, exec: exec, claimed: claimed, historySeq: &historySeq)
 
         // ── Completed children ──────────────────────────────────────────────────
@@ -686,32 +684,8 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             }
         }
 
-        // Write update results to strand.workflow_updates (not strand.events)
-        for (correlationID, result) in updateResults {
-            try await WorkflowStateQueries.writeUpdateResult(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                correlationID: correlationID,
-                result: result,
-                error: nil,
-                logger: exec.logger
-            )
-        }
-        for (correlationID, errorMsg) in updateErrors {
-            try await WorkflowStateQueries.writeUpdateResult(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                correlationID: correlationID,
-                result: nil,
-                error: errorMsg,
-                logger: exec.logger
-            )
-        }
-
-        // Write history — updates get UPDATE_APPLIED, signals get SIGNAL_RECEIVED.
-        // signal.name is always the clean handler name for both kinds.
+        // Build history batch before the transaction (historySeq is inout — can't be
+        // captured by the @Sendable closure).
         var historyBatch: [(seq: Int, eventType: WorkflowStateQueries.HistoryEventType, eventData: ByteBuffer?)] = []
         for signal in signals {
             let eventType: WorkflowStateQueries.HistoryEventType =
@@ -721,29 +695,44 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             historySeq += 1
             historyBatch.append((seq: seq, eventType: eventType, eventData: sigData))
         }
-        // Write all signal history events in one batch — one round-trip regardless of N signals.
-        if !historyBatch.isEmpty {
-            try await WorkflowStateQueries.batchAppendHistory(
-                on: exec.postgres,
+        let stateBuf = try JSON.encode(state)
+        let signalIDs = signals.map { $0.id }
+        // Wrap all writes in one transaction — one pool checkout, properly atomic.
+        // A crash between batchAppendHistory and deleteSignals is safe via idempotency
+        // (ON CONFLICT DO NOTHING), but the transaction makes it explicit.
+        try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+            // Write all update results and errors in one round-trip.
+            try await WorkflowStateQueries.batchWriteUpdateResults(
+                on: conn,
                 namespaceID: exec.namespace,
                 taskID: claimed.taskID,
-                events: historyBatch,
+                results: updateResults,
+                errors: updateErrors,
+                logger: exec.logger
+            )
+            // Write all signal history events in one batch — one round-trip regardless of N signals.
+            if !historyBatch.isEmpty {
+                try await WorkflowStateQueries.batchAppendHistory(
+                    on: conn,
+                    namespaceID: exec.namespace,
+                    taskID: claimed.taskID,
+                    events: historyBatch,
+                    logger: exec.logger
+                )
+            }
+            try await WorkflowStateQueries.saveState(
+                on: conn,
+                taskID: claimed.taskID,
+                namespaceID: exec.namespace,
+                stateBuffer: stateBuf,
+                logger: exec.logger
+            )
+            try await WorkflowStateQueries.deleteSignals(
+                on: conn,
+                ids: signalIDs,
                 logger: exec.logger
             )
         }
-        let stateBuf = try JSON.encode(state)
-        try await WorkflowStateQueries.saveState(
-            on: exec.postgres,
-            taskID: claimed.taskID,
-            namespaceID: exec.namespace,
-            stateBuffer: stateBuf,
-            logger: exec.logger
-        )
-        try await WorkflowStateQueries.deleteSignals(
-            on: exec.postgres,
-            ids: signals.map { $0.id },
-            logger: exec.logger
-        )
     }
 
     /// Runs all queued local activities to completion, draining the executor after each

@@ -1649,49 +1649,51 @@ extension ManagementQueries {
             return rows
         }
         if useDaily {
-            // Daily buckets via strand_tasks_throughput_day_idx.
+            // Daily buckets: one table scan + GROUP BY, then LEFT JOIN to fill zero-count days.
             return try await decode(
                 client.query(
                     """
-                    SELECT
-                        gs AS bucket,
-                        (SELECT COUNT(*)
-                         FROM strand.tasks
-                         WHERE namespace_id = \(namespaceID)
-                           AND state = \(TaskState.completed)
-                           AND date_trunc('day', completed_at, 'UTC') = gs
-                           AND completed_at >= \(cutoff)
-                        ) AS cnt
+                    SELECT gs.bucket,
+                           COALESCE(t.cnt, 0) AS cnt
                     FROM generate_series(
                         date_trunc('day', \(cutoff), 'UTC'),
                         date_trunc('day', NOW(), 'UTC'),
                         INTERVAL '1 day'
-                    ) AS gs
-                    ORDER BY gs
+                    ) AS gs(bucket)
+                    LEFT JOIN (
+                        SELECT date_trunc('day', created_at, 'UTC') AS bucket, COUNT(*) AS cnt
+                        FROM strand.tasks
+                        WHERE namespace_id = \(namespaceID)
+                          AND state IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                          AND created_at >= \(cutoff)
+                        GROUP BY date_trunc('day', created_at, 'UTC')
+                    ) t ON t.bucket = gs.bucket
+                    ORDER BY gs.bucket
                     """,
                     logger: logger
                 )
             )
         } else {
-            // Hourly buckets via strand_tasks_throughput_hour_idx.
+            // Hourly buckets: one table scan + GROUP BY, then LEFT JOIN to fill zero-count hours.
             return try await decode(
                 client.query(
                     """
-                    SELECT
-                        gs AS bucket,
-                        (SELECT COUNT(*)
-                         FROM strand.tasks
-                         WHERE namespace_id = \(namespaceID)
-                           AND state = \(TaskState.completed)
-                           AND date_trunc('hour', completed_at, 'UTC') = gs
-                           AND completed_at >= \(cutoff)
-                        ) AS cnt
+                    SELECT gs.bucket,
+                           COALESCE(t.cnt, 0) AS cnt
                     FROM generate_series(
                         date_trunc('hour', \(cutoff), 'UTC'),
                         date_trunc('hour', NOW(), 'UTC'),
                         INTERVAL '1 hour'
-                    ) AS gs
-                    ORDER BY gs
+                    ) AS gs(bucket)
+                    LEFT JOIN (
+                        SELECT date_trunc('hour', created_at, 'UTC') AS bucket, COUNT(*) AS cnt
+                        FROM strand.tasks
+                        WHERE namespace_id = \(namespaceID)
+                          AND state IN (\(TaskState.completed), \(TaskState.failed), \(TaskState.cancelled))
+                          AND created_at >= \(cutoff)
+                        GROUP BY date_trunc('hour', created_at, 'UTC')
+                    ) t ON t.bucket = gs.bucket
+                    ORDER BY gs.bucket
                     """,
                     logger: logger
                 )

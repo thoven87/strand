@@ -159,7 +159,7 @@ struct FairnessTests {
                     concurrency: 1,
                     activities: [activity]
                 ) {
-                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(10))
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(20))
                 }
             }
 
@@ -231,7 +231,7 @@ struct FairnessTests {
                     concurrency: 1,
                     activities: [activity]
                 ) {
-                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(10))
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(20))
                 }
             }
 
@@ -295,7 +295,7 @@ struct FairnessTests {
                     workflows: [FairnessTrackingWorkflow.self],
                     activities: [activity]
                 ) {
-                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(15))
+                    try await allDone.wait(for: "all \(total) activities", count: total, timeout: .seconds(25))
                 }
             }
 

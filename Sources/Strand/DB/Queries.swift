@@ -396,6 +396,258 @@ enum Queries {
         let rateLimitKey: String?
     }
 
+    // MARK: - BatchEnqueueItem
+
+    /// Per-item data for ``enqueueBatch``. All other options are shared across the batch.
+    struct BatchEnqueueItem: Sendable {
+        /// Pre-generated UUIDv7; used as new-row probe.
+        let taskID: UUID
+        /// Pre-generated UUIDv7 for the first run row.
+        let runID: UUID
+        let paramsBuffer: ByteBuffer
+        let idempotencyKey: String
+    }
+
+    // MARK: - enqueueBatch
+
+    /// Batch-enqueue N tasks of the same type in O(1) Postgres round-trips.
+    ///
+    /// Unlike N × `enqueueTask` (~7N round-trips), `enqueueBatch` uses multi-row
+    /// VALUES INSERTs and a single `pg_notify` regardless of N.
+    ///
+    /// - Returns: `[EnqueueRow]` in the same order as `items`.
+    ///   Idempotency-key conflicts return the existing task/run IDs (`created: false`).
+    @discardableResult
+    static func enqueueBatch(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        taskName: String,
+        items: [BatchEnqueueItem],
+        headersBuffer: ByteBuffer?,
+        retryStrategyBuffer: ByteBuffer,
+        maxAttempts: Int?,
+        cancellationBuffer: ByteBuffer?,
+        priority: TaskPriority,
+        scheduledAt: Date?,
+        timeoutSeconds: Int?,
+        heartbeatTimeoutSeconds: Int?,
+        scheduleToStartTimeoutSeconds: Int?,
+        deadlineAt: Date?,
+        fairnessKey: String?,
+        fairnessWeight: Double,
+        kind: TaskKind,
+        rateLimitKey: String?,
+        rateLimitIntervalMs: Int?,
+        logger: Logger
+    ) async throws -> [EnqueueRow] {
+        guard !items.isEmpty else { return [] }
+
+        return try await client.withTransaction(logger: logger) { conn in
+            // ── 1. Register the queue (idempotent) ──────────────────────────────────────
+            try await createQueue(on: conn, namespaceID: namespaceID, name: queue, logger: logger)
+
+            // ── 2. Insert all task rows — one multi-row VALUES statement ──────────────────
+            // Built via PostgresQuery.StringInterpolation so every field, including
+            // nullable BYTEAs (headers, retry_strategy, cancellation), is bound as an
+            // individual typed parameter — one round-trip for all N tasks.
+            var taskInterp = PostgresQuery.StringInterpolation(
+                literalCapacity: 300 + items.count * 256,
+                interpolationCount: items.count * 20
+            )
+            taskInterp.appendLiteral(
+                "INSERT INTO strand.tasks "
+                    + "(namespace_id, id, queue, name, params, headers, "
+                    + "retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, "
+                    + "schedule_to_start_timeout_seconds, cancellation, idempotency_key, priority, "
+                    + "fairness_key, fairness_weight, state, kind, deadline_at) VALUES "
+            )
+            for (i, item) in items.enumerated() {
+                if i > 0 { taskInterp.appendLiteral(", ") }
+                taskInterp.appendLiteral("(")
+                taskInterp.appendInterpolation(namespaceID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(item.taskID)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(queue)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(taskName)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(item.paramsBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(headersBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(retryStrategyBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(maxAttempts)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(timeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(heartbeatTimeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(scheduleToStartTimeoutSeconds)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(cancellationBuffer)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(item.idempotencyKey)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(priority)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(fairnessKey)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(fairnessWeight)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(TaskState.pending)
+                taskInterp.appendLiteral(", ")
+                try taskInterp.appendInterpolation(kind)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(deadlineAt)
+                taskInterp.appendLiteral(")")
+            }
+            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING RETURNING id")
+            // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
+            // silently discards conflicts, so only genuinely new task IDs are returned.
+            // No separate SELECT round-trip needed.
+            var newIDSet: Set<UUID> = []
+            for try await row in try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger) {
+                var col = row.makeIterator()
+                newIDSet.insert(try col.next()!.decode(UUID.self, context: .default))
+            }
+
+            // ── 4. Insert runs for genuinely new tasks ────────────────────────────
+            let newItems = items.filter { newIDSet.contains($0.taskID) }
+            if !newItems.isEmpty {
+                var runInterp = PostgresQuery.StringInterpolation(
+                    literalCapacity: 220 + newItems.count * 160,
+                    interpolationCount: newItems.count * 9
+                )
+                runInterp.appendLiteral(
+                    "INSERT INTO strand.runs "
+                        + "(namespace_id, id, task_id, queue, attempt, state, "
+                        + "available_at, priority, fairness_key, fairness_weight, kind) VALUES "
+                )
+                for (i, item) in newItems.enumerated() {
+                    if i > 0 { runInterp.appendLiteral(", ") }
+                    runInterp.appendLiteral("(")
+                    runInterp.appendInterpolation(namespaceID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(item.runID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(item.taskID)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(queue)
+                    runInterp.appendLiteral(", 1, ")
+                    try runInterp.appendInterpolation(TaskState.pending)
+                    runInterp.appendLiteral(", COALESCE(")
+                    runInterp.appendInterpolation(scheduledAt)
+                    runInterp.appendLiteral(", NOW()), ")
+                    try runInterp.appendInterpolation(priority)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(fairnessKey)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(fairnessWeight)
+                    runInterp.appendLiteral(", ")
+                    try runInterp.appendInterpolation(kind)
+                    runInterp.appendLiteral(")")
+                }
+                try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
+            }
+
+            // ── 5. Batch-insert root spans for new tasks ──────────────────────────
+            if !newItems.isEmpty {
+                let spanItems = newItems.map { (spanID: $0.taskID.uuidString, taskID: $0.taskID) }
+                try await TraceSpanQueries.insertRootSpansBatch(
+                    on: conn,
+                    items: spanItems,
+                    namespaceID: namespaceID,
+                    kind: kind == .workflow ? .workflow : .activity,
+                    name: taskName,
+                    state: .waiting,
+                    maxAttempts: maxAttempts,
+                    queuedAt: scheduledAt ?? Date(),
+                    logger: logger
+                )
+            }
+
+            // ── 6. Rate-limit slot allocation ───────────────────────────────────────────
+            if let intervalMs = rateLimitIntervalMs, !newItems.isEmpty {
+                let rlQueues = Array(repeating: queue, count: newItems.count)
+                let rlSlotKeys = Array(repeating: rateLimitKey ?? taskName, count: newItems.count)
+                let rlRunIDs = newItems.map { $0.runID }
+                let rlIntervalMses = Array(repeating: intervalMs, count: newItems.count)
+                try await applyRateLimitSlots(
+                    on: conn,
+                    namespaceID: namespaceID,
+                    queues: rlQueues,
+                    slotKeys: rlSlotKeys,
+                    runIDs: rlRunIDs,
+                    intervalMses: rlIntervalMses,
+                    logger: logger
+                )
+            }
+
+            // ── 7. Notify workers ───────────────────────────────────────────────────────────
+            if !newIDSet.isEmpty {
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            }
+
+            // ── 8. Resolve idempotency hits ─────────────────────────────────────────────────
+            // Build a lookup table: idempotency_key → EnqueueRow.
+            // New tasks: use the pre-generated IDs directly.
+            // Idempotency hits: query the DB for the existing task/run IDs.
+            var idKeyToRow: [String: EnqueueRow] = [:]
+            for item in newItems {
+                idKeyToRow[item.idempotencyKey] = EnqueueRow(
+                    taskID: item.taskID,
+                    runID: item.runID,
+                    attempt: 1,
+                    created: true
+                )
+            }
+            let hitItems = items.filter { !newIDSet.contains($0.taskID) }
+            if !hitItems.isEmpty {
+                let hitKeys = hitItems.map { $0.idempotencyKey }
+                let hitStream = try await conn.query(
+                    """
+                    SELECT DISTINCT ON (t.idempotency_key) t.id, r.id, r.attempt, t.idempotency_key
+                    FROM strand.tasks t
+                    JOIN strand.runs r ON r.task_id = t.id
+                    WHERE t.namespace_id    = \(namespaceID)
+                      AND t.queue           = \(queue)
+                      AND t.idempotency_key = ANY(\(hitKeys))
+                    ORDER BY t.idempotency_key, r.attempt DESC
+                    """,
+                    logger: logger
+                )
+                for try await hitRow in hitStream {
+                    var col = hitRow.makeIterator()
+                    let eTaskID = try col.next()!.decode(UUID.self, context: .default)
+                    let eRunID = try col.next()!.decode(UUID.self, context: .default)
+                    let eAttempt = try col.next()!.decode(Int.self, context: .default)
+                    let eKey = try col.next()!.decode(String.self, context: .default)
+                    idKeyToRow[eKey] = EnqueueRow(
+                        taskID: eTaskID,
+                        runID: eRunID,
+                        attempt: eAttempt,
+                        created: false
+                    )
+                }
+            }
+
+            // ── 9. Assemble result in original order ───────────────────────────────────
+            return try items.map { item in
+                guard let enqRow = idKeyToRow[item.idempotencyKey] else {
+                    throw StrandError.database(
+                        underlying: QueryError(
+                            "enqueueBatch: no row for idempotency_key \(item.idempotencyKey)"
+                        )
+                    )
+                }
+                return enqRow
+            }
+        }
+    }
+
     // MARK: - enqueueChildTasksBatch
 
     /// Batch-enqueue every child task (activity or child workflow) spawned by one workflow
@@ -491,19 +743,11 @@ enum Queries {
                 taskInterp.appendInterpolation(child.deadlineAt)
                 taskInterp.appendLiteral(")")
             }
-            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING")
-            try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger)
-
-            // ── 3. Identify which tasks were genuinely inserted ──────────────────────
-            // A generated taskID present in the DB means the INSERT succeeded (new row).
-            // An absent generated taskID means the conflict clause fired (idempotency hit).
-            let generatedIDs = children.map { $0.taskID }
-            let newIDsStream = try await conn.query(
-                "SELECT id FROM strand.tasks WHERE namespace_id = \(namespaceID) AND id = ANY(\(generatedIDs))",
-                logger: logger
-            )
+            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING RETURNING id")
+            // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
+            // silently discards conflicts, so only genuinely new task IDs are returned.
             var newIDSet: Set<UUID> = []
-            for try await row in newIDsStream {
+            for try await row in try await conn.query(PostgresQuery(stringInterpolation: taskInterp), logger: logger) {
                 var col = row.makeIterator()
                 newIDSet.insert(try col.next()!.decode(UUID.self, context: .default))
             }
@@ -546,22 +790,25 @@ enum Queries {
                 }
                 try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
                 // Write-through to trace_spans — atomic with the batch enqueue transaction.
-                // If any write fails the whole transaction rolls back and the caller retries.
-                for child in newChildren {
-                    try await TraceSpanQueries.upsertTaskSpan(
-                        on: conn,
-                        id: child.taskID.uuidString,
-                        namespaceID: namespaceID,
-                        taskID: child.taskID,
-                        parentID: parentTaskID.uuidString,
-                        kind: child.kind == .workflow ? .workflow : .activity,
-                        name: child.taskName,
-                        state: .waiting,
-                        maxAttempts: child.maxAttempts,
-                        queuedAt: child.scheduledAt ?? Date(),
-                        logger: logger
+                // Single round-trip for all N children via insertChildSpansBatch.
+                let spanItems = newChildren.map {
+                    (
+                        spanID: $0.taskID.uuidString,
+                        taskID: $0.taskID,
+                        kind: $0.kind == .workflow ? WorkflowSpanKind.workflow : .activity,
+                        name: $0.taskName,
+                        maxAttempts: $0.maxAttempts,
+                        queuedAt: $0.scheduledAt ?? Date()
                     )
                 }
+                try await TraceSpanQueries.insertChildSpansBatch(
+                    on: conn,
+                    items: spanItems,
+                    namespaceID: namespaceID,
+                    parentSpanID: parentTaskID.uuidString,
+                    state: .waiting,
+                    logger: logger
+                )
             }
 
             // ── 4b. Rate-limit slot allocation ──────────────────────────────────────────
@@ -947,6 +1194,8 @@ enum Queries {
             // CAS on version — if another worker already wrote a completion, bail out.
             // The tasks update is gated on the runs CAS via the CTE: if r is empty
             // (CAS failed), the WHERE subquery returns NULL and no task row is touched.
+            // del_waits and trace_upd are gated on (SELECT COUNT(*) FROM r) > 0 so they
+            // are no-ops when the CAS fails — one round-trip for all three operations.
             let casStream = try await conn.query(
                 """
                 WITH r AS (
@@ -955,31 +1204,29 @@ enum Queries {
                     WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version)
                       AND namespace_id = \(namespaceID)
                     RETURNING task_id
+                ),
+                task_upd AS (
+                    UPDATE strand.tasks
+                    SET state = \(TaskState.completed), completed_at = NOW(), result = \(resultBuffer)
+                    WHERE id = (SELECT task_id FROM r)
+                    RETURNING id
+                ),
+                del_waits AS (
+                    DELETE FROM strand.event_waits
+                    WHERE run_id = \(runID) AND (SELECT COUNT(*) FROM r) > 0
+                ),
+                trace_upd AS (
+                    UPDATE strand.trace_spans
+                    SET state       = \(WorkflowSpanState.completed),
+                        finished_at = NOW()
+                    WHERE id = UPPER((SELECT task_id::text FROM r))
+                      AND (SELECT COUNT(*) FROM r) > 0
                 )
-                UPDATE strand.tasks
-                SET state = \(TaskState.completed), completed_at = NOW(), result = \(resultBuffer)
-                WHERE id = (SELECT task_id FROM r)
-                RETURNING id
+                SELECT id FROM task_upd
                 """,
                 logger: logger
             )
             guard try await casStream.first(where: { _ in true }) != nil else { return }
-            try await conn.query(
-                "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
-                logger: logger
-            )
-            // Write-through to trace_spans — atomic with the completion transaction.
-            // If this fails the whole transaction rolls back; the run stays RUNNING,
-            // lease expires, sweep re-queues, activation retries with consistent data.
-            try await conn.query(
-                """
-                UPDATE strand.trace_spans
-                SET state       = \(WorkflowSpanState.completed),
-                    finished_at = NOW()
-                WHERE id = \(taskID.uuidString)
-                """,
-                logger: logger
-            )
             try await emitTaskCompletionSignal(
                 conn: conn,
                 namespaceID: namespaceID,
@@ -1146,7 +1393,7 @@ enum Queries {
         try await client.withTransaction(logger: logger) { conn in
             let infoStream = try await conn.query(
                 """
-                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.deadline_at, t.kind
+                SELECT t.id, t.attempt, t.max_attempts, t.retry_strategy, t.deadline_at, t.kind, r.queue
                 FROM   strand.runs r
                 JOIN   strand.tasks t ON t.id = r.task_id
                 WHERE  r.id           = \(runID)
@@ -1163,29 +1410,34 @@ enum Queries {
             let retryStrategyBuf = try col.next()!.decode(ByteBuffer?.self, context: .default)
             let deadlineAt = try col.next()!.decode(Date?.self, context: .default)
             let taskKind = try col.next()!.decode(TaskKind.self, context: .default)
-            // Step 2 — CAS: only transitions the run that this worker claimed.
-            let failStream = try await conn.query(
-                "UPDATE strand.runs SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW() WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version) RETURNING id",
-                logger: logger
-            )
-            guard try await failStream.first(where: { _ in true }) != nil else { return }
-            try await conn.query(
-                "DELETE FROM strand.event_waits WHERE run_id = \(runID)",
-                logger: logger
-            )
-            // Write-through to trace_spans — atomic with the failure transaction.
-            // If a retry is scheduled, claimTasks will later overwrite this with state='RUNNING'.
+            let queue = try col.next()!.decode(String.self, context: .default)
+            // Step 2 — CAS + event-wait cleanup + trace update in a single round-trip.
+            // del_waits and trace_upd are gated on CAS success via (SELECT COUNT(*) FROM fail_run) > 0.
             let _spanError: String? = (try? JSON.decode(_FailureMessage.self, from: reasonBuffer))?.message
-            try await conn.query(
+            let failStream = try await conn.query(
                 """
-                UPDATE strand.trace_spans
-                SET state       = \(WorkflowSpanState.failed),
-                    finished_at = NOW(),
-                    error       = \(_spanError)
-                WHERE id        = \(taskID.uuidString)
+                WITH fail_run AS (
+                    UPDATE strand.runs
+                    SET state = \(TaskState.failed), failure_reason = \(reasonBuffer), finished_at = NOW()
+                    WHERE id = \(runID) AND state = \(TaskState.running) AND version = \(version)
+                    RETURNING id
+                ),
+                del_waits AS (
+                    DELETE FROM strand.event_waits
+                    WHERE run_id = \(runID) AND (SELECT COUNT(*) FROM fail_run) > 0
+                ),
+                trace_upd AS (
+                    UPDATE strand.trace_spans
+                    SET state       = \(WorkflowSpanState.failed),
+                        finished_at = NOW(),
+                        error       = \(_spanError)
+                    WHERE id = \(taskID.uuidString) AND (SELECT COUNT(*) FROM fail_run) > 0
+                )
+                SELECT id FROM fail_run
                 """,
                 logger: logger
             )
+            guard try await failStream.first(where: { _ in true }) != nil else { return }
 
             // ── Check 0: non_retryable flag (from NonRetryableError protocol) ──────────
             // Activities whose Failure type conforms to NonRetryableError encode
@@ -1315,15 +1567,7 @@ enum Queries {
             )
             // Only notify when the retry is immediately runnable (no sleep delay).
             if newState == .pending {
-                let qStream = try await conn.query(
-                    "SELECT queue FROM strand.runs WHERE id = \(runID)",
-                    logger: logger
-                )
-                if let qRow = try await qStream.first(where: { _ in true }) {
-                    var qCol = qRow.makeIterator()
-                    let q = try qCol.next()!.decode(String.self, context: .default)
-                    try await conn.notifyWorkers(namespace: namespaceID, queue: q, logger: logger)
-                }
+                try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             }
         }
     }
@@ -1771,11 +2015,11 @@ enum Queries {
     /// correctly reconstructs deterministic values (uuid(), random()) even when
     /// `failRun` has created a new run_id for a workflow retry.
     static func getCheckpointStates(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         taskID: UUID,
         logger: Logger
     ) async throws -> [CheckpointRow] {
-        let stream = try await client.query(
+        let stream = try await conn.query(
             """
             SELECT seq_num, name, state
             FROM strand.checkpoints
@@ -1787,6 +2031,14 @@ enum Queries {
         var rows: [CheckpointRow] = []
         for try await row in stream { rows.append(try CheckpointRow(row: row)) }
         return rows
+    }
+
+    static func getCheckpointStates(
+        on client: PostgresClient,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> [CheckpointRow] {
+        try await client.withConnection { try await getCheckpointStates(on: $0, taskID: taskID, logger: logger) }
     }
 
     /// Upserts a step checkpoint keyed by `(task_id, seq_num)`; optionally extends the claim lease.
@@ -2274,7 +2526,7 @@ enum Queries {
     /// *same worker* is still running the task and is genuinely stuck —
     /// it goes through ``failRun`` and does increment the attempt counter.
     static func sweepExpiredLeases(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         namespaceID: String,
         queue: String,
         logger: Logger
@@ -2282,7 +2534,7 @@ enum Queries {
         // Select expired runs and re-queue them atomically.
         // `FOR UPDATE SKIP LOCKED` ensures two concurrent sweepers on the
         // same queue never double-process the same run.
-        let stream = try await client.query(
+        let stream = try await conn.query(
             """
             WITH expired AS (
                 SELECT r.id AS run_id, r.task_id
@@ -2321,7 +2573,7 @@ enum Queries {
                 "re-queued \(count) run(s) with expired lease—worker was likely restarted",
                 metadata: ["queue": "\(queue)"]
             )
-            try await client.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
+            try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
         }
     }
 
@@ -2467,7 +2719,7 @@ enum Queries {
     /// Upserts a worker heartbeat row into `strand.workers`.
     /// Called on startup (running=0) and on every heartbeat tick (with current running count).
     static func upsertWorker(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         workerID: String,
         namespaceID: String,
         queue: String,
@@ -2476,7 +2728,7 @@ enum Queries {
         sdkVersion: String,
         logger: Logger
     ) async throws {
-        try await client.query(
+        try await conn.query(
             """
             INSERT INTO strand.workers (id, namespace_id, queue, concurrency, running, sdk_version, started_at, updated_at)
             VALUES (\(workerID), \(namespaceID), \(queue), \(concurrency), \(running), \(sdkVersion), NOW(), NOW())
@@ -2489,6 +2741,30 @@ enum Queries {
             """,
             logger: logger
         )
+    }
+
+    static func upsertWorker(
+        on client: PostgresClient,
+        workerID: String,
+        namespaceID: String,
+        queue: String,
+        concurrency: Int,
+        running: Int,
+        sdkVersion: String,
+        logger: Logger
+    ) async throws {
+        try await client.withConnection { conn in
+            try await upsertWorker(
+                on: conn,
+                workerID: workerID,
+                namespaceID: namespaceID,
+                queue: queue,
+                concurrency: concurrency,
+                running: running,
+                sdkVersion: sdkVersion,
+                logger: logger
+            )
+        }
     }
 
     /// Deletes a worker row — called on clean shutdown.
@@ -2542,11 +2818,11 @@ enum Queries {
     /// Removes worker rows whose `updated_at` is older than `olderThanSeconds`.
     /// Called on each heartbeat tick so stale entries from crashed workers are cleaned up.
     static func sweepStaleWorkers(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         olderThanSeconds: Int,
         logger: Logger
     ) async throws {
-        try await client.query(
+        try await conn.query(
             "DELETE FROM strand.workers WHERE updated_at < NOW() - \(olderThanSeconds) * INTERVAL '1 second'",
             logger: logger
         )

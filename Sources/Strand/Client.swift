@@ -157,6 +157,191 @@ public struct StrandClient: Sendable {
         return try snap.decodeResult(as: A.Output.self)
     }
 
+    // MARK: - enqueueActivities
+
+    /// Enqueues N activities of the same type in O(1) Postgres round-trips.
+    ///
+    /// All activities share the same options; only `inputs` vary per item.
+    /// One `pg_notify` is emitted for the queue regardless of N.
+    ///
+    /// ```swift
+    /// let results = try await client.enqueueActivities(
+    ///     ProcessItemActivity.self,
+    ///     inputs: items
+    /// )
+    /// // results[i].taskID corresponds to items[i]
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - idempotencyKeys: Optional per-item idempotency keys. When provided,
+    ///     must have the same count as `inputs`. `nil` auto-generates a unique key
+    ///     per item (use this for fire-and-forget batch ingestion).
+    @discardableResult
+    public func enqueueActivities<A: Activity>(
+        _ type: A.Type,
+        inputs: [A.Input],
+        idempotencyKeys: [String]? = nil,
+        options: ActivityOptions = .init()
+    ) async throws -> [EnqueueResult] {
+        guard idempotencyKeys == nil || idempotencyKeys!.count == inputs.count else {
+            throw StrandError.serialization(
+                underlying: QueryError(
+                    "enqueueActivities: idempotencyKeys.count (\(idempotencyKeys!.count)) "
+                        + "must equal inputs.count (\(inputs.count))"
+                )
+            )
+        }
+        guard !inputs.isEmpty else { return [] }
+
+        let queue = options.queue ?? queueName
+        let rlParams = options.rateLimit.map { $0.slotParams(for: A.name) }
+        let maxAttempts = options.maxAttempts ?? A.defaultMaxAttempts ?? self.options.defaultMaxAttempts
+        let deadlineAt: Date? = options.maxDuration.map { Date.now.addingDuration($0) }
+        let retryStrategyBuffer = try JSON.encode(
+            options.retryStrategy ?? self.options.defaultRetryStrategy
+        )
+        let cancellationBuffer: ByteBuffer? = try options.cancellation.map { try JSON.encode($0) }
+
+        return try await withSpan("\(A.name).batch", ofKind: .producer) { span in
+            span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(A.name)
+            span.attributes[StrandLogKeys.queue] = SpanAttribute.string(queue)
+            span.attributes[StrandLogKeys.namespace] = SpanAttribute.string(namespaceID)
+            span.attributes["batch.count"] = SpanAttribute.int(Int64(inputs.count))
+
+            // Inject OTel trace context once — shared headers for all items in the batch.
+            var h = options.headers
+            if let ctx = ServiceContext.current {
+                InstrumentationSystem.tracer.inject(ctx, into: &h, using: DictionaryInjector())
+            }
+            let headersBuffer: ByteBuffer? = h.isEmpty ? nil : try JSON.encode(h)
+
+            // Build per-item specs: each gets its own taskID, runID, and idempotency key.
+            let batchItems: [Queries.BatchEnqueueItem] = try inputs.enumerated().map { (i, input) in
+                let resolvedKey = idempotencyKeys?[i] ?? A.generateActivityID()
+                return Queries.BatchEnqueueItem(
+                    taskID: UUID.v7(),
+                    runID: UUID.v7(),
+                    paramsBuffer: try JSON.encode(input),
+                    idempotencyKey: resolvedKey
+                )
+            }
+
+            let rows = try await Queries.enqueueBatch(
+                on: postgres,
+                namespaceID: namespaceID,
+                queue: queue,
+                taskName: A.name,
+                items: batchItems,
+                headersBuffer: headersBuffer,
+                retryStrategyBuffer: retryStrategyBuffer,
+                maxAttempts: maxAttempts,
+                cancellationBuffer: cancellationBuffer,
+                priority: options.priority,
+                scheduledAt: options.delayUntil,
+                timeoutSeconds: nil,
+                heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
+                scheduleToStartTimeoutSeconds: options.scheduleToStartTimeout.map { Int($0.components.seconds) },
+                deadlineAt: deadlineAt,
+                fairnessKey: options.fairnessKey,
+                fairnessWeight: options.fairnessWeight,
+                kind: .activity,
+                rateLimitKey: rlParams?.slotKey,
+                rateLimitIntervalMs: rlParams?.intervalMs,
+                logger: logger
+            )
+
+            return rows.map { row in
+                EnqueueResult(taskID: row.taskID, runID: row.runID, attempt: row.attempt, createdAt: Date.now)
+            }
+        }
+    }
+
+    // MARK: - startWorkflows
+
+    /// Starts N workflows of the same type in O(1) Postgres round-trips.
+    ///
+    /// All workflows share the same options; only `inputs` vary per item.
+    ///
+    /// ```swift
+    /// let handles = try await client.startWorkflows(
+    ///     OrderWorkflow.self,
+    ///     inputs: orders
+    /// )
+    /// ```
+    @discardableResult
+    public func startWorkflows<W: Workflow>(
+        _ type: W.Type,
+        inputs: [W.Input],
+        options: WorkflowOptions = .init()
+    ) async throws -> [WorkflowHandle<W>] {
+        guard !inputs.isEmpty else { return [] }
+
+        let queue = options.queue ?? queueName
+        let maxAttempts = options.maxAttempts ?? self.options.defaultMaxAttempts
+        let deadlineAt: Date? = options.maxDuration.map { Date.now.addingDuration($0) }
+        let retryStrategyBuffer = try JSON.encode(
+            options.retryStrategy ?? self.options.defaultRetryStrategy
+        )
+
+        return try await withSpan("\(W.workflowName).batch", ofKind: .producer) { span in
+            span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(W.workflowName)
+            span.attributes[StrandLogKeys.queue] = SpanAttribute.string(queue)
+            span.attributes[StrandLogKeys.namespace] = SpanAttribute.string(namespaceID)
+            span.attributes["batch.count"] = SpanAttribute.int(Int64(inputs.count))
+
+            // Inject OTel trace context once — shared headers for all items in the batch.
+            var h = options.headers
+            if let ctx = ServiceContext.current {
+                InstrumentationSystem.tracer.inject(ctx, into: &h, using: DictionaryInjector())
+            }
+            let headersBuffer: ByteBuffer? = h.isEmpty ? nil : try JSON.encode(h)
+
+            // Build per-item specs: each workflow gets its own unique ID and UUIDs.
+            let batchItems: [Queries.BatchEnqueueItem] = try inputs.map { input in
+                let resolvedID = W.generateWorkflowID()
+                return Queries.BatchEnqueueItem(
+                    taskID: UUID.v7(),
+                    runID: UUID.v7(),
+                    paramsBuffer: try JSON.encode(input),
+                    idempotencyKey: resolvedID
+                )
+            }
+
+            let rows = try await Queries.enqueueBatch(
+                on: postgres,
+                namespaceID: namespaceID,
+                queue: queue,
+                taskName: W.workflowName,
+                items: batchItems,
+                headersBuffer: headersBuffer,
+                retryStrategyBuffer: retryStrategyBuffer,
+                maxAttempts: maxAttempts,
+                cancellationBuffer: nil,
+                priority: options.priority,
+                scheduledAt: options.delayUntil,
+                timeoutSeconds: nil,
+                heartbeatTimeoutSeconds: nil,
+                scheduleToStartTimeoutSeconds: nil,
+                deadlineAt: deadlineAt,
+                fairnessKey: options.fairnessKey,
+                fairnessWeight: options.fairnessWeight,
+                kind: .workflow,
+                rateLimitKey: nil,
+                rateLimitIntervalMs: nil,
+                logger: logger
+            )
+
+            return zip(rows, batchItems).map { (row, item) in
+                WorkflowHandle<W>(
+                    workflowID: item.idempotencyKey,
+                    taskID: row.taskID,
+                    initialRunID: row.runID,
+                    client: self
+                )
+            }
+        }
+    }
+
     // MARK: - startWorkflow
 
     /// Enqueues a ``Workflow`` and returns a ``WorkflowHandle`` for signalling,
