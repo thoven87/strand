@@ -90,7 +90,7 @@ public struct TestExpectation: Sendable {
 /// | `POSTGRES_DB` | `strand_dev` |
 public func makePostgresClient(logger: Logger) -> PostgresClient {
     let env = ProcessInfo.processInfo.environment
-    var config = PostgresClient.Configuration(
+    let config = PostgresClient.Configuration(
         host: env["POSTGRES_HOST"] ?? "localhost",
         port: Int(env["POSTGRES_PORT"] ?? "5499") ?? 5499,
         username: env["POSTGRES_USER"] ?? "strand",

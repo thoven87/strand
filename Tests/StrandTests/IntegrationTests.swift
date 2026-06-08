@@ -716,14 +716,16 @@ struct LeaseExpiryTests {
             try await Task.sleep(for: .seconds(2))
 
             // Sweep the expired lease — this marks the run FAILED and creates a retry run.
-            try await Queries.sweepExpiredLeases(
-                on: client.postgres,
-                namespaceID: "default",
-                queue: client.queueName,
-                logger: client.logger
-            )
+            try await client.postgres.withConnection { conn in
+                try await Queries.sweepExpiredLeases(
+                    on: conn,
+                    namespaceID: "default",
+                    queue: client.queueName,
+                    logger: client.logger
+                )
+            }
 
-            // Real worker picks up the retry run.
+            // Worker picks up the retry run.
             try await withWorker(
                 postgres: client.postgres,
                 queueName: client.queueName,
