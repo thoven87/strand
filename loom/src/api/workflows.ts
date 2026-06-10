@@ -141,7 +141,29 @@ export const triggerWorkflow = (
     workflowName: string,
     input: string,
     queue?: string,
+    description?: string,
 ): Promise<{ taskID: string; runID: string; attempt: number }> =>
     api
-        .post(`/api/${namespace}/workflows/run`, { workflowName, queue, input })
+        .post(`/api/${namespace}/workflows/run`, {
+            workflowName,
+            queue,
+            input,
+            description,
+        })
+        .then((r) => r.data);
+
+export const enqueueActivity = (
+    namespace: string,
+    activityName: string,
+    input: string,
+    queue?: string,
+    description?: string,
+): Promise<{ taskID: string; runID: string; attempt: number }> =>
+    api
+        .post(`/api/${namespace}/activities/enqueue`, {
+            activityName,
+            queue,
+            input,
+            description,
+        })
         .then((r) => r.data);

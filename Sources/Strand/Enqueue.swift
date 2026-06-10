@@ -85,6 +85,10 @@ public struct EnqueueOptions: Sendable {
     /// limiting.  See ``RateLimit`` for full documentation.
     public var rateLimit: RateLimit?
 
+    /// Human-readable description for this execution — shown in the Loom
+    /// dashboard.  Stored in the `strand.tasks.description` column; `nil` stores nothing.
+    public var description: String?
+
     public init(
         queue: String? = nil,
         maxAttempts: Int? = nil,
@@ -97,7 +101,8 @@ public struct EnqueueOptions: Sendable {
         maxDuration: Duration? = nil,
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
-        rateLimit: RateLimit? = nil
+        rateLimit: RateLimit? = nil,
+        description: String? = nil
     ) {
         self.queue = queue
         self.maxAttempts = maxAttempts
@@ -111,6 +116,7 @@ public struct EnqueueOptions: Sendable {
         self.fairnessKey = fairnessKey
         self.fairnessWeight = max(fairnessWeight, 0.001)  // guard against divide-by-zero
         self.rateLimit = rateLimit
+        self.description = description
     }
 }
 
@@ -443,6 +449,60 @@ public struct TaskResultSnapshot: Sendable, Codable {
     /// Raw JSON string of the result value; `nil` if not yet completed.
     public let resultJSON: String?
     public let failure: TaskFailure?
+    /// Decoded failure — populated from `strand.runs.failure_reason` by
+    /// `StrandClient.taskSnapshot(from:)` when a DB row is decoded.  Used by
+    /// `StrandClient.runActivity` to throw `A.Failure` directly without a
+    /// second round of JSON decoding.
+    ///
+    /// Not part of the `Codable` representation: the failure IS durable in the
+    /// DB, but this field is not serialised to JSON (e.g. over an HTTP API) and
+    /// is set back to `nil` on `init(from decoder:)`.  External callers should
+    /// read `TaskResultSnapshot.failure` instead.
+    package let _activityFailure: ActivityFailure?
+
+    // Codable only encodes the four public fields; _failureBuffer is runtime-only.
+    private enum CodingKeys: String, CodingKey {
+        case taskID, state, resultJSON, failure
+    }
+
+    /// Public memberwise initialiser (for external callers — no runtime failure data).
+    public init(
+        taskID: UUID,
+        state: TaskState,
+        resultJSON: String?,
+        failure: TaskFailure?
+    ) {
+        self.taskID = taskID
+        self.state = state
+        self.resultJSON = resultJSON
+        self.failure = failure
+        self._activityFailure = nil
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.taskID = try c.decode(UUID.self, forKey: .taskID)
+        self.state = try c.decode(TaskState.self, forKey: .state)
+        self.resultJSON = try c.decodeIfPresent(String.self, forKey: .resultJSON)
+        self.failure = try c.decodeIfPresent(TaskFailure.self, forKey: .failure)
+        self._activityFailure = nil  // not in JSON wire format; see _activityFailure doc comment
+    }
+
+    /// Package-internal initialiser that carries the already-decoded `ActivityFailure`
+    /// for typed-failure propagation in `StrandClient.runActivity`.
+    package init(
+        taskID: UUID,
+        state: TaskState,
+        resultJSON: String?,
+        failure: TaskFailure?,
+        activityFailure: ActivityFailure?
+    ) {
+        self.taskID = taskID
+        self.state = state
+        self.resultJSON = resultJSON
+        self.failure = failure
+        self._activityFailure = activityFailure
+    }
 
     /// Decodes the result JSON into `T`.
     ///

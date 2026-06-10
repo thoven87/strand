@@ -120,6 +120,9 @@ struct TaskDetailResponse: Codable, Sendable {
     let workflowId: String?
     /// Scheduling metadata for tasks triggered by a schedule, or `null` if not scheduled.
     let scheduling: SchedulingInfoResponse?
+    /// Human-readable description supplied at enqueue time via
+    /// `ActivityOptions.description` / `WorkflowOptions.description`.  `null` if not set.
+    let description: String?
 
     init(from row: TaskDetailRow) {
         id = row.id
@@ -137,6 +140,7 @@ struct TaskDetailResponse: Codable, Sendable {
         kind = row.kind
         parentTaskId = row.parentTaskId
         workflowId = row.workflowId
+        description = row.description
         scheduling = row.schedulingMetadata.map {
             SchedulingInfoResponse(
                 scheduleName: $0.scheduledBy,
@@ -162,6 +166,7 @@ struct RunResponse: Codable, Sendable {
     let createdAt: Date
     let availableAt: Date
     let failureReason: String?  // raw JSON
+    let heartbeatDetails: String?  // raw JSON — live progress written by heartbeat()
 
     init(from row: RunSummaryRow) {
         id = row.id
@@ -175,8 +180,10 @@ struct RunResponse: Codable, Sendable {
         createdAt = row.createdAt
         availableAt = row.availableAt
         failureReason = row.failureBuffer.map { String(buffer: $0) }
+        heartbeatDetails = row.heartbeatDetailsBuffer.map { String(buffer: $0) }
     }
 }
+
 extension RunResponse: ResponseCodable {}
 
 struct CheckpointResponse: Codable, Sendable {

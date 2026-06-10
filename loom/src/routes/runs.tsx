@@ -199,12 +199,17 @@ export function RunsPage() {
     usePageTitle("Runs");
     const { namespace } = useParams({ strict: false }) as { namespace: string };
 
-    // ── All filters live in the URL ─────────────────────────────────────────
+    // ── All filters live in the URL ──────────────────────────────────────────────────
     const search = useSearch({ strict: false }) as {
         queue?: string;
         state?: string;
         kind?: string;
         name?: string;
+        /** Backfill UUID — when set, list shows only tasks created by this backfill. */
+        backfillId?: string;
+        /** Schedule UUID — filter by idempotency-key prefix `$schedule:<id>:`.
+         *  Used by backfill task list for pre-existing tasks (allowOverwrite=false). */
+        scheduleId?: string;
     };
     const navigate = useNavigate();
 
@@ -212,6 +217,8 @@ export function RunsPage() {
     const stateFilter = search.state;
     const kindFilter = search.kind as TaskKind | undefined;
     const nameFilter = search.name ?? "";
+    const backfillIdFilter = search.backfillId;
+    const scheduleIdFilter = search.scheduleId;
 
     // Pagination is local state — it resets on any filter change
     const [cursor, setCursor] = useState<string | undefined>(undefined);
@@ -266,6 +273,8 @@ export function RunsPage() {
         refetchInterval: intervalMs,
     });
 
+    const isBackfillScoped = !!(backfillIdFilter || scheduleIdFilter);
+
     const { data, isLoading, error } = useQuery({
         queryKey: [
             "tasks-global",
@@ -275,6 +284,8 @@ export function RunsPage() {
             kindFilter,
             nameFilter,
             rootOnly,
+            backfillIdFilter,
+            scheduleIdFilter,
             cursor,
         ],
         queryFn: () =>
@@ -283,7 +294,15 @@ export function RunsPage() {
                 state: stateFilter,
                 kind: kindFilter,
                 name: nameFilter || undefined,
-                rootOnly: rootOnly ? true : undefined,
+                // Disable rootOnly when scoped to a backfill/schedule so child
+                // activities spawned by backfill workflows are also visible.
+                rootOnly: isBackfillScoped
+                    ? undefined
+                    : rootOnly
+                      ? true
+                      : undefined,
+                backfillId: backfillIdFilter,
+                scheduleId: scheduleIdFilter,
                 cursor,
                 limit: 50,
             }),
@@ -341,7 +360,37 @@ export function RunsPage() {
     // ── Render ─────────────────────────────────────────────────────────────
     return (
         <div className="px-6 py-5 space-y-4">
-            {/* ── Header row: title + queue selector + name search ────────── */}
+            {/* Backfill context banner — shown when navigated from a backfill row */}
+            {isBackfillScoped && (
+                <div className="rounded-lg border border-blue-500/25 bg-blue-500/8 px-4 py-2.5 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-mono text-blue-400/70 bg-blue-500/15 border border-blue-500/20 rounded px-1.5 py-0.5">
+                            {scheduleIdFilter ? "SCHEDULE" : "BACKFILL"}
+                        </span>
+                        <span className="text-xs text-muted-foreground font-mono truncate max-w-xs">
+                            {scheduleIdFilter ?? backfillIdFilter}
+                        </span>
+                    </div>
+                    <button
+                        onClick={() =>
+                            navigate({
+                                to: "/$namespace/runs",
+                                params: { namespace },
+                                search: {
+                                    queue: selectedQueue || undefined,
+                                    name: nameFilter || undefined,
+                                },
+                                replace: true,
+                            })
+                        }
+                        className="text-[11px] text-muted-foreground hover:text-foreground transition-colors shrink-0 ml-4"
+                    >
+                        Clear filter ×
+                    </button>
+                </div>
+            )}
+
+            {/* ── Header row: title + queue selector + name search ────────────── */}
             <div className="flex items-center gap-3 flex-wrap">
                 <h1 className="text-base font-semibold text-foreground mr-auto">
                     Runs

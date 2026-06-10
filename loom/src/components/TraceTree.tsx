@@ -322,6 +322,51 @@ function fmtCursorTime(ms: number): string {
 
 // ── Visual style helpers ──────────────────────────────────────────────────────
 
+/**
+ * Maps span kind to a bar height class.
+ * Execution spans (WORKFLOW / ACTIVITY) are tall; suspension spans
+ * (SLEEP / WAIT / CONDITION) are short to signal "time passing, nothing running".
+ */
+export function barHeightClass(kind: TraceSpan["kind"]): string {
+    if (kind === "SLEEP" || kind === "WAIT" || kind === "CONDITION")
+        return "h-1.5";
+    return "h-5";
+}
+
+/**
+ * Returns an optional CSS backgroundImage overlay applied on top of the bar's
+ * Tailwind bg colour.
+ *
+ * - RUNNING spans get a subtle barber-pole diagonal to signal active execution.
+ * - Suspension spans (SLEEP / WAIT / CONDITION) get a vertical-comb pattern
+ *   to signal "time is passing but no code is running".
+ */
+export function barPatternStyle(
+    kind: TraceSpan["kind"],
+    state: SpanState,
+): React.CSSProperties {
+    if (
+        state === "RUNNING" &&
+        kind !== "SLEEP" &&
+        kind !== "WAIT" &&
+        kind !== "CONDITION"
+    ) {
+        // Barber-pole diagonal stripes — subtle white overlay on the status colour
+        return {
+            backgroundImage:
+                "repeating-linear-gradient(-45deg, transparent, transparent 6px, rgba(255,255,255,0.12) 6px, rgba(255,255,255,0.12) 8px)",
+        };
+    }
+    if (kind === "SLEEP" || kind === "WAIT" || kind === "CONDITION") {
+        // Vertical comb — suggests passing time without execution
+        return {
+            backgroundImage:
+                "repeating-linear-gradient(90deg, transparent, transparent 3px, rgba(255,255,255,0.08) 3px, rgba(255,255,255,0.08) 5px)",
+        };
+    }
+    return {};
+}
+
 function barClass(kind: TraceSpan["kind"], state: SpanState): string {
     // Suspension spans use a striped/dashed style to distinguish from execution.
     // TIMED_OUT variant gets orange to signal the timeout visually.
@@ -1182,10 +1227,10 @@ export function TraceTree({
                                             />
                                         ) : (
                                             <>
-                                                {/* Queued prefix bar (dashed, shows time-in-queue) */}
+                                                {/* Queued prefix bar — short so it reads as overhead */}
                                                 {queuedMs > 0 && (
                                                     <div
-                                                        className="absolute top-1/2 -translate-y-1/2 h-5 border border-dashed border-current opacity-30 rounded-sm"
+                                                        className="absolute top-1/2 -translate-y-1/2 h-1.5 border border-dashed border-current opacity-30 rounded-sm"
                                                         style={{
                                                             left: pct(
                                                                 row.startMs,
@@ -1198,7 +1243,10 @@ export function TraceTree({
                                                 {/* Execution bar */}
                                                 <div
                                                     className={cn(
-                                                        "absolute top-1/2 -translate-y-1/2 h-5 rounded-sm",
+                                                        "absolute top-1/2 -translate-y-1/2 rounded-sm",
+                                                        barHeightClass(
+                                                            row.kind,
+                                                        ),
                                                         barClass(
                                                             row.kind,
                                                             row.state,
@@ -1207,6 +1255,10 @@ export function TraceTree({
                                                     style={{
                                                         left: pct(execStart),
                                                         width: `max(4px, ${pctDur(execDuration)}%)`,
+                                                        ...barPatternStyle(
+                                                            row.kind,
+                                                            row.state,
+                                                        ),
                                                     }}
                                                 />
 

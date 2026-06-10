@@ -86,6 +86,8 @@ struct TaskRoutes {
             let name = qp.get("name")
             let kind = qp.get("kind").flatMap { TaskKind(rawValue: $0) }  // "WORKFLOW" | "ACTIVITY" | nil = all
             let rootOnly: Bool? = qp.get("rootOnly").map { $0 == "true" }
+            let backfillID = qp.get("backfillId").flatMap { UUID(uuidString: $0) }
+            let scheduleID = qp.get("scheduleId").flatMap { UUID(uuidString: $0) }
             let limit = qp.get("limit").flatMap(Int.init) ?? 50
             let cursor = qp.get("cursor").flatMap { UUID(uuidString: $0) }
             do {
@@ -97,6 +99,8 @@ struct TaskRoutes {
                     name: name,
                     kind: kind,
                     rootOnly: rootOnly,
+                    backfillID: backfillID,
+                    scheduleID: scheduleID,
                     cursor: cursor,
                     limit: min(limit, 200),
                     logger: self.client.logger

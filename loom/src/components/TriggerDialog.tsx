@@ -1,16 +1,26 @@
 import { useState, useEffect } from "react";
-import { Loader2, Zap, ExternalLink } from "lucide-react";
+import { Loader2, Zap, Play, ExternalLink } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { JsonEditor } from "@/components/JsonEditor";
-import { triggerWorkflow } from "@/api/workflows";
+import { triggerWorkflow, enqueueActivity } from "@/api/workflows";
 
+/**
+ * Shared dialog for dispatching both workflows ("Run") and standalone activities
+ * ("Enqueue").  Pass `kind="ACTIVITY"` for the activity variant; the default is
+ * `kind="WORKFLOW"`.  The two variants differ only in header text, button colour,
+ * the name-field label, and the API call — everything else (queue, JSON input,
+ * optional description) is identical.
+ */
 interface TriggerDialogProps {
     open: boolean;
     onClose: () => void;
     namespace: string;
-    /** Pre-fill the workflow name (e.g. when triggered from a task detail page). */
+    kind?: "WORKFLOW" | "ACTIVITY";
+    /** Pre-fill the task name field (workflow name or activity name). */
     initialWorkflowName?: string;
+    /** Alias for `initialWorkflowName` when kind="ACTIVITY". */
+    initialActivityName?: string;
     /** Pre-fill the queue (e.g. when triggered from a task detail page). */
     initialQueue?: string;
     /**
@@ -26,13 +36,21 @@ export function TriggerDialog({
     open,
     onClose,
     namespace,
+    kind = "WORKFLOW",
     initialWorkflowName,
+    initialActivityName,
     initialQueue,
     initialInput,
 }: TriggerDialogProps) {
-    const [workflowName, setWorkflowName] = useState("");
+    const isActivity = kind === "ACTIVITY";
+    const initialName = isActivity
+        ? (initialActivityName ?? initialWorkflowName ?? "")
+        : (initialWorkflowName ?? "");
+
+    const [taskName, setTaskName] = useState("");
     const [queue, setQueue] = useState("");
     const [input, setInput] = useState("{}");
+    const [description, setDescription] = useState("");
     const [result, setResult] = useState<{
         taskID: string;
         runID: string;
@@ -40,16 +58,27 @@ export function TriggerDialog({
     } | null>(null);
 
     const mutation = useMutation({
-        mutationFn: () =>
-            triggerWorkflow(
+        mutationFn: () => {
+            const desc = description.trim() || undefined;
+            if (isActivity) {
+                return enqueueActivity(
+                    namespace,
+                    taskName.trim(),
+                    input,
+                    queue.trim() || undefined,
+                    desc,
+                );
+            }
+            return triggerWorkflow(
                 namespace,
-                workflowName.trim(),
+                taskName.trim(),
                 input,
                 queue.trim() || undefined,
-            ),
+                desc,
+            );
+        },
         onSuccess: (data) => {
             setResult(data);
-            // Auto-close after 4s if user doesn't interact
             const timer = setTimeout(() => {
                 handleClose();
             }, 4_000);
@@ -60,9 +89,10 @@ export function TriggerDialog({
     // Reset state when dialog opens
     useEffect(() => {
         if (open) {
-            setWorkflowName(initialWorkflowName ?? "");
+            setTaskName(initialName);
             setQueue(initialQueue ?? "");
             setInput(initialInput ?? "{}");
+            setDescription("");
             setResult(null);
             mutation.reset();
         }
@@ -74,8 +104,8 @@ export function TriggerDialog({
         onClose();
     }
 
-    function handleTrigger() {
-        if (!workflowName.trim()) return;
+    function handleSubmit() {
+        if (!taskName.trim()) return;
         mutation.mutate();
     }
 
@@ -84,6 +114,12 @@ export function TriggerDialog({
     }
 
     if (!open) return null;
+
+    const nameLabel = isActivity ? "Activity name" : "Workflow name";
+    const namePlaceholder = isActivity
+        ? "e.g. ChargeCardActivity"
+        : "e.g. SpaceMissionWorkflow";
+    const isNameReadOnly = !!initialName;
 
     return (
         <div
@@ -105,10 +141,12 @@ export function TriggerDialog({
                         id="trigger-dialog-title"
                         className="text-base font-semibold text-foreground"
                     >
-                        Run workflow
+                        {isActivity ? "Enqueue activity" : "Run workflow"}
                     </h2>
                     <p className="mt-1 text-sm text-muted-foreground">
-                        Run a workflow immediately with a custom input.
+                        {isActivity
+                            ? "Dispatch a standalone activity immediately with a custom input."
+                            : "Run a workflow immediately with a custom input."}
                     </p>
                 </div>
 
@@ -118,7 +156,9 @@ export function TriggerDialog({
                     {result ? (
                         <div className="rounded-lg border border-green-500/30 bg-green-500/10 p-4 space-y-2">
                             <p className="text-sm font-medium text-green-300">
-                                Workflow started
+                                {isActivity
+                                    ? "Activity enqueued"
+                                    : "Workflow started"}
                             </p>
                             <div className="space-y-1">
                                 <p className="text-xs text-muted-foreground">
@@ -141,7 +181,7 @@ export function TriggerDialog({
                                 </p>
                             </div>
                             <a
-                                href={`/${namespace}/tasks/${result.taskID}?queue=${encodeURIComponent(queue)}`}
+                                href={`/${namespace}/tasks/${result.taskID}?queue=${encodeURIComponent(queue || "default")}`}
                                 className="inline-flex items-center gap-1.5 text-xs text-brand hover:underline mt-1"
                             >
                                 <ExternalLink size={11} />
@@ -159,24 +199,24 @@ export function TriggerDialog({
                                 </div>
                             )}
 
-                            {/* Workflow name */}
+                            {/* Task name */}
                             <div className="space-y-1.5">
                                 <label className="text-xs font-medium text-foreground">
-                                    Workflow name{" "}
+                                    {nameLabel}{" "}
                                     <span className="text-red-400">*</span>
                                 </label>
                                 <input
-                                    autoFocus={!initialWorkflowName}
-                                    readOnly={!!initialWorkflowName}
-                                    className={`w-full rounded border border-border bg-secondary/30 px-3 py-2 text-sm font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring ${initialWorkflowName ? "opacity-70 cursor-default" : ""}`}
-                                    placeholder="e.g. SpaceMissionWorkflow"
-                                    value={workflowName}
+                                    autoFocus={!isNameReadOnly}
+                                    readOnly={isNameReadOnly}
+                                    className={`w-full rounded border border-border bg-secondary/30 px-3 py-2 text-sm font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring ${isNameReadOnly ? "opacity-70 cursor-default" : ""}`}
+                                    placeholder={namePlaceholder}
+                                    value={taskName}
                                     onChange={(e) =>
-                                        !initialWorkflowName &&
-                                        setWorkflowName(e.target.value)
+                                        !isNameReadOnly &&
+                                        setTaskName(e.target.value)
                                     }
                                     onKeyDown={(e) => {
-                                        if (e.key === "Enter") handleTrigger();
+                                        if (e.key === "Enter") handleSubmit();
                                     }}
                                 />
                             </div>
@@ -206,7 +246,25 @@ export function TriggerDialog({
                                     value={input}
                                     onChange={setInput}
                                     placeholder='{"key": "value"}'
-                                    minHeight="140px"
+                                    minHeight="120px"
+                                />
+                            </div>
+
+                            {/* Description */}
+                            <div className="space-y-1.5">
+                                <label className="text-xs font-medium text-foreground">
+                                    Description{" "}
+                                    <span className="text-muted-foreground font-normal">
+                                        (optional)
+                                    </span>
+                                </label>
+                                <input
+                                    className="w-full rounded border border-border bg-secondary/30 px-3 py-2 text-sm placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
+                                    placeholder="What does this execution do?"
+                                    value={description}
+                                    onChange={(e) =>
+                                        setDescription(e.target.value)
+                                    }
                                 />
                             </div>
                         </>
@@ -227,17 +285,22 @@ export function TriggerDialog({
                         <Button
                             variant="default"
                             size="sm"
-                            onClick={handleTrigger}
-                            disabled={
-                                mutation.isPending || !workflowName.trim()
+                            onClick={handleSubmit}
+                            disabled={mutation.isPending || !taskName.trim()}
+                            className={
+                                isActivity
+                                    ? "gap-1.5 bg-amber-600 hover:bg-amber-500 text-white border-0"
+                                    : "gap-1.5"
                             }
                         >
                             {mutation.isPending ? (
                                 <Loader2 size={13} className="animate-spin" />
+                            ) : isActivity ? (
+                                <Play size={13} />
                             ) : (
                                 <Zap size={13} />
                             )}
-                            Run
+                            {isActivity ? "Enqueue" : "Run"}
                         </Button>
                     )}
                 </div>

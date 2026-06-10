@@ -51,6 +51,10 @@ export interface ScheduleRun {
     attempt: number;
     createdAt: string;
     completedAt: string | null;
+    /** Canonical slot time from scheduling_metadata.partitionTime.
+     *  Use this (not createdAt) to place runs in the partition grid:
+     *  backfill tasks are created at wall-clock time but belong to a past slot. */
+    partitionTime: string | null;
 }
 
 export const getScheduleRuns = (
@@ -77,7 +81,10 @@ export const runSchedulePartition = (
         .post<{
             taskId: string;
             runId: string;
-        }>(`/api/${namespace}/schedules/${encodeURIComponent(scheduleId)}/run`, body)
+        }>(
+            `/api/${namespace}/schedules/${encodeURIComponent(scheduleId)}/run`,
+            body,
+        )
         .then((r) => r.data);
 
 export const getScheduleUpcoming = (

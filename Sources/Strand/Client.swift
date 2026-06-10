@@ -75,7 +75,8 @@ public struct StrandClient: Sendable {
             fairnessKey: enqueueOpts.fairnessKey,
             fairnessWeight: enqueueOpts.fairnessWeight,
             rateLimitKey: rlParams?.slotKey,
-            rateLimitIntervalMs: rlParams?.intervalMs
+            rateLimitIntervalMs: rlParams?.intervalMs,
+            description: enqueueOpts.description
         )
     }
 
@@ -125,7 +126,8 @@ public struct StrandClient: Sendable {
             kind: .activity,
             parentTaskID: nil,
             rateLimitKey: rlParams?.slotKey,
-            rateLimitIntervalMs: rlParams?.intervalMs
+            rateLimitIntervalMs: rlParams?.intervalMs,
+            description: options.description
         )
     }
 
@@ -151,8 +153,12 @@ public struct StrandClient: Sendable {
             options: AwaitTaskResultOptions(timeout: options.timeout)
         )
         guard snap.state == .completed else {
+            // _activityFailure is already decoded once in taskSnapshot — no second decode needed.
+            // Mirrors WorkflowContext.runActivity: try A.Failure first, fall back to ActivityError.
+            let af = snap._activityFailure
+            if let typedErr = af?.decode(A.Failure.self) { throw typedErr }
             let retryState: ActivityRetryState = snap.state == .cancelled ? .cancelled : .maximumAttemptsReached
-            throw ActivityError(activityName: A.name, retryState: retryState, cause: nil)
+            throw ActivityError(activityName: A.name, retryState: retryState, cause: af)
         }
         return try snap.decodeResult(as: A.Output.self)
     }
@@ -238,7 +244,7 @@ public struct StrandClient: Sendable {
                 cancellationBuffer: cancellationBuffer,
                 priority: options.priority,
                 scheduledAt: options.delayUntil,
-                timeoutSeconds: nil,
+                timeoutSeconds: options.timeout.map { Int($0.components.seconds) },
                 heartbeatTimeoutSeconds: options.heartbeatTimeout.map { Int($0.components.seconds) },
                 scheduleToStartTimeoutSeconds: options.scheduleToStartTimeout.map { Int($0.components.seconds) },
                 deadlineAt: deadlineAt,
@@ -247,6 +253,7 @@ public struct StrandClient: Sendable {
                 kind: .activity,
                 rateLimitKey: rlParams?.slotKey,
                 rateLimitIntervalMs: rlParams?.intervalMs,
+                description: options.description,
                 logger: logger
             )
 
@@ -297,6 +304,9 @@ public struct StrandClient: Sendable {
             let headersBuffer: ByteBuffer? = h.isEmpty ? nil : try JSON.encode(h)
 
             // Build per-item specs: each workflow gets its own unique ID and UUIDs.
+            // NOTE: options.id is intentionally not forwarded here — a single
+            // idempotency key cannot be shared across N independent workflow starts.
+            // Pass per-item keys via a dedicated multi-enqueue API if needed.
             let batchItems: [Queries.BatchEnqueueItem] = try inputs.map { input in
                 let resolvedID = W.generateWorkflowID()
                 return Queries.BatchEnqueueItem(
@@ -328,6 +338,7 @@ public struct StrandClient: Sendable {
                 kind: .workflow,
                 rateLimitKey: nil,
                 rateLimitIntervalMs: nil,
+                description: options.description,
                 logger: logger
             )
 
@@ -365,48 +376,56 @@ public struct StrandClient: Sendable {
         let queue = options.queue ?? queueName
         let taskName = W.workflowName
         let paramsBuffer = try JSON.encode(input)
-        let headersBuffer: ByteBuffer? =
-            options.headers.isEmpty ? nil : try JSON.encode(options.headers)
-        let retryBuf: ByteBuffer? = try options.retryStrategy.map { try JSON.encode($0) }
-
-        // When the caller doesn't set an explicit ID we generate one from the
-        // workflow type name + current milliseconds: "MissionControlWorkflow-1746218580123".
-        // This is stored as the idempotency_key so `client.workflow(id:)` can find
-        // the run by this human-readable string, not just by the raw UUID.
-        // We sanitise the type name so generic types (e.g. `Order<PayPal>`) produce
-        // a valid, filesystem-safe identifier.
         // Use the caller-supplied ID when provided; otherwise delegate to the workflow
         // type's own ID generator (overridable per type via WorkflowRegistrable).
         let resolvedID = options.id ?? W.generateWorkflowID()
         let workflowDeadlineAt: Date? = options.maxDuration.map { Date.now.addingDuration($0) }
+        // Always encode a retry strategy so the worker never falls back to defaults
+        // that diverge from StrandOptions.defaultRetryStrategy — matches startWorkflows.
+        let retryBuf = try JSON.encode(options.retryStrategy ?? self.options.defaultRetryStrategy)
 
-        let row = try await Queries.enqueueTask(
-            on: postgres,
-            namespaceID: namespaceID,
-            queue: queue,
-            taskName: taskName,
-            paramsBuffer: paramsBuffer,
-            headersBuffer: headersBuffer,
-            retryStrategyBuffer: retryBuf,
-            maxAttempts: options.maxAttempts ?? self.options.defaultMaxAttempts,
-            cancellationBuffer: nil,
-            idempotencyKey: resolvedID,  // always set — enables client.workflow(id:) lookup
-            priority: options.priority,
-            scheduledAt: options.delayUntil,
-            deadlineAt: workflowDeadlineAt,
-            fairnessKey: options.fairnessKey,
-            fairnessWeight: options.fairnessWeight,
-            kind: .workflow,
-            parentTaskID: nil,
-            logger: logger
-        )
+        // Producer span: same pattern as startWorkflows and enqueueActivity so
+        // the task appears nested under the caller's span in Jaeger.
+        return try await withSpan(taskName, ofKind: .producer) { span in
+            span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(taskName)
+            span.attributes[StrandLogKeys.queue] = SpanAttribute.string(queue)
+            span.attributes[StrandLogKeys.namespace] = SpanAttribute.string(namespaceID)
 
-        return WorkflowHandle<W>(
-            workflowID: resolvedID,
-            taskID: row.taskID,
-            initialRunID: row.runID,
-            client: self
-        )
+            var h = options.headers
+            if let ctx = ServiceContext.current {
+                InstrumentationSystem.tracer.inject(ctx, into: &h, using: DictionaryInjector())
+            }
+            let headersBuffer: ByteBuffer? = h.isEmpty ? nil : try JSON.encode(h)
+
+            let row = try await Queries.enqueueTask(
+                on: postgres,
+                namespaceID: namespaceID,
+                queue: queue,
+                taskName: taskName,
+                paramsBuffer: paramsBuffer,
+                headersBuffer: headersBuffer,
+                retryStrategyBuffer: retryBuf,
+                maxAttempts: options.maxAttempts ?? self.options.defaultMaxAttempts,
+                cancellationBuffer: nil,
+                idempotencyKey: resolvedID,  // always set — enables client.workflow(id:) lookup
+                priority: options.priority,
+                scheduledAt: options.delayUntil,
+                deadlineAt: workflowDeadlineAt,
+                fairnessKey: options.fairnessKey,
+                fairnessWeight: options.fairnessWeight,
+                kind: .workflow,
+                parentTaskID: nil,
+                description: options.description,
+                logger: logger
+            )
+
+            return WorkflowHandle<W>(
+                workflowID: resolvedID,
+                taskID: row.taskID,
+                initialRunID: row.runID,
+                client: self
+            )
+        }
     }
 
     // MARK: - Handle reconstruction
@@ -511,7 +530,8 @@ public struct StrandClient: Sendable {
         kind: TaskKind = .workflow,
         parentTaskID: UUID? = nil,
         rateLimitKey: String? = nil,
-        rateLimitIntervalMs: Int? = nil
+        rateLimitIntervalMs: Int? = nil,
+        description: String? = nil
     ) async throws -> EnqueueResult {
         let deadlineAt: Date? = maxDuration.map { Date.now.addingDuration($0) }
         // Producer span: wraps the DB insert so that the context injected into
@@ -553,6 +573,7 @@ public struct StrandClient: Sendable {
                 parentClosePolicy: parentClosePolicy,
                 rateLimitKey: rateLimitKey,
                 rateLimitIntervalMs: rateLimitIntervalMs,
+                description: description,
                 logger: logger
             )
             return EnqueueResult(
@@ -794,11 +815,15 @@ public struct StrandClient: Sendable {
     }
 
     func taskSnapshot(from row: TaskResultRow) -> TaskResultSnapshot {
-        TaskResultSnapshot(
+        // Decode once here; runActivity uses _activityFailure directly.
+        let af = row.failureBuffer.flatMap { ActivityFailure.decode(from: $0) }
+        let failure = af.map { TaskFailure(errorType: $0.name, message: $0.message, traceback: nil) }
+        return TaskResultSnapshot(
             taskID: row.taskID,
             state: TaskState(rawValue: row.state) ?? .pending,
             resultJSON: row.resultBuffer.map { String(buffer: $0) },
-            failure: nil
+            failure: failure,
+            activityFailure: af
         )
     }
 
@@ -866,21 +891,32 @@ public struct StrandClient: Sendable {
         queue: String,
         namespaceID overrideNS: String? = nil,
         taskName: String,
-        paramsBuffer: ByteBuffer
+        paramsBuffer: ByteBuffer,
+        kind: TaskKind = .workflow,
+        description: String? = nil,
+        headers: [String: String] = [:]
     ) async throws -> EnqueueResult {
         let ns = overrideNS ?? self.namespaceID
+        // Inject OTel trace context so Loom-triggered tasks appear nested under the
+        // HTTP request span in Jaeger, not as orphan roots.
+        var h = headers
+        if let ctx = ServiceContext.current {
+            InstrumentationSystem.tracer.inject(ctx, into: &h, using: DictionaryInjector())
+        }
+        let headersBuffer: ByteBuffer? = h.isEmpty ? nil : try? JSON.encode(h)
         let row = try await Queries.enqueueTask(
             on: postgres,
             namespaceID: ns,
             queue: queue,
             taskName: taskName,
             paramsBuffer: paramsBuffer,
-            headersBuffer: nil,
+            headersBuffer: headersBuffer,
             retryStrategyBuffer: nil,
             maxAttempts: nil,
             cancellationBuffer: nil,
             idempotencyKey: nil,
-            kind: .workflow,
+            kind: kind,
+            description: description,
             logger: logger
         )
         return EnqueueResult(
@@ -1290,6 +1326,7 @@ public struct StrandClient: Sendable {
             cancellationBuffer: schedule.cancellationBuffer,
             idempotencyKey: idempotencyKey,
             kind: schedule.kind,
+            scheduleID: scheduleID,
             logger: logger
         )
         return (taskID: enqueued.taskID, runID: enqueued.runID)
@@ -1364,15 +1401,6 @@ public struct StrandClient: Sendable {
         let paramsBuffer = try JSON.encode(input)
         let patternBuffer = try JSON.encode(schedule)
         let id = UUID.v7()
-        // Subtract 1 s so the start is inclusive: nextRunTime finds the slot AT
-        // lowerBound when it coincides with a schedule boundary
-        // (-1 ms adjustment on BackfillRequest.StartTime).
-        let firstSlot =
-            try ScheduleCalculator.nextRunTime(
-                for: schedule,
-                after: range.lowerBound.addingTimeInterval(-1),
-                timezone: schedule.timezone
-            ) ?? range.lowerBound
         let totalSlots = ScheduleCalculator.countSlots(for: schedule, in: range)
         try await BackfillQueries.createBackfill(
             on: postgres,
@@ -1392,7 +1420,6 @@ public struct StrandClient: Sendable {
             allowOverwrite: options.allowOverwrite,
             description: options.description,
             scheduleId: scheduleId,
-            nextSlotTime: firstSlot,
             totalSlots: totalSlots,
             logger: logger
         )
@@ -1414,12 +1441,6 @@ public struct StrandClient: Sendable {
         let paramsBuffer = try JSON.encode(input)
         let patternBuffer = try JSON.encode(schedule)
         let id = UUID.v7()
-        let firstSlot =
-            try ScheduleCalculator.nextRunTime(
-                for: schedule,
-                after: range.lowerBound.addingTimeInterval(-1),
-                timezone: schedule.timezone
-            ) ?? range.lowerBound
         let totalSlots = ScheduleCalculator.countSlots(for: schedule, in: range)
         try await BackfillQueries.createBackfill(
             on: postgres,
@@ -1439,7 +1460,6 @@ public struct StrandClient: Sendable {
             allowOverwrite: options.allowOverwrite,
             description: options.description,
             scheduleId: scheduleId,
-            nextSlotTime: firstSlot,
             totalSlots: totalSlots,
             logger: logger
         )

@@ -227,6 +227,10 @@ public struct ActivityOptions: Sendable {
     /// is enqueued immediately at full speed.
     public var rateLimit: RateLimit?
 
+    /// Human-readable description for this execution — shown in the Loom
+    /// dashboard.  Stored in the `strand.tasks.description` column; `nil` stores nothing.
+    public var description: String?
+
     public init(
         timeout: Duration? = nil,
         heartbeatTimeout: Duration? = nil,
@@ -243,7 +247,8 @@ public struct ActivityOptions: Sendable {
         cancellation: CancellationPolicy? = nil,
         rateLimit: RateLimit? = nil,
         scheduleToStartTimeout: Duration? = nil,
-        cancellationType: ActivityCancellationType = .tryCancel
+        cancellationType: ActivityCancellationType = .tryCancel,
+        description: String? = nil
     ) {
         self.timeout = timeout
         self.heartbeatTimeout = heartbeatTimeout
@@ -261,6 +266,7 @@ public struct ActivityOptions: Sendable {
         self.rateLimit = rateLimit
         self.scheduleToStartTimeout = scheduleToStartTimeout
         self.cancellationType = cancellationType
+        self.description = description
     }
 }
 
@@ -560,11 +566,16 @@ extension Activity {
     /// Auto-generated idempotency key used by `StrandClient.enqueueActivity`
     /// when `ActivityOptions.id` is not supplied.
     ///
-    /// Format: `"<ActivityName>-<epochMs>"` —
-    /// e.g. `"ChargeCardActivity-1746218580123"`.
+    /// Format: `"<ActivityName>-<epochMs>-<4-hex-random>"` —
+    /// e.g. `"ChargeCardActivity-1746218580123-a3f2"`.
+    ///
+    /// The millisecond timestamp makes the key human-readable and sortable;
+    /// the 4-hex random suffix prevents collisions when the same activity
+    /// is enqueued more than once within the same millisecond.
     static func generateActivityID() -> String {
         let ms = Int(Date.now.timeIntervalSince1970 * 1000)
-        return "\(name)-\(ms)"
+        let jitter = UInt16.random(in: 0..<UInt16.max)
+        return "\(name)-\(ms)-\(String(jitter, radix: 16, uppercase: false))"
     }
 
 }

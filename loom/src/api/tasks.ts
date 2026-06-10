@@ -37,6 +37,12 @@ export const getTasksGlobal = (
         name?: string;
         kind?: string;
         rootOnly?: boolean;
+        /** Filter to tasks created by a specific backfill (allowOverwrite=true, or new slots). */
+        backfillId?: string;
+        /** Filter to all tasks belonging to a schedule (by idempotency-key prefix).
+         *  Used for backfill task lists when backfill_id is NULL because the task
+         *  pre-existed (allowOverwrite=false, slot already ran via regular schedule). */
+        scheduleId?: string;
         cursor?: string;
         limit?: number;
     } = {},

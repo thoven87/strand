@@ -515,7 +515,21 @@ public struct StrandScheduler: Service {
                 ),
                 slotAt < backfill.rangeEnd
             else {
-                // Range exhausted — mark the backfill complete.
+                // Range exhausted.
+                // Flush any slots fired in this batch BEFORE marking complete.
+                // Without this, completedSlots is never incremented for the
+                // last partial batch and nextSlotTime is left at the pre-batch
+                // value — producing "COMPLETED" with an understated slot count.
+                if fired > 0 {
+                    try await BackfillQueries.advanceCursor(
+                        on: postgres,
+                        backfillID: backfill.id,
+                        namespaceID: backfill.namespaceID,
+                        nextSlotTime: cursor,
+                        firedCount: fired,
+                        logger: logger
+                    )
+                }
                 try await BackfillQueries.markCompleted(
                     on: postgres,
                     backfillID: backfill.id,
@@ -572,6 +586,7 @@ public struct StrandScheduler: Service {
                 idempotencyKey: idKey,
                 kind: backfill.taskKind,
                 backfillID: backfill.id,
+                scheduleID: backfill.scheduleId,
                 logger: logger
             )
 
@@ -742,6 +757,7 @@ public struct StrandScheduler: Service {
                 cancellationBuffer: row.cancellationBuffer,
                 idempotencyKey: idempotencyKey,
                 kind: row.kind,
+                scheduleID: row.id,
                 logger: logger
             )
             lastTaskID = enqueued.taskID
