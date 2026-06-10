@@ -244,7 +244,7 @@ struct MetricsTests {
             ) {
                 let handle = try await client.startWorkflow(
                     FailingWorkflow.self,
-                    options: .init(),
+                    options: .init(maxAttempts: 1),
                     input: "x"
                 )
                 let snap = try await awaitTerminal(

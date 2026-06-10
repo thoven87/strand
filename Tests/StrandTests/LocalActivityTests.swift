@@ -200,7 +200,7 @@ struct LocalActivityTests {
             ) {
                 let handle = try await client.startWorkflow(
                     FailLocalWorkflow.self,
-                    options: .init(),
+                    options: .init(maxAttempts: 1),
                     input: "trigger"
                 )
                 let snap = try await awaitTerminal(
