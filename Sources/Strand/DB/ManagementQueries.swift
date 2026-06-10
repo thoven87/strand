@@ -82,6 +82,10 @@ package struct TaskDetailRow: Sendable {
     package let schedulingMetadata: SchedulingMetadata?
     /// Human-readable workflow ID (stored as `idempotency_key`). See ``TaskSummaryRow/workflowId``.
     package let workflowId: String?
+    /// Human-readable description set via `ActivityOptions.description` /
+    /// `WorkflowOptions.description` at enqueue time.  Stored in the
+    /// `strand.tasks.description` column.  `nil` if not set.
+    package let description: String?
 }
 
 extension TaskDetailRow {
@@ -103,6 +107,7 @@ extension TaskDetailRow {
         parentTaskId = try col.next()!.decode(UUID?.self, context: .default)
         schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
         workflowId = try col.next()!.decode(String?.self, context: .default)
+        description = try col.next()!.decode(String?.self, context: .default)
     }
 }
 
@@ -119,6 +124,7 @@ package struct RunSummaryRow: Sendable {
     package let createdAt: Date
     package let availableAt: Date
     package let failureBuffer: ByteBuffer?  // raw JSON BYTEA
+    package let heartbeatDetailsBuffer: ByteBuffer?  // raw JSON BYTEA
 }
 
 extension RunSummaryRow {
@@ -135,6 +141,7 @@ extension RunSummaryRow {
         createdAt = try col.next()!.decode(Date.self, context: .default)
         availableAt = try col.next()!.decode(Date.self, context: .default)
         failureBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
+        heartbeatDetailsBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
     }
 }
 
@@ -369,6 +376,8 @@ package enum ManagementQueries {
         name: String?,
         kind: TaskKind? = nil,
         rootOnly: Bool? = nil,
+        backfillID: UUID? = nil,
+        scheduleID: UUID? = nil,
         cursor: UUID?,
         limit: Int,
         logger: Logger
@@ -380,11 +389,13 @@ package enum ManagementQueries {
                    kind, parent_task_id, scheduling_metadata, idempotency_key
             FROM strand.tasks
             WHERE namespace_id = \(namespaceID)
-              AND (\(queue)::text IS NULL OR queue = \(queue))
-              AND (\(state)::text IS NULL OR state = \(state))
-              AND (\(name)::text IS NULL OR name = \(name))
-              AND (\(kind)::text IS NULL OR kind = \(kind))
+              AND (\(queue)::text    IS NULL OR queue       = \(queue))
+              AND (\(state)::text    IS NULL OR state       = \(state))
+              AND (\(name)::text     IS NULL OR name        = \(name))
+              AND (\(kind)::text     IS NULL OR kind        = \(kind))
               AND (\(rootOnly)::bool IS NULL OR (parent_task_id IS NULL) = \(rootOnly))
+              AND (\(backfillID)::uuid  IS NULL OR backfill_id  = \(backfillID))
+              AND (\(scheduleID)::uuid  IS NULL OR schedule_id  = \(scheduleID))
               AND (\(cursor)::uuid IS NULL OR id < \(cursor))
             ORDER BY id DESC
             LIMIT \(fetchLimit)
@@ -410,7 +421,7 @@ package enum ManagementQueries {
             """
             SELECT id, name, queue, params, state, attempt, max_attempts,
                    created_at, first_run_at, completed_at, result, cancelled_at,
-                   kind, parent_task_id, scheduling_metadata, idempotency_key
+                   kind, parent_task_id, scheduling_metadata, idempotency_key, description
             FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
             """,
             logger: logger
@@ -431,7 +442,8 @@ package enum ManagementQueries {
         let stream = try await client.query(
             """
             SELECT id, attempt, state, worker_id, sdk_version,
-                   started_at, finished_at, lease_expires_at, created_at, available_at, failure_reason
+                   started_at, finished_at, lease_expires_at, created_at, available_at,
+                   failure_reason, heartbeat_details
             FROM strand.runs
             WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)
             ORDER BY attempt DESC

@@ -103,6 +103,10 @@ struct ScheduleRunResponse: Codable, Sendable {
     let attempt: Int
     let createdAt: Date
     let completedAt: Date?
+    /// Canonical slot time from `scheduling_metadata.partitionTime`.
+    /// Use this (not `createdAt`) for partition grids: backfill tasks are
+    /// created at wall-clock time but belong to a past partition.
+    let partitionTime: Date?
 }
 extension ScheduleRunResponse: ResponseCodable {}
 
@@ -202,7 +206,8 @@ struct ScheduleRoutes {
                     state: row.state,
                     attempt: row.attempt,
                     createdAt: row.createdAt,
-                    completedAt: row.completedAt
+                    completedAt: row.completedAt,
+                    partitionTime: row.partitionTime
                 )
             }
         }

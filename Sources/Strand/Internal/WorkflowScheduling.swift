@@ -421,7 +421,8 @@ extension WorkflowRegistration {
                             fairnessWeight: options.fairnessWeight,
                             kind: .activity,
                             rateLimitIntervalMs: rlParams?.intervalMs,
-                            rateLimitKey: rlParams?.slotKey
+                            rateLimitKey: rlParams?.slotKey,
+                            description: options.description
                         )
                     )
                     childHistoryItems.append(
@@ -690,7 +691,8 @@ extension WorkflowRegistration {
                             fairnessWeight: childFairnessWeight,
                             kind: .workflow,
                             rateLimitIntervalMs: nil,
-                            rateLimitKey: nil
+                            rateLimitKey: nil,
+                            description: nil
                         )
                     )
                     childHistoryItems.append(

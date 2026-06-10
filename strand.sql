@@ -240,6 +240,7 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     parent_close_policy TEXT,                  -- TERMINATE|ABANDON|REQUEST_CANCEL; NULL = TERMINATE (default)
     cancel_requested    BOOLEAN NOT NULL DEFAULT FALSE,  -- set by cancelDescendants when parent closes with REQUEST_CANCEL
     idempotency_key TEXT,
+    description     TEXT,   -- optional human-readable label set at enqueue time
 
     -- Dispatch routing
     priority        INTEGER     NOT NULL DEFAULT 3,   -- 1 (critical) … 5 (minimal)
@@ -268,6 +269,8 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     deadline_at  TIMESTAMPTZ,
     result       BYTEA,                  -- JSON-encoded success payload
     backfill_id  UUID,                  -- set when fired by StrandScheduler.processBackfills; FK added below
+    schedule_id  UUID,                  -- set when fired by StrandScheduler (regular or backfill); direct FK avoids
+                                        -- string-parsing the '$schedule:<uuid>:…' idempotency-key prefix
 
     CONSTRAINT strand_tasks_pkey            PRIMARY KEY (id),
     -- FK to strand.queues: tasks are always in a registered queue.
@@ -342,6 +345,10 @@ CREATE INDEX IF NOT EXISTS strand_tasks_failed_idx
 -- as well as root workflows.
 CREATE INDEX IF NOT EXISTS strand_tasks_ns_name_idx
     ON strand.tasks (namespace_id, name, kind);
+
+CREATE INDEX IF NOT EXISTS strand_tasks_schedule_id_idx
+    ON strand.tasks (namespace_id, schedule_id)
+    WHERE schedule_id IS NOT NULL;
 
 -- Dashboard task-definitions view: covering partial index eliminates the seq-scan
 -- of all tasks in the namespace. Both listTaskDefinitions (GROUP BY name, kind) and

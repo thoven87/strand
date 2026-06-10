@@ -55,6 +55,11 @@ package struct ScheduleRunRow: Sendable {
     package let attempt: Int
     package let createdAt: Date
     package let completedAt: Date?
+    /// Canonical slot time from `scheduling_metadata.partitionTime`.
+    /// `nil` for tasks enqueued before this field was added or without scheduling metadata.
+    /// Use this (not `createdAt`) to place runs in a partition grid: backfill tasks
+    /// are created at wall-clock time but their partition is in the past.
+    package let partitionTime: Date?
 }
 
 /// Full schedule row returned by ``ScheduleQueries/getSchedule(on:namespaceID:id:logger:)``.
@@ -560,13 +565,12 @@ package enum ScheduleQueries {
         limit: Int,
         logger: Logger
     ) async throws -> [ScheduleRunRow] {
-        let prefixPattern = "$schedule:\(scheduleID):%"
         let stream = try await client.query(
             """
-            SELECT id, state, attempt, created_at, completed_at
+            SELECT id, state, attempt, created_at, completed_at, scheduling_metadata
             FROM strand.tasks
-            WHERE namespace_id    = \(namespaceID)
-              AND idempotency_key LIKE \(prefixPattern)
+            WHERE namespace_id = \(namespaceID)
+              AND schedule_id  = \(scheduleID)
             ORDER BY created_at DESC
             LIMIT \(min(limit, 100))
             """,
@@ -575,13 +579,20 @@ package enum ScheduleQueries {
         var rows: [ScheduleRunRow] = []
         for try await row in stream {
             var col = row.makeIterator()
+            let id = try col.next()!.decode(UUID.self, context: .default)
+            let state = try col.next()!.decode(String.self, context: .default)
+            let attempt = try col.next()!.decode(Int.self, context: .default)
+            let createdAt = try col.next()!.decode(Date.self, context: .default)
+            let completedAt = try col.next()!.decode(Date?.self, context: .default)
+            let partitionTime = try col.next()!.decode(SchedulingMetadata?.self, context: .default)?.partitionTime
             rows.append(
                 ScheduleRunRow(
-                    id: try col.next()!.decode(UUID.self, context: .default),
-                    state: try col.next()!.decode(String.self, context: .default),
-                    attempt: try col.next()!.decode(Int.self, context: .default),
-                    createdAt: try col.next()!.decode(Date.self, context: .default),
-                    completedAt: try col.next()!.decode(Date?.self, context: .default)
+                    id: id,
+                    state: state,
+                    attempt: attempt,
+                    createdAt: createdAt,
+                    completedAt: completedAt,
+                    partitionTime: partitionTime
                 )
             )
         }

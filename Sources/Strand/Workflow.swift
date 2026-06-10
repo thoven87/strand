@@ -545,6 +545,10 @@ public struct WorkflowOptions: Sendable {
     /// ```
     public var maxDuration: Duration?
 
+    /// Human-readable description for this execution — shown in the Loom
+    /// dashboard.  Stored in the `strand.tasks.description` column; `nil` stores nothing.
+    public var description: String?
+
     public init(
         id: String? = nil,
         queue: String? = nil,
@@ -555,7 +559,8 @@ public struct WorkflowOptions: Sendable {
         headers: [String: String] = [:],
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
-        maxDuration: Duration? = nil
+        maxDuration: Duration? = nil,
+        description: String? = nil
     ) {
         self.id = id
         self.queue = queue
@@ -567,6 +572,7 @@ public struct WorkflowOptions: Sendable {
         self.fairnessKey = fairnessKey
         self.fairnessWeight = max(fairnessWeight, 0.001)
         self.maxDuration = maxDuration
+        self.description = description
     }
 }
 

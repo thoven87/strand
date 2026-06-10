@@ -72,12 +72,6 @@ struct BackfillRoutes {
 
             let id = UUID.v7()
             let pattern = try JSON.decode(SchedulePattern.self, from: schedule.patternBuffer)
-            let firstSlot =
-                try ScheduleCalculator.nextRunTime(
-                    for: pattern,
-                    after: body.rangeStart,
-                    timezone: pattern.timezone
-                ) ?? body.rangeStart
             let concurrency = max(1, body.concurrency ?? 1)
             let totalSlots = ScheduleCalculator.countSlots(for: pattern, in: body.rangeStart..<body.rangeEnd)
 
@@ -99,7 +93,6 @@ struct BackfillRoutes {
                 allowOverwrite: body.allowOverwrite ?? false,
                 description: body.description,
                 scheduleId: scheduleID,
-                nextSlotTime: firstSlot,
                 totalSlots: totalSlots,
                 logger: self.client.logger
             )

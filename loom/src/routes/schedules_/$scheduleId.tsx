@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams, useNavigate } from "@tanstack/react-router";
@@ -27,6 +29,7 @@ import {
 } from "@/api/backfills";
 import { runSchedulePartition } from "@/api/schedules";
 import { Play } from "lucide-react";
+import { PartitionGrid } from "@/components/PartitionGrid";
 
 // ── ISO 8601 helpers ──────────────────────────────────────────────────────────
 
@@ -104,14 +107,33 @@ function fmtUTC(iso: string): string {
     );
 }
 
-function OptionalTime({ iso }: { iso: string | null }) {
+function OptionalTime({
+    iso,
+    warnIfPast = false,
+}: {
+    iso: string | null;
+    /** When true, renders an amber "overdue" badge if the timestamp is in the past.
+     *  Use on "Next run" so a missed slot is immediately visible. */
+    warnIfPast?: boolean;
+}) {
     if (!iso) return <span className="text-muted-foreground">—</span>;
+    const isPast = warnIfPast && new Date(iso).getTime() < Date.now();
     return (
         <span className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono text-xs text-foreground">
+            <span
+                className={`font-mono text-xs ${
+                    isPast ? "text-amber-400" : "text-foreground"
+                }`}
+            >
                 {fmtUTC(iso)}
             </span>
-            <RelativeTime iso={iso} />
+            {isPast ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/25">
+                    overdue · <RelativeTime iso={iso} />
+                </span>
+            ) : (
+                <RelativeTime iso={iso} />
+            )}
         </span>
     );
 }
@@ -496,6 +518,18 @@ function BackfillList({
                                     {" · "}concurrency {b.concurrency}
                                     {b.allowOverwrite && " · overwrite"}
                                 </p>
+                                <p className="text-[10px] text-muted-foreground/60">
+                                    Created <RelativeTime iso={b.createdAt} />
+                                    {b.completedAt && (
+                                        <>
+                                            {" · "}
+                                            {b.status === "FAILED"
+                                                ? "Failed"
+                                                : "Completed"}{" "}
+                                            <RelativeTime iso={b.completedAt} />
+                                        </>
+                                    )}
+                                </p>
                             </div>
                             <span
                                 className={`text-xs font-medium shrink-0 ${statusColor}`}
@@ -521,28 +555,46 @@ function BackfillList({
                         )}
 
                         {/* Actions */}
-                        <div className="flex gap-1.5">
-                            {b.status === "RUNNING" && (
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => haltMut.mutate(b.id)}
-                                    disabled={haltMut.isPending}
-                                    className="h-6 text-[10px] px-2"
+                        <div className="flex items-center gap-1.5 justify-between">
+                            <div className="flex gap-1.5">
+                                {b.status === "RUNNING" && (
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => haltMut.mutate(b.id)}
+                                        disabled={haltMut.isPending}
+                                        className="h-6 text-[10px] px-2"
+                                    >
+                                        Halt
+                                    </Button>
+                                )}
+                                {b.status === "HALTED" && (
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => resumeMut.mutate(b.id)}
+                                        disabled={resumeMut.isPending}
+                                        className="h-6 text-[10px] px-2"
+                                    >
+                                        Resume
+                                    </Button>
+                                )}
+                            </div>
+
+                            {b.completedSlots > 0 && (
+                                <Link
+                                    to="/$namespace/runs"
+                                    params={{ namespace }}
+                                    search={{
+                                        backfillId: b.id,
+                                        queue: b.queue,
+                                        name: b.taskName,
+                                    }}
+                                    className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
                                 >
-                                    Halt
-                                </Button>
-                            )}
-                            {b.status === "HALTED" && (
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => resumeMut.mutate(b.id)}
-                                    disabled={resumeMut.isPending}
-                                    className="h-6 text-[10px] px-2"
-                                >
-                                    Resume
-                                </Button>
+                                    View {b.completedSlots} task
+                                    {b.completedSlots !== 1 ? "s" : ""} →
+                                </Link>
                             )}
                         </div>
                     </div>
@@ -559,6 +611,7 @@ export function ScheduleDetailPage() {
     };
     const navigate = useNavigate();
     const qc = useQueryClient();
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
 
     const {
         data: schedule,
@@ -567,21 +620,21 @@ export function ScheduleDetailPage() {
     } = useQuery({
         queryKey: qk.schedules.detail(namespace, scheduleId),
         queryFn: () => getSchedule(namespace, scheduleId),
-        refetchInterval: 30_000,
+        refetchInterval: intervalMs,
     });
     usePageTitle(schedule?.name ?? "Schedule");
 
     const { data: runs = [] } = useQuery({
         queryKey: qk.schedules.runs(namespace, scheduleId),
         queryFn: () => getScheduleRuns(namespace, scheduleId),
-        refetchInterval: schedule?.isActive ? 30_000 : false,
+        refetchInterval: intervalMs,
     });
 
     const { data: upcoming = [] } = useQuery({
         queryKey: [...qk.schedules.detail(namespace, scheduleId), "upcoming"],
         queryFn: () => getScheduleUpcoming(namespace, scheduleId, 5),
         enabled: !!schedule?.isActive,
-        refetchInterval: 60_000,
+        refetchInterval: intervalMs,
     });
 
     const pauseMut = useMutation({
@@ -670,6 +723,10 @@ export function ScheduleDetailPage() {
 
                         {/* Actions */}
                         <div className="flex items-center gap-2 shrink-0">
+                            <AutoRefreshControl
+                                intervalMs={intervalMs}
+                                setIntervalMs={setIntervalMs}
+                            />
                             {schedule.isActive ? (
                                 <Button
                                     variant="outline"
@@ -760,7 +817,7 @@ export function ScheduleDetailPage() {
                             Timing
                         </h2>
                         <DetailRow label="Next run">
-                            <OptionalTime iso={schedule.nextRunAt} />
+                            <OptionalTime iso={schedule.nextRunAt} warnIfPast />
                         </DetailRow>
                         <DetailRow label="Last run">
                             <OptionalTime iso={schedule.lastRunAt} />
@@ -813,6 +870,17 @@ export function ScheduleDetailPage() {
                             scheduleId={scheduleId}
                         />
                     </section>
+
+                    {/* Partition Health Grid */}
+                    {runs.length > 0 && schedule && (
+                        <PartitionGrid
+                            runs={runs}
+                            upcoming={upcoming ?? []}
+                            namespace={namespace}
+                            scheduleId={scheduleId}
+                            queue={schedule.queue}
+                        />
+                    )}
 
                     {/* Recent Runs */}
                     <section className="rounded-lg border border-border bg-card/40 overflow-hidden">

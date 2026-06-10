@@ -95,6 +95,8 @@ export interface TaskDetail {
     kind: TaskKind;
     parentTaskId: string | null;
     workflowId: string | null;
+    /** Human-readable description set at enqueue time. null if not set. */
+    description: string | null;
     scheduling: {
         scheduleName: string | null;
         scheduleId: string | null;

@@ -4,7 +4,7 @@ import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
-import { Zap, Search } from "lucide-react";
+import { Zap, Play, Search } from "lucide-react";
 import {
     listTaskDefinitions,
     getTaskDefinitionActivity,
@@ -92,6 +92,7 @@ export function TasksPage() {
     const { namespace } = useParams({ strict: false }) as { namespace: string };
     const { intervalMs, setIntervalMs } = useAutoRefresh();
     const [triggerTarget, setTriggerTarget] = useState<string | null>(null);
+    const [enqueueTarget, setEnqueueTarget] = useState<string | null>(null);
     const [query, setQuery] = useState("");
 
     const { data: definitions = [], isLoading } = useQuery({
@@ -149,7 +150,7 @@ export function TasksPage() {
                     </div>
                     <div className="rounded-lg border border-border overflow-hidden">
                         <table className="w-full text-sm">
-                            <thead>
+                            <thead className="sticky top-0 z-10 bg-background">
                                 <tr className="border-b border-border bg-secondary/20">
                                     {(
                                         [
@@ -276,6 +277,22 @@ export function TasksPage() {
                                                             Run
                                                         </Button>
                                                     )}
+                                                    {def.kind ===
+                                                        "ACTIVITY" && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="outline"
+                                                            onClick={() =>
+                                                                setEnqueueTarget(
+                                                                    def.name,
+                                                                )
+                                                            }
+                                                            className="gap-1 h-7 text-xs text-amber-500 border-amber-500/30 hover:bg-amber-500/10"
+                                                        >
+                                                            <Play size={11} />
+                                                            Enqueue
+                                                        </Button>
+                                                    )}
                                                 </div>
                                             </td>
                                         </tr>
@@ -291,6 +308,14 @@ export function TasksPage() {
                 onClose={() => setTriggerTarget(null)}
                 namespace={namespace}
                 initialWorkflowName={triggerTarget ?? undefined}
+            />
+
+            <TriggerDialog
+                kind="ACTIVITY"
+                open={enqueueTarget !== null}
+                onClose={() => setEnqueueTarget(null)}
+                namespace={namespace}
+                initialActivityName={enqueueTarget ?? undefined}
             />
         </div>
     );

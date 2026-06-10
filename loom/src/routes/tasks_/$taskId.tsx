@@ -672,6 +672,12 @@ function ChildActivities({
                             >
                                 {child.name}
                             </Link>
+                            {/* Attempt badge — only shown on retry */}
+                            {child.attempt > 1 && (
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-500/80 border-amber-500/25 shrink-0">
+                                    ×{child.attempt}
+                                </span>
+                            )}
                             <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">
                                 {fmtDuration(childDurationMs)}
                             </span>
@@ -1045,7 +1051,7 @@ export function TaskDetailPage() {
     });
     usePageTitle(task?.name ?? "Task");
 
-    const { data: runs = [] } = useQuery({
+    const { data: runs = [], isLoading: runsLoading } = useQuery({
         queryKey: qk.runs.list(namespace, queue, taskId),
         queryFn: () => getRuns(namespace, queue, taskId),
         refetchInterval: task && isTerminal(task.state) ? intervalMs : 3_000,
@@ -1372,7 +1378,19 @@ export function TaskDetailPage() {
                 </div>
             </div>
 
-            {/* ── Schedule card (full width, below header) ────────────────── */}
+            {/* ── Description card (full width, below header, if set) ─────────── */}
+            {task.description && (
+                <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3">
+                    <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-1">
+                        Description
+                    </p>
+                    <p className="text-sm text-foreground">
+                        {task.description}
+                    </p>
+                </div>
+            )}
+
+            {/* ── Schedule card (full width, below header) ────────────────────── */}
             {task.scheduling && <ScheduleCard scheduling={task.scheduling} />}
 
             {/* Performance metrics — sourced from DDSketch broadcast */}
@@ -1579,20 +1597,43 @@ export function TaskDetailPage() {
                 </button>
                 {runsOpen && (
                     <div className="border-t border-border/50 p-3 space-y-2">
-                        {runs.length === 0 && (
-                            <p className="text-sm text-muted-foreground">
-                                No runs yet.
-                            </p>
+                        {runsLoading && runs.length === 0 ? (
+                            [0, 1, 2].map((i) => (
+                                <div
+                                    key={i}
+                                    className="rounded border border-border/60 overflow-hidden"
+                                >
+                                    <div className="flex items-center gap-2.5 px-3 py-2">
+                                        <div className="h-3 w-3 rounded bg-muted/40 animate-pulse shrink-0" />
+                                        <div
+                                            className="h-3 rounded bg-muted/40 animate-pulse"
+                                            style={{ width: "80px" }}
+                                        />
+                                        <div
+                                            className="h-5 rounded bg-muted/40 animate-pulse"
+                                            style={{ width: `${60 + i * 20}%` }}
+                                        />
+                                    </div>
+                                </div>
+                            ))
+                        ) : (
+                            <>
+                                {runs.length === 0 && (
+                                    <p className="text-sm text-muted-foreground">
+                                        No runs yet.
+                                    </p>
+                                )}
+                                {[...runs].reverse().map((run) => (
+                                    <RunRow
+                                        key={run.id}
+                                        namespace={namespace}
+                                        run={run}
+                                        queue={queue}
+                                        taskId={taskId}
+                                    />
+                                ))}
+                            </>
                         )}
-                        {[...runs].reverse().map((run) => (
-                            <RunRow
-                                key={run.id}
-                                namespace={namespace}
-                                run={run}
-                                queue={queue}
-                                taskId={taskId}
-                            />
-                        ))}
                     </div>
                 )}
             </div>

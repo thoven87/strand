@@ -64,10 +64,15 @@ package enum BackfillQueries {
         allowOverwrite: Bool,
         description: String?,
         scheduleId: UUID? = nil,
-        nextSlotTime: Date,
         totalSlots: Int,
         logger: Logger
     ) async throws {
+        // The cursor must sit one second before rangeStart so that
+        // processBackfill's `nextRunTime(after: cursor)` returns rangeStart
+        // as the first slot to fire. Storing rangeStart itself would cause the
+        // first slot to be skipped (nextRunTime is strictly-after, not at-or-after).
+        // This invariant lives here — callers never need to know about it.
+        let initialCursor = rangeStart.addingTimeInterval(-1)
         try await client.withConnection { conn in
             try await Queries.createQueue(
                 on: conn,
@@ -86,7 +91,7 @@ package enum BackfillQueries {
                     (\(id), \(namespaceID), \(queue), \(taskName), \(taskKind),
                      \(paramsBuffer), \(headersBuffer), \(retryStrategyBuffer), \(maxAttempts),
                      \(schedulePatternBuffer), \(rangeStart), \(rangeEnd), \(concurrency),
-                     \(allowOverwrite), \(description), \(scheduleId), \(nextSlotTime), \(totalSlots))
+                     \(allowOverwrite), \(description), \(scheduleId), \(initialCursor), \(totalSlots))
                 """,
                 logger: logger
             )

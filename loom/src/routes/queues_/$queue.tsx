@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { getTasks } from "@/api/tasks";
@@ -118,6 +120,7 @@ export function QueueDetailPage() {
     );
     const [cursor, setCursor] = useState<string | undefined>(undefined);
     const [history, setHistory] = useState<string[]>([]);
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
 
     // ── Queue detail (stats + paused) ───────────────────────────────────────
     // Queue detail always shows root tasks only — child activities are spawned
@@ -125,7 +128,7 @@ export function QueueDetailPage() {
     const { data: queueData } = useQuery({
         queryKey: qk.queues.detail(namespace, queue),
         queryFn: () => getQueue(namespace, queue, { rootOnly: true }),
-        refetchInterval: 5_000,
+        refetchInterval: intervalMs,
     });
 
     const pauseMut = useMutation({
@@ -154,18 +157,7 @@ export function QueueDetailPage() {
                 limit: 50,
                 rootOnly: true,
             }),
-        refetchInterval: (query) => {
-            const items = query.state.data?.items as
-                | Array<{ state: string }>
-                | undefined;
-            const hasActive = items?.some(
-                (t) =>
-                    t.state === "RUNNING" ||
-                    t.state === "PENDING" ||
-                    t.state === "SLEEPING",
-            );
-            return hasActive ? 4_000 : 15_000;
-        },
+        refetchInterval: intervalMs,
     });
 
     function goNext() {
@@ -193,11 +185,17 @@ export function QueueDetailPage() {
                         {queue}
                     </h1>
                 </div>
-                <Link to={`/${namespace}/events` as never}>
-                    <Button variant="outline" size="sm">
-                        <CalendarClock size={14} /> Events
-                    </Button>
-                </Link>
+                <div className="flex items-center gap-2">
+                    <AutoRefreshControl
+                        intervalMs={intervalMs}
+                        setIntervalMs={setIntervalMs}
+                    />
+                    <Link to={`/${namespace}/events` as never}>
+                        <Button variant="outline" size="sm">
+                            <CalendarClock size={14} /> Events
+                        </Button>
+                    </Link>
+                </div>
             </div>
 
             {/* Stats card */}

@@ -1,5 +1,7 @@
 import { useState, useMemo } from "react";
 import { usePageTitle } from "@/lib/usePageTitle";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { Search, Zap, ChevronRight, Copy, Check } from "lucide-react";
@@ -605,6 +607,7 @@ export function EventsPage() {
     const [cursor, setCursor] = useState<string | undefined>(undefined);
     const [history, setHistory] = useState<string[]>([]);
     const [emitOpen, setEmitOpen] = useState(false);
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
     const [timeRange, setTimeRange] = useState<"1h" | "24h" | "7d" | "all">(
         "24h",
     );
@@ -640,7 +643,7 @@ export function EventsPage() {
                 limit: 50,
                 since,
             }),
-        refetchInterval: 10_000,
+        refetchInterval: intervalMs,
     });
 
     const showQueue = !selectedQueue;
@@ -730,6 +733,11 @@ export function EventsPage() {
                         </option>
                     ))}
                 </Select>
+
+                <AutoRefreshControl
+                    intervalMs={intervalMs}
+                    setIntervalMs={setIntervalMs}
+                />
 
                 {/* Emit event button */}
                 <Button

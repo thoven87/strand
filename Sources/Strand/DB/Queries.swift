@@ -166,9 +166,11 @@ enum Queries {
         parentTaskID: UUID? = nil,
         firstTaskID: UUID? = nil,
         backfillID: UUID? = nil,
+        scheduleID: UUID? = nil,
         parentClosePolicy: ParentClosePolicy? = nil,
         rateLimitKey: String? = nil,
         rateLimitIntervalMs: Int? = nil,
+        description: String? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
         try await client.withTransaction(logger: logger) { conn in
@@ -181,15 +183,15 @@ enum Queries {
                 INSERT INTO strand.tasks
                     (namespace_id, id, queue, name, params, headers, scheduling_metadata,
                      retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, schedule_to_start_timeout_seconds,
-                     cancellation, idempotency_key, priority, fairness_key, fairness_weight,
-                     state, kind, parent_task_id, first_task_id, deadline_at, backfill_id, parent_close_policy)
+                     cancellation, idempotency_key, description, priority, fairness_key, fairness_weight,
+                     state, kind, parent_task_id, first_task_id, deadline_at, backfill_id, schedule_id, parent_close_policy)
                 VALUES (\(namespaceID), \(taskID), \(queue), \(taskName), \(paramsBuffer),
                         \(headersBuffer), \(schedulingMetadata),
                         \(retryStrategyBuffer), \(maxAttempts),
                         \(timeoutSeconds), \(heartbeatTimeoutSeconds), \(scheduleToStartTimeoutSeconds),
-                        \(cancellationBuffer), \(idempotencyKey), \(priority),
+                        \(cancellationBuffer), \(idempotencyKey), \(description), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
-                        \(kind), \(parentTaskID), \(firstTaskID), \(deadlineAt), \(backfillID), \(parentClosePolicy))
+                        \(kind), \(parentTaskID), \(firstTaskID), \(deadlineAt), \(backfillID), \(scheduleID), \(parentClosePolicy))
                 ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
                 """,
                 logger: logger
@@ -394,6 +396,8 @@ enum Queries {
         /// Rate-limit slot key.  `nil` falls back to `taskName` in the SQL.
         /// Set to `"ActivityName:entityKey"` for per-entity buckets.
         let rateLimitKey: String?
+        /// Optional human-readable label set via `ActivityOptions.description`.
+        let description: String?
     }
 
     // MARK: - BatchEnqueueItem
@@ -439,6 +443,7 @@ enum Queries {
         kind: TaskKind,
         rateLimitKey: String?,
         rateLimitIntervalMs: Int?,
+        description: String? = nil,
         logger: Logger
     ) async throws -> [EnqueueRow] {
         guard !items.isEmpty else { return [] }
@@ -459,7 +464,7 @@ enum Queries {
                 "INSERT INTO strand.tasks "
                     + "(namespace_id, id, queue, name, params, headers, "
                     + "retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, "
-                    + "schedule_to_start_timeout_seconds, cancellation, idempotency_key, priority, "
+                    + "schedule_to_start_timeout_seconds, cancellation, idempotency_key, description, priority, "
                     + "fairness_key, fairness_weight, state, kind, deadline_at) VALUES "
             )
             for (i, item) in items.enumerated() {
@@ -490,6 +495,8 @@ enum Queries {
                 taskInterp.appendInterpolation(cancellationBuffer)
                 taskInterp.appendLiteral(", ")
                 taskInterp.appendInterpolation(item.idempotencyKey)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(description)
                 taskInterp.appendLiteral(", ")
                 try taskInterp.appendInterpolation(priority)
                 taskInterp.appendLiteral(", ")
@@ -696,7 +703,7 @@ enum Queries {
                 "INSERT INTO strand.tasks "
                     + "(namespace_id, id, queue, name, params, headers, "
                     + "retry_strategy, max_attempts, timeout_seconds, heartbeat_timeout_seconds, "
-                    + "schedule_to_start_timeout_seconds, parent_close_policy, idempotency_key, priority, "
+                    + "schedule_to_start_timeout_seconds, parent_close_policy, idempotency_key, description, priority, "
                     + "fairness_key, fairness_weight, state, kind, parent_task_id, deadline_at) VALUES "
             )
             for (i, child) in children.enumerated() {
@@ -727,6 +734,8 @@ enum Queries {
                 try taskInterp.appendInterpolation(child.parentClosePolicy)
                 taskInterp.appendLiteral(", ")
                 taskInterp.appendInterpolation(child.idempotencyKey)
+                taskInterp.appendLiteral(", ")
+                taskInterp.appendInterpolation(child.description)
                 taskInterp.appendLiteral(", ")
                 try taskInterp.appendInterpolation(child.priority)
                 taskInterp.appendLiteral(", ")

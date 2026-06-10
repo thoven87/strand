@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useAutoRefresh } from "@/lib/useAutoRefresh";
+import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { usePageTitle } from "@/lib/usePageTitle";
 import { Link, useParams } from "@tanstack/react-router";
 import { api } from "@/api/client";
@@ -161,6 +163,7 @@ export function WorkerDetailPage() {
     // The workerId in the URL is encodeURIComponent'd — decode it back.
     const workerID = decodeURIComponent(workerId);
     usePageTitle(`Worker · ${workerID ?? "\u2026"}`);
+    const { intervalMs, setIntervalMs } = useAutoRefresh();
     // Human-readable short name: "hostname:pid" → "hostname"
     const shortName = workerID.split(":")[0] ?? workerID;
     const pid = workerID.split(":")[1];
@@ -181,7 +184,7 @@ export function WorkerDetailPage() {
                         ? null
                         : r.data,
                 ),
-        refetchInterval: 5_000,
+        refetchInterval: intervalMs,
     });
 
     // null means the server returned 204 — worker is gone, not an error.
@@ -250,8 +253,15 @@ export function WorkerDetailPage() {
                         </p>
                     </div>
 
+                    <div className="ml-auto">
+                        <AutoRefreshControl
+                            intervalMs={intervalMs}
+                            setIntervalMs={setIntervalMs}
+                        />
+                    </div>
+
                     {data && (
-                        <div className="ml-2 flex items-center gap-2">
+                        <div className="flex items-center gap-2">
                             <span
                                 className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-normal ${
                                     data.isHealthy
