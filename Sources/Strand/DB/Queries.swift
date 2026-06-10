@@ -2810,10 +2810,18 @@ enum Queries {
             WITH expire_runs AS (
                 UPDATE strand.runs
                 SET lease_expires_at = NOW()
-                WHERE worker_id    = \(workerID)
-                  AND namespace_id = \(namespaceID)
-                  AND state        = \(TaskState.running)
-                  AND created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
+                WHERE id = ANY(
+                    -- Subquery with ORDER BY id ensures all concurrent shutdownWorker
+                    -- calls acquire row locks in the same order, preventing deadlocks
+                    -- when multiple workers shut down simultaneously.
+                    SELECT id FROM strand.runs
+                    WHERE  worker_id    = \(workerID)
+                      AND  namespace_id = \(namespaceID)
+                      AND  state        = \(TaskState.running)
+                      AND  created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
+                    ORDER BY id
+                    FOR UPDATE
+                )
             )
             DELETE FROM strand.workers
             WHERE id           = \(workerID)
