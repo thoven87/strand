@@ -18,7 +18,7 @@ struct MetricsResponse: Codable, Sendable {
     struct TaskTiming: Codable, Sendable {
         let queue: String
         let taskName: String
-        let state: TaskState
+        let state: TaskStatus
         let count: Int
         /// Executions per second for this (queue, task, state) in the last broadcast cycle.
         /// `nil` when no ``AggregatedMetricsBuffer`` is wired in.
@@ -124,20 +124,32 @@ struct MetricsRoutes {
 
             // ── Terminal counts + hourly charts — three concurrent DB queries ─────────────
             async let summaryTask = ManagementQueries.metricsSummary(
-                on: self.postgres, namespaceID: ns, since: cutoff, logger: self.logger)
+                on: self.postgres,
+                namespaceID: ns,
+                since: cutoff,
+                logger: self.logger
+            )
             async let throughputTask = ManagementQueries.metricsThroughput(
-                on: self.postgres, namespaceID: ns, since: cutoff, useDaily: useDaily,
-                logger: self.logger)
+                on: self.postgres,
+                namespaceID: ns,
+                since: cutoff,
+                useDaily: useDaily,
+                logger: self.logger
+            )
             async let errorTask = ManagementQueries.metricsErrorRate(
-                on: self.postgres, namespaceID: ns, since: cutoff, useDaily: useDaily,
-                logger: self.logger)
+                on: self.postgres,
+                namespaceID: ns,
+                since: cutoff,
+                useDaily: useDaily,
+                logger: self.logger
+            )
 
             let (summaryTuple, throughputBuckets, errorBuckets) =
                 try await (summaryTask, throughputTask, errorTask)
 
-            let completed  = summaryTuple.completed
-            let failed     = summaryTuple.failed
-            let cancelled  = summaryTuple.cancelled
+            let completed = summaryTuple.completed
+            let failed = summaryTuple.failed
+            let cancelled = summaryTuple.cancelled
             var avgDurationMs: Int? = nil
 
             let throughput = throughputBuckets.map {

@@ -115,8 +115,8 @@ function TriggeredFunctionsPanel({
                             <span className="font-mono text-xs text-foreground truncate flex-1">
                                 {t.taskName}
                             </span>
-                            <span className="text-[10px] text-muted-foreground/60 capitalize shrink-0">
-                                {t.taskState.toLowerCase()}
+                            <span className="text-[10px] text-muted-foreground/60 shrink-0">
+                                {t.taskState}
                             </span>
                             <ChevronRight
                                 size={11}

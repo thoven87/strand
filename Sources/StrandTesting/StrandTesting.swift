@@ -417,11 +417,15 @@ public func awaitScheduleRunCount(
 public func awaitAnyTask(
     client: StrandClient,
     taskName: String,
-    state: TaskState,
+    status: TaskStatus,
     timeout: Duration = .seconds(10),
     label: String? = nil
 ) async throws {
     let deadline = ContinuousClock.now + timeout
+    // status.dbStates expands RUNNING → [RUNNING, SLEEPING, WAITING] and
+    // QUEUED → [PENDING]; all others map 1-to-1.  = ANY($n) handles every case
+    // in a single parameterised query.
+    let states = status.dbStates
     while ContinuousClock.now < deadline {
         let stream = try await client.postgres.query(
             """
@@ -429,7 +433,7 @@ public func awaitAnyTask(
             WHERE namespace_id = \(client.namespaceID)
               AND queue        = \(client.queueName)
               AND name         = \(taskName)
-              AND state        = \(state)
+              AND state        = ANY(\(states))
             LIMIT 1
             """,
             logger: client.logger
@@ -438,7 +442,7 @@ public func awaitAnyTask(
         try await Task.sleep(for: .milliseconds(200))
     }
     throw StrandTestError(
-        label ?? "no '\(taskName)' task reached state '\(state.rawValue)' within \(timeout)"
+        label ?? "no '\(taskName)' task reached status '\(status.rawValue)' within \(timeout)"
     )
 }
 

@@ -1327,7 +1327,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
         if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
-            throw WorkflowError(workflowName: CW.workflowName, state: nonSuccess.state)
+            throw WorkflowError(workflowName: CW.workflowName, state: nonSuccess.state.taskStatus)
         }
 
         // Fast path 2: pre-loaded result (child completed in a prior activation).
@@ -1383,7 +1383,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             _impl.executor.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
             return try JSON.decode(CW.Output.self, from: resultBuffer)
         } catch let signal as _ActivityFailureSignal {
-            throw WorkflowError(workflowName: CW.workflowName, state: signal.state)
+            throw WorkflowError(workflowName: CW.workflowName, state: signal.state.taskStatus)
         }
     }
 }

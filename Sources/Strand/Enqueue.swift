@@ -286,26 +286,99 @@ extension WorkflowSpanState: PostgresCodable {
 
 // MARK: - Task result types
 
-public enum TaskState: String, Sendable, Codable {
+// MARK: - TaskState (internal scheduling state)
+
+/// Internal run-level state used by `strand.runs` and `strand.tasks`.
+///
+/// This enum is `package`-only — it is never exposed to library consumers.
+/// All public API surfaces use ``TaskStatus`` instead, which collapses the
+/// granular scheduling states (SLEEPING, WAITING) into a single RUNNING value.
+package enum TaskState: String, Sendable, Codable {
     case pending = "PENDING"
     case running = "RUNNING"
-    /// Workflow is suspended waiting for an activity or child workflow to
-    /// complete, or for a timed sleep to elapse. No worker slot is held.
+    /// Workflow activation completed and released its slot; suspended on a
+    /// timer or timed event wait.  The run auto-wakes when `available_at` elapses.
     case sleeping = "SLEEPING"
-    /// Workflow is suspended waiting for a named event or signal.
+    /// Workflow activation completed and released its slot; suspended waiting
+    /// for child activities/workflows to complete or for an untimed event.
     case waiting = "WAITING"
+    /// Workflow is paused by an explicit pause operation.
+    case paused = "PAUSED"
     case completed = "COMPLETED"
     case failed = "FAILED"
     case cancelled = "CANCELLED"
     /// The workflow called `context.continueAsNew(input:)` — a new task was
-    /// enqueued with a fresh input and this task's execution is complete.
+    /// enqueued with a fresh input and this task’s execution is complete.
     case continuedAsNew = "CONTINUED_AS_NEW"
 
     /// Returns `true` for states from which a task will never transition again.
+    package var isTerminal: Bool {
+        switch self {
+        case .completed, .failed, .cancelled, .continuedAsNew: return true
+        case .pending, .running, .sleeping, .waiting, .paused: return false
+        }
+    }
+
+    /// Projects this internal scheduling state to the public ``TaskStatus``.
+    ///
+    /// The mapping is intentionally lossy: `sleeping` and `waiting` both become
+    /// `.running` because from a user’s perspective the task is still in progress.
+    package var taskStatus: TaskStatus {
+        switch self {
+        case .pending: return .queued
+        case .running, .sleeping, .waiting: return .running
+        case .paused: return .paused
+        case .completed: return .completed
+        case .failed: return .failed
+        case .cancelled: return .cancelled
+        case .continuedAsNew: return .continuedAsNew
+        }
+    }
+}
+
+// MARK: - TaskStatus (public API state)
+
+/// The observable status of a task execution — what the public API and Loom
+/// dashboard expose to callers.
+///
+/// Unlike the internal ``TaskState``, this enum does not distinguish *why* a
+/// workflow is suspended between activations.  Whether a workflow is sleeping
+/// on a timer, waiting for an activity, or waiting for a named event, the
+/// public status is always `running`.
+public enum TaskStatus: String, Sendable, Codable {
+    /// Not yet claimed by a worker (was PENDING internally).
+    case queued = "QUEUED"
+    /// Being executed or suspended between activations (RUNNING / SLEEPING / WAITING).
+    case running = "RUNNING"
+    /// Explicitly paused; will not be scheduled until resumed.
+    case paused = "PAUSED"
+    case completed = "COMPLETED"
+    case failed = "FAILED"
+    case cancelled = "CANCELLED"
+    case continuedAsNew = "CONTINUED_AS_NEW"
+
+    /// Returns `true` for terminal states.
     public var isTerminal: Bool {
         switch self {
         case .completed, .failed, .cancelled, .continuedAsNew: return true
-        case .pending, .running, .sleeping, .waiting: return false
+        case .queued, .running, .paused: return false
+        }
+    }
+
+    /// The internal `TaskState` values that correspond to this status.
+    ///
+    /// `RUNNING` expands to the three scheduling sub-states; `QUEUED` maps to
+    /// `PENDING`; all others map 1-to-1.  Use with `= ANY($1)` so a single
+    /// parameterised query covers every expansion case without string-building.
+    package var dbStates: [TaskState] {
+        switch self {
+        case .running: return [.running, .sleeping, .waiting]
+        case .queued: return [.pending]
+        case .paused: return [.paused]
+        case .completed: return [.completed]
+        case .failed: return [.failed]
+        case .cancelled: return [.cancelled]
+        case .continuedAsNew: return [.continuedAsNew]
         }
     }
 }
@@ -361,7 +434,43 @@ extension TaskPriority: PostgresCodable {
     }
 }
 
+// TaskState PostgresCodable — package-only, used by internal DB queries.
+// PostgresNonThrowingEncodable: our encode only calls rawValue.encode which never throws.
+// PostgresArrayEncodable: allows [TaskState] to be interpolated as = ANY($1) in queries.
+extension TaskState: PostgresNonThrowingEncodable {}
+extension TaskState: PostgresArrayEncodable {
+    package static var psqlArrayType: PostgresDataType { .textArray }
+}
 extension TaskState: PostgresCodable {
+    package static var psqlType: PostgresDataType { .text }
+    package static var psqlFormat: PostgresFormat { .binary }
+
+    // Non-throwing: rawValue.encode never throws for String.
+    // The non-throwing signature satisfies both PostgresEncodable (which allows throws)
+    // and PostgresNonThrowingEncodable (which requires no throws).
+    package func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    package init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        guard let state = TaskState(rawValue: raw) else {
+            throw PostgresDecodingError.Code.typeMismatch
+        }
+        self = state
+    }
+}
+
+// TaskStatus PostgresCodable — public, used by public API response decoding.
+extension TaskStatus: PostgresCodable {
     public static var psqlType: PostgresDataType { .text }
     public static var psqlFormat: PostgresFormat { .binary }
 
@@ -379,10 +488,10 @@ extension TaskState: PostgresCodable {
         context: PostgresDecodingContext<D>
     ) throws {
         let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
-        guard let state = TaskState(rawValue: raw) else {
+        guard let status = TaskStatus(rawValue: raw) else {
             throw PostgresDecodingError.Code.typeMismatch
         }
-        self = state
+        self = status
     }
 }
 
@@ -445,7 +554,7 @@ public struct TaskFailure: Sendable, Codable {
 /// Snapshot of a task's terminal (or current) state.
 public struct TaskResultSnapshot: Sendable, Codable {
     public let taskID: UUID
-    public let state: TaskState
+    public let state: TaskStatus
     /// Raw JSON string of the result value; `nil` if not yet completed.
     public let resultJSON: String?
     public let failure: TaskFailure?
@@ -468,7 +577,7 @@ public struct TaskResultSnapshot: Sendable, Codable {
     /// Public memberwise initialiser (for external callers — no runtime failure data).
     public init(
         taskID: UUID,
-        state: TaskState,
+        state: TaskStatus,
         resultJSON: String?,
         failure: TaskFailure?
     ) {
@@ -482,7 +591,7 @@ public struct TaskResultSnapshot: Sendable, Codable {
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.taskID = try c.decode(UUID.self, forKey: .taskID)
-        self.state = try c.decode(TaskState.self, forKey: .state)
+        self.state = try c.decode(TaskStatus.self, forKey: .state)
         self.resultJSON = try c.decodeIfPresent(String.self, forKey: .resultJSON)
         self.failure = try c.decodeIfPresent(TaskFailure.self, forKey: .failure)
         self._activityFailure = nil  // not in JSON wire format; see _activityFailure doc comment
@@ -492,7 +601,7 @@ public struct TaskResultSnapshot: Sendable, Codable {
     /// for typed-failure propagation in `StrandClient.runActivity`.
     package init(
         taskID: UUID,
-        state: TaskState,
+        state: TaskStatus,
         resultJSON: String?,
         failure: TaskFailure?,
         activityFailure: ActivityFailure?
