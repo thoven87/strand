@@ -137,12 +137,7 @@ struct VersionTests {
 
                 // Wait until the workflow is confirmed SLEEPING before overwriting
                 // the checkpoint — ensures markVersion commits before the timer fires.
-                try await awaitSnapshot(
-                    handle,
-                    where: { $0.state == .sleeping },
-                    timeout: .seconds(5),
-                    label: "workflow SLEEPING"
-                )
+                try await awaitRunState(client: client, taskID: handle.taskID, state: .sleeping, timeout: .seconds(5), label: "workflow SLEEPING")
                 try await client.markVersion(
                     changeID: "v2-feature",
                     value: false,
@@ -179,12 +174,7 @@ struct VersionTests {
             ) {
                 // Wait until the workflow is SLEEPING (version checkpoint persisted,
                 // now suspended on the sleep timer).
-                try await awaitSnapshot(
-                    handle,
-                    where: { $0.state == .sleeping },
-                    timeout: .seconds(5),
-                    label: "workflow SLEEPING"
-                )
+                try await awaitRunState(client: client, taskID: handle.taskID, state: .sleeping, timeout: .seconds(5), label: "workflow SLEEPING")
                 // Return from closure — worker shuts down, leaving run in SLEEPING state.
             }
 
@@ -249,12 +239,7 @@ struct VersionTests {
                     input: "start"
                 )
 
-                try await awaitSnapshot(
-                    handle,
-                    where: { $0.state == .sleeping },
-                    timeout: .seconds(5),
-                    label: "workflow SLEEPING"
-                )
+                try await awaitRunState(client: client, taskID: handle.taskID, state: .sleeping, timeout: .seconds(5), label: "workflow SLEEPING")
 
                 try await client.markVersion(
                     changeID: "multi-v3",
@@ -287,12 +272,7 @@ struct VersionTests {
                     input: "start"
                 )
 
-                try await awaitSnapshot(
-                    handle,
-                    where: { $0.state == .sleeping },
-                    timeout: .seconds(5),
-                    label: "workflow SLEEPING"
-                )
+                try await awaitRunState(client: client, taskID: handle.taskID, state: .sleeping, timeout: .seconds(5), label: "workflow SLEEPING")
 
                 try await client.markVersion(
                     changeID: "multi-v2",
