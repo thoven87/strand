@@ -11,6 +11,15 @@ import {
 } from "@tanstack/react-router";
 import { getQueues } from "@/api/queues";
 import { getTasksGlobal } from "@/api/tasks";
+import { getMetrics } from "@/api/metrics";
+import {
+    BarChart,
+    Bar,
+    XAxis,
+    YAxis,
+    Tooltip,
+    ResponsiveContainer,
+} from "recharts";
 import { qk } from "@/lib/queryKeys";
 import { StatusBadge } from "@/components/ui/badge";
 import { RelativeTime } from "@/components/RelativeTime";
@@ -18,7 +27,12 @@ import { LiveTimer } from "@/components/LiveTimer";
 import { Paginator } from "@/components/Paginator";
 import { Select } from "@/components/ui/select";
 import { Search, X, Copy, Check } from "lucide-react";
-import type { TaskSummary, TaskKind, TaskState, QueueStats } from "@/api/types";
+import type {
+    TaskSummary,
+    TaskKind,
+    TaskStatus,
+    QueueStats,
+} from "@/api/types";
 import { EmptyState } from "@/components/EmptyState";
 import { fmtDuration } from "@/lib/utils";
 
@@ -87,11 +101,10 @@ const KINDS: { label: string; value: TaskKind | undefined }[] = [
     { label: "Activities", value: "ACTIVITY" },
 ];
 
-// State config: label, count key, accent colour classes for the count badge
+// State config: label, count key, accent colour classes for the count badge.
 // countKey maps a filter state to the matching field on QueueStats.
-// COMPLETED and CANCELLED are null because they were removed from QueueStats
-// (counting all-time terminal tasks requires a full table scan).
-// The filter pills still work for those states; they just show no live count.
+// RUNNING sums running + sleeping + waiting from QueueStats (all are "in progress").
+// COMPLETED and CANCELLED are null (all-time terminal counts require a full table scan).
 const STATE_CONFIG: ReadonlyArray<{
     state: string;
     countKey: keyof import("@/api/types").QueueStats | null;
@@ -99,38 +112,33 @@ const STATE_CONFIG: ReadonlyArray<{
 }> = [
     {
         state: "RUNNING",
-        countKey: "running",
+        countKey: "running", // server sums running+sleeping+waiting for the RUNNING filter
         accent: "bg-yellow-500/20 text-yellow-300",
     },
     {
-        state: "PENDING",
+        state: "QUEUED",
         countKey: "pending",
-        accent: "bg-blue-500/15   text-blue-400",
+        accent: "bg-blue-500/15 text-blue-400",
     },
     {
-        state: "SLEEPING",
-        countKey: "sleeping",
-        accent: "bg-slate-500/20  text-slate-300",
-    },
-    {
-        state: "WAITING",
-        countKey: "waiting",
-        accent: "bg-violet-500/20 text-violet-300",
+        state: "PAUSED",
+        countKey: null,
+        accent: "bg-blue-500/20 text-blue-300",
     },
     {
         state: "COMPLETED",
         countKey: null,
-        accent: "bg-green-500/15  text-green-400",
+        accent: "bg-green-500/15 text-green-400",
     },
     {
         state: "FAILED",
         countKey: "failedRecent",
-        accent: "bg-red-500/20    text-red-400",
+        accent: "bg-red-500/20 text-red-400",
     },
     {
         state: "CANCELLED",
         countKey: null,
-        accent: "bg-slate-500/15  text-slate-400",
+        accent: "bg-slate-500/15 text-slate-400",
     },
 ];
 
@@ -156,7 +164,7 @@ function StatePill({
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"
             }`}
         >
-            {label.charAt(0) + label.slice(1).toLowerCase()}
+            {label}
             {count > 0 && (
                 <span
                     className={`rounded px-1 py-px text-[10px] font-mono leading-none ${
@@ -313,16 +321,61 @@ export function RunsPage() {
                 : (q) => {
                       const items = q.state.data?.items;
                       const hasActive = items?.some(
-                          (t) =>
-                              t.state === "RUNNING" ||
-                              t.state === "PENDING" ||
-                              t.state === "SLEEPING",
+                          (t) => t.state === "RUNNING" || t.state === "QUEUED",
                       );
                       return hasActive
                           ? Math.min(intervalMs, 4_000)
                           : intervalMs;
                   },
     });
+
+    const { data: metricsData } = useQuery({
+        queryKey: [...qk.metrics.get(namespace), 24],
+        queryFn: () => getMetrics(namespace, 24),
+        refetchInterval: intervalMs,
+    });
+
+    const throughputData = useMemo(() => {
+        if (!metricsData) return [];
+        const byHour = new Map<
+            string,
+            { label: string; completed: number; failed: number }
+        >();
+        for (const b of metricsData.throughputPerHour) {
+            const h = new Date(b.hour).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            });
+            byHour.set(b.hour, { label: h, completed: b.count, failed: 0 });
+        }
+        for (const b of metricsData.errorRatePerHour) {
+            const h = new Date(b.hour).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            });
+            const ex = byHour.get(b.hour) ?? {
+                label: h,
+                completed: 0,
+                failed: 0,
+            };
+            ex.failed = b.count;
+            byHour.set(b.hour, ex);
+        }
+        return (
+            [...byHour.entries()]
+                .sort(([a], [b]) => a.localeCompare(b))
+                // Keep raw counts — stackOffset="expand" on BarChart normalises
+                // them to exactly [0,1] per column, avoiding manual rounding errors
+                // where Math.round(a%) + Math.round(b%) ≠ 100.
+                .map(([, v]) => ({
+                    label: v.label,
+                    ok: v.completed,
+                    err: v.failed,
+                }))
+        );
+    }, [metricsData]);
 
     // ── Derive per-state counts from queue stats ────────────────────────────
     // When a queue is selected, use that queue's stats; otherwise sum all queues.
@@ -433,6 +486,98 @@ export function RunsPage() {
                     setIntervalMs={setIntervalMs}
                 />
             </div>
+
+            {/* ── Throughput chart ─────────────────────────────────────────────── */}
+            {throughputData.length > 0 && (
+                <div className="rounded-lg border border-border bg-card/40 px-3 pt-3 pb-3">
+                    <ResponsiveContainer width="100%" height={140}>
+                        <BarChart
+                            data={throughputData}
+                            margin={{ top: 4, right: 4, bottom: 0, left: 0 }}
+                            barCategoryGap="30%"
+                            barGap={2}
+                        >
+                            <XAxis
+                                dataKey="label"
+                                tick={{ fontSize: 9, fill: "#64748b" }}
+                                axisLine={false}
+                                tickLine={false}
+                                interval="preserveStartEnd"
+                            />
+                            <YAxis
+                                tickFormatter={(v: number) =>
+                                    v >= 1000
+                                        ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k`
+                                        : String(v)
+                                }
+                                tick={{ fontSize: 9, fill: "#64748b" }}
+                                axisLine={false}
+                                tickLine={false}
+                                allowDecimals={false}
+                                width={32}
+                            />
+                            <Tooltip
+                                content={({ active, payload, label }) => {
+                                    if (!active || !payload?.length)
+                                        return null;
+                                    return (
+                                        <div className="rounded border border-border bg-background px-2.5 py-1.5 text-xs shadow-lg space-y-0.5">
+                                            <p className="text-muted-foreground mb-1">
+                                                {label}
+                                            </p>
+                                            {payload.map((p) => (
+                                                <p
+                                                    key={p.name}
+                                                    style={{
+                                                        color: p.fill as string,
+                                                    }}
+                                                    className="font-medium"
+                                                >
+                                                    {p.name === "ok"
+                                                        ? "COMPLETED"
+                                                        : "FAILED"}
+                                                    :{" "}
+                                                    {(
+                                                        p.value as number
+                                                    ).toLocaleString()}
+                                                </p>
+                                            ))}
+                                        </div>
+                                    );
+                                }}
+                                cursor={{ fill: "rgba(255,255,255,0.04)" }}
+                            />
+                            <Bar
+                                dataKey="ok"
+                                fill="#006E8C"
+                                maxBarSize={5}
+                                radius={[2, 2, 0, 0]}
+                            />
+                            <Bar
+                                dataKey="err"
+                                fill="#BC46DD"
+                                maxBarSize={5}
+                                radius={[2, 2, 0, 0]}
+                            />
+                        </BarChart>
+                    </ResponsiveContainer>
+                    {/* Legend */}
+                    <div className="flex items-center gap-4 mt-2 px-1">
+                        <div className="flex items-center gap-1.5">
+                            <span className="w-2.5 h-2.5 rounded-full bg-[#006E8C] shrink-0" />
+                            <span className="text-[10px] text-muted-foreground tracking-wide">
+                                COMPLETED
+                            </span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                            <span className="w-2.5 h-2.5 rounded-full bg-[#BC46DD] shrink-0" />
+                            <span className="text-[10px] text-muted-foreground tracking-wide">
+                                FAILED
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* ── Filter bar: kind pills + state-count badges ───────────────── */}
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -641,7 +786,7 @@ export function RunsPage() {
                                                     <td className="px-4 py-2.5">
                                                         <StatusBadge
                                                             state={
-                                                                task.state as TaskState
+                                                                task.state as TaskStatus
                                                             }
                                                         />
                                                     </td>
@@ -682,11 +827,7 @@ export function RunsPage() {
                                                                 className="text-green-400 tabular-nums"
                                                             />
                                                         ) : task.state ===
-                                                              "PENDING" ||
-                                                          task.state ===
-                                                              "WAITING" ||
-                                                          task.state ===
-                                                              "SLEEPING" ? (
+                                                          "QUEUED" ? (
                                                             <span className="text-muted-foreground/60 text-[10px]">
                                                                 queued{" "}
                                                                 <RelativeTime

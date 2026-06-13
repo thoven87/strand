@@ -152,7 +152,7 @@ public struct StrandClient: Sendable {
             id: enq.taskID,
             options: AwaitTaskResultOptions(timeout: options.timeout)
         )
-        guard snap.state == .completed else {
+        guard snap.state == .completed else {  // TaskStatus.completed
             // _activityFailure is already decoded once in taskSnapshot — no second decode needed.
             // Mirrors WorkflowContext.runActivity: try A.Failure first, fall back to ActivityError.
             let af = snap._activityFailure
@@ -801,8 +801,8 @@ public struct StrandClient: Sendable {
                 taskID: taskID,
                 logger: logger
             ) {
-                let state = TaskState(rawValue: row.state) ?? .pending
-                if state == .completed || state == .failed || state == .cancelled {
+                let status = row.state.taskStatus
+                if status.isTerminal {
                     return taskSnapshot(from: row)
                 }
             }
@@ -820,7 +820,7 @@ public struct StrandClient: Sendable {
         let failure = af.map { TaskFailure(errorType: $0.name, message: $0.message, traceback: nil) }
         return TaskResultSnapshot(
             taskID: row.taskID,
-            state: TaskState(rawValue: row.state) ?? .pending,
+            state: row.state.taskStatus,
             resultJSON: row.resultBuffer.map { String(buffer: $0) },
             failure: failure,
             activityFailure: af

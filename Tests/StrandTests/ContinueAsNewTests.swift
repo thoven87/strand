@@ -149,7 +149,7 @@ struct ContinueAsNewTests {
                 try await awaitAnyTask(
                     client: client,
                     taskName: "ContinueWorkflow",
-                    state: .completed,
+                    status: .completed,
                     timeout: .seconds(15),
                     label: "terminal ContinueWorkflow generation (count == 3)"
                 )

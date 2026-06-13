@@ -289,7 +289,7 @@ struct WorkerLifecycleTests {
                 try await Task.sleep(for: .seconds(1))
                 let earlySnap = try await client.fetchTaskResult(id: handle.taskID)
                 #expect(
-                    earlySnap?.state == .pending,
+                    earlySnap?.state == .queued,
                     "task must remain PENDING before delayUntil elapses"
                 )
 
@@ -456,7 +456,7 @@ struct WorkerLifecycleTests {
             try await Task.sleep(for: .seconds(1))
             let earlySnap = try await clientA.fetchTaskResult(id: handle.taskID)
             #expect(
-                earlySnap?.state == .pending,
+                earlySnap?.state == .queued,
                 "worker B must not claim tasks belonging to namespace A"
             )
 

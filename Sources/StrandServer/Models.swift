@@ -68,7 +68,7 @@ struct TaskSummaryResponse: Codable, Sendable {
     let id: UUID
     let name: String
     let queue: String
-    let state: String
+    let state: TaskStatus
     let attempt: Int
     let createdAt: Date
     let completedAt: Date?
@@ -88,7 +88,7 @@ struct TaskSummaryResponse: Codable, Sendable {
         id = row.id
         name = row.name
         queue = row.queue
-        state = row.state.rawValue
+        state = row.state.taskStatus
         attempt = row.attempt
         createdAt = row.createdAt
         completedAt = row.completedAt
@@ -106,7 +106,7 @@ struct TaskDetailResponse: Codable, Sendable {
     let name: String
     let queue: String
     let params: String  // raw JSON
-    let state: String
+    let state: TaskStatus
     let attempt: Int
     let maxAttempts: Int?
     let createdAt: Date
@@ -129,7 +129,7 @@ struct TaskDetailResponse: Codable, Sendable {
         name = row.name
         queue = row.queue
         params = String(buffer: row.paramsBuffer)
-        state = row.state.rawValue
+        state = row.state.taskStatus
         attempt = row.attempt
         maxAttempts = row.maxAttempts
         createdAt = row.createdAt
@@ -200,19 +200,19 @@ extension CheckpointResponse: ResponseCodable {}
 
 struct EventResponse: Codable, Sendable {
     struct TriggeredTaskResponse: Codable, Sendable {
-        let taskId: String
+        let taskId: UUID
         let taskName: String
         let taskState: String
         let taskKind: String
     }
-    let id: String  // emission UUID (lowercase) — new in append-only log
+    let id: UUID
     let name: String
     let payload: String?  // raw JSON
     let createdAt: Date
     let queue: String
     let triggeredTasks: [TriggeredTaskResponse]
     init(from row: EventRow) {
-        id = row.id.uuidString.lowercased()
+        id = row.id
         name = row.name
         // Strip the JSONB binary wire-format version byte (0x01) if present.
         // PostgreSQL prepends this byte in binary protocol mode; reading with
@@ -231,7 +231,7 @@ struct EventResponse: Codable, Sendable {
         queue = row.queue
         triggeredTasks = row.triggeredTasks.map {
             TriggeredTaskResponse(
-                taskId: $0.taskId.uuidString,
+                taskId: $0.taskId,
                 taskName: $0.taskName,
                 taskState: $0.taskState,
                 taskKind: $0.taskKind
@@ -242,16 +242,16 @@ struct EventResponse: Codable, Sendable {
 extension EventResponse: ResponseCodable {}
 
 struct EventWaiterResponse: Codable, Sendable {
-    let taskId: String  // UUID as lowercase string
+    let taskId: UUID
     let taskName: String
-    let taskState: String
+    let taskState: TaskStatus
     let seqNum: Int
     let timeoutAt: Date?
 
     init(from row: EventWaiterRow) {
-        taskId = row.taskId.uuidString.lowercased()
+        taskId = row.taskId
         taskName = row.taskName
-        taskState = row.taskState.rawValue
+        taskState = row.taskState.taskStatus
         seqNum = row.seqNum
         timeoutAt = row.timeoutAt
     }
@@ -263,13 +263,13 @@ extension EventWaiterResponse: ResponseCodable {}
 struct EventTriggerResponse: Codable, Sendable {
     /// UUID of the specific `strand.events` row (emission) that woke this task.
     /// `nil` for tasks triggered before the append-only migration.
-    let emissionId: String?
+    let emissionId: UUID?
     let eventName: String
     let queue: String
     let triggeredAt: Date
 
     init(from row: EventTriggerRow) {
-        emissionId = row.emissionID?.uuidString.lowercased()
+        emissionId = row.emissionID
         eventName = row.eventName
         queue = row.queue
         triggeredAt = row.triggeredAt

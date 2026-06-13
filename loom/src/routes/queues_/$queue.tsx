@@ -13,31 +13,25 @@ import { RelativeTime } from "@/components/RelativeTime";
 import { Paginator } from "@/components/Paginator";
 import { Button } from "@/components/ui/button";
 import { CalendarClock, ArrowLeft, Pause, Play } from "lucide-react";
-import type { Queue, TaskState, TaskSummary } from "@/api/types";
+import type { Queue, TaskStatus, TaskSummary } from "@/api/types";
 
-// State config mirrors runs.tsx — label, stats key, accent colour
+// State config — collapsed to public TaskStatus values.
+// RUNNING covers running+sleeping+waiting; QUEUED covers pending.
+// The server still stores the granular states; the count keys map to
+// the QueueStats fields that the backend aggregates from strand.tasks.
 const STATE_CONFIG = [
     {
         state: "RUNNING",
-        key: "running" as const,
+        // running + sleeping + waiting are all "in progress" from user perspective
+        countFn: (s: import("@/api/types").QueueStats) =>
+            s.running + s.sleeping + s.waiting,
         accent: "bg-yellow-500/20 text-yellow-300",
     },
     {
-        state: "PENDING",
-        key: "pending" as const,
-        accent: "bg-blue-500/15   text-blue-400",
+        state: "QUEUED",
+        countFn: (s: import("@/api/types").QueueStats) => s.pending,
+        accent: "bg-blue-500/15 text-blue-400",
     },
-    {
-        state: "SLEEPING",
-        key: "sleeping" as const,
-        accent: "bg-slate-500/20  text-slate-300",
-    },
-    {
-        state: "WAITING",
-        key: "waiting" as const,
-        accent: "bg-violet-500/20 text-violet-300",
-    },
-    // COMPLETED and CANCELLED omitted from queue stats — not live counts.
 ] as const;
 
 function StatePill({
@@ -62,7 +56,7 @@ function StatePill({
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"
             }`}
         >
-            {label.charAt(0) + label.slice(1).toLowerCase()}
+            {label}
             {count > 0 && (
                 <span
                     className={`rounded px-1 py-px text-[10px] font-mono leading-none ${
@@ -258,11 +252,11 @@ export function QueueDetailPage() {
                 />
 
                 {/* Per-state pills with counts from queueData.stats */}
-                {STATE_CONFIG.map(({ state, key, accent }) => (
+                {STATE_CONFIG.map(({ state, countFn, accent }) => (
                     <StatePill
                         key={state}
                         label={state}
-                        count={queueData?.stats[key] ?? 0}
+                        count={queueData ? countFn(queueData.stats) : 0}
                         active={stateFilter === state}
                         accent={accent}
                         onClick={() => {
@@ -335,7 +329,7 @@ export function QueueDetailPage() {
                                         </td>
                                         <td className="px-4 py-3">
                                             <StatusBadge
-                                                state={task.state as TaskState}
+                                                state={task.state as TaskStatus}
                                             />
                                         </td>
                                         <td className="px-4 py-3 text-muted-foreground text-sm">

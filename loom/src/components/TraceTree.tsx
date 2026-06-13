@@ -344,8 +344,10 @@ export function barHeightClass(kind: TraceSpan["kind"]): string {
 export function barPatternStyle(
     kind: TraceSpan["kind"],
     state: SpanState,
+    isLive: boolean,
 ): React.CSSProperties {
     if (
+        isLive &&
         state === "RUNNING" &&
         kind !== "SLEEP" &&
         kind !== "WAIT" &&
@@ -367,7 +369,11 @@ export function barPatternStyle(
     return {};
 }
 
-function barClass(kind: TraceSpan["kind"], state: SpanState): string {
+function barClass(
+    kind: TraceSpan["kind"],
+    state: SpanState,
+    isLive: boolean,
+): string {
     // Suspension spans use a striped/dashed style to distinguish from execution.
     // TIMED_OUT variant gets orange to signal the timeout visually.
     if (kind === "WAIT") {
@@ -410,8 +416,12 @@ function barClass(kind: TraceSpan["kind"], state: SpanState): string {
             return "border border-dashed border-blue-500/40 bg-transparent";
         case "RUNNING":
             return kind === "WORKFLOW"
-                ? "animate-pulse bg-blue-400/80"
-                : "animate-pulse bg-amber-400/80";
+                ? isLive
+                    ? "animate-pulse bg-blue-400/80"
+                    : "bg-blue-400/80"
+                : isLive
+                  ? "animate-pulse bg-amber-400/80"
+                  : "bg-amber-400/80";
         case "COMPLETED":
         default:
             if (kind === "WORKFLOW") return "bg-blue-500/80";
@@ -421,12 +431,12 @@ function barClass(kind: TraceSpan["kind"], state: SpanState): string {
 }
 
 /** Color class for the small left-cell state dot. */
-function dotClass(state: SpanState): string {
+function dotClass(state: SpanState, isLive: boolean): string {
     switch (state) {
         case "COMPLETED":
             return "bg-emerald-400";
         case "RUNNING":
-            return "bg-blue-400 animate-pulse";
+            return isLive ? "bg-blue-400 animate-pulse" : "bg-blue-400";
         case "FAILED":
             return "bg-red-500";
         case "CRASHED":
@@ -491,7 +501,7 @@ function JsonSkeleton() {
 }
 
 /** Right-side status icon shown in the left cell. Not rendered for LOG rows. */
-function StatusIcon({ span }: { span: TraceSpan }) {
+function StatusIcon({ span, isLive }: { span: TraceSpan; isLive: boolean }) {
     if (span.kind === "LOG") return null;
     const size = 12;
     const wrap = "shrink-0 w-4 h-4 flex items-center justify-center";
@@ -507,7 +517,11 @@ function StatusIcon({ span }: { span: TraceSpan }) {
                 <span className={wrap}>
                     <Loader2
                         size={size}
-                        className="text-blue-400 animate-spin"
+                        className={
+                            isLive
+                                ? "text-blue-400 animate-spin"
+                                : "text-blue-400"
+                        }
                     />
                 </span>
             );
@@ -1104,7 +1118,11 @@ export function TraceTree({
                                                 "relative shrink-0 rounded-full w-[6px] h-[6px]",
                                                 isLog
                                                     ? logDotClass(row.logLevel)
-                                                    : dotClass(row.state),
+                                                    : dotClass(
+                                                          row.state,
+                                                          row.isLive ??
+                                                              propIsLive,
+                                                      ),
                                             )}
                                         />
 
@@ -1169,7 +1187,10 @@ export function TraceTree({
                                         )}
 
                                         {/* Right-aligned status icon */}
-                                        <StatusIcon span={row} />
+                                        <StatusIcon
+                                            span={row}
+                                            isLive={row.isLive ?? propIsLive}
+                                        />
                                     </div>
 
                                     {/* ── Right cell — Gantt bar ───────────────────────────────── */}
@@ -1250,6 +1271,8 @@ export function TraceTree({
                                                         barClass(
                                                             row.kind,
                                                             row.state,
+                                                            row.isLive ??
+                                                                propIsLive,
                                                         ),
                                                     )}
                                                     style={{
@@ -1258,6 +1281,8 @@ export function TraceTree({
                                                         ...barPatternStyle(
                                                             row.kind,
                                                             row.state,
+                                                            row.isLive ??
+                                                                propIsLive,
                                                         ),
                                                     }}
                                                 />
@@ -1476,7 +1501,10 @@ export function TraceTree({
                                 <span
                                     className={cn(
                                         "w-[7px] h-[7px] rounded-full shrink-0",
-                                        dotClass(selected.state),
+                                        dotClass(
+                                            selected.state,
+                                            selected.isLive ?? propIsLive,
+                                        ),
                                     )}
                                 />
                                 <span className="text-[10px] text-muted-foreground">
