@@ -62,8 +62,8 @@ public enum StrandError: Error, LocalizedError, Sendable {
 public struct WorkflowError: Error, LocalizedError, Sendable {
     /// The registered name of the workflow (e.g. `"OrderWorkflow"`).
     public let workflowName: String
-    /// The terminal state the workflow reached.
-    public let state: TaskState
+    /// The terminal status the workflow reached.
+    public let state: TaskStatus
 
     public var errorDescription: String? {
         "Workflow '\(workflowName)' reached terminal state: \(state.rawValue)"
@@ -215,7 +215,7 @@ public protocol RetryAfterError: Error {
 /// instead.
 public struct RetryAfterDelay: Error, RetryAfterError, CustomStringConvertible, Sendable {
     public let nextRetryDelay: Duration
-    public let description:    String
+    public let description: String
 
     /// - Parameters:
     ///   - delay:   How long to wait before the next attempt.
@@ -223,7 +223,7 @@ public struct RetryAfterDelay: Error, RetryAfterError, CustomStringConvertible, 
     ///              Defaults to `"Retry after \(delay)"` when omitted.
     public init(_ delay: Duration, _ message: String? = nil) {
         self.nextRetryDelay = delay
-        self.description    = message ?? "Retry after \(delay)"
+        self.description = message ?? "Retry after \(delay)"
     }
 }
 

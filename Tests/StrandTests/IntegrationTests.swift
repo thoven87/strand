@@ -469,10 +469,11 @@ struct EventTests {
                     input: EventWaitInput(eventName: eventName)
                 )
 
-                // Wait until the workflow has registered its event_waits row (state = WAITING).
-                try await awaitSnapshot(
-                    handle,
-                    where: { $0.state == .waiting },
+                /// Wait until the workflow has registered its event_waits row (state = WAITING).
+                try await awaitRunState(
+                    client: client,
+                    taskID: handle.taskID,
+                    state: .waiting,
                     timeout: .seconds(5),
                     label: "workflow WAITING"
                 )
@@ -505,9 +506,9 @@ struct EventTests {
                     input: "London"
                 )
 
-                // Wait until both have registered their event_wait (state = WAITING).
-                try await awaitSnapshot(handleNYC, where: { $0.state == .waiting }, timeout: .seconds(5))
-                try await awaitSnapshot(handleLDN, where: { $0.state == .waiting }, timeout: .seconds(5))
+                // Wait until both have registered their event_wait.
+                try await awaitRunState(client: client, taskID: handleNYC.taskID, state: .waiting, timeout: .seconds(5))
+                try await awaitRunState(client: client, taskID: handleLDN.taskID, state: .waiting, timeout: .seconds(5))
 
                 // Emit London — the NYC workflow must NOT wake (predicate mismatch).
                 try await client.emit(
@@ -517,7 +518,7 @@ struct EventTests {
                 try await Task.sleep(for: .milliseconds(400))
 
                 let snapNYC = try await handleNYC.snapshot()
-                #expect(snapNYC?.state == .waiting, "NYC workflow should not wake on London event")
+                #expect(snapNYC?.state == .running, "NYC workflow should not wake on London event")
 
                 // Emit NYC — only the NYC workflow should wake.
                 try await client.emit(

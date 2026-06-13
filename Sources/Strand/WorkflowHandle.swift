@@ -158,7 +158,7 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
                     // the old instance which is now done. Treat as a completion
                     // without a result value.
                     throw WorkflowError(workflowName: W.workflowName, state: snap.state)
-                case .pending, .running, .sleeping, .waiting:
+                case .queued, .running, .paused:
                     break  // Still in progress — keep polling.
                 }
             }

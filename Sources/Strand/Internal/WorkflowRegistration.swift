@@ -565,7 +565,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     state == .cancelled ? .cancelled : isTimeout ? .timedOut : .maximumAttemptsReached
                 let err: Error
                 if kind == .workflow {
-                    err = WorkflowError(workflowName: name, state: state)
+                    err = WorkflowError(workflowName: name, state: state.taskStatus)
                 } else {
                     // Use _ActivityFailureSignal so runActivity<A> can decode A.Failure.
                     err = _ActivityFailureSignal(

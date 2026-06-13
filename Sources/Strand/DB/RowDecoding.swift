@@ -170,7 +170,7 @@ struct EnqueueRow: Sendable {
 /// Returned by ``Queries/fetchTaskResult``.
 struct TaskResultRow: Sendable {
     let taskID: UUID
-    let state: String
+    let state: TaskState
     let resultBuffer: ByteBuffer?
     let failureBuffer: ByteBuffer?
 }
@@ -180,7 +180,7 @@ extension TaskResultRow {
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         taskID = try col.next()!.decode(UUID.self, context: .default)
-        state = try col.next()!.decode(String.self, context: .default)
+        state = try col.next()!.decode(TaskState.self, context: .default)
         resultBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
         failureBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
     }

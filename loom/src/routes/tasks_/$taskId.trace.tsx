@@ -22,11 +22,11 @@ import { qk } from "@/lib/queryKeys";
 import { useAutoRefresh } from "@/lib/useAutoRefresh";
 import { AutoRefreshControl } from "@/components/AutoRefreshControl";
 import { ArrowLeft, RefreshCw, XCircle, GitBranch } from "lucide-react";
-import type { RetryOptions, TaskState } from "@/api/types";
+import type { RetryOptions, TaskStatus } from "@/api/types";
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-const isTerminal = (s: TaskState) =>
+const isTerminal = (s: TaskStatus) =>
     s === "COMPLETED" ||
     s === "FAILED" ||
     s === "CANCELLED" ||
@@ -149,7 +149,7 @@ export function TaskTracePage() {
                     Trace
                 </span>
 
-                {task && <StatusBadge state={task.state as TaskState} />}
+                {task && <StatusBadge state={task.state as TaskStatus} />}
 
                 {task && (
                     <span className="text-xs text-muted-foreground hidden sm:block">

@@ -56,7 +56,7 @@ public final class AggregatedMetricsBuffer: Sendable {
     public func record(
         queue: String,
         taskName: String,
-        state: TaskState,
+        state: TaskStatus,
         execMs: Double,
         waitMs: Double = 0
     ) {

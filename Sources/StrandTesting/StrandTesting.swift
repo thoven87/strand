@@ -401,6 +401,48 @@ public func awaitScheduleRunCount(
     )
 }
 
+// MARK: - awaitRunState
+
+/// Polls `strand.runs` until the current run for `taskID` reaches an internal
+/// ``TaskState`` scheduling state, or throws ``StrandTestError`` on `timeout`.
+///
+/// Use this in tests that need to synchronise on a granular internal state
+/// (`SLEEPING`, `WAITING`) that is collapsed to ``TaskStatus/running`` in the
+/// public API — for example, confirming a workflow has called `waitForEvent`
+/// before emitting the event:
+///
+/// ```swift
+/// try await awaitRunState(client: client, taskID: handle.taskID,
+///                         state: .waiting, timeout: .seconds(5))
+/// try await client.emitEvent("my.event", payload: ...)
+/// ```
+package func awaitRunState(
+    client: StrandClient,
+    taskID: UUID,
+    state internalState: TaskState,
+    timeout: Duration = .seconds(10),
+    label: String? = nil
+) async throws {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        let stream = try await client.postgres.query(
+            """
+            SELECT 1 FROM strand.runs
+            WHERE task_id      = \(taskID)
+              AND namespace_id = \(client.namespaceID)
+              AND state        = \(internalState)
+            LIMIT 1
+            """,
+            logger: client.logger
+        )
+        if (try await stream.first(where: { _ in true })) != nil { return }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    throw StrandTestError(
+        label ?? "run for task \(taskID) did not reach internal state '\(internalState.rawValue)' within \(timeout)"
+    )
+}
+
 // MARK: - awaitAnyTask
 
 /// Polls `listTasks` until at least one task named `taskName` in the client's
@@ -417,11 +459,15 @@ public func awaitScheduleRunCount(
 public func awaitAnyTask(
     client: StrandClient,
     taskName: String,
-    state: TaskState,
+    status: TaskStatus,
     timeout: Duration = .seconds(10),
     label: String? = nil
 ) async throws {
     let deadline = ContinuousClock.now + timeout
+    // status.dbStates expands RUNNING → [RUNNING, SLEEPING, WAITING] and
+    // QUEUED → [PENDING]; all others map 1-to-1.  = ANY($n) handles every case
+    // in a single parameterised query.
+    let states = status.dbStates
     while ContinuousClock.now < deadline {
         let stream = try await client.postgres.query(
             """
@@ -429,7 +475,7 @@ public func awaitAnyTask(
             WHERE namespace_id = \(client.namespaceID)
               AND queue        = \(client.queueName)
               AND name         = \(taskName)
-              AND state        = \(state)
+              AND state        = ANY(\(states))
             LIMIT 1
             """,
             logger: client.logger
@@ -438,7 +484,7 @@ public func awaitAnyTask(
         try await Task.sleep(for: .milliseconds(200))
     }
     throw StrandTestError(
-        label ?? "no '\(taskName)' task reached state '\(state.rawValue)' within \(timeout)"
+        label ?? "no '\(taskName)' task reached status '\(status.rawValue)' within \(timeout)"
     )
 }
 

@@ -152,8 +152,8 @@ struct ConditionTests {
                     input: "start"
                 )
 
-                // Wait until the workflow enters condition suspension (WAITING state).
-                try await awaitSnapshot(handle, where: { $0.state == .waiting }, timeout: .seconds(5))
+                // Wait until the workflow enters condition suspension (WAITING run state).
+                try await awaitRunState(client: client, taskID: handle.taskID, state: .waiting, timeout: .seconds(5))
 
                 // Deliver the signal that sets `unpaused = true`.
                 try await handle.signal(name: "unpause")
@@ -183,12 +183,9 @@ struct ConditionTests {
                     input: "start"
                 )
 
-                // Wait until the workflow enters condition suspension (SLEEPING/WAITING state).
-                try await awaitSnapshot(
-                    handle,
-                    where: { $0.state == .waiting || $0.state == .sleeping },
-                    timeout: .seconds(5)
-                )
+                // Wait until the workflow enters condition suspension.
+                // The timed condition uses SLEEPING; no-timeout uses WAITING.
+                try await awaitRunState(client: client, taskID: handle.taskID, state: .sleeping, timeout: .seconds(5))
 
                 // Send the signal — well within the 10 s deadline.
                 try await handle.signal(name: "unpause")

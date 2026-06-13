@@ -18,7 +18,7 @@ import { WorkersPage } from "@/routes/workers";
 import { WorkerDetailPage } from "@/routes/workers_/$workerId";
 import { WorkflowsPage } from "@/routes/workflows";
 import { MetricsPage } from "@/routes/metrics";
-import { TaskTracePage } from "@/routes/tasks_/$taskId.trace";
+
 import { NotFound } from "@/routes/not-found";
 // ── Root ───────────────────────────────────────────────────────────────────
 
@@ -95,7 +95,16 @@ const taskDetailRoute = createRoute({
 const taskTraceRoute = createRoute({
     getParentRoute: () => namespaceRoute,
     path: "tasks/$taskId/trace",
-    component: TaskTracePage,
+    beforeLoad: ({ params }) => {
+        throw redirect({
+            to: "/$namespace/tasks/$taskId",
+            params: { namespace: params.namespace, taskId: params.taskId },
+            search: (prev: Record<string, unknown>) => ({
+                ...prev,
+                tab: "trace",
+            }),
+        });
+    },
 });
 
 // ── /$namespace/events ─────────────────────────────────────────────────────

@@ -58,8 +58,8 @@ public struct StrandMetricsBroadcast: Codable, Sendable {
     public struct TimingSnapshot: Codable, Sendable {
         public let queue: String
         public let taskName: String
-        /// Terminal state — `.completed` or `.failed`.
-        public let state: TaskState
+        /// Terminal status — `.completed` or `.failed`.
+        public let state: TaskStatus
         /// Number of executions recorded in this cycle.
         public let count: Int
         /// Throughput rate for this (queue, task, state) in the current cycle.
@@ -269,12 +269,12 @@ public struct StrandMetricsLoop: Service {
                 guard entry.execTime.count > 0 else { return nil }
                 let parts = key.split(separator: "/", maxSplits: 2)
                 guard parts.count == 3,
-                    let state = TaskState(rawValue: String(parts[2]))
+                    let internalState = TaskState(rawValue: String(parts[2]))
                 else { return nil }
                 return StrandMetricsBroadcast.TimingSnapshot(
                     queue: String(parts[0]),
                     taskName: String(parts[1]),
-                    state: state,
+                    state: internalState.taskStatus,
                     count: entry.execTime.count,
                     ratePerSec: Double(entry.execTime.count) / intervalSecs,
                     execTime: DDSketch.Serialized(from: entry.execTime),

@@ -15,7 +15,7 @@ import {
     type ScheduleRun,
     type UpcomingSlot,
 } from "@/api/schedules";
-import type { TaskState } from "@/api/types";
+import type { TaskStatus } from "@/api/types";
 import { qk } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/ui/badge";
@@ -942,7 +942,7 @@ export function ScheduleDetailPage() {
                                             <td className="px-4 py-3">
                                                 <StatusBadge
                                                     state={
-                                                        run.state as TaskState
+                                                        run.state as TaskStatus
                                                     }
                                                 />
                                             </td>

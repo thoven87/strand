@@ -1,14 +1,29 @@
 // ─── States ────────────────────────────────────────────────────────────────
 
-export type TaskState =
-    | "PENDING"
-    | "RUNNING"
-    | "SLEEPING"
-    | "WAITING"
+/** Public task status returned by the API. SLEEPING/WAITING collapse to RUNNING. */
+export type TaskStatus =
+    | "QUEUED" // not yet claimed by a worker (was PENDING internally)
+    | "RUNNING" // executing or suspended between activations
+    | "PAUSED" // explicitly paused
     | "COMPLETED"
     | "FAILED"
     | "CANCELLED"
     | "CONTINUED_AS_NEW";
+
+/** Internal run-level state — only used by the run detail view (strand.runs). */
+export type RunState =
+    | "PENDING" // run queued, no worker yet
+    | "RUNNING" // worker is executing this activation
+    | "SLEEPING" // suspended on a timer
+    | "WAITING" // suspended waiting for activity/event
+    | "PAUSED"
+    | "COMPLETED"
+    | "FAILED"
+    | "CANCELLED"
+    | "CONTINUED_AS_NEW";
+
+/** @deprecated Use TaskStatus for task-level state, RunState for run-level state. */
+export type TaskState = TaskStatus;
 
 // ─── Queue ─────────────────────────────────────────────────────────────────
 
@@ -60,7 +75,7 @@ export interface TaskSummary {
     id: string;
     name: string;
     queue: string;
-    state: TaskState;
+    state: TaskStatus;
     attempt: number;
     createdAt: string;
     firstRunAt: string | null;
@@ -84,7 +99,7 @@ export interface TaskDetail {
     name: string;
     queue: string;
     params: string; // raw JSON string
-    state: TaskState;
+    state: TaskStatus;
     attempt: number;
     maxAttempts: number | null;
     createdAt: string;
@@ -117,7 +132,8 @@ export interface CursorPage<T> {
 export interface Run {
     id: string;
     attempt: number;
-    state: TaskState;
+    /** Internal run-level state — SLEEPING/WAITING remain visible for debugging. */
+    state: RunState;
     workerID: string | null;
     sdkVersion: string | null;
     startedAt: string | null;

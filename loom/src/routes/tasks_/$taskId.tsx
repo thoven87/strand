@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { usePageTitle } from "@/lib/usePageTitle";
 import {
     useQuery,
@@ -12,7 +12,13 @@ import {
     useParams,
     useSearch,
 } from "@tanstack/react-router";
-import { getTask, cancelTask, requeueTask, getChildTasks } from "@/api/tasks";
+import {
+    getTask,
+    cancelTask,
+    requeueTask,
+    getChildTasks,
+    getTaskTrace,
+} from "@/api/tasks";
 import { getEventTriggerForTask } from "@/api/events";
 import { getTaskMetrics, type TaskMetrics } from "@/api/metrics";
 import { RetryDialog } from "@/components/RetryDialog";
@@ -44,12 +50,12 @@ import {
     XCircle,
     ArrowUpRight,
     Send,
-    GitBranch,
     Zap,
 } from "lucide-react";
 import { TriggerDialog } from "@/components/TriggerDialog";
 import type { Checkpoint, Run, TaskState, HistoryEvent } from "@/api/types";
 import { fmtDuration } from "@/lib/utils";
+import { TraceTree } from "@/components/TraceTree";
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1027,12 +1033,22 @@ export function TaskDetailPage() {
         queue?: string;
         prevId?: string;
         nextId?: string;
+        tab?: string;
     };
     const queue = search.queue ?? "";
     const prevId = search.prevId;
     const nextId = search.nextId;
     const qc = useQueryClient();
     const { intervalMs, setIntervalMs } = useAutoRefresh();
+    const navigate = useNavigate();
+    const activeTab = search.tab ?? "overview";
+    const setTab = (tab: string) => {
+        void navigate({
+            to: "/$namespace/tasks/$taskId",
+            params: { namespace, taskId },
+            search: (prev) => ({ ...prev, tab }),
+        });
+    };
 
     const {
         data: task,
@@ -1087,6 +1103,20 @@ export function TaskDetailPage() {
         refetchInterval: 15_000,
     });
 
+    const { data: traceSpans, isLoading: traceLoading } = useQuery({
+        queryKey: qk.tasks.trace(namespace, taskId),
+        queryFn: () => getTaskTrace(namespace, taskId),
+        enabled: activeTab === "trace",
+        // While the task is active: poll at 3s when spans are live, otherwise at
+        // the user interval. When terminal: stop — a one-shot refetch (below)
+        // settles any stale RUNNING bars the moment the task completes.
+        refetchInterval: (q) => {
+            if (task && isTerminal(task.state)) return false;
+            const hasLive = q.state.data?.some((s) => s.isLive);
+            return hasLive ? Math.min(intervalMs || 3_000, 3_000) : intervalMs;
+        },
+    });
+
     const [runsOpen, setRunsOpen] = useState(false);
     const [stateOpen, setStateOpen] = useState(false);
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
@@ -1126,8 +1156,6 @@ export function TaskDetailPage() {
         },
     });
 
-    const navigate = useNavigate();
-
     const requeueMutation = useMutation({
         mutationFn: (opts: RetryOptions) =>
             requeueTask(namespace, queue, taskId, opts),
@@ -1153,6 +1181,18 @@ export function TaskDetailPage() {
         },
     });
 
+    // One-shot: the moment the task turns terminal, fire a final trace refetch
+    // so stale RUNNING bars settle without waiting for the next poll cycle.
+    // Must be before any early return to satisfy Rules of Hooks.
+    useEffect(() => {
+        if (task && isTerminal(task.state) && activeTab === "trace") {
+            void qc.refetchQueries({
+                queryKey: qk.tasks.trace(namespace, taskId),
+            });
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [task?.state]);
+
     if (isLoading)
         return (
             <div className="px-6 py-6">
@@ -1168,6 +1208,7 @@ export function TaskDetailPage() {
         );
 
     const terminal = isTerminal(task.state);
+
     // Use firstRunAt (when a worker first picked this task up) as the start
     // of the duration clock. Falling back to createdAt is only correct for
     // brand-new tasks that have never been queued; for retried tasks it would
@@ -1243,7 +1284,15 @@ export function TaskDetailPage() {
 
                     {/* ID + Queue + Parent */}
                     <div className="flex items-center gap-2 mt-1 flex-wrap text-xs text-muted-foreground font-mono">
-                        <span className="select-all">{task.id}</span>
+                        {task.workflowId && (
+                            <>
+                                <span className="select-all">
+                                    {task.workflowId}
+                                </span>
+                                <span>·</span>
+                            </>
+                        )}
+                        <span className="select-all opacity-50">{task.id}</span>
                         <span>·</span>
                         <span>{task.queue}</span>
                         {task.parentTaskId && (
@@ -1266,36 +1315,58 @@ export function TaskDetailPage() {
                     </div>
 
                     {/* Timing strip */}
-                    <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground flex-wrap">
-                        {durationMs !== null ? (
-                            <span className="text-foreground font-medium">
-                                {fmtDuration(durationMs)}
+                    <div className="flex items-center gap-3 mt-2 text-xs flex-wrap">
+                        {(durationMs !== null ||
+                            (!terminal && task.firstRunAt)) && (
+                            <span className="flex items-center gap-1">
+                                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
+                                    Run Time
+                                </span>
+                                {durationMs !== null ? (
+                                    <span className="text-foreground font-medium tabular-nums">
+                                        {fmtDuration(durationMs)}
+                                    </span>
+                                ) : (
+                                    <LiveTimer
+                                        startIso={task.firstRunAt!}
+                                        className="text-foreground font-medium tabular-nums"
+                                    />
+                                )}
                             </span>
-                        ) : !terminal && task.firstRunAt ? (
-                            <LiveTimer
-                                startIso={task.firstRunAt}
-                                className="text-foreground font-medium tabular-nums"
-                            />
-                        ) : null}
-                        <span>
-                            Created <RelativeTime iso={task.createdAt} />
+                        )}
+                        <span className="flex items-center gap-1 text-muted-foreground">
+                            <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
+                                Created
+                            </span>
+                            <RelativeTime iso={task.createdAt} />
                         </span>
                         {task.firstRunAt && (
-                            <span>
-                                Started <RelativeTime iso={task.firstRunAt} />
+                            <span className="flex items-center gap-1 text-muted-foreground">
+                                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
+                                    Started
+                                </span>
+                                <RelativeTime iso={task.firstRunAt} />
                             </span>
                         )}
                         {task.completedAt && (
-                            <span>
-                                Finished <RelativeTime iso={task.completedAt} />
+                            <span className="flex items-center gap-1 text-muted-foreground">
+                                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
+                                    Finished
+                                </span>
+                                <RelativeTime iso={task.completedAt} />
                             </span>
                         )}
                         {task.attempt > 1 && (
-                            <span>
-                                Attempt {task.attempt}
-                                {task.maxAttempts
-                                    ? ` / ${task.maxAttempts}`
-                                    : ""}
+                            <span className="flex items-center gap-1 text-muted-foreground">
+                                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
+                                    Attempt
+                                </span>
+                                <span>
+                                    {task.attempt}
+                                    {task.maxAttempts
+                                        ? ` / ${task.maxAttempts}`
+                                        : ""}
+                                </span>
                             </span>
                         )}
                     </div>
@@ -1307,17 +1378,7 @@ export function TaskDetailPage() {
                         intervalMs={intervalMs}
                         setIntervalMs={setIntervalMs}
                     />
-                    {isWorkflow && (
-                        <Link
-                            to="/$namespace/tasks/$taskId/trace"
-                            params={{ namespace, taskId }}
-                            search={queue ? { queue } : {}}
-                            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/40 transition-colors"
-                        >
-                            <GitBranch size={12} />
-                            View Trace
-                        </Link>
-                    )}
+
                     {!terminal && isWorkflow && (
                         <Button
                             variant="outline"
@@ -1378,302 +1439,409 @@ export function TaskDetailPage() {
                 </div>
             </div>
 
-            {/* ── Description card (full width, below header, if set) ─────────── */}
-            {task.description && (
-                <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3">
-                    <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-1">
-                        Description
-                    </p>
-                    <p className="text-sm text-foreground">
-                        {task.description}
-                    </p>
-                </div>
-            )}
-
-            {/* ── Schedule card (full width, below header) ────────────────────── */}
-            {task.scheduling && <ScheduleCard scheduling={task.scheduling} />}
-
-            {/* Performance metrics — sourced from DDSketch broadcast */}
-            {taskMetrics &&
-                (taskMetrics.p50Ms != null ||
-                    taskMetrics.completedCount > 0) && (
-                    <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3">
-                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-2.5">
-                            Performance
-                        </p>
-                        <div className="flex flex-wrap gap-x-6 gap-y-1.5">
-                            {taskMetrics.p50Ms != null && (
-                                <div>
-                                    <span className="text-[10px] text-muted-foreground">
-                                        p50{" "}
-                                    </span>
-                                    <span className="font-mono text-[11px] text-foreground">
-                                        {taskMetrics.p50Ms < 1000
-                                            ? `${Math.round(taskMetrics.p50Ms)}ms`
-                                            : `${(taskMetrics.p50Ms / 1000).toFixed(1)}s`}
-                                    </span>
-                                </div>
-                            )}
-                            {taskMetrics.p95Ms != null && (
-                                <div>
-                                    <span className="text-[10px] text-muted-foreground">
-                                        p95{" "}
-                                    </span>
-                                    <span className="font-mono text-[11px] text-foreground">
-                                        {taskMetrics.p95Ms < 1000
-                                            ? `${Math.round(taskMetrics.p95Ms)}ms`
-                                            : `${(taskMetrics.p95Ms / 1000).toFixed(1)}s`}
-                                    </span>
-                                </div>
-                            )}
-                            {taskMetrics.p99Ms != null && (
-                                <div>
-                                    <span className="text-[10px] text-muted-foreground">
-                                        p99{" "}
-                                    </span>
-                                    <span className="font-mono text-[11px] text-foreground">
-                                        {taskMetrics.p99Ms < 1000
-                                            ? `${Math.round(taskMetrics.p99Ms)}ms`
-                                            : `${(taskMetrics.p99Ms / 1000).toFixed(1)}s`}
-                                    </span>
-                                </div>
-                            )}
-                            {taskMetrics.ratePerSec != null && (
-                                <div>
-                                    <span className="text-[10px] text-muted-foreground">
-                                        rate{" "}
-                                    </span>
-                                    <span className="font-mono text-[11px] text-foreground">
-                                        {taskMetrics.ratePerSec.toFixed(2)}/s
-                                    </span>
-                                </div>
-                            )}
-                            {taskMetrics.completedCount > 0 && (
-                                <div>
-                                    <span className="text-[10px] text-muted-foreground">
-                                        ok{" "}
-                                    </span>
-                                    <span className="font-mono text-[11px] text-green-400">
-                                        {taskMetrics.completedCount}
-                                    </span>
-                                </div>
-                            )}
-                            {taskMetrics.failedCount > 0 && (
-                                <div>
-                                    <span className="text-[10px] text-muted-foreground">
-                                        fail{" "}
-                                    </span>
-                                    <span className="font-mono text-[11px] text-red-400">
-                                        {taskMetrics.failedCount}
-                                    </span>
-                                </div>
-                            )}
-                        </div>
-                        <p className="text-[9px] text-muted-foreground/40 mt-2">
-                            From broadcast window · refreshes every 30s
-                        </p>
-                    </div>
-                )}
-
-            {/* ── Woken by event card ─────────────────────────────── */}
-            {eventTrigger && (
-                <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3 flex items-center gap-3">
-                    <div className="w-2 h-2 rounded-full bg-purple-400 shrink-0" />
-                    <div className="flex-1 min-w-0">
-                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-0.5">
-                            Woken by event
-                        </p>
-                        <div className="flex items-center gap-2 flex-wrap">
-                            <span className="font-mono text-sm text-foreground">
-                                {eventTrigger.eventName}
-                            </span>
-                            <span className="text-xs text-muted-foreground">
-                                in{" "}
-                                <span className="font-mono">
-                                    {eventTrigger.queue}
-                                </span>
-                            </span>
-                            <RelativeTime iso={eventTrigger.triggeredAt} />
-                        </div>
-                        {eventTrigger.emissionId && (
-                            <p className="font-mono text-[10px] text-muted-foreground/50 mt-0.5 select-all">
-                                {eventTrigger.emissionId}
-                            </p>
-                        )}
-                    </div>
-                    {eventTrigger.emissionId && (
-                        <Link
-                            to="/$namespace/events"
-                            params={{ namespace }}
-                            className="text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0"
-                        >
-                            View emission →
-                        </Link>
-                    )}
-                </div>
-            )}
-
-            {/* ── Input / Output ───────────────────────────────────────── */}
-            <div className="grid md:grid-cols-2 gap-3">
-                <div className="rounded-lg border border-border bg-card/40 p-4">
-                    <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
-                        Input
-                    </p>
-                    <JsonView value={task.params} />
-                </div>
-                <div className="rounded-lg border border-border bg-card/40 p-4">
-                    <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
-                        {task.state === "FAILED" ? "Error" : "Output"}
-                    </p>
-                    {/* For failed tasks task.result is null — pull failure reason from the
-              latest run instead (most recent attempt first from the API). */}
-                    {task.state === "FAILED" && !task.result ? (
-                        (() => {
-                            const latestFailure = runs.find(
-                                (r) => r.failureReason,
-                            )?.failureReason;
-                            return latestFailure ? (
-                                <FailureReasonView raw={latestFailure} />
-                            ) : (
-                                <p className="text-xs text-muted-foreground/50 italic">
-                                    No error detail available.
-                                </p>
-                            );
-                        })()
-                    ) : (
-                        <JsonView value={task.result} />
-                    )}
-                </div>
+            {/* ── Tab bar ──────────────────────────────────────────────────────── */}
+            <div className="flex items-center gap-6 border-b border-border/50">
+                {(isWorkflow
+                    ? (["overview", "trace", "logs"] as const)
+                    : (["overview", "logs"] as const)
+                ).map((t) => (
+                    <button
+                        key={t}
+                        onClick={() => setTab(t)}
+                        className={`py-2.5 text-xs font-medium capitalize transition-colors border-b-2 -mb-px ${
+                            activeTab === t
+                                ? "text-foreground border-brand"
+                                : "text-muted-foreground border-transparent hover:text-foreground hover:border-border"
+                        }`}
+                    >
+                        {t === "trace"
+                            ? "Traces"
+                            : t === "logs"
+                              ? "Logs"
+                              : "Overview"}
+                    </button>
+                ))}
             </div>
 
-            {/* ── Run Timeline (workflows only) ──────────────────────────── */}
-            {isWorkflow && (
-                <section>
-                    <h2 className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
-                        Run Timeline
-                    </h2>
-                    <div className="rounded-lg border border-border bg-card/40 p-4">
-                        <ActivityTimeline
+            {activeTab === "overview" && (
+                <div className="space-y-4">
+                    {/* ── Description card (full width, below header, if set) ─────────── */}
+                    {task.description && (
+                        <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3">
+                            <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-1">
+                                Description
+                            </p>
+                            <p className="text-sm text-foreground">
+                                {task.description}
+                            </p>
+                        </div>
+                    )}
+
+                    {/* ── Schedule card (full width, below header) ────────────────────── */}
+                    {task.scheduling && (
+                        <ScheduleCard scheduling={task.scheduling} />
+                    )}
+
+                    {/* Performance metrics — sourced from DDSketch broadcast */}
+                    {taskMetrics &&
+                        (taskMetrics.p50Ms != null ||
+                            taskMetrics.completedCount > 0) && (
+                            <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3">
+                                <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-2.5">
+                                    Performance
+                                </p>
+                                <div className="flex flex-wrap gap-x-6 gap-y-1.5">
+                                    {taskMetrics.p50Ms != null && (
+                                        <div>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                p50{" "}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-foreground">
+                                                {taskMetrics.p50Ms < 1000
+                                                    ? `${Math.round(taskMetrics.p50Ms)}ms`
+                                                    : `${(taskMetrics.p50Ms / 1000).toFixed(1)}s`}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {taskMetrics.p95Ms != null && (
+                                        <div>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                p95{" "}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-foreground">
+                                                {taskMetrics.p95Ms < 1000
+                                                    ? `${Math.round(taskMetrics.p95Ms)}ms`
+                                                    : `${(taskMetrics.p95Ms / 1000).toFixed(1)}s`}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {taskMetrics.p99Ms != null && (
+                                        <div>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                p99{" "}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-foreground">
+                                                {taskMetrics.p99Ms < 1000
+                                                    ? `${Math.round(taskMetrics.p99Ms)}ms`
+                                                    : `${(taskMetrics.p99Ms / 1000).toFixed(1)}s`}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {taskMetrics.ratePerSec != null && (
+                                        <div>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                rate{" "}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-foreground">
+                                                {taskMetrics.ratePerSec.toFixed(
+                                                    2,
+                                                )}
+                                                /s
+                                            </span>
+                                        </div>
+                                    )}
+                                    {taskMetrics.completedCount > 0 && (
+                                        <div>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                ok{" "}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-green-400">
+                                                {taskMetrics.completedCount}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {taskMetrics.failedCount > 0 && (
+                                        <div>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                fail{" "}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-red-400">
+                                                {taskMetrics.failedCount}
+                                            </span>
+                                        </div>
+                                    )}
+                                </div>
+                                <p className="text-[9px] text-muted-foreground/40 mt-2">
+                                    From broadcast window · refreshes every 30s
+                                </p>
+                            </div>
+                        )}
+
+                    {/* ── Woken by event card ─────────────────────────────── */}
+                    {eventTrigger && (
+                        <div className="rounded-lg border border-border/60 bg-secondary/10 px-4 py-3 flex items-center gap-3">
+                            <div className="w-2 h-2 rounded-full bg-purple-400 shrink-0" />
+                            <div className="flex-1 min-w-0">
+                                <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-0.5">
+                                    Woken by event
+                                </p>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="font-mono text-sm text-foreground">
+                                        {eventTrigger.eventName}
+                                    </span>
+                                    <span className="text-xs text-muted-foreground">
+                                        in{" "}
+                                        <span className="font-mono">
+                                            {eventTrigger.queue}
+                                        </span>
+                                    </span>
+                                    <RelativeTime
+                                        iso={eventTrigger.triggeredAt}
+                                    />
+                                </div>
+                                {eventTrigger.emissionId && (
+                                    <p className="font-mono text-[10px] text-muted-foreground/50 mt-0.5 select-all">
+                                        {eventTrigger.emissionId}
+                                    </p>
+                                )}
+                            </div>
+                            {eventTrigger.emissionId && (
+                                <Link
+                                    to="/$namespace/events"
+                                    params={{ namespace }}
+                                    className="text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                                >
+                                    View emission →
+                                </Link>
+                            )}
+                        </div>
+                    )}
+
+                    {/* ── Input / Output ───────────────────────────────────────── */}
+                    <div className="grid md:grid-cols-2 gap-3">
+                        <div className="rounded-lg border border-border bg-card/40 p-4">
+                            <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
+                                Input
+                            </p>
+                            <JsonView value={task.params} />
+                        </div>
+                        <div className="rounded-lg border border-border bg-card/40 p-4">
+                            <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
+                                {task.state === "FAILED" ? "Error" : "Output"}
+                            </p>
+                            {/* For failed tasks task.result is null — pull failure reason from the
+              latest run instead (most recent attempt first from the API). */}
+                            {task.state === "FAILED" && !task.result ? (
+                                (() => {
+                                    const latestFailure = runs.find(
+                                        (r) => r.failureReason,
+                                    )?.failureReason;
+                                    return latestFailure ? (
+                                        <FailureReasonView
+                                            raw={latestFailure}
+                                        />
+                                    ) : (
+                                        <p className="text-xs text-muted-foreground/50 italic">
+                                            No error detail available.
+                                        </p>
+                                    );
+                                })()
+                            ) : (
+                                <JsonView value={task.result} />
+                            )}
+                        </div>
+                    </div>
+
+                    {/* ── Run Timeline (workflows only) ──────────────────────────── */}
+                    {isWorkflow && (
+                        <section>
+                            <h2 className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
+                                Run Timeline
+                            </h2>
+                            <div className="rounded-lg border border-border bg-card/40 p-4">
+                                <ActivityTimeline
+                                    namespace={namespace}
+                                    queue={queue}
+                                    taskId={taskId}
+                                    taskCreatedAt={task.createdAt}
+                                />
+                            </div>
+                        </section>
+                    )}
+
+                    {/* ── Child Activities ─────────────────────────────────────────── */}
+                    {isWorkflow && (
+                        <ChildActivities
                             namespace={namespace}
                             queue={queue}
                             taskId={taskId}
-                            taskCreatedAt={task.createdAt}
-                        />
-                    </div>
-                </section>
-            )}
-
-            {/* ── Child Activities ─────────────────────────────────────────── */}
-            {isWorkflow && (
-                <ChildActivities
-                    namespace={namespace}
-                    queue={queue}
-                    taskId={taskId}
-                    parentCreatedAt={task.createdAt}
-                    parentCompletedAt={task.completedAt}
-                />
-            )}
-
-            {/* ── Runs / Checkpoints (collapsible, secondary) ──────────────── */}
-            <div className="rounded-lg border border-border bg-card/40 overflow-hidden">
-                <button
-                    onClick={() => setRunsOpen((o) => !o)}
-                    className="flex w-full items-center gap-2.5 px-4 py-3 text-left hover:bg-secondary/20 transition-colors"
-                >
-                    {runsOpen ? (
-                        <ChevronDown
-                            size={13}
-                            className="text-muted-foreground shrink-0"
-                        />
-                    ) : (
-                        <ChevronRight
-                            size={13}
-                            className="text-muted-foreground shrink-0"
+                            parentCreatedAt={task.createdAt}
+                            parentCompletedAt={task.completedAt}
                         />
                     )}
-                    <span className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground">
-                        Runs &amp; Checkpoints ({runs.length})
-                    </span>
-                </button>
-                {runsOpen && (
-                    <div className="border-t border-border/50 p-3 space-y-2">
-                        {runsLoading && runs.length === 0 ? (
-                            [0, 1, 2].map((i) => (
-                                <div
-                                    key={i}
-                                    className="rounded border border-border/60 overflow-hidden"
-                                >
-                                    <div className="flex items-center gap-2.5 px-3 py-2">
-                                        <div className="h-3 w-3 rounded bg-muted/40 animate-pulse shrink-0" />
+
+                    {/* ── Runs / Checkpoints (collapsible, secondary) ──────────────── */}
+                    <div className="rounded-lg border border-border bg-card/40 overflow-hidden">
+                        <button
+                            onClick={() => setRunsOpen((o) => !o)}
+                            className="flex w-full items-center gap-2.5 px-4 py-3 text-left hover:bg-secondary/20 transition-colors"
+                        >
+                            {runsOpen ? (
+                                <ChevronDown
+                                    size={13}
+                                    className="text-muted-foreground shrink-0"
+                                />
+                            ) : (
+                                <ChevronRight
+                                    size={13}
+                                    className="text-muted-foreground shrink-0"
+                                />
+                            )}
+                            <span className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground">
+                                Runs &amp; Checkpoints ({runs.length})
+                            </span>
+                        </button>
+                        {runsOpen && (
+                            <div className="border-t border-border/50 p-3 space-y-2">
+                                {runsLoading && runs.length === 0 ? (
+                                    [0, 1, 2].map((i) => (
                                         <div
-                                            className="h-3 rounded bg-muted/40 animate-pulse"
-                                            style={{ width: "80px" }}
-                                        />
-                                        <div
-                                            className="h-5 rounded bg-muted/40 animate-pulse"
-                                            style={{ width: `${60 + i * 20}%` }}
-                                        />
-                                    </div>
-                                </div>
-                            ))
-                        ) : (
-                            <>
-                                {runs.length === 0 && (
-                                    <p className="text-sm text-muted-foreground">
-                                        No runs yet.
-                                    </p>
+                                            key={i}
+                                            className="rounded border border-border/60 overflow-hidden"
+                                        >
+                                            <div className="flex items-center gap-2.5 px-3 py-2">
+                                                <div className="h-3 w-3 rounded bg-muted/40 animate-pulse shrink-0" />
+                                                <div
+                                                    className="h-3 rounded bg-muted/40 animate-pulse"
+                                                    style={{ width: "80px" }}
+                                                />
+                                                <div
+                                                    className="h-5 rounded bg-muted/40 animate-pulse"
+                                                    style={{
+                                                        width: `${60 + i * 20}%`,
+                                                    }}
+                                                />
+                                            </div>
+                                        </div>
+                                    ))
+                                ) : (
+                                    <>
+                                        {runs.length === 0 && (
+                                            <p className="text-sm text-muted-foreground">
+                                                No runs yet.
+                                            </p>
+                                        )}
+                                        {[...runs].reverse().map((run) => (
+                                            <RunRow
+                                                key={run.id}
+                                                namespace={namespace}
+                                                run={run}
+                                                queue={queue}
+                                                taskId={taskId}
+                                            />
+                                        ))}
+                                    </>
                                 )}
-                                {[...runs].reverse().map((run) => (
-                                    <RunRow
-                                        key={run.id}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* ── Version Gates ───────────────────────────────────────────── */}
+                    {isWorkflow && versionMarkers.length > 0 && (
+                        <VersionMarkersPanel markers={versionMarkers} />
+                    )}
+
+                    {/* ── Workflow State (collapsible, secondary) ───────────────────── */}
+                    {isWorkflow && (
+                        <div className="rounded-lg border border-border bg-card/40 overflow-hidden">
+                            <button
+                                onClick={() => setStateOpen((o) => !o)}
+                                className="flex w-full items-center gap-2.5 px-4 py-3 text-left hover:bg-secondary/20 transition-colors"
+                            >
+                                {stateOpen ? (
+                                    <ChevronDown
+                                        size={13}
+                                        className="text-muted-foreground shrink-0"
+                                    />
+                                ) : (
+                                    <ChevronRight
+                                        size={13}
+                                        className="text-muted-foreground shrink-0"
+                                    />
+                                )}
+                                <span className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground">
+                                    Workflow State
+                                </span>
+                            </button>
+                            {stateOpen && (
+                                <div className="border-t border-border/50 p-4">
+                                    <WorkflowStateView
                                         namespace={namespace}
-                                        run={run}
                                         queue={queue}
                                         taskId={taskId}
                                     />
-                                ))}
-                            </>
-                        )}
-                    </div>
-                )}
-            </div>
-
-            {/* ── Version Gates ───────────────────────────────────────────── */}
-            {isWorkflow && versionMarkers.length > 0 && (
-                <VersionMarkersPanel markers={versionMarkers} />
-            )}
-
-            {/* ── Workflow State (collapsible, secondary) ───────────────────── */}
-            {isWorkflow && (
-                <div className="rounded-lg border border-border bg-card/40 overflow-hidden">
-                    <button
-                        onClick={() => setStateOpen((o) => !o)}
-                        className="flex w-full items-center gap-2.5 px-4 py-3 text-left hover:bg-secondary/20 transition-colors"
-                    >
-                        {stateOpen ? (
-                            <ChevronDown
-                                size={13}
-                                className="text-muted-foreground shrink-0"
-                            />
-                        ) : (
-                            <ChevronRight
-                                size={13}
-                                className="text-muted-foreground shrink-0"
-                            />
-                        )}
-                        <span className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground">
-                            Workflow State
-                        </span>
-                    </button>
-                    {stateOpen && (
-                        <div className="border-t border-border/50 p-4">
-                            <WorkflowStateView
-                                namespace={namespace}
-                                queue={queue}
-                                taskId={taskId}
-                            />
+                                </div>
+                            )}
                         </div>
                     )}
+                </div>
+            )}
+
+            {activeTab === "trace" && (
+                <div className="mt-4">
+                    {traceLoading && !traceSpans && (
+                        <p className="text-sm text-muted-foreground">
+                            Loading trace…
+                        </p>
+                    )}
+                    {!traceLoading && traceSpans && traceSpans.length === 0 && (
+                        <p className="text-sm text-muted-foreground">
+                            No trace spans recorded for this task.
+                        </p>
+                    )}
+                    {traceSpans && traceSpans.length > 0 && (
+                        <TraceTree
+                            spans={traceSpans}
+                            totalMs={traceSpans[0].durationMs ?? 1_000}
+                            isLive={
+                                !terminal || traceSpans.some((s) => s.isLive)
+                            }
+                            traceStartEpochMs={
+                                task.createdAt
+                                    ? new Date(task.createdAt).getTime()
+                                    : undefined
+                            }
+                            onViewTask={(spanTaskId) =>
+                                void navigate({
+                                    to: "/$namespace/tasks/$taskId",
+                                    params: { namespace, taskId: spanTaskId },
+                                    search: queue ? { queue } : {},
+                                })
+                            }
+                            rootSummary={{
+                                name: task.name,
+                                state: task.state,
+                                createdAt: task.createdAt,
+                                startedAt: task.firstRunAt ?? undefined,
+                                completedAt: task.completedAt ?? undefined,
+                            }}
+                            onLoadSpanDetail={async (spanTaskId) => {
+                                try {
+                                    const t = await getTask(
+                                        namespace,
+                                        queue || "",
+                                        spanTaskId,
+                                    );
+                                    return {
+                                        input: t.params ?? null,
+                                        output: t.result ?? null,
+                                    };
+                                } catch {
+                                    return { input: null, output: null };
+                                }
+                            }}
+                            className="h-[calc(100vh-14rem)]"
+                        />
+                    )}
+                </div>
+            )}
+
+            {activeTab === "logs" && (
+                <div className="mt-4">
+                    <p className="text-sm text-muted-foreground">
+                        Stream chunk logs will appear here when streaming is
+                        enabled.
+                    </p>
                 </div>
             )}
 
