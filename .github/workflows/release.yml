@@ -75,7 +75,7 @@ jobs:
 
             # ── 4. Create the GitHub release ──────────────────────────────────
             - name: Create GitHub release
-              uses: softprops/action-gh-release@v3
+              uses: softprops/action-gh-release@v3.0.1
               with:
                   name: ${{ github.ref_name }}
                   prerelease: ${{ steps.meta.outputs.prerelease }}
