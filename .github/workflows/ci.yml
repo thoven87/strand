@@ -51,7 +51,7 @@ jobs:
                     POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.postgres-auth }} --set max_connections=1000
         steps:
             - name: Checkout
-              uses: actions/checkout@v7.0.0
+              uses: actions/checkout@v7.0.1
             - name: Install PostgreSQL client
               run: apt-get update -q && apt-get install -yq postgresql-client
             - name: Apply schema
