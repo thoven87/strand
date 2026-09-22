@@ -109,9 +109,16 @@ final class _WorkflowTaskCache<W: Workflow>: Sendable {
     func cancelAll() {
         _mutex.withLock { states in
             for (_, state) in states {
-                state.activation.stateMachine.cancelPending()
-                state.executor.drain()
+                // Cancel the handler Task first (cooperative-cancellation signal).
                 state.task.cancel()
+                // Route cancelPending() through the serial executor so it cannot
+                // race with an active drain loop mutating the same state machine.
+                // Task(executorPreference:) enqueues the job synchronously;
+                // drain() then runs it or the running drain's recheck picks it up.
+                Task(executorPreference: state.executor) {
+                    state.activation.stateMachine.cancelPending()
+                }
+                state.executor.drain()
             }
             states.removeAll()
         }
@@ -133,9 +140,17 @@ final class _WorkflowTaskCache<W: Workflow>: Sendable {
             return states[taskID]
         }
         guard let cached else { return }
-        cached.activation.stateMachine.cancelPending()
-        cached.executor.drain()
+        // Cancel the handler Task first (cooperative-cancellation signal).
         cached.task.cancel()
+        // Route cancelPending() through the serial executor so it cannot race
+        // with an active drain loop that is currently mutating the same state
+        // machine.  Task(executorPreference:) enqueues the job synchronously;
+        // drain() then runs it — or the running drain's release-and-recheck
+        // loop picks it up after the current pass finishes.
+        Task(executorPreference: cached.executor) {
+            cached.activation.stateMachine.cancelPending()
+        }
+        cached.executor.drain()
     }
 }
 
