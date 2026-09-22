@@ -1,5 +1,6 @@
 import Logging
 import NIOCore
+import PostgresNIO  // PostgresClient and query types used in the metrics broadcast loop
 public import ServiceLifecycle
 
 #if canImport(FoundationEssentials)

@@ -82,6 +82,25 @@ enum Queries {
         }
     }
 
+    /// Registers multiple queues in one round-trip using unnest.
+    /// Idempotent — existing queues are silently ignored.
+    static func createQueuesBatch(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        names: [String],
+        logger: Logger
+    ) async throws {
+        guard !names.isEmpty else { return }
+        try await conn.query(
+            """
+            INSERT INTO strand.queues (namespace_id, name)
+            SELECT \(namespaceID), unnest(\(names)::text[])
+            ON CONFLICT (namespace_id, name) DO NOTHING
+            """,
+            logger: logger
+        )
+    }
+
     static func dropQueue(
         on client: PostgresClient,
         namespaceID: String,
@@ -684,12 +703,9 @@ enum Queries {
         guard !children.isEmpty else { return [] }
 
         return try await client.withTransaction(logger: logger) { conn in
-            // ── 1. Register all distinct child queues ────────────────────────────────
-            var seenQueues: Set<String> = []
-            for child in children {
-                guard seenQueues.insert(child.queue).inserted else { continue }
-                try await createQueue(on: conn, namespaceID: namespaceID, name: child.queue, logger: logger)
-            }
+            // ── 1. Register all distinct child queues (+ parent queue) — one round-trip ──
+            let distinctQueues = Array(Set(children.map { $0.queue }).union([parentQueue]))
+            try await createQueuesBatch(on: conn, namespaceID: namespaceID, names: distinctQueues, logger: logger)
 
             // ── 2. Insert all task rows — one multi-row VALUES statement ──────────────
             // Built via PostgresQuery.StringInterpolation so every field, including
@@ -989,8 +1005,9 @@ enum Queries {
     // MARK: - Worker
 
     /// Claims up to `qty` runs from `queue` atomically using `FOR UPDATE SKIP LOCKED`.
+    /// Connection overload — SQL lives here; used inside shared-connection poll cycles.
     static func claimTasks(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         namespaceID: String,
         queue: String,
         workerID: String,
@@ -998,7 +1015,7 @@ enum Queries {
         qty: Int,
         logger: Logger
     ) async throws -> [ClaimedTask] {
-        let stream = try await client.query(
+        let stream = try await conn.query(
             """
             WITH
             -- Ensure the sketch row exists for this (namespace, queue) pair.
@@ -1148,6 +1165,29 @@ enum Queries {
         var tasks: [ClaimedTask] = []
         for try await row in stream { tasks.append(try ClaimedTask(row: row)) }
         return tasks
+    }
+
+    /// Pool-level overload — acquires a connection then delegates to the connection overload.
+    static func claimTasks(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        workerID: String,
+        claimTimeoutSeconds: Int,
+        qty: Int,
+        logger: Logger
+    ) async throws -> [ClaimedTask] {
+        try await client.withConnection { conn in
+            try await claimTasks(
+                on: conn,
+                namespaceID: namespaceID,
+                queue: queue,
+                workerID: workerID,
+                claimTimeoutSeconds: claimTimeoutSeconds,
+                qty: qty,
+                logger: logger
+            )
+        }
     }
 
     /// Marks a run as completed with optimistic concurrency (version CAS).
@@ -2081,7 +2121,10 @@ enum Queries {
         )
     }
 
-    /// Client overload — delegates to the connection overload; also extends the claim lease when requested.
+    /// Client overload — delegates to the connection overload; also extends the claim
+    /// lease when requested.  Both writes share a single connection checkout so that
+    /// the checkpoint INSERT and the lease extension are issued on the same connection,
+    /// halving the number of pool checkouts compared to the old two-call approach.
     static func setCheckpointState(
         on client: PostgresClient,
         namespaceID: String,
@@ -2104,15 +2147,15 @@ enum Queries {
                 runID: runID,
                 logger: logger
             )
-        }
-        if let secs = extendClaimBySeconds {
-            try await extendClaim(
-                on: client,
-                namespaceID: namespaceID,
-                runID: runID,
-                extendBySeconds: secs,
-                logger: logger
-            )
+            if let secs = extendClaimBySeconds {
+                try await extendClaim(
+                    on: conn,
+                    namespaceID: namespaceID,
+                    runID: runID,
+                    extendBySeconds: secs,
+                    logger: logger
+                )
+            }
         }
     }
 
@@ -3379,6 +3422,23 @@ enum Queries {
                 """,
                 logger: logger
             )
+            // Write-through to trace_spans — atomic with the task/run inserts so
+            // claimTasks can correctly set started_at on the same row.
+            // Without this, claimTasks' UPDATE on trace_spans finds no row (no-op)
+            // and the re-run task has no trace data.
+            try await TraceSpanQueries.upsertTaskSpan(
+                on: conn,
+                id: newTaskID.uuidString,
+                namespaceID: namespaceID,
+                taskID: newTaskID,
+                parentID: nil,
+                kind: kind == .workflow ? .workflow : .activity,
+                name: name,
+                state: .waiting,
+                maxAttempts: maxAttempts,
+                queuedAt: Date(),
+                logger: logger
+            )
             try await conn.notifyWorkers(namespace: namespaceID, queue: queue, logger: logger)
             return EnqueueRow(taskID: newTaskID, runID: newRunID, attempt: 1, created: true)
         }
@@ -3468,13 +3528,15 @@ enum Queries {
     ///      run WAITING with the flag still set.  This should be impossible under
     ///      normal row-locking semantics, but serves as defence-in-depth for any
     ///      edge case not yet anticipated.
+    /// Connection overload — SQL lives here; used inside the shared pollLoop connection.
     static func wakeCompletedWaiting(
-        on client: PostgresClient,
+        on conn: PostgresConnection,
         namespaceID: String,
         queue: String,
+        limit: Int = 500,
         logger: Logger
     ) async throws {
-        let stream = try await client.query(
+        let stream = try await conn.query(
             """
             WITH
             to_wake AS (
@@ -3500,7 +3562,7 @@ enum Queries {
                       )
                   )
                 ORDER BY r.id
-                LIMIT 50
+                LIMIT \(limit)
                 FOR UPDATE SKIP LOCKED
             ),
             woken AS (
@@ -3528,6 +3590,19 @@ enum Queries {
                 "woke \(count) WAITING run(s) with completed children",
                 metadata: ["strand.queue": .string(queue)]
             )
+        }
+    }
+
+    /// Pool-level overload — acquires a connection then delegates to the connection overload.
+    static func wakeCompletedWaiting(
+        on client: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        limit: Int = 500,
+        logger: Logger
+    ) async throws {
+        try await client.withConnection { conn in
+            try await wakeCompletedWaiting(on: conn, namespaceID: namespaceID, queue: queue, limit: limit, logger: logger)
         }
     }
 }

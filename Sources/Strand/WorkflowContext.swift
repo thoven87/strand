@@ -87,9 +87,11 @@ struct ConditionResultSentinel: Codable {
 ///
 /// - Important: Store the generator in a `var` — `next()` is `mutating`.
 public struct WorkflowRandomNumberGenerator: RandomNumberGenerator {
-    private let _next: @Sendable () -> UInt64
+    // Plain (non-Sendable) stored closure — evaluated exclusively on the
+    // serial workflow executor, never sent across isolation boundaries.
+    private let _next: () -> UInt64
 
-    init(_ next: @escaping @Sendable () -> UInt64) {
+    init(_ next: @escaping () -> UInt64) {
         self._next = next
     }
 
@@ -102,22 +104,28 @@ public struct WorkflowRandomNumberGenerator: RandomNumberGenerator {
 
 /// Holds all mutable per-activation state for a single workflow execution attempt.
 ///
-/// One instance is created per worker claim. The `WorkflowContext` struct holds a
-/// reference to this object and routes all API calls through it.
+/// One instance is created per worker claim.  `WorkflowContext` stores a reference
+/// to this object and routes all API calls through it.
 ///
 /// ## Why `final class` instead of `actor`
-/// A workflow activation is executed by exactly one async task at a time — the worker
+/// A workflow activation is owned by exactly one async task at a time — the worker
 /// claims a run, the handler executes to completion or suspension, then the run is
-/// There is no concurrent access to `checkpointCache`, `activationCounter`, or
-/// `watchdog` during a single activation. Using a `final class` instead of an `actor`
-/// eliminates unnecessary actor hops on every checkpoint/cache access, keeping the hot
-/// path synchronous and simple.
+/// released.  There is no concurrent access to any property during a single activation.
+/// Using a `final class` instead of an `actor` eliminates unnecessary actor hops on
+/// every checkpoint/cache access, keeping the hot path synchronous and simple.
 ///
-/// ## Why `@unchecked Sendable`
-/// `WorkflowContext<W>: Sendable` stores a reference to this object. The `@unchecked`
-/// is safe because the invariant above (single-task exclusive access) is enforced by
-/// the worker's claim mechanism — never by Swift's type system.
-final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
+/// ## `Sendable` via `nonisolated(unsafe)` properties
+/// Mutable `var` properties carry `nonisolated(unsafe)` rather than marking the
+/// whole type `@unchecked Sendable`.  This scopes the unsafety declaration to
+/// the exact properties that need it; every `let` property is straightforwardly
+/// `Sendable`.  The invariant that makes it safe:
+///
+/// - Every `nonisolated(unsafe)` var is read or written **only** from the worker's
+///   activation code (`_activate` / `resumeActivation`) or from inside a `drain()`
+///   call on the serial executor — never concurrently.
+/// - Instances are stored in `_WorkflowTaskCache` behind a `Mutex`, which serialises
+///   handoffs between activations.  Between handoffs exactly one task owns the reference.
+final class _WorkflowActivation<W: Workflow>: Sendable {
 
     // MARK: - Identity (set once in init, never mutated)
 
@@ -148,7 +156,8 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     /// Number of history events recorded before this activation started.
     /// Derived from `nextHistorySeq() - 1` at activation load time.
     /// Use `WorkflowContext.historyEventCount` to check this in a handler.
-    var historyEventCount: Int
+    // historyEventCount is mutated between activations to reflect accumulated history.
+    nonisolated(unsafe) var historyEventCount: Int
 
     // MARK: - Dependencies (set once in init, never mutated)
 
@@ -156,28 +165,32 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     let logger: Logger
     /// Deterministic serial executor used to drain the handler's job queue during activation.
     let executor: StrandWorkflowExecutor
+    /// All mutable workflow state: continuations, pending commands, preloaded results.
+    /// Extracted from `StrandWorkflowExecutor` as a `~Copyable` value so the compiler
+    /// prevents accidental copies. Accessed exclusively during/between drain() calls.
+    nonisolated(unsafe) var stateMachine: WorkflowStateMachine
     /// Heap-allocated workflow value shared between handler invocations and signal delivery.
     let stateBox: ArcBox<W>
 
     // MARK: - Mutable replay state
 
     /// Checkpoint values loaded at activation start. Keyed by seq_num (Int).
-    var checkpointCache: [Int: ByteBuffer]
+    nonisolated(unsafe) var checkpointCache: [Int: ByteBuffer]
     /// Names stored alongside each checkpoint, keyed by seq_num.
     /// Populated from DB rows at activation start; updated when new checkpoints are written.
     /// Used by fast-path-1 to detect non-determinism (wrong activity replaying a stale result).
-    var checkpointNameCache: [Int: String] = [:]
+    nonisolated(unsafe) var checkpointNameCache: [Int: String] = [:]
     /// Version gate values loaded at activation start from `strand.workflow_version_markers`.
     /// Keyed by changeID — version gates do not consume sequence numbers.
-    var versionMarkerCache: [String: Bool]
+    nonisolated(unsafe) var versionMarkerCache: [String: Bool]
     /// Monotonic activation counter — each context call produces a unique seq_num.
-    var activationCounter: ActivationCounter
+    nonisolated(unsafe) var activationCounter: ActivationCounter
 
     /// The `#fileID` and `#line` of the most recent `WorkflowContext` call (runActivity,
     /// sleep, waitForEvent, condition). Stamped onto the `FailureReason` when the
     /// handler throws — tells the dashboard which line in the workflow handler failed.
     /// Updated by WorkflowContext public functions; read by activate() on handler failure.
-    var lastCallSite: (fileID: String, line: Int)? = nil
+    nonisolated(unsafe) var lastCallSite: (fileID: String, line: Int)? = nil
 
     /// Set to `true` when `claimed.cancelRequested` is set at activation start.
     ///
@@ -187,7 +200,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
     /// The activation paths set this from `claimed.cancelRequested` and also call
     /// `handlerTask.cancel()` so that slow-path `try Task.checkCancellation()` gates
     /// in `runActivity`/`sleep`/`waitForEvent` throw natively inside the handler Task.
-    var isCancelRequested: Bool = false
+    nonisolated(unsafe) var isCancelRequested: Bool = false
 
     // MARK: - Init
 
@@ -206,6 +219,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         postgres: PostgresClient,
         logger: Logger,
         executor: StrandWorkflowExecutor,
+        stateMachine: consuming WorkflowStateMachine,
         stateBox: ArcBox<W>,
         checkpointCache: [Int: ByteBuffer],
         checkpointNameCache: [Int: String],
@@ -228,6 +242,7 @@ final class _WorkflowActivation<W: Workflow>: @unchecked Sendable {
         self.postgres = postgres
         self.logger = logger
         self.executor = executor
+        self.stateMachine = stateMachine
         self.stateBox = stateBox
         self.checkpointCache = checkpointCache
         self.checkpointNameCache = checkpointNameCache
@@ -538,7 +553,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             // Re-throw the stored error without emitting any command — exactly-once guard
             // that prevents ACTIVITY_FAILED from being written more than once on replay.
             if ActivityFailedSentinel.detect(in: cached) {
-                if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
+                if let nonSuccess = _impl.stateMachine.preloadedNonCompletion(for: seqNum) {
                     if let buf = nonSuccess.failureReason,
                         let af = ActivityFailure.decode(from: buf),
                         let typedErr = af.decode(A.Failure.self)
@@ -557,12 +572,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // ── Fast path 2a: activity terminated with FAILED or CANCELLED in a prior activation ───
-        if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
+        if let nonSuccess = _impl.stateMachine.preloadedNonCompletion(for: seqNum) {
             _impl.lastCallSite = (fileID, line)
             // Write a failure sentinel so the next fresh-path replay hits fast path 1 and
             // does not re-emit .activityCompleted — exactly-once ACTIVITY_FAILED history write.
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: ActivityFailedSentinel.encoded))
-            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: ActivityFailedSentinel.encoded))
+            _impl.stateMachine.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
             // Attempt to decode the original typed Failure value from the stored payload.
             // Falls back to ActivityError when Failure = Never or payload is absent.
             if let buf = nonSuccess.failureReason,
@@ -582,12 +597,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // ── Fast path 2: pre-loaded by executor (activity completed this activation) ────
         // The worker called executor.resolveCompleted(_:) before drain(), pre-populating
         // results for all child activities that already finished. No DB round-trip needed.
-        if let preloaded = _impl.executor.preloadedResult(for: seqNum) {
+        if let preloaded = _impl.stateMachine.preloadedResult(for: seqNum) {
             // Cache in memory so subsequent replay within this activation hits fast path 1.
             _impl.cacheCheckpoint(seqNum: seqNum, name: A.name, buffer: preloaded)
             // Emit a checkpoint write so the worker persists this result after drain.
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: preloaded))
-            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: preloaded))
+            _impl.stateMachine.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
             return try JSON.decode(A.Output.self, from: preloaded)
         }
 
@@ -601,7 +616,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // the workflow task UUID and call-site sequence number.
         let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
 
-        _impl.executor.emit(
+        _impl.stateMachine.emit(
             .scheduleActivity(
                 name: A.name,
                 input: inputBuffer,
@@ -616,21 +631,21 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // _ActivityFailureSignal (resumeActivityFailure) on re-activation.
         do {
             let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, Error>) in
-                _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
+                (cont: CheckedContinuation<ByteBuffer, any Error>) in
+                _impl.stateMachine.suspendActivity(seqNum: seqNum, continuation: cont)
             }
             // Continuation resumed — activity completed in this activation.
             // Write a checkpoint so fresh-path replays use fast path 1 without needing
             // task_completions. Emit .activityCompleted for the ACTIVITY_COMPLETED history event.
             _impl.cacheCheckpoint(seqNum: seqNum, name: A.name, buffer: resultBuffer)
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: resultBuffer))
-            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: resultBuffer))
+            _impl.stateMachine.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
             return try JSON.decode(A.Output.self, from: resultBuffer)
         } catch let signal as _ActivityFailureSignal {
             // Re-activation delivered a typed failure signal.
             // Write a failure sentinel so fresh-path replays hit fast path 1 (exactly-once guard).
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: ActivityFailedSentinel.encoded))
-            _impl.executor.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: ActivityFailedSentinel.encoded))
+            _impl.stateMachine.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: true))
             // Try to decode A.Failure from the stored payload.
             if let buf = signal.failureReason,
                 let af = ActivityFailure.decode(from: buf),
@@ -692,7 +707,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         let value = compute()
         let buf = try JSON.encode(value)
         _impl.checkpointCache[seqNum] = buf
-        _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: label, value: buf))
+        _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: label, value: buf))
         return value
     }
 
@@ -756,7 +771,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             // UInt64 is always Codable — force-unwrap is safe here.
             let buf = try! JSON.encode(value)
             _impl.checkpointCache[seqNum] = buf
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: "rng", value: buf))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: "rng", value: buf))
             return value
         }
     }
@@ -799,7 +814,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             // First time: persist the wake time so future replays use the same instant.
             let buf = try JSON.encode(wakeAt.timeIntervalSince1970)
             _impl.checkpointCache[seqNum] = buf
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: "sleep", value: buf))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: "sleep", value: buf))
             resolvedWakeAt = wakeAt
         }
 
@@ -807,23 +822,23 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         if Date.now >= resolvedWakeAt {
             let sentinel = try JSON.encode(SleepCompletedSentinel())
             _impl.checkpointCache[seqNum] = sentinel
-            _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: "sleep", value: sentinel))
-            _impl.executor.emit(.timerFired(seqNum: seqNum))
+            _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: "sleep", value: sentinel))
+            _impl.stateMachine.emit(.timerFired(seqNum: seqNum))
             return
         }
 
         // Slow path: timer not yet elapsed — suspend via continuation.
         // Guard: don't start new timers when cooperatively cancelled.
         try Task.checkCancellation()
-        _impl.executor.emit(.startTimer(wakeAt: resolvedWakeAt, seqNum: seqNum))
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            _impl.executor.suspendTimer(seqNum: seqNum, continuation: cont)
+        _impl.stateMachine.emit(.startTimer(wakeAt: resolvedWakeAt, seqNum: seqNum))
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+            _impl.stateMachine.suspendTimer(seqNum: seqNum, continuation: cont)
         }
         // Timer fired — write completion sentinel and record TIMER_FIRED.
         let sentinel = try JSON.encode(SleepCompletedSentinel())
         _impl.checkpointCache[seqNum] = sentinel
-        _impl.executor.emit(.writeCheckpoint(seqNum: seqNum, name: "sleep", value: sentinel))
-        _impl.executor.emit(.timerFired(seqNum: seqNum))
+        _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: "sleep", value: sentinel))
+        _impl.stateMachine.emit(.timerFired(seqNum: seqNum))
     }
 
     // MARK: - waitForEvent
@@ -922,15 +937,15 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         if _impl.wakeEvent == name {
             if let payload = _impl.eventPayload {
                 _impl.checkpointCache[seqNum] = payload
-                _impl.executor.emit(
+                _impl.stateMachine.emit(
                     .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: payload)
                 )
-                _impl.executor.emit(.eventReceived(eventName: name))
+                _impl.stateMachine.emit(.eventReceived(eventName: name))
                 return try JSON.decode(T.self, from: payload)
             } else {
                 // Woken by timeout — applyScheduleCommands writes the sentinel checkpoint
                 // and EVENT_WAIT_TIMED_OUT history row atomically via writeEventWaitTimedOut.
-                _impl.executor.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
+                _impl.stateMachine.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
                 return nil
             }
         }
@@ -943,7 +958,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
         let timeoutAt: Date? = timeout.map { Date.now.addingDuration($0) }
 
-        _impl.executor.emit(
+        _impl.stateMachine.emit(
             .awaitEvent(
                 eventName: name,
                 seqNum: seqNum,
@@ -959,12 +974,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         let resultBuffer: ByteBuffer
         do {
             resultBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, Error>) in
-                _impl.executor.suspendEvent(seqNum: seqNum, eventName: name, continuation: cont)
+                (cont: CheckedContinuation<ByteBuffer, any Error>) in
+                _impl.stateMachine.suspendEvent(seqNum: seqNum, eventName: name, continuation: cont)
             }
         } catch let err as StrandError {
             if case .timeout = err {
-                _impl.executor.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
+                _impl.stateMachine.emit(.eventWaitTimedOut(eventName: name, seqNum: seqNum))
                 return nil
             }
             throw err
@@ -974,10 +989,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // (a) crash-recovery fresh activations fast-path through this seqNum, and
         // (b) the trace view shows a complete WAIT span duration.
         _impl.checkpointCache[seqNum] = resultBuffer
-        _impl.executor.emit(
+        _impl.stateMachine.emit(
             .writeCheckpoint(seqNum: seqNum, name: "waitForEvent:\(name)", value: resultBuffer)
         )
-        _impl.executor.emit(.eventReceived(eventName: name))
+        _impl.stateMachine.emit(.eventReceived(eventName: name))
         return try JSON.decode(T.self, from: resultBuffer)
     }
 
@@ -1035,7 +1050,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     public func emitEvent(_ name: String, payload: some Codable & Sendable) throws {
         // JSON-encode synchronously — no await, no DB, no suspension.
         let buf = try JSON.encode(payload)
-        _impl.executor.emit(.emitEvent(name: name, payload: buf))
+        _impl.stateMachine.emit(.emitEvent(name: name, payload: buf))
     }
 
     // MARK: - condition
@@ -1065,12 +1080,16 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// ```
     ///
     /// - Parameter predicate: A closure that reads (not mutates) workflow state and
-    ///   returns `true` when the condition is satisfied. Must be `@Sendable`.
+    ///   returns `true` when the condition is satisfied.
     public func condition(_ predicate: @escaping @Sendable (W) -> Bool) async throws {
+        // `@escaping @Sendable` are required: the predicate is registered by the
+        // workflow handler Task and evaluated by the worker Task after `drain()` returns.
+        // These are different tasks crossing a task boundary, so `@Sendable` is needed.
+        //
         // Two-phase predicate registration:
         //
-        // 1. Register the predicate as a `() -> Bool` closure that reads `stateBox`
-        //    via `withValue`. The closure is stored WITHOUT being evaluated —
+        // 1. Register the predicate as a `@Sendable () -> Bool` closure that reads
+        //    `stateBox` via `withValue`. The closure is stored WITHOUT being evaluated —
         //    evaluation happens post-drain, after `run()` has suspended and no longer
         //    holds exclusive access on `stateBox.value`.
         //
@@ -1082,19 +1101,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         //    the continuation is resumed and the handler continues; if `false` the
         //    worker applies WAITING to the DB and the activation ends.
         let stateBox = _impl.stateBox
-        let id = _impl.executor.registerCondition {
+        let id = _impl.stateMachine.registerCondition {
             stateBox.withValue { predicate($0) }
         }
         // The no-timeout overload is always resumed with true (predicate satisfied);
         // we discard the Bool since there is no timeout path to return false.
-        _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
-            _impl.executor.linkConditionContinuation(cont, forID: id)
+        _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, any Error>) in
+            _impl.stateMachine.linkConditionContinuation(cont, forID: id)
         }
         // No seqNum / no completion sentinel — no-timeout conditions have no checkpoint
         // guard, so conditionMet may appear more than once in history across replays.
         // This is benign: ON CONFLICT DO NOTHING in appendHistory prevents duplicate rows
         // for the same seq, and executionHistorySpansForTrace uses only the first CONDITION_MET.
-        _impl.executor.emit(.conditionMet(seqNum: nil))
+        _impl.stateMachine.emit(.conditionMet(seqNum: nil))
     }
 
     /// Suspends the workflow until `predicate` evaluates `true` on current state,
@@ -1114,7 +1133,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///
     /// - Parameters:
     ///   - predicate: A closure that reads (not mutates) workflow state and
-    ///     returns `true` when the condition is satisfied. Must be `@Sendable`.
+    ///     returns `true` when the condition is satisfied.
     ///   - timeout: Maximum duration to wait. When elapsed, returns `false`.
     /// - Returns: `true` when the predicate was satisfied; `false` on timeout.
     @discardableResult
@@ -1122,6 +1141,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         _ predicate: @escaping @Sendable (W) -> Bool,
         timeout: Duration
     ) async throws -> Bool {
+        // `@escaping @Sendable` are required: the predicate is registered by the
+        // workflow handler Task and evaluated by the worker Task after `drain()` returns.
+        // These are different tasks crossing a task boundary, so `@Sendable` is needed.
+
         // Checkpoint the deadline once so it's stable across activations.
         let seqNum = _impl.nextSeqNum()
         let wakeAt: Date
@@ -1137,7 +1160,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             wakeAt = Date.now.addingDuration(timeout)
             let buf = try JSON.encode(wakeAt.timeIntervalSince1970)
             _impl.checkpointCache[seqNum] = buf
-            _impl.executor.emit(
+            _impl.stateMachine.emit(
                 .writeCheckpoint(seqNum: seqNum, name: "conditionDeadline", value: buf)
             )
         }
@@ -1147,26 +1170,26 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Emit conditionTimedOut so applyScheduleCommands writes the completion
         // sentinel and CONDITION_TIMED_OUT history row atomically.
         if Date.now >= wakeAt {
-            _impl.executor.emit(.conditionTimedOut(seqNum: seqNum))
+            _impl.stateMachine.emit(.conditionTimedOut(seqNum: seqNum))
             return false
         }
 
         // Same post-drain pattern as the no-timeout overload, with `wakeAt` attached
         // so the worker can apply SLEEPING (not WAITING) to the DB.
         let stateBox = _impl.stateBox
-        let id = _impl.executor.registerCondition(
+        let id = _impl.stateMachine.registerCondition(
             predicate: { stateBox.withValue { predicate($0) } },
             wakeAt: wakeAt,
             timeout: timeout
         )
-        let result = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
-            _impl.executor.linkConditionContinuation(cont, forID: id)
+        let result = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, any Error>) in
+            _impl.stateMachine.linkConditionContinuation(cont, forID: id)
         }
         // Record the result so applyScheduleCommands writes sentinel + history atomically.
         if result {
-            _impl.executor.emit(.conditionMet(seqNum: seqNum))
+            _impl.stateMachine.emit(.conditionMet(seqNum: seqNum))
         } else {
-            _impl.executor.emit(.conditionTimedOut(seqNum: seqNum))
+            _impl.stateMachine.emit(.conditionTimedOut(seqNum: seqNum))
         }
         return result
     }
@@ -1234,15 +1257,15 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Schedule for in-process execution post-drain.
         let inputBuffer = try JSON.encode(input)
-        let id = _impl.executor.scheduleLocalActivity(
+        let id = _impl.stateMachine.scheduleLocalActivity(
             name: A.name,
             input: inputBuffer,
             seqNum: seqNum,
             options: options
         )
         let result = try await withCheckedThrowingContinuation {
-            (cont: CheckedContinuation<ByteBuffer, Error>) in
-            _impl.executor.linkLocalActivityContinuation(cont, forID: id)
+            (cont: CheckedContinuation<ByteBuffer, any Error>) in
+            _impl.stateMachine.linkLocalActivityContinuation(cont, forID: id)
         }
         return try JSON.decode(A.Output.self, from: result)
     }
@@ -1294,7 +1317,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
         // First encounter: cache locally and emit command to write to DB.
         _impl.versionMarkerCache[changeID] = true
-        _impl.executor.emit(.recordVersionMarker(changeID: changeID, value: true))
+        _impl.stateMachine.emit(.recordVersionMarker(changeID: changeID, value: true))
         return true
     }
 
@@ -1326,19 +1349,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
 
         // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
-        if let nonSuccess = _impl.executor.preloadedNonCompletion(for: seqNum) {
+        if let nonSuccess = _impl.stateMachine.preloadedNonCompletion(for: seqNum) {
             throw WorkflowError(workflowName: CW.workflowName, state: nonSuccess.state.taskStatus)
         }
 
         // Fast path 2: pre-loaded result (child completed in a prior activation).
         // loadCompletedChildActivities covers child workflows too (same parent_task_id JOIN).
         // A checkpoint is written here so subsequent replays use fast path 1.
-        if let preloaded = _impl.executor.preloadedResult(for: seqNum) {
+        if let preloaded = _impl.stateMachine.preloadedResult(for: seqNum) {
             _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: preloaded)
-            _impl.executor.emit(
+            _impl.stateMachine.emit(
                 .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded)
             )
-            _impl.executor.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
+            _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
             return try JSON.decode(CW.Output.self, from: preloaded)
         }
 
@@ -1351,7 +1374,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // the worker injects parent context headers when enqueuing the child task.
 
         let childDeadlineAt: Date? = options.maxDuration.map { _impl.activationTime.addingDuration($0) }
-        _impl.executor.emit(
+        _impl.stateMachine.emit(
             .scheduleChildWorkflow(
                 name: CW.workflowName,
                 queue: options.queue,
@@ -1371,16 +1394,16 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         do {
             let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, Error>) in
-                _impl.executor.suspendActivity(seqNum: seqNum, continuation: cont)
+                (cont: CheckedContinuation<ByteBuffer, any Error>) in
+                _impl.stateMachine.suspendActivity(seqNum: seqNum, continuation: cont)
             }
             // Slow path: continuation resumed — child completed in this activation.
             // Write a checkpoint so replays use fast path 1.
             _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: resultBuffer)
-            _impl.executor.emit(
+            _impl.stateMachine.emit(
                 .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: resultBuffer)
             )
-            _impl.executor.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
+            _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
             return try JSON.decode(CW.Output.self, from: resultBuffer)
         } catch let signal as _ActivityFailureSignal {
             throw WorkflowError(workflowName: CW.workflowName, state: signal.state.taskStatus)

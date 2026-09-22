@@ -2,6 +2,7 @@ import DequeModule
 
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
+import Foundation  // CharacterSet (trimmingCharacters) not in FoundationEssentials on Linux
 #else
 public import Foundation
 #endif
@@ -20,13 +21,13 @@ public struct CronExpression: Sendable, CustomStringConvertible, Codable {
 
     // MARK: - Codable Implementation
 
-    public init(from decoder: Decoder) throws {
+    public init(from decoder: any Decoder) throws {
         let container = try decoder.singleValueContainer()
         let expressionString = try container.decode(String.self)
         try self.init(expressionString)
     }
 
-    public func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: any Encoder) throws {
         var container = encoder.singleValueContainer()
         try container.encode(expression)
     }

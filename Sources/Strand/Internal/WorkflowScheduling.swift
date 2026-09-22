@@ -34,7 +34,7 @@ extension WorkflowRegistration {
         exec: _WorkerExec,
         activation: _WorkflowActivation<W>,
         cache: _WorkflowTaskCache<W>,
-        handlerResult: ArcBox<Result<W.Output, Error>?>,
+        handlerResult: ArcBox<Result<W.Output, any Error>?>,
         handlerTask: Task<Void, Never>,
         stateBox: ArcBox<W>,
         historySeq: inout Int,
@@ -52,6 +52,7 @@ extension WorkflowRegistration {
         // all history events are committed in a single round-trip at activation exit.
         var pendingHistory: [(seq: Int, eventType: WorkflowStateQueries.HistoryEventType, eventData: ByteBuffer?)] = []
         var pendingCheckpoints: [(seqNum: Int, name: String?, state: ByteBuffer)] = []
+        var pendingVersionMarkers: [(changeID: String, value: Bool)] = []
 
         // record() is now a pure synchronous accumulator — no DB I/O, no try await.
         func record(_ type: WorkflowStateQueries.HistoryEventType, _ data: ByteBuffer?) {
@@ -69,8 +70,17 @@ extension WorkflowRegistration {
         // flushWrites() can be called multiple times (once combined with a state transition
         // in step 7, once at step 8 for any remaining items) without double-writing.
         func flushWrites() async throws {
-            guard !pendingCheckpoints.isEmpty || !pendingHistory.isEmpty else { return }
+            guard !pendingCheckpoints.isEmpty || !pendingHistory.isEmpty || !pendingVersionMarkers.isEmpty else { return }
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                if !pendingVersionMarkers.isEmpty {
+                    try await WorkflowStateQueries.batchWriteVersionMarkers(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        markers: pendingVersionMarkers,
+                        logger: exec.logger
+                    )
+                }
                 if !pendingCheckpoints.isEmpty {
                     try await Queries.batchSetCheckpointsOnConn(
                         on: conn,
@@ -110,6 +120,7 @@ extension WorkflowRegistration {
                 }
             }
             // Clear after successful commit so double-calling is safe (no duplicate writes).
+            pendingVersionMarkers.removeAll()
             pendingCheckpoints.removeAll()
             pendingHistory.removeAll()
         }
@@ -130,19 +141,12 @@ extension WorkflowRegistration {
         }
 
         // ── 1b. Version marker writes (queryable projection of version checkpoints) ─
+        // Accumulated here; flushed atomically with checkpoints and history in flushWrites().
         let versionMarkerWrites = commands.compactMap { cmd -> (changeID: String, value: Bool)? in
             if case .recordVersionMarker(let changeID, let value) = cmd { return (changeID, value) }
             return nil
         }
-        if !versionMarkerWrites.isEmpty {
-            try await WorkflowStateQueries.batchWriteVersionMarkers(
-                on: exec.postgres,
-                namespaceID: exec.namespace,
-                taskID: claimed.taskID,
-                markers: versionMarkerWrites,
-                logger: exec.logger
-            )
-        }
+        pendingVersionMarkers.append(contentsOf: versionMarkerWrites)
 
         // ── 2. Replay fast-path history events (TIMER_FIRED, EVENT_RECEIVED) ─────────
         for cmd in commands {
@@ -197,7 +201,7 @@ extension WorkflowRegistration {
                 // Write ACTIVITY_STARTED before ACTIVITY_COMPLETED so the history tab shows
                 // the actual queue wait time. Data comes from strand.runs via resolveCompleted —
                 // no extra DB round-trip, no separate connection, no advisory locks.
-                if let startInfo = executor.preloadedStartInfo(for: seqNum) {
+                if let startInfo = activation.stateMachine.preloadedStartInfo(for: seqNum) {
                     record(
                         .activityStarted,
                         try! JSON.encode(
@@ -257,7 +261,7 @@ extension WorkflowRegistration {
         case .success(let output):
             // Handler completed — persist final state and return the encoded result.
             // The caller (runTask) writes COMPLETED to the run.
-            teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
+            teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor, activation: activation)
             let finalStateBuf = try JSON.encode(stateBox.value)
             try await WorkflowStateQueries.saveState(
                 on: exec.postgres,
@@ -282,7 +286,7 @@ extension WorkflowRegistration {
             // CallSiteAnnotatedError to wrap the signal — defeating the
             // `catch let signal as _ContinueAsNewSignal` in runTask.
             if let signal = error as? _ContinueAsNewSignal {
-                teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
+                teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor, activation: activation)
                 throw signal
             }
             // CancellationError means the workflow received a cooperative cancel request
@@ -294,7 +298,7 @@ extension WorkflowRegistration {
             // Distinct from worker-shutdown CancellationError (which propagates from
             // applyScheduleCommands' own await points, never reaching this branch).
             if error is CancellationError {
-                teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
+                teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor, activation: activation)
                 record(.workflowCancelled, nil)
                 try await flushWrites()
                 // Transition run + task to CANCELLED and wake awaitTaskResult callers.
@@ -328,7 +332,7 @@ extension WorkflowRegistration {
                 }
                 return nil
             }
-            teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor)
+            teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor, activation: activation)
             let errData = try! JSON.encode(WorkflowStateQueries.WorkflowFailedData(error: String(describing: error)))
             record(.workflowFailed, errData)
             try await flushWrites()
@@ -749,7 +753,7 @@ extension WorkflowRegistration {
         // • condition(_:)          → WAITING (no timer; woken only by a signal)
         // • condition(_:timeout:)  → SLEEPING with available_at = deadline
         //   (woken by timer expiry OR by a signal that transitions SLEEPING → PENDING)
-        if executor.hasUnsatisfiedConditions && scheduleCommands.isEmpty {
+        if activation.stateMachine.hasUnsatisfiedConditions && scheduleCommands.isEmpty {
             let condTaskID = claimed.taskID
             let condRunID = claimed.runID
 
@@ -757,6 +761,17 @@ extension WorkflowRegistration {
             // (see the step 6–7 comment above for why this is necessary).
             var conditionState: TaskState = .waiting
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                // Version markers must commit before the run becomes claimable so
+                // another worker cannot replay the wrong branch on a re-activation.
+                if !pendingVersionMarkers.isEmpty {
+                    try await WorkflowStateQueries.batchWriteVersionMarkers(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        markers: pendingVersionMarkers,
+                        logger: exec.logger
+                    )
+                }
                 // Write checkpoints + history accumulated so far.
                 if !pendingCheckpoints.isEmpty {
                     try await Queries.batchSetCheckpointsOnConn(
@@ -811,7 +826,7 @@ extension WorkflowRegistration {
                 //       cancelDescendants blocks on it; after we commit (WAITING) it runs
                 //       request_cancel_wake and wakes the now-WAITING run (Sequence E).
                 let condSQL: PostgresRowSequence
-                if let wakeAt = executor.conditionMinWakeAt {
+                if let wakeAt = activation.stateMachine.conditionMinWakeAt {
                     condSQL = try await conn.query(
                         """
                         WITH
@@ -889,6 +904,7 @@ extension WorkflowRegistration {
                     conditionState = try col.next()!.decode(TaskState.self, context: .default)
                 }
             }
+            pendingVersionMarkers.removeAll()
             pendingCheckpoints.removeAll()
             pendingHistory.removeAll()
 
@@ -911,15 +927,25 @@ extension WorkflowRegistration {
         // This check is safe on the fresh path: `hasPendingContinuations &&
         // scheduleCommands.isEmpty` cannot both be true there — any parked continuation
         // on the fresh path must have emitted a .scheduleActivity / .awaitEvent command.
-        if executor.hasPendingContinuations
+        if activation.stateMachine.hasPendingContinuations
             && scheduleCommands.isEmpty
-            && !executor.hasUnsatisfiedConditions
+            && !activation.stateMachine.hasUnsatisfiedConditions
         {
             // Steps 7+7B share one transaction so the run stays RUNNING until
             // all writes are durable. READ COMMITTED gives step 7B a fresh snapshot
             // so it sees task_completions commits that step 7 missed.
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
-                // ── flushWrites content ───────────────────────────────────────────────
+                // ── flushWrites content ─────────────────────────────────────────────────────────────────────────
+                // Version markers must commit before the run becomes claimable.
+                if !pendingVersionMarkers.isEmpty {
+                    try await WorkflowStateQueries.batchWriteVersionMarkers(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        markers: pendingVersionMarkers,
+                        logger: exec.logger
+                    )
+                }
                 if !pendingCheckpoints.isEmpty {
                     try await Queries.batchSetCheckpointsOnConn(
                         on: conn,
@@ -1033,6 +1059,7 @@ extension WorkflowRegistration {
                     )
                 }
             }
+            pendingVersionMarkers.removeAll()
             pendingCheckpoints.removeAll()
             pendingHistory.removeAll()
             needsNotifyAfterFlush = true  // speculative: fires even if run went WAITING
@@ -1085,11 +1112,12 @@ extension WorkflowRegistration {
         cache: _WorkflowTaskCache<W>,
         taskID: UUID,
         handlerTask: Task<Void, Never>,
-        executor: StrandWorkflowExecutor
+        executor: StrandWorkflowExecutor,
+        activation: _WorkflowActivation<W>
     ) {
         cache.remove(taskID)
         handlerTask.cancel()
-        executor.cancelPending()
+        activation.stateMachine.cancelPending()
         executor.drain()
     }
 }

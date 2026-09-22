@@ -3,6 +3,7 @@ import PostgresNIO
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
+import Foundation  // Calendar.dateComponents, String(format:) not in FoundationEssentials on Linux
 #else
 import Foundation
 #endif
