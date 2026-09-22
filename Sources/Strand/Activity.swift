@@ -487,8 +487,24 @@ public struct ActivityContext: Sendable {
 
     /// Suspends until this activity is cancelled (either by external signal or
     /// Swift task cancellation), then returns.
+    ///
+    /// Both cancellation signals are wired:
+    /// - **External DB cancellation** — detected by the heartbeat loop, which sets
+    ///   the flag and resumes all waiting continuations.
+    /// - **Swift task cancellation** — worker shutdown or the 2× claim-window fatal
+    ///   deadline.  Because the activity cannot heartbeat while suspended here,
+    ///   cancellation of the surrounding task is also forwarded to the flag via
+    ///   `withTaskCancellationHandler`, guaranteeing the task group can always exit.
     public func waitForCancellation() async {
-        await _cancellationFlag.waitForCancellation()
+        // Fast path — already cancelled via external signal or task cancellation.
+        if isCancelled { return }
+        // Wire Swift task cancellation into the flag so the continuation is always
+        // resumed even when no heartbeat is running to detect the DB-side signal.
+        await withTaskCancellationHandler {
+            await _cancellationFlag.waitForCancellation()
+        } onCancel: {
+            _cancellationFlag.cancel()
+        }
     }
 
     package init(

@@ -761,6 +761,17 @@ extension WorkflowRegistration {
             // (see the step 6–7 comment above for why this is necessary).
             var conditionState: TaskState = .waiting
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
+                // Version markers must commit before the run becomes claimable so
+                // another worker cannot replay the wrong branch on a re-activation.
+                if !pendingVersionMarkers.isEmpty {
+                    try await WorkflowStateQueries.batchWriteVersionMarkers(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        markers: pendingVersionMarkers,
+                        logger: exec.logger
+                    )
+                }
                 // Write checkpoints + history accumulated so far.
                 if !pendingCheckpoints.isEmpty {
                     try await Queries.batchSetCheckpointsOnConn(
@@ -893,6 +904,7 @@ extension WorkflowRegistration {
                     conditionState = try col.next()!.decode(TaskState.self, context: .default)
                 }
             }
+            pendingVersionMarkers.removeAll()
             pendingCheckpoints.removeAll()
             pendingHistory.removeAll()
 
@@ -923,7 +935,17 @@ extension WorkflowRegistration {
             // all writes are durable. READ COMMITTED gives step 7B a fresh snapshot
             // so it sees task_completions commits that step 7 missed.
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
-                // ── flushWrites content ───────────────────────────────────────────────
+                // ── flushWrites content ─────────────────────────────────────────────────────────────────────────
+                // Version markers must commit before the run becomes claimable.
+                if !pendingVersionMarkers.isEmpty {
+                    try await WorkflowStateQueries.batchWriteVersionMarkers(
+                        on: conn,
+                        namespaceID: exec.namespace,
+                        taskID: claimed.taskID,
+                        markers: pendingVersionMarkers,
+                        logger: exec.logger
+                    )
+                }
                 if !pendingCheckpoints.isEmpty {
                     try await Queries.batchSetCheckpointsOnConn(
                         on: conn,
@@ -1037,6 +1059,7 @@ extension WorkflowRegistration {
                     )
                 }
             }
+            pendingVersionMarkers.removeAll()
             pendingCheckpoints.removeAll()
             pendingHistory.removeAll()
             needsNotifyAfterFlush = true  // speculative: fires even if run went WAITING

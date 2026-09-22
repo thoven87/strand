@@ -486,14 +486,11 @@ public protocol ActivityContainerProtocol: Sendable {
 
 /// Reference-counted workflow state wrapper. One allocation per workflow lifetime.
 ///
-/// `nonisolated(unsafe)` on `value` suppresses the compiler's isolation check
-/// for that one property; the surrounding invariant (single async task per
-/// activation, no concurrent access) provides the safety guarantee.
-///
-/// No `T: Sendable` constraint — `ArcBox` is designed for executor-pinned values
-/// accessed exclusively from one task at a time.  Because the compiler cannot
-/// prove thread-safety for `T`, callers take full responsibility for ensuring
-/// the boxed value is never shared across concurrency boundaries.
+/// `T: Sendable` is required so the compiler verifies that boxed values are
+/// safe to cross concurrency boundaries. `nonisolated(unsafe)` on `value` then
+/// suppresses the additional isolation check for that stored property, relying
+/// on the surrounding invariant (single async task per activation, no concurrent
+/// access) for safety beyond what the compiler can verify automatically.
 public final class ArcBox<T: Sendable>: Sendable {
     nonisolated(unsafe) public var value: T
     public init(_ value: T) { self.value = value }
