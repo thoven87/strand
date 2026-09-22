@@ -2,6 +2,7 @@ package import NIOCore
 
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
+import Foundation  // LocalizedError.localizedDescription not in FoundationEssentials on Linux
 #else
 public import Foundation
 #endif

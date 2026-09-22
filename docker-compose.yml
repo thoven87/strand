@@ -10,7 +10,7 @@ services:
             - "5499:5432"
         volumes:
             - ./strand.sql:/docker-entrypoint-initdb.d/strand.sql
-            - db_data:/var/lib/postgresql/data
+            - db_data:/var/lib/postgresql
         shm_size: 4g
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U strand -d strand_dev"]
@@ -25,17 +25,17 @@ services:
     #         - "4317:4317" # OTLP gRPC (default port — no config needed)
     #     environment:
     #         COLLECTOR_OTLP_ENABLED: "true"
-    hyperdx:
-        image: docker.hyperdx.io/hyperdx/hyperdx-all-in-one:latest
-        container_name: strand-hyperdx
-        ports:
-            - "8081:8080" # HyperDX UI
-            - "4317:4317" # OTLP gRPC
-            - "4318:4318" # OTLP HTTP
-        volumes:
-            - strand_data:/data/db
-            - strand_data:/var/lib/clickhouse
-            - strand_data:/var/log/clickhouse-server
+    # hyperdx:
+    #     image: docker.hyperdx.io/hyperdx/hyperdx-all-in-one:latest
+    #     container_name: strand-hyperdx
+    #     ports:
+    #         - "8081:8080" # HyperDX UI
+    #         - "4317:4317" # OTLP gRPC
+    #         - "4318:4318" # OTLP HTTP
+    #     volumes:
+    #         - strand_data:/data/db
+    #         - strand_data:/var/lib/clickhouse
+    #         - strand_data:/var/log/clickhouse-server
 
 volumes:
     strand_data:

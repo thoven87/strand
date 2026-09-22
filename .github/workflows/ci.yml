@@ -23,7 +23,7 @@ jobs:
         strategy:
             matrix:
                 image:
-                    - "swift:6.3"
+                    - "swift:6.4"
                 postgres-image:
                     - "postgres:18"
                 include:
