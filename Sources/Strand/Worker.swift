@@ -779,6 +779,11 @@ public struct StrandWorker: Service {
             ("queue", options.queue),
         ]
 
+        // Bind the task-scoped logger to the task-local slot so that any
+        // function invoked from this execution path can read `Logger.current`
+        // without needing an explicit `logger:` parameter.
+        await withLogger(taskLogger) { taskLogger in
+
         // ── Race execution against 2× timeout ─────────────────────────
         // Execution and deadline enforcement run as structured children of the
         // same group — whichever finishes first cancels the other cleanly.
@@ -1046,8 +1051,11 @@ public struct StrandWorker: Service {
                 logger: taskLogger
             )
         }
+
+        } // end withLogger
     }
 
+    // MARK: - Shared activation helpers
     /// Records a task failure in metrics and persists it via `Queries.failRun`.
     ///
     /// Shared by the typed-failure catch (`_TypedActivityFailure`) and the generic
