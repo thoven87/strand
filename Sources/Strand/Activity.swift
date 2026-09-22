@@ -711,7 +711,9 @@ extension Activity {
             heartbeatImpl: { _ in }  // no-op: local activities run synchronously in the activation
         )
         let output = try await ActivityContext.$_current.withValue(ctx) {
-            try await self.run(input: decodedInput, context: ctx)
+            try await withLogger(ctx.logger) { _ in
+                try await self.run(input: decodedInput, context: ctx)
+            }
         }
         return try JSON.encode(output)
     }
@@ -820,7 +822,9 @@ extension Activity {
         // The activity just runs directly inside the outer span.
         do {
             let output = try await ActivityContext.$_current.withValue(ctx) {
-                try await self.run(input: input, context: ctx)
+                try await withLogger(ctx.logger) { _ in
+                    try await self.run(input: input, context: ctx)
+                }
             }
             return try JSON.encode(output)
         } catch let typedFailure as Failure {
