@@ -94,7 +94,7 @@ enum Queries {
         try await conn.query(
             """
             INSERT INTO strand.queues (namespace_id, name)
-            SELECT \(namespaceID), unnest(\(names))
+            SELECT \(namespaceID), unnest(\(names)::text[])
             ON CONFLICT (namespace_id, name) DO NOTHING
             """,
             logger: logger

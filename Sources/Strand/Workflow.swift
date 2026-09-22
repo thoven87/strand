@@ -494,7 +494,7 @@ public protocol ActivityContainerProtocol: Sendable {
 /// accessed exclusively from one task at a time.  Because the compiler cannot
 /// prove thread-safety for `T`, callers take full responsibility for ensuring
 /// the boxed value is never shared across concurrency boundaries.
-public final class ArcBox<T>: Sendable {
+public final class ArcBox<T: Sendable>: Sendable {
     nonisolated(unsafe) public var value: T
     public init(_ value: T) { self.value = value }
 

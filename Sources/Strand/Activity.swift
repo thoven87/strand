@@ -285,9 +285,9 @@ public struct ActivityOptions: Sendable {
 package final class _ActivityCancellationFlag: Sendable {
     package enum State: Sendable {
         case active
-        /// Suspended caller waiting for cancellation. The continuation is resumed
-        /// by `cancel()` with a `Void` value.
-        case waiting(CheckedContinuation<Void, Never>)
+        /// Suspended callers waiting for cancellation. All continuations are resumed
+        /// by `cancel()` with a `Void` value. Multiple concurrent callers are supported.
+        case waiting([CheckedContinuation<Void, Never>])
         case cancelled
     }
 
@@ -303,28 +303,28 @@ package final class _ActivityCancellationFlag: Sendable {
 
     /// Cancel the activity.
     ///
-    /// Idempotent — safe to call multiple times. Resumes any caller suspended in
-    /// `waitForCancellation()` exactly once.
+    /// Idempotent — safe to call multiple times. Resumes all callers suspended in
+    /// `waitForCancellation()`.
     package func cancel() {
-        let cont: CheckedContinuation<Void, Never>? = _state.withLock { s in
+        let conts: [CheckedContinuation<Void, Never>] = _state.withLock { s in
             switch s {
             case .active:
                 s = .cancelled
-                return nil
-            case .waiting(let c):
+                return []
+            case .waiting(let cs):
                 s = .cancelled
-                return c
+                return cs
             case .cancelled:
-                return nil  // idempotent
+                return []  // idempotent
             }
         }
-        cont?.resume()
+        for cont in conts { cont.resume() }
     }
 
     /// Suspends until `cancel()` is called, then returns.
     ///
-    /// Returns immediately when already cancelled. Must not be called
-    /// concurrently from two tasks (only one caller may wait at a time).
+    /// Returns immediately when already cancelled. All concurrent callers are
+    /// resumed when `cancel()` fires — multiple tasks may call this simultaneously.
     package func waitForCancellation() async {
         // Fast path — already cancelled; no suspension needed.
         if case .cancelled = _state.withLock({ $0 }) { return }
@@ -333,12 +333,14 @@ package final class _ActivityCancellationFlag: Sendable {
             let alreadyCancelled: Bool = _state.withLock { s in
                 switch s {
                 case .active:
-                    s = .waiting(cont)
+                    s = .waiting([cont])
+                    return false
+                case .waiting(var conts):
+                    conts.append(cont)
+                    s = .waiting(conts)
                     return false
                 case .cancelled:
                     return true  // resume immediately outside the lock
-                case .waiting:
-                    fatalError("_ActivityCancellationFlag.waitForCancellation called from two tasks simultaneously")
                 }
             }
             if alreadyCancelled { cont.resume() }

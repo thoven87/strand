@@ -631,7 +631,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // _ActivityFailureSignal (resumeActivityFailure) on re-activation.
         do {
             let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, Error>) in
+                (cont: CheckedContinuation<ByteBuffer, any Error>) in
                 _impl.stateMachine.suspendActivity(seqNum: seqNum, continuation: cont)
             }
             // Continuation resumed — activity completed in this activation.
@@ -831,7 +831,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Guard: don't start new timers when cooperatively cancelled.
         try Task.checkCancellation()
         _impl.stateMachine.emit(.startTimer(wakeAt: resolvedWakeAt, seqNum: seqNum))
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
             _impl.stateMachine.suspendTimer(seqNum: seqNum, continuation: cont)
         }
         // Timer fired — write completion sentinel and record TIMER_FIRED.
@@ -974,7 +974,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         let resultBuffer: ByteBuffer
         do {
             resultBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, Error>) in
+                (cont: CheckedContinuation<ByteBuffer, any Error>) in
                 _impl.stateMachine.suspendEvent(seqNum: seqNum, eventName: name, continuation: cont)
             }
         } catch let err as StrandError {
@@ -1081,18 +1081,15 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     ///
     /// - Parameter predicate: A closure that reads (not mutates) workflow state and
     ///   returns `true` when the condition is satisfied.
-    public func condition(_ predicate: (W) -> Bool) async throws {
-        // `@Sendable` and `@escaping` are not required:
-        // • `NonIsolatedNonSendingByDefault` (SE-0461) makes closures nonisolated(nonsending)
-        //   by default — no Sendable requirement when the caller is non-isolated.
-        // • `withoutActuallyEscaping` bounds the predicate's lifetime to this suspension:
-        //   the predicate is stored, evaluated post-drain (while this task is suspended),
-        //   then removed before the continuation resumes — so it never outlives this scope.
+    public func condition(_ predicate: @escaping @Sendable (W) -> Bool) async throws {
+        // `@escaping @Sendable` are required: the predicate is registered by the
+        // workflow handler Task and evaluated by the worker Task after `drain()` returns.
+        // These are different tasks crossing a task boundary, so `@Sendable` is needed.
         //
         // Two-phase predicate registration:
         //
-        // 1. Register the predicate as a `() -> Bool` closure that reads `stateBox`
-        //    via `withValue`. The closure is stored WITHOUT being evaluated —
+        // 1. Register the predicate as a `@Sendable () -> Bool` closure that reads
+        //    `stateBox` via `withValue`. The closure is stored WITHOUT being evaluated —
         //    evaluation happens post-drain, after `run()` has suspended and no longer
         //    holds exclusive access on `stateBox.value`.
         //
@@ -1104,21 +1101,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         //    the continuation is resumed and the handler continues; if `false` the
         //    worker applies WAITING to the DB and the activation ends.
         let stateBox = _impl.stateBox
-        try await withoutActuallyEscaping(predicate) { escapingPredicate in
-            let id = _impl.stateMachine.registerCondition {
-                stateBox.withValue { escapingPredicate($0) }
-            }
-            // The no-timeout overload is always resumed with true (predicate satisfied);
-            // we discard the Bool since there is no timeout path to return false.
-            _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, any Error>) in
-                _impl.stateMachine.linkConditionContinuation(cont, forID: id)
-            }
-            // No seqNum / no completion sentinel — no-timeout conditions have no checkpoint
-            // guard, so conditionMet may appear more than once in history across replays.
-            // This is benign: ON CONFLICT DO NOTHING in appendHistory prevents duplicate rows
-            // for the same seq, and executionHistorySpansForTrace uses only the first CONDITION_MET.
-            _impl.stateMachine.emit(.conditionMet(seqNum: nil))
+        let id = _impl.stateMachine.registerCondition {
+            stateBox.withValue { predicate($0) }
         }
+        // The no-timeout overload is always resumed with true (predicate satisfied);
+        // we discard the Bool since there is no timeout path to return false.
+        _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, any Error>) in
+            _impl.stateMachine.linkConditionContinuation(cont, forID: id)
+        }
+        // No seqNum / no completion sentinel — no-timeout conditions have no checkpoint
+        // guard, so conditionMet may appear more than once in history across replays.
+        // This is benign: ON CONFLICT DO NOTHING in appendHistory prevents duplicate rows
+        // for the same seq, and executionHistorySpansForTrace uses only the first CONDITION_MET.
+        _impl.stateMachine.emit(.conditionMet(seqNum: nil))
     }
 
     /// Suspends the workflow until `predicate` evaluates `true` on current state,
@@ -1143,11 +1138,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// - Returns: `true` when the predicate was satisfied; `false` on timeout.
     @discardableResult
     public func condition(
-        _ predicate: (W) -> Bool,
+        _ predicate: @escaping @Sendable (W) -> Bool,
         timeout: Duration
     ) async throws -> Bool {
-        // `@Sendable` and `@escaping` are not required — see the no-timeout overload
-        // for the full safety argument (`NonIsolatedNonSendingByDefault` + `withoutActuallyEscaping`).
+        // `@escaping @Sendable` are required: the predicate is registered by the
+        // workflow handler Task and evaluated by the worker Task after `drain()` returns.
+        // These are different tasks crossing a task boundary, so `@Sendable` is needed.
 
         // Checkpoint the deadline once so it's stable across activations.
         let seqNum = _impl.nextSeqNum()
@@ -1181,23 +1177,21 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // Same post-drain pattern as the no-timeout overload, with `wakeAt` attached
         // so the worker can apply SLEEPING (not WAITING) to the DB.
         let stateBox = _impl.stateBox
-        return try await withoutActuallyEscaping(predicate) { escapingPredicate in
-            let id = _impl.stateMachine.registerCondition(
-                predicate: { stateBox.withValue { escapingPredicate($0) } },
-                wakeAt: wakeAt,
-                timeout: timeout
-            )
-            let result = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, any Error>) in
-                _impl.stateMachine.linkConditionContinuation(cont, forID: id)
-            }
-            // Record the result so applyScheduleCommands writes sentinel + history atomically.
-            if result {
-                _impl.stateMachine.emit(.conditionMet(seqNum: seqNum))
-            } else {
-                _impl.stateMachine.emit(.conditionTimedOut(seqNum: seqNum))
-            }
-            return result
+        let id = _impl.stateMachine.registerCondition(
+            predicate: { stateBox.withValue { predicate($0) } },
+            wakeAt: wakeAt,
+            timeout: timeout
+        )
+        let result = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, any Error>) in
+            _impl.stateMachine.linkConditionContinuation(cont, forID: id)
         }
+        // Record the result so applyScheduleCommands writes sentinel + history atomically.
+        if result {
+            _impl.stateMachine.emit(.conditionMet(seqNum: seqNum))
+        } else {
+            _impl.stateMachine.emit(.conditionTimedOut(seqNum: seqNum))
+        }
+        return result
     }
 
     // MARK: - continueAsNew
@@ -1270,7 +1264,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             options: options
         )
         let result = try await withCheckedThrowingContinuation {
-            (cont: CheckedContinuation<ByteBuffer, Error>) in
+            (cont: CheckedContinuation<ByteBuffer, any Error>) in
             _impl.stateMachine.linkLocalActivityContinuation(cont, forID: id)
         }
         return try JSON.decode(A.Output.self, from: result)
@@ -1400,7 +1394,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         do {
             let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, Error>) in
+                (cont: CheckedContinuation<ByteBuffer, any Error>) in
                 _impl.stateMachine.suspendActivity(seqNum: seqNum, continuation: cont)
             }
             // Slow path: continuation resumed — child completed in this activation.

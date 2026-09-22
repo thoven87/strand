@@ -147,10 +147,11 @@ struct LocalActivityEntry {
 /// `predicate` is stored as a plain (non-Sendable) closure.  The surrounding
 /// invariant (`nonisolated(unsafe) var stateMachine` on `_WorkflowActivation`)
 /// ensures single-threaded access, so `Sendable` is not required here.
-struct ConditionEntry {
+struct ConditionEntry: Sendable {
     /// Reads `stateBox` via `withValue`. Evaluated only after `drain()` returns,
     /// when `run()` has suspended and no longer holds exclusive access on the box.
-    let predicate: () -> Bool
+    /// Crosses a task boundary (workflow handler task → worker task), so `@Sendable` is required.
+    let predicate: @Sendable () -> Bool
     /// Deadline for `condition(_:timeout:)` waits; `nil` for indefinite conditions.
     let wakeAt: Date?
     /// Original timeout duration — used only for the error message in
@@ -517,7 +518,7 @@ struct WorkflowStateMachine: ~Copyable {
     ///     here — evaluated post-drain by the worker's condition-check loop.
     ///   - wakeAt: Deadline for `condition(_:timeout:)`, `nil` for indefinite waits.
     mutating func registerCondition(
-        predicate: @escaping () -> Bool,
+        predicate: @escaping @Sendable () -> Bool,
         wakeAt: Date? = nil,
         timeout: Duration? = nil
     ) -> Int {
@@ -618,10 +619,16 @@ struct WorkflowStateMachine: ~Copyable {
 /// continue the handler from where it paused.
 final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, Sendable {
 
-    private let jobs: Mutex<_JobQueue>
+    private struct _ExecState: ~Copyable {
+        var queue: _JobQueue
+        /// True while a drain loop owns the executor. A second drain() call is a
+        /// no-op — the running loop picks up any newly-enqueued jobs before exiting.
+        var isDraining: Bool = false
+    }
+    private let _state: Mutex<_ExecState>
 
     init() {
-        jobs = Mutex(_JobQueue())
+        _state = Mutex(_ExecState(queue: _JobQueue()))
     }
 
     /// Buffer a Swift concurrency job for later synchronous execution by `drain()`.
@@ -634,7 +641,7 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, Sendable {
     func enqueue(_ job: consuming ExecutorJob) {
         let unowned = UnownedJob(job)
         let taskID = _getJobTaskId(unowned)
-        jobs.withLock { $0.push(taskID, unowned) }
+        _state.withLock { $0.queue.push(taskID, unowned) }
     }
 
     /// Returns an unowned reference to `self` as a `SerialExecutor`.
@@ -693,15 +700,36 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, Sendable {
     /// Read `stateMachine.pendingCommands` after this call to discover what the
     /// worker needs to write to Postgres.
     func drain() {
-        var currentTaskID: UInt64? = nil
-        while true {
-            guard let (taskID, job) = jobs.withLock({ $0.pop(continuing: currentTaskID) })
-            else { return }
-            currentTaskID = taskID
-            job.runSynchronously(
-                isolatedTo: asUnownedSerialExecutor(),
-                taskExecutor: asUnownedTaskExecutor()
-            )
-        }
+        // Acquire the drain permit. A second concurrent call returns immediately;
+        // the running loop will process any newly-enqueued jobs before it exits.
+        guard _state.withLock({ s -> Bool in
+            guard !s.isDraining else { return false }
+            s.isDraining = true
+            return true
+        }) else { return }
+
+        // Release the permit, re-check atomically to prevent stranded jobs.
+        // If cancelPending() enqueued jobs and called drain() while we were
+        // running (it got the permit-denied return), we must drain again.
+        repeat {
+            var currentTaskID: UInt64? = nil
+            while true {
+                guard let (taskID, job) = _state.withLock({ $0.queue.pop(continuing: currentTaskID) })
+                else { break }
+                currentTaskID = taskID
+                job.runSynchronously(
+                    isolatedTo: asUnownedSerialExecutor(),
+                    taskExecutor: asUnownedTaskExecutor()
+                )
+            }
+            // Atomically release and check for new work. If the queue is non-empty,
+            // re-acquire the permit and loop again.
+        } while _state.withLock({ s -> Bool in
+            s.isDraining = false
+            if s.queue.isEmpty { return false }
+            // New jobs arrived; re-acquire.
+            s.isDraining = true
+            return true
+        })
     }
 }
