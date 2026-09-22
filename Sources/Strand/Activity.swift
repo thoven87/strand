@@ -270,20 +270,80 @@ public struct ActivityOptions: Sendable {
     }
 }
 
-// MARK: - ActivityContext
-
 // MARK: - Cancellation flag
 
-/// Shared mutable cancellation flag passed between `ActivityContext` and
-/// the heartbeat closure inside `Activity._run`.
+/// Cancellation coordination for a running activity.
 ///
-/// Using a reference type (class) lets both the struct and the closure refer
-/// to the same storage without copying. `@unchecked Sendable` is safe here:
-/// the `Mutex` provides the required thread safety.
+/// Upgrades the old `Mutex<Bool>` flag to a four-state machine so activity code
+/// can `await waitForCancellation()` instead of polling `isCancelled` in a loop.
+///
+/// Allowed transitions (illegal transitions `fatalError`):
+///   `.active` → `.waiting` (waitForCancellation suspends)
+///   `.active` → `.cancelled` (cancel() before wait)
+///   `.waiting` → `.cancelled` (cancel() while waiting)
+///   any terminal → stays unchanged (cancel() is idempotent after cancellation)
 package final class _ActivityCancellationFlag: Sendable {
-    private let _flag: Mutex<Bool> = Mutex(false)
-    package var isCancelled: Bool { _flag.withLock { $0 } }
-    package func markCancelled() { _flag.withLock { $0 = true } }
+    package enum State: Sendable {
+        case active
+        /// Suspended caller waiting for cancellation. The continuation is resumed
+        /// by `cancel()` with a `Void` value.
+        case waiting(CheckedContinuation<Void, Never>)
+        case cancelled
+    }
+
+    private let _state: Mutex<State> = .init(.active)
+
+    /// `true` when the activity has been cancelled.
+    package var isCancelled: Bool {
+        _state.withLock {
+            if case .cancelled = $0 { return true }
+            return false
+        }
+    }
+
+    /// Cancel the activity.
+    ///
+    /// Idempotent — safe to call multiple times. Resumes any caller suspended in
+    /// `waitForCancellation()` exactly once.
+    package func cancel() {
+        let cont: CheckedContinuation<Void, Never>? = _state.withLock { s in
+            switch s {
+            case .active:
+                s = .cancelled
+                return nil
+            case .waiting(let c):
+                s = .cancelled
+                return c
+            case .cancelled:
+                return nil  // idempotent
+            }
+        }
+        cont?.resume()
+    }
+
+    /// Suspends until `cancel()` is called, then returns.
+    ///
+    /// Returns immediately when already cancelled. Must not be called
+    /// concurrently from two tasks (only one caller may wait at a time).
+    package func waitForCancellation() async {
+        // Fast path — already cancelled; no suspension needed.
+        if case .cancelled = _state.withLock({ $0 }) { return }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let alreadyCancelled: Bool = _state.withLock { s in
+                switch s {
+                case .active:
+                    s = .waiting(cont)
+                    return false
+                case .cancelled:
+                    return true  // resume immediately outside the lock
+                case .waiting:
+                    fatalError("_ActivityCancellationFlag.waitForCancellation called from two tasks simultaneously")
+                }
+            }
+            if alreadyCancelled { cont.resume() }
+        }
+    }
 }
 
 // MARK: - ActivityContext
@@ -293,7 +353,32 @@ package final class _ActivityCancellationFlag: Sendable {
 /// Unlike `WorkflowContext`, `ActivityContext` carries no orchestration
 /// primitives — activities are pure units of work that do I/O and return
 /// a typed result. They do not call other activities or workflows.
+///
+/// ## Ambient access
+/// The context for the currently-executing activity is available anywhere
+/// in the call stack without threading it through function parameters:
+///
+/// ```swift
+/// func sendAuditLog() async throws {
+///     let ctx = ActivityContext.current!   // ambient — set by the Strand worker
+///     ctx.logger.info("audit: \(ctx.activityName) attempt \(ctx.attempt)")
+/// }
+/// ```
 public struct ActivityContext: Sendable {
+
+    // MARK: - Ambient access
+
+    /// The context for the activity currently executing on this task.
+    ///
+    /// Set automatically by the Strand worker before calling `Activity.run(input:context:)`.
+    /// Returns `nil` when called from outside an activity execution (e.g. from a workflow
+    /// handler or a background task that was not spawned by the activity runner).
+    ///
+    /// - Note: For local activities the context is also set, even though no `strand.runs`
+    ///   row backs the execution.
+    public static var current: ActivityContext? { _current }
+
+    @TaskLocal package static var _current: ActivityContext?
     /// The UUID of the task row in `strand.tasks` for this activity execution.
     public let activityID: UUID
     /// The registered name of this activity.
@@ -396,6 +481,12 @@ public struct ActivityContext: Sendable {
     /// ```
     public var isCancelled: Bool {
         Task.isCancelled || _cancellationFlag.isCancelled
+    }
+
+    /// Suspends until this activity is cancelled (either by external signal or
+    /// Swift task cancellation), then returns.
+    public func waitForCancellation() async {
+        await _cancellationFlag.waitForCancellation()
     }
 
     package init(
@@ -601,7 +692,9 @@ extension Activity {
             parentWorkflowID: parentWorkflowID,
             heartbeatImpl: { _ in }  // no-op: local activities run synchronously in the activation
         )
-        let output = try await self.run(input: decodedInput, context: ctx)
+        let output = try await ActivityContext.$_current.withValue(ctx) {
+            try await self.run(input: decodedInput, context: ctx)
+        }
         return try JSON.encode(output)
     }
 
@@ -689,7 +782,7 @@ extension Activity {
                     // the run itself is also cancelled, so extendClaim finds no RUNNING
                     // row and throws InternalError before we ever reach this branch.
                     if taskCancelled {
-                        cancellationFlag.markCancelled()
+                        cancellationFlag.cancel()
                         // Don't throw — allow the activity to complete naturally.
                     }
                 } catch is InternalError {
@@ -697,7 +790,7 @@ extension Activity {
                     // externally. Set the flag so context.isCancelled returns true
                     // immediately, then throw CancellationError (Swift's standard
                     // cancellation type) rather than leaking InternalError.
-                    cancellationFlag.markCancelled()
+                    cancellationFlag.cancel()
                     throw CancellationError()
                 }
             }
@@ -708,7 +801,9 @@ extension Activity {
         // strand.run.id, same attempt — which look like replay bugs.
         // The activity just runs directly inside the outer span.
         do {
-            let output = try await self.run(input: input, context: ctx)
+            let output = try await ActivityContext.$_current.withValue(ctx) {
+                try await self.run(input: input, context: ctx)
+            }
             return try JSON.encode(output)
         } catch let typedFailure as Failure {
             // Typed failure declared by the activity — encode the full Codable value.

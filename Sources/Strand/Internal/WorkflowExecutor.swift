@@ -1,5 +1,6 @@
 import DequeModule
 import NIOCore
+import Synchronization
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -118,19 +119,11 @@ enum WorkflowCommand: Sendable {
     )
 }
 
-// MARK: - StrandWorkflowExecutor
+// MARK: - LocalActivityEntry
 
-/// The deterministic serial executor for workflow activations.
-///
-/// One instance is created per workflow type at registration time and stored in
-/// `_WorkflowTaskCache<W>`. The handler `Task` stays alive between activations,
-/// parked on `CheckedContinuation`s here. On re-activation the worker calls the
-/// Resume API (`resumeActivity`, `resumeAllTimers`, etc.) to deliver real results,
-/// then calls `drain()` to continue the handler from where it paused.
-///
-/// All access occurs on the drain loop caller's thread. Never share this object
-/// across concurrent tasks or call `drain()` from two threads at once.
 /// A local activity scheduled for in-process execution post-drain.
+/// A local activity runs entirely in-process within the current activation and
+/// never crosses a thread boundary as a value, so `Sendable` is not required.
 struct LocalActivityEntry {
     /// Registered activity name, used to look up the runner in `_WorkerExec`.
     let name: String
@@ -141,15 +134,23 @@ struct LocalActivityEntry {
     /// Execution options (timeout, retries, cancellation type) for this local activity.
     let options: LocalActivityOptions
     /// Parked continuation. Linked immediately after the task suspends.
-    var continuation: CheckedContinuation<ByteBuffer, Error>?
+    var continuation: CheckedContinuation<ByteBuffer, any Error>?
 }
+
+// MARK: - ConditionEntry
 
 /// One registered condition: a predicate to be evaluated post-drain and the
 /// continuation to resume when it is satisfied.
+/// One registered condition: a predicate to be evaluated post-drain and the
+/// continuation to resume when it is satisfied.
+///
+/// `predicate` is stored as a plain (non-Sendable) closure.  The surrounding
+/// invariant (`nonisolated(unsafe) var stateMachine` on `_WorkflowActivation`)
+/// ensures single-threaded access, so `Sendable` is not required here.
 struct ConditionEntry {
     /// Reads `stateBox` via `withValue`. Evaluated only after `drain()` returns,
     /// when `run()` has suspended and no longer holds exclusive access on the box.
-    let predicate: @Sendable () -> Bool
+    let predicate: () -> Bool
     /// Deadline for `condition(_:timeout:)` waits; `nil` for indefinite conditions.
     let wakeAt: Date?
     /// Original timeout duration — used only for the error message in
@@ -158,29 +159,90 @@ struct ConditionEntry {
     /// Parked continuation. Linked immediately after the task suspends via
     /// `linkConditionContinuation(_:forID:)`.
     /// Resumed with `true` when the predicate is satisfied, `false` on timeout.
-    var continuation: CheckedContinuation<Bool, Error>?
+    var continuation: CheckedContinuation<Bool, any Error>?
 }
 
-final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Sendable {
+// MARK: - Runtime hook
 
-    // MARK: - Job queue
+/// Returns the Swift task ID embedded in an `UnownedJob` by the Swift runtime.
+/// Used by `_JobQueue` to group continuations by task so the drain loop can
+/// advance each task to its next suspension point before switching tasks.
+///
+/// `@_silgen_name` is currently the only reliable way to get a stable numeric task
+/// identity from a job.  SE-0469 (Swift 6.2) adds `UnownedJob.unsafeCurrentTask`
+/// which exposes the task object; if `UnsafeCurrentTask` gains `Hashable` conformance
+/// that can replace this hook and remove the dependency on a private symbol.
+@_silgen_name("swift_task_getJobTaskId")
+private func _getJobTaskId(_ job: UnownedJob) -> UInt64
 
-    /// Jobs buffered by `enqueue(_:)`. Processed in FIFO order by `drain()`.
+// MARK: - _JobQueue
+
+/// An O(1)-amortised per-task job queue.
+///
+/// Jobs belonging to the same Swift `Task` are kept in a separate `Deque`
+/// keyed by task ID.  A secondary `Deque<UInt64>` tracks task IDs in
+/// first-seen arrival order, acting as the FIFO scheduler between tasks.
+///
+/// `pop(continuing:)` first tries to continue the task that is currently
+/// executing, then falls back to the next non-empty task in first-seen order.
+/// Every operation is O(1) amortised — no linear scans.
+private struct _JobQueue: ~Copyable {
+    /// Jobs per task, in enqueue order.
+    private var queues: [UInt64: Deque<UnownedJob>] = [:]
+    /// Task IDs in first-seen arrival order.
+    /// May temporarily contain IDs whose `queues` entry has already been
+    /// removed; these stale entries are skipped and cleaned up lazily in `pop`.
+    private var order: Deque<UInt64> = []
+
+    var isEmpty: Bool { queues.isEmpty }
+
+    /// Append `job` to task `taskID`'s queue, registering the task
+    /// in first-seen order on its first appearance.
+    mutating func push(_ taskID: UInt64, _ job: UnownedJob) {
+        if queues[taskID] == nil { order.append(taskID) }
+        queues[taskID, default: Deque()].append(job)
+    }
+
+    /// Return the next job to run.
     ///
-    /// `Deque` (from swift-collections) provides O(1) `popFirst()` AND O(1) `append()`.
-    /// `ContiguousArray.removeFirst()` is O(n) — it shifts every element down on each
-    /// dequeue. For a workflow that fans out many activities the difference is material.
-    private var jobQueue: Deque<UnownedJob> = {
-        var d = Deque<UnownedJob>()
-        d.reserveCapacity(64)  // pre-size for the average workflow fan-out
-        return d
-    }()
+    /// Prefers `currentID`'s queue so its continuation chain is exhausted
+    /// before the scheduler switches to another task.  Falls back to the
+    /// first non-empty task in first-seen FIFO order, lazily removing
+    /// exhausted entries from the front of `order` as it goes.
+    mutating func pop(continuing currentID: UInt64?) -> (UInt64, UnownedJob)? {
+        // Continue the current task if it still has pending jobs.
+        if let id = currentID, queues[id] != nil {
+            return popFrom(id)
+        }
+        // Scan forward until we find a non-empty task queue.
+        while let front = order.first {
+            if queues[front] != nil { return popFrom(front) }
+            order.removeFirst()  // clean up exhausted or never-populated entry
+        }
+        return nil
+    }
 
-    /// Guards against re-entrant calls to `drain()`.
-    /// A job running inside the drain loop must never call `drain()` again.
-    private var isDraining = false
+    /// Pop one job from task `id`'s queue.
+    /// Removes the dictionary entry (but not the `order` entry) when the queue
+    /// becomes empty; the stale `order` entry is cleaned up lazily by `pop`.
+    private mutating func popFrom(_ id: UInt64) -> (UInt64, UnownedJob) {
+        let job = queues[id]!.popFirst()!
+        if queues[id]!.isEmpty { queues.removeValue(forKey: id) }
+        return (id, job)
+    }
+}
 
-    // MARK: - Pre-loaded results (set before drain, read by emitScheduleActivity)
+// MARK: - WorkflowStateMachine
+
+/// All mutable workflow-activation state: continuations, pending commands,
+/// preloaded results, and ID counters.
+///
+/// Extracted from `StrandWorkflowExecutor` as a `~Copyable` value so the compiler
+/// prevents accidental copies. Accessed exclusively during/between `drain()` calls
+/// on the serial executor — no concurrent access, no locking required.
+struct WorkflowStateMachine: ~Copyable {
+
+    // MARK: - Pre-loaded results (from resolveCompleted, set before drain)
 
     /// Activity results already known before this activation.
     /// Keyed by seq_num — the monotonic activation counter assigned when the
@@ -189,19 +251,18 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     /// When `WorkflowContext.runActivity` finds a hit here it emits a `writeCheckpoint`
     /// command and returns immediately — no suspension, no DB round-trip.
     /// This is the replay fast path that makes re-activations idempotent.
-    private var preloadedResults: [Int: ByteBuffer] = [:]
+    private(set) var preloadedResults: [Int: ByteBuffer] = [:]
 
     /// Start-time metadata for each completed child, keyed by seq_num.
     /// Populated by `resolveCompleted`; consumed by `applyScheduleCommands`
     /// to write `ACTIVITY_STARTED` alongside `ACTIVITY_COMPLETED`.
-    private var preloadedStartInfo: [Int: (startedAt: Date?, attempt: Int, workerID: String?)] = [:]
+    private(set) var preloadedStartInfo: [Int: (startedAt: Date?, attempt: Int, workerID: String?)] = [:]
 
     /// Terminal non-success states for child activities/workflows (FAILED, CANCELLED).
     /// Keyed by seq_num → `(state, failureReason)`. Checked by fast path 2a in
     /// `runActivity` and `runChildWorkflow`: if present, throw immediately instead of
     /// registering an event_wait after the completion signal already fired.
-    private var preloadedNonCompletions: [Int: (state: TaskState, failureReason: ByteBuffer?)] =
-        [:]
+    private(set) var preloadedNonCompletions: [Int: (state: TaskState, failureReason: ByteBuffer?)] = [:]
 
     // MARK: - Commands (accumulated during drain, applied by worker after drain)
 
@@ -212,11 +273,11 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     // MARK: - Continuations (indexed by checkpoint name)
 
     /// Activity continuations parked by `suspendActivity(seqNum:continuation:)`.
-    private var activityContinuations: [Int: CheckedContinuation<ByteBuffer, Error>] = [:]
+    private var activityContinuations: [Int: CheckedContinuation<ByteBuffer, any Error>] = [:]
     /// Timer continuations parked by `suspendTimer(seqNum:continuation:)`.
-    private var timerContinuations: [Int: CheckedContinuation<Void, Error>] = [:]
+    private var timerContinuations: [Int: CheckedContinuation<Void, any Error>] = [:]
     /// Event-wait continuations parked by `suspendEvent(seqNum:eventName:continuation:)`.
-    private var eventContinuations: [Int: CheckedContinuation<ByteBuffer, Error>] = [:]
+    private var eventContinuations: [Int: CheckedContinuation<ByteBuffer, any Error>] = [:]
     /// Maps event name → seqNum for parked event continuations.
     /// Populated by `suspendEvent`; lets the worker look up the right continuation
     /// when a named event fires on a cached re-activation.
@@ -238,7 +299,330 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     private(set) var localActivityEntries: [Int: LocalActivityEntry] = [:]
     private var nextLocalActivityID: Int = 0
 
-    // MARK: - TaskExecutor / SerialExecutor conformance
+    // MARK: - Pre-load API (called by worker before drain)
+
+    /// Pre-populate completed activity results from Postgres.
+    ///
+    /// Call this BEFORE creating the handler task and calling `drain()`. Typically
+    /// the worker reads terminal checkpoints from `strand.task_completions` and passes
+    /// them here. Both COMPLETED (result buffer) and FAILED (nil buffer) entries are
+    /// included so the fast path can handle failures without hitting the slow path.
+    mutating func resolveCompleted(
+        _ completions: [(
+            seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
+            state: TaskState, kind: TaskKind, name: String,
+            startedAt: Date?, runAttempt: Int, workerID: String?
+        )]
+    ) {
+        for (seqNum, result, failureReason, state, _, _, startedAt, runAttempt, workerID) in completions {
+            preloadedStartInfo[seqNum] = (startedAt: startedAt, attempt: runAttempt, workerID: workerID)
+            switch state {
+            case .completed:
+                if let result { preloadedResults[seqNum] = result }
+            case .failed, .cancelled:
+                preloadedNonCompletions[seqNum] = (state: state, failureReason: failureReason)
+            default:
+                break  // task_completions only holds terminal states; ignore anything unexpected
+            }
+        }
+    }
+
+    /// Returns the pre-loaded result for `seqNum`, or `nil` if not available.
+    /// Called by `WorkflowContext.runActivity` and `runChildWorkflow` on every
+    /// call. A non-nil return means the activity completed in a prior activation and
+    /// its result was persisted to Postgres; the handler can proceed without suspension.
+    mutating func preloadedResult(for seqNum: Int) -> ByteBuffer? {
+        preloadedResults[seqNum]
+    }
+
+    /// Returns the terminal non-success entry `(state, failureReason)` for
+    /// `seqNum`, or `nil` if the activity succeeded or hasn't completed yet.
+    /// Fast path 2a in `runActivity` / `runChildWorkflow` uses this to throw the
+    /// correct typed error instead of registering an event_wait that never fires.
+    mutating func preloadedNonCompletion(
+        for seqNum: Int
+    ) -> (
+        state: TaskState, failureReason: ByteBuffer?
+    )? {
+        preloadedNonCompletions[seqNum]
+    }
+
+    /// Returns the run start metadata for `seqNum`, or `nil` if not available.
+    /// Used by `applyScheduleCommands` to write `ACTIVITY_STARTED` history events.
+    mutating func preloadedStartInfo(for seqNum: Int) -> (startedAt: Date?, attempt: Int, workerID: String?)? {
+        preloadedStartInfo[seqNum]
+    }
+
+    // MARK: - Command emission API (called by WorkflowContext methods during drain)
+
+    /// Append a command to the pending list.
+    ///
+    /// Called synchronously on the executor by `WorkflowContext` methods — safe
+    /// without locks because all access is confined to the drain loop caller.
+    mutating func emit(_ command: WorkflowCommand) {
+        pendingCommands.append(command)
+    }
+
+    // MARK: - Local activity API
+
+    /// Register a local activity for in-process execution post-drain. Returns an ID
+    /// that is used to link the `CheckedContinuation` and later resolve the result.
+    mutating func scheduleLocalActivity(name: String, input: ByteBuffer, seqNum: Int, options: LocalActivityOptions = .init()) -> Int {
+        let id = nextLocalActivityID
+        nextLocalActivityID += 1
+        localActivityEntries[id] = LocalActivityEntry(
+            name: name,
+            input: input,
+            seqNum: seqNum,
+            options: options
+        )
+        return id
+    }
+
+    /// Attach the continuation immediately after the task suspends
+    /// (called synchronously from within `withCheckedThrowingContinuation`).
+    mutating func linkLocalActivityContinuation(
+        _ cont: CheckedContinuation<ByteBuffer, any Error>,
+        forID id: Int
+    ) {
+        localActivityEntries[id]?.continuation = cont
+    }
+
+    /// Resume a local activity's continuation with a successful result and remove its entry.
+    mutating func resolveLocalActivity(id: Int, result: ByteBuffer) {
+        if let entry = localActivityEntries.removeValue(forKey: id) {
+            entry.continuation?.resume(returning: result)
+        }
+    }
+
+    /// Resume a local activity's continuation with an error and remove its entry.
+    mutating func failLocalActivity(id: Int, error: any Error) {
+        if let entry = localActivityEntries.removeValue(forKey: id) {
+            entry.continuation?.resume(throwing: error)
+        }
+    }
+
+    // MARK: - Suspension API (called by WorkflowContext to park a task)
+
+    /// Store an activity continuation. The task suspends after this returns.
+    ///
+    /// The continuation stays parked until `resumeActivity(seqNum:result:)` or
+    /// `resumeActivityFailure(seqNum:error:)` is called on re-activation.
+    mutating func suspendActivity(
+        seqNum: Int,
+        continuation: CheckedContinuation<ByteBuffer, any Error>
+    ) {
+        activityContinuations[seqNum] = continuation
+    }
+
+    /// Store a timer continuation. The task suspends after this returns.
+    mutating func suspendTimer(
+        seqNum: Int,
+        continuation: CheckedContinuation<Void, any Error>
+    ) {
+        timerContinuations[seqNum] = continuation
+    }
+
+    /// Store an event-wait continuation. The task suspends after this returns.
+    /// `eventName` is recorded so the worker can resume this continuation by name
+    /// on a cached re-activation (see `seqNum(forEventName:)` and `resumeEvent`).
+    mutating func suspendEvent(
+        seqNum: Int,
+        eventName: String,
+        continuation: CheckedContinuation<ByteBuffer, any Error>
+    ) {
+        eventContinuations[seqNum] = continuation
+        eventNameToSeqNum[eventName] = seqNum
+    }
+
+    // MARK: - Resume API
+    //
+    // Called by the worker on re-activation to deliver real results to the parked
+    // continuations. After calling the appropriate resume method(s), the worker
+    // calls drain() to continue the handler from where it paused.
+    // All access is from a single drain() caller — no locking needed.
+
+    /// Resume an activity or child-workflow continuation with a successful result.
+    mutating func resumeActivity(seqNum: Int, result: ByteBuffer) {
+        activityContinuations.removeValue(forKey: seqNum)?.resume(returning: result)
+    }
+
+    /// Resume an activity or child-workflow continuation with a failure error.
+    mutating func resumeActivityFailure(seqNum: Int, error: any Error) {
+        activityContinuations.removeValue(forKey: seqNum)?.resume(throwing: error)
+    }
+
+    /// Resume all parked timer continuations (timer elapsed; run woken from SLEEPING).
+    /// In normal operation at most one timer is active at a time.
+    mutating func resumeAllTimers() {
+        let keys = Array(timerContinuations.keys)
+        for seqNum in keys {
+            timerContinuations.removeValue(forKey: seqNum)?.resume()
+        }
+    }
+
+    /// Resume the event continuation identified by `seqNum` with the delivered payload.
+    mutating func resumeEvent(seqNum: Int, payload: ByteBuffer) {
+        eventContinuations.removeValue(forKey: seqNum)?.resume(returning: payload)
+        eventNameToSeqNum = eventNameToSeqNum.filter { $1 != seqNum }
+    }
+
+    /// Resume the event continuation for `eventName` with a timeout error (no payload arrived).
+    mutating func resumeEventWithTimeout(seqNum: Int, eventName: String) {
+        eventContinuations.removeValue(forKey: seqNum)?
+            .resume(throwing: StrandError.timeout(message: "Timed out waiting for event \"\(eventName)\""))
+        eventNameToSeqNum.removeValue(forKey: eventName)
+    }
+
+    /// Returns the seqNum for the parked event continuation registered under `name`, or `nil`.
+    mutating func seqNum(forEventName name: String) -> Int? {
+        eventNameToSeqNum[name]
+    }
+
+    /// Resume any condition continuations whose deadlines have elapsed.
+    /// Returns `true` when at least one was resumed (caller should `drain()` and loop).
+    mutating func resumeExpiredConditions() -> Bool {
+        let now = Date()
+        for (id, entry) in conditionEntries {
+            if let wakeAt = entry.wakeAt, now >= wakeAt {
+                conditionEntries.removeValue(forKey: id)
+                // Timeout is normal control flow — resume with false so the
+                // caller can decide what to do (e.g. auto-approve after SLA).
+                entry.continuation?.resume(returning: false)
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Discard all accumulated commands from a previous activation before resuming
+    /// cached continuations and re-draining. Only call on the cached activation path.
+    mutating func clearPendingCommands() {
+        pendingCommands.removeAll()
+    }
+
+    // MARK: - Condition API
+    //
+    // Registration is split across two steps, both within the same drain() call:
+    //   Step 1 — registerCondition(): stores the predicate. Not evaluated yet.
+    //   Step 2 — linkConditionContinuation(): attaches the continuation after the task
+    //             suspends inside withCheckedThrowingContinuation.
+    // Post-drain: the worker calls evaluateAndResumeFirstSatisfiedCondition() in a loop;
+    //             predicates are safe to evaluate because run() has released exclusive access.
+
+    /// Register a condition predicate and return its ID.
+    ///
+    /// - Parameters:
+    ///   - predicate: Closure that reads `stateBox` via `withValue`. **Not** called
+    ///     here — evaluated post-drain by the worker's condition-check loop.
+    ///   - wakeAt: Deadline for `condition(_:timeout:)`, `nil` for indefinite waits.
+    mutating func registerCondition(
+        predicate: @escaping () -> Bool,
+        wakeAt: Date? = nil,
+        timeout: Duration? = nil
+    ) -> Int {
+        let id = nextConditionID
+        nextConditionID += 1
+        conditionEntries[id] = ConditionEntry(predicate: predicate, wakeAt: wakeAt, timeout: timeout)
+        return id
+    }
+
+    /// Store the `CheckedContinuation` for a registered condition (called synchronously
+    /// from within `withCheckedThrowingContinuation` while the task is suspending).
+    mutating func linkConditionContinuation(_ cont: CheckedContinuation<Bool, any Error>, forID id: Int) {
+        conditionEntries[id]?.continuation = cont
+    }
+
+    /// Evaluate all stored condition predicates and resume the first one that returns
+    /// `true`. Removes the satisfied entry. Returns `true` when a condition was
+    /// resumed (the caller should `drain()` again and loop).
+    ///
+    /// Must be called AFTER `drain()` — at that point `run()` has suspended and
+    /// no longer holds exclusive access on `stateBox.value`.
+    mutating func evaluateAndResumeFirstSatisfiedCondition() -> Bool {
+        for (id, entry) in conditionEntries where entry.predicate() {
+            conditionEntries.removeValue(forKey: id)
+            entry.continuation?.resume(returning: true)
+            return true
+        }
+        return false
+    }
+
+    /// `true` when at least one condition predicate is registered but not yet satisfied.
+    var hasUnsatisfiedConditions: Bool { !conditionEntries.isEmpty }
+
+    /// The earliest deadline across all pending condition-with-timeout entries.
+    /// `nil` when all remaining conditions are indefinite (no timeout).
+    var conditionMinWakeAt: Date? {
+        conditionEntries.values.compactMap(\.wakeAt).min()
+    }
+
+    // MARK: - Teardown
+
+    /// Resume all pending continuations with `InternalError.cancelled`.
+    ///
+    /// **Only call during true teardown** (workflow completion, real failure, worker
+    /// shutdown). The normal suspension path does NOT call this — the handler Task
+    /// stays alive between activations, parked on its continuations, and the Resume
+    /// API delivers real results on re-activation.
+    mutating func cancelPending() {
+        for (_, cont) in activityContinuations { cont.resume(throwing: InternalError.cancelled) }
+        for (_, cont) in timerContinuations { cont.resume(throwing: InternalError.cancelled) }
+        for (_, cont) in eventContinuations { cont.resume(throwing: InternalError.cancelled) }
+        for (_, entry) in conditionEntries {
+            entry.continuation?.resume(throwing: InternalError.cancelled)
+        }
+        for (_, entry) in localActivityEntries {
+            entry.continuation?.resume(throwing: InternalError.cancelled)
+        }
+        activityContinuations.removeAll()
+        timerContinuations.removeAll()
+        eventContinuations.removeAll()
+        conditionEntries.removeAll()
+        localActivityEntries.removeAll()
+        eventNameToSeqNum.removeAll()
+        preloadedStartInfo.removeAll()
+        preloadedResults.removeAll()
+        preloadedNonCompletions.removeAll()
+    }
+
+    // MARK: - Inspection
+
+    /// `true` when at least one continuation is parked (handler suspended mid-activation).
+    ///
+    /// The worker checks this after `drain()` to decide between:
+    ///   - `true`  → handler is suspended; write commands to DB and finish activation.
+    ///   - `false` → handler completed synchronously; finalize the run.
+    var hasPendingContinuations: Bool {
+        !activityContinuations.isEmpty
+            || !timerContinuations.isEmpty
+            || !eventContinuations.isEmpty
+            || !conditionEntries.isEmpty
+            || !localActivityEntries.isEmpty
+    }
+}
+
+// MARK: - StrandWorkflowExecutor
+
+/// The deterministic serial executor for workflow activations.
+///
+/// Pure job-queue. All workflow state lives in the accompanying `WorkflowStateMachine`
+/// stored on `_WorkflowActivation`. `Sendable` conformance is genuine — all mutation
+/// is serialised through the `Mutex`-protected job deque; no mutable state is shared
+/// outside the queue itself.
+///
+/// One instance is created per workflow type at registration time and stored in
+/// `_WorkflowTaskCache<W>`. The handler `Task` stays alive between activations,
+/// parked on `CheckedContinuation`s in the `WorkflowStateMachine`. On re-activation
+/// the worker delivers real results via the state machine, then calls `drain()` to
+/// continue the handler from where it paused.
+final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, Sendable {
+
+    private let jobs: Mutex<_JobQueue>
+
+    init() {
+        jobs = Mutex(_JobQueue())
+    }
 
     /// Buffer a Swift concurrency job for later synchronous execution by `drain()`.
     ///
@@ -248,8 +632,9 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     /// control the exact moment of execution and guarantee a deterministic total order
     /// over all jobs within one activation.
     func enqueue(_ job: consuming ExecutorJob) {
-        jobQueue.append(UnownedJob(job))
-        // DO NOT drain here — the worker calls drain() explicitly.
+        let unowned = UnownedJob(job)
+        let taskID = _getJobTaskId(unowned)
+        jobs.withLock { $0.push(taskID, unowned) }
     }
 
     /// Returns an unowned reference to `self` as a `SerialExecutor`.
@@ -297,330 +682,26 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, @unchecked Se
     ///
     /// When `drain()` returns the queue is empty and every task has either:
     ///   - **Completed**: the handler result is available externally.
-    ///   - **Suspended**: a continuation is stored via one of the `suspend*` methods,
-    ///     waiting for an activity result, timer, or event.
+    ///   - **Suspended**: a continuation is stored in `WorkflowStateMachine` via one
+    ///     of the `suspend*` methods, waiting for an activity result, timer, or event.
     ///
-    /// Read `pendingCommands` after this call to discover what the worker needs to
-    /// write to Postgres.
+    /// Drain ordering: exhaust the currently-running task's continuation chain
+    /// before switching to a different task. This prevents task interleaving
+    /// within a single logical activation step and produces the same deterministic
+    /// command sequence on every replay regardless of Swift's scheduling choices.
+    ///
+    /// Read `stateMachine.pendingCommands` after this call to discover what the
+    /// worker needs to write to Postgres.
     func drain() {
-        guard !isDraining else {
-            // Re-entrant drain is a programming error: a job running inside the
-            // drain loop must not call drain() again.
-            return
-        }
-        isDraining = true
-        defer { isDraining = false }
-
-        while let job = jobQueue.popFirst() {
-            // O(1) dequeue with Deque. New jobs enqueued during execution of this
-            // job are appended to the back and processed in subsequent iterations.
+        var currentTaskID: UInt64? = nil
+        while true {
+            guard let (taskID, job) = jobs.withLock({ $0.pop(continuing: currentTaskID) })
+            else { return }
+            currentTaskID = taskID
             job.runSynchronously(
                 isolatedTo: asUnownedSerialExecutor(),
                 taskExecutor: asUnownedTaskExecutor()
             )
         }
     }
-
-    // MARK: - Pre-load API (called by worker before drain)
-
-    /// Pre-populate completed activity results from Postgres.
-    ///
-    /// Call this BEFORE creating the handler task and calling `drain()`. Typically
-    /// the worker reads terminal checkpoints from `strand.task_completions` and passes
-    /// them here. Both COMPLETED (result buffer) and FAILED (nil buffer) entries are
-    /// included so the fast path can handle failures without hitting the slow path.
-    func resolveCompleted(
-        _ completions: [(
-            seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
-            state: TaskState, kind: TaskKind, name: String,
-            startedAt: Date?, runAttempt: Int, workerID: String?
-        )]
-    ) {
-        for (seqNum, result, failureReason, state, _, _, startedAt, runAttempt, workerID) in completions {
-            preloadedStartInfo[seqNum] = (startedAt: startedAt, attempt: runAttempt, workerID: workerID)
-            switch state {
-            case .completed:
-                if let result { preloadedResults[seqNum] = result }
-            case .failed, .cancelled:
-                preloadedNonCompletions[seqNum] = (state: state, failureReason: failureReason)
-            default:
-                break  // task_completions only holds terminal states; ignore anything unexpected
-            }
-        }
-    }
-
-    /// Returns the pre-loaded result for `seqNum`, or `nil` if not available.
-    /// Called by `WorkflowContext.runActivity` and `runChildWorkflow` on every
-    /// call. A non-nil return means the activity completed in a prior activation and
-    /// its result was persisted to Postgres; the handler can proceed without suspension.
-    func preloadedResult(for seqNum: Int) -> ByteBuffer? {
-        preloadedResults[seqNum]
-    }
-
-    /// Returns the terminal non-success entry `(state, failureReason)` for
-    /// `seqNum`, or `nil` if the activity succeeded or hasn't completed yet.
-    /// Fast path 2a in `runActivity` / `runChildWorkflow` uses this to throw the
-    /// correct typed error instead of registering an event_wait that never fires.
-    func preloadedNonCompletion(
-        for seqNum: Int
-    ) -> (
-        state: TaskState, failureReason: ByteBuffer?
-    )? {
-        preloadedNonCompletions[seqNum]
-    }
-
-    /// Returns the run start metadata for `seqNum`, or `nil` if not available.
-    /// Used by `applyScheduleCommands` to write `ACTIVITY_STARTED` history events.
-    func preloadedStartInfo(for seqNum: Int) -> (startedAt: Date?, attempt: Int, workerID: String?)? {
-        preloadedStartInfo[seqNum]
-    }
-
-    // MARK: - Command emission API (called by WorkflowContext methods during drain)
-
-    /// Append a command to the pending list.
-    ///
-    /// Called synchronously on the executor by `WorkflowContext` methods — safe
-    /// without locks because all access is confined to the drain loop caller.
-    func emit(_ command: WorkflowCommand) {
-        pendingCommands.append(command)
-    }
-
-    // MARK: - Local activity API
-
-    /// Register a local activity for in-process execution post-drain. Returns an ID
-    /// that is used to link the `CheckedContinuation` and later resolve the result.
-    func scheduleLocalActivity(name: String, input: ByteBuffer, seqNum: Int, options: LocalActivityOptions = .init()) -> Int {
-        let id = nextLocalActivityID
-        nextLocalActivityID += 1
-        localActivityEntries[id] = LocalActivityEntry(
-            name: name,
-            input: input,
-            seqNum: seqNum,
-            options: options
-        )
-        return id
-    }
-
-    /// Attach the continuation immediately after the task suspends
-    /// (called synchronously from within `withCheckedThrowingContinuation`).
-    func linkLocalActivityContinuation(
-        _ cont: CheckedContinuation<ByteBuffer, Error>,
-        forID id: Int
-    ) {
-        localActivityEntries[id]?.continuation = cont
-    }
-
-    /// Resume a local activity’s continuation with a successful result and remove its entry.
-    func resolveLocalActivity(id: Int, result: ByteBuffer) {
-        if let entry = localActivityEntries.removeValue(forKey: id) {
-            entry.continuation?.resume(returning: result)
-        }
-    }
-
-    /// Resume a local activity’s continuation with an error and remove its entry.
-    func failLocalActivity(id: Int, error: Error) {
-        if let entry = localActivityEntries.removeValue(forKey: id) {
-            entry.continuation?.resume(throwing: error)
-        }
-    }
-
-    // MARK: - Suspension API (called by WorkflowContext to park a task)
-
-    /// Store an activity continuation. The task suspends after this returns.
-    ///
-    /// The continuation stays parked until `resumeActivity(seqNum:result:)` or
-    /// `resumeActivityFailure(seqNum:error:)` is called on re-activation.
-    func suspendActivity(
-        seqNum: Int,
-        continuation: CheckedContinuation<ByteBuffer, Error>
-    ) {
-        activityContinuations[seqNum] = continuation
-    }
-
-    /// Store a timer continuation. The task suspends after this returns.
-    func suspendTimer(
-        seqNum: Int,
-        continuation: CheckedContinuation<Void, Error>
-    ) {
-        timerContinuations[seqNum] = continuation
-    }
-
-    /// Store an event-wait continuation. The task suspends after this returns.
-    /// `eventName` is recorded so the worker can resume this continuation by name
-    /// on a cached re-activation (see `seqNum(forEventName:)` and `resumeEvent`).
-    func suspendEvent(
-        seqNum: Int,
-        eventName: String,
-        continuation: CheckedContinuation<ByteBuffer, Error>
-    ) {
-        eventContinuations[seqNum] = continuation
-        eventNameToSeqNum[eventName] = seqNum
-    }
-
-    // MARK: - Resume API
-    //
-    // Called by the worker on re-activation to deliver real results to the parked
-    // continuations. After calling the appropriate resume method(s), the worker
-    // calls drain() to continue the handler from where it paused.
-    // All access is from a single drain() caller — no locking needed.
-
-    /// Resume an activity or child-workflow continuation with a successful result.
-    func resumeActivity(seqNum: Int, result: ByteBuffer) {
-        activityContinuations.removeValue(forKey: seqNum)?.resume(returning: result)
-    }
-
-    /// Resume an activity or child-workflow continuation with a failure error.
-    func resumeActivityFailure(seqNum: Int, error: Error) {
-        activityContinuations.removeValue(forKey: seqNum)?.resume(throwing: error)
-    }
-
-    /// Resume all parked timer continuations (timer elapsed; run woken from SLEEPING).
-    /// In normal operation at most one timer is active at a time.
-    func resumeAllTimers() {
-        let keys = Array(timerContinuations.keys)
-        for seqNum in keys {
-            timerContinuations.removeValue(forKey: seqNum)?.resume()
-        }
-    }
-
-    /// Resume the event continuation identified by `seqNum` with the delivered payload.
-    func resumeEvent(seqNum: Int, payload: ByteBuffer) {
-        eventContinuations.removeValue(forKey: seqNum)?.resume(returning: payload)
-        eventNameToSeqNum = eventNameToSeqNum.filter { $1 != seqNum }
-    }
-
-    /// Resume the event continuation for `eventName` with a timeout error (no payload arrived).
-    func resumeEventWithTimeout(seqNum: Int, eventName: String) {
-        eventContinuations.removeValue(forKey: seqNum)?
-            .resume(throwing: StrandError.timeout(message: "Timed out waiting for event \"\(eventName)\""))
-        eventNameToSeqNum.removeValue(forKey: eventName)
-    }
-
-    /// Returns the seqNum for the parked event continuation registered under `name`, or `nil`.
-    func seqNum(forEventName name: String) -> Int? {
-        eventNameToSeqNum[name]
-    }
-
-    /// Resume any condition continuations whose deadlines have elapsed.
-    /// Returns `true` when at least one was resumed (caller should `drain()` and loop).
-    func resumeExpiredConditions() -> Bool {
-        let now = Date()
-        for (id, entry) in conditionEntries {
-            if let wakeAt = entry.wakeAt, now >= wakeAt {
-                conditionEntries.removeValue(forKey: id)
-                // Timeout is normal control flow — resume with false so the
-                // caller can decide what to do (e.g. auto-approve after SLA).
-                entry.continuation?.resume(returning: false)
-                return true
-            }
-        }
-        return false
-    }
-
-    /// Discard all accumulated commands from a previous activation before resuming
-    /// cached continuations and re-draining. Only call on the cached activation path.
-    func clearPendingCommands() {
-        pendingCommands.removeAll()
-    }
-
-    // MARK: - Condition API
-    //
-    // Registration is split across two steps, both within the same drain() call:
-    //   Step 1 — registerCondition(): stores the predicate. Not evaluated yet.
-    //   Step 2 — linkConditionContinuation(): attaches the continuation after the task
-    //             suspends inside withCheckedThrowingContinuation.
-    // Post-drain: the worker calls evaluateAndResumeFirstSatisfiedCondition() in a loop;
-    //             predicates are safe to evaluate because run() has released exclusive access.
-
-    /// Register a condition predicate and return its ID.
-    ///
-    /// - Parameters:
-    ///   - predicate: Closure that reads `stateBox` via `withValue`. **Not** called
-    ///     here — evaluated post-drain by the worker's condition-check loop.
-    ///   - wakeAt: Deadline for `condition(_:timeout:)`, `nil` for indefinite waits.
-    func registerCondition(
-        predicate: @escaping @Sendable () -> Bool,
-        wakeAt: Date? = nil,
-        timeout: Duration? = nil
-    ) -> Int {
-        let id = nextConditionID
-        nextConditionID += 1
-        conditionEntries[id] = ConditionEntry(predicate: predicate, wakeAt: wakeAt, timeout: timeout)
-        return id
-    }
-
-    /// Store the `CheckedContinuation` for a registered condition (called synchronously
-    /// from within `withCheckedThrowingContinuation` while the task is suspending).
-    func linkConditionContinuation(_ cont: CheckedContinuation<Bool, Error>, forID id: Int) {
-        conditionEntries[id]?.continuation = cont
-    }
-
-    /// Evaluate all stored condition predicates and resume the first one that returns
-    /// `true`. Removes the satisfied entry. Returns `true` when a condition was
-    /// resumed (the caller should `drain()` again and loop).
-    ///
-    /// Must be called AFTER `drain()` — at that point `run()` has suspended and
-    /// no longer holds exclusive access on `stateBox.value`.
-    func evaluateAndResumeFirstSatisfiedCondition() -> Bool {
-        for (id, entry) in conditionEntries where entry.predicate() {
-            conditionEntries.removeValue(forKey: id)
-            entry.continuation?.resume(returning: true)
-            return true
-        }
-        return false
-    }
-
-    /// `true` when at least one condition predicate is registered but not yet satisfied.
-    var hasUnsatisfiedConditions: Bool { !conditionEntries.isEmpty }
-
-    /// The earliest deadline across all pending condition-with-timeout entries.
-    /// `nil` when all remaining conditions are indefinite (no timeout).
-    var conditionMinWakeAt: Date? {
-        conditionEntries.values.compactMap(\.wakeAt).min()
-    }
-
-    // MARK: - Teardown
-
-    /// Resume all pending continuations with `InternalError.cancelled`.
-    ///
-    /// **Only call during true teardown** (workflow completion, real failure, worker
-    /// shutdown). The normal suspension path does NOT call this — the handler Task
-    /// stays alive between activations, parked on its continuations, and the Resume
-    /// API delivers real results on re-activation.
-    func cancelPending() {
-        for (_, cont) in activityContinuations { cont.resume(throwing: InternalError.cancelled) }
-        for (_, cont) in timerContinuations { cont.resume(throwing: InternalError.cancelled) }
-        for (_, cont) in eventContinuations { cont.resume(throwing: InternalError.cancelled) }
-        for (_, entry) in conditionEntries {
-            entry.continuation?.resume(throwing: InternalError.cancelled)
-        }
-        for (_, entry) in localActivityEntries {
-            entry.continuation?.resume(throwing: InternalError.cancelled)
-        }
-        activityContinuations.removeAll()
-        timerContinuations.removeAll()
-        eventContinuations.removeAll()
-        conditionEntries.removeAll()
-        localActivityEntries.removeAll()
-        eventNameToSeqNum.removeAll()
-        preloadedStartInfo.removeAll()
-        preloadedResults.removeAll()
-        preloadedNonCompletions.removeAll()
-    }
-
-    // MARK: - Inspection
-
-    /// `true` when at least one continuation is parked (handler suspended mid-activation).
-    ///
-    /// The worker checks this after `drain()` to decide between:
-    ///   - `true`  → handler is suspended; write commands to DB and finish activation.
-    ///   - `false` → handler completed synchronously; finalize the run.
-    var hasPendingContinuations: Bool {
-        !activityContinuations.isEmpty
-            || !timerContinuations.isEmpty
-            || !eventContinuations.isEmpty
-            || !conditionEntries.isEmpty
-            || !localActivityEntries.isEmpty
-    }
-
 }

@@ -487,6 +487,7 @@ public struct StrandWorker: Service {
         // Dispatch body: claims work when slots are available, parks when full.
         // Execution tasks are added as independent children of the same group
         // so cancellation propagates cleanly on graceful shutdown.
+        var lastWakeAt = ContinuousClock.now - .seconds(1)
         try await withThrowingDiscardingTaskGroup { group in
             // When graceful shutdown fires the shutdown task signals notifySignal
             // to unblock this loop, then we detect isShuttingDownGracefully here
@@ -503,35 +504,34 @@ public struct StrandWorker: Service {
                     continue
                 }
 
-                // ── Claim up to `free` tasks ──────────────────────────────
-                // Transition WAITING runs whose children have completed to PENDING
-                // so they are immediately eligible for the claimTasks call below.
-                // Errors are non-fatal: a transient failure is retried on the next
-                // poll tick without affecting the claim path.
-                do {
-                    try await Queries.wakeCompletedWaiting(
-                        on: postgres,
-                        namespaceID: namespace,
-                        queue: queueName,
-                        logger: logger
-                    )
-                } catch {
-                    logger.warning(
-                        "wakeCompletedWaiting failed",
-                        metadata: .forError(error) + ["strand.queue": .string(queueName)]
-                    )
-                }
+                // ── Claim up to `free` tasks ────────────────────────
+                // Single connection for wake + claim — halves pool pressure per poll cycle.
+                // wakeCompletedWaiting is rate-limited to ≤200 ms to avoid redundant sweeps
+                // on every tight poll loop iteration; the pg_notify primary path wakes parents
+                // immediately without relying on this sweep.
                 let claimed: [ClaimedTask]
                 do {
-                    claimed = try await Queries.claimTasks(
-                        on: postgres,
-                        namespaceID: namespace,
-                        queue: queueName,
-                        workerID: workerID,
-                        claimTimeoutSeconds: claimSecs,
-                        qty: free,
-                        logger: logger
-                    )
+                    claimed = try await postgres.withConnection { conn in
+                        let now = ContinuousClock.now
+                        if now - lastWakeAt >= .milliseconds(200) {
+                            lastWakeAt = now
+                            try? await Queries.wakeCompletedWaiting(
+                                on: conn,
+                                namespaceID: namespace,
+                                queue: queueName,
+                                logger: logger
+                            )
+                        }
+                        return try await Queries.claimTasks(
+                            on: conn,
+                            namespaceID: namespace,
+                            queue: queueName,
+                            workerID: workerID,
+                            claimTimeoutSeconds: claimSecs,
+                            qty: free,
+                            logger: logger
+                        )
+                    }
                 } catch {
                     if let handler = options.onError {
                         await handler(error)

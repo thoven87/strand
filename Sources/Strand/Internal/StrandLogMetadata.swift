@@ -94,7 +94,7 @@ struct DictionaryExtractor: Extractor {
 extension Logger.Metadata {
 
     /// OTel-convention error metadata: `error.type` + `exception.message`.
-    static func forError(_ error: Error) -> Logger.Metadata {
+    static func forError(_ error: any Error) -> Logger.Metadata {
         [
             StrandLogKeys.errorType: .string(String(describing: type(of: error))),
             StrandLogKeys.exceptionMessage: .string(String(describing: error)),

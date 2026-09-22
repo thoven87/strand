@@ -115,12 +115,16 @@ package enum TraceSpanQueries {
                 u.span_id, \(namespaceID), u.task_id, u.task_id, NULL,
                 \(kind), \(name), \(state),
                 0, NULL, \(maxAttempts),
-                \(queuedAt), NULL, NULL, NULL
+                COALESCE(t.created_at, \(queuedAt)),
+                NULL, NULL, NULL
             FROM unnest(\(spanIDs), \(taskIDs)) AS u(span_id, task_id)
+            LEFT JOIN strand.tasks t
+                   ON t.id = u.task_id AND t.namespace_id = \(namespaceID)
             ON CONFLICT (id) DO UPDATE
                 SET state       = EXCLUDED.state,
                     attempt     = GREATEST(EXCLUDED.attempt, strand.trace_spans.attempt),
                     worker_id   = COALESCE(EXCLUDED.worker_id,   strand.trace_spans.worker_id),
+                    queued_at   = LEAST(EXCLUDED.queued_at,      strand.trace_spans.queued_at),
                     started_at  = COALESCE(EXCLUDED.started_at,  strand.trace_spans.started_at),
                     finished_at = COALESCE(EXCLUDED.finished_at, strand.trace_spans.finished_at),
                     error       = COALESCE(EXCLUDED.error,       strand.trace_spans.error)
@@ -145,9 +149,14 @@ package enum TraceSpanQueries {
         logger: Logger
     ) async throws {
         guard !items.isEmpty else { return }
+        // Restructured as SELECT FROM (VALUES ...) LEFT JOIN strand.tasks so that
+        // queued_at is sourced from tasks.created_at — the authoritative creation
+        // timestamp — rather than the caller's wall clock.  This prevents a
+        // re-enqueue after a host sleep/resume cycle from stamping spans with a
+        // future queued_at while started_at retains the original claim time.
         var interp = PostgresQuery.StringInterpolation(
-            literalCapacity: 400 + items.count * 200,
-            interpolationCount: items.count * 8 + 4
+            literalCapacity: 500 + items.count * 220,
+            interpolationCount: items.count * 8 + 6
         )
         // Resolve root_task_id once from the parent span — shared by all child rows.
         interp.appendLiteral(
@@ -163,35 +172,53 @@ package enum TraceSpanQueries {
                 + "    (id, namespace_id, root_task_id, task_id, parent_id,\n"
                 + "     kind, name, state, attempt, worker_id, max_attempts,\n"
                 + "     queued_at, started_at, finished_at, error)\n"
-                + "VALUES\n"
+                + "SELECT\n"
+                + "    v.span_id, "
+        )
+        interp.appendInterpolation(namespaceID)
+        interp.appendLiteral(
+            ", (SELECT root_task_id FROM parent_root), v.task_id, "
+        )
+        interp.appendInterpolation(parentSpanID)
+        interp.appendLiteral(
+            ",\n"
+                + "    v.kind, v.name, "
+        )
+        try interp.appendInterpolation(state)
+        interp.appendLiteral(
+            ", 0, NULL, v.max_attempts,\n"
+                + "    COALESCE(t.created_at, v.fallback_queued_at),\n"
+                + "    NULL, NULL, NULL\n"
+                + "FROM (VALUES\n"
         )
         for (i, item) in items.enumerated() {
             if i > 0 { interp.appendLiteral(",\n") }
             interp.appendLiteral("    (")
             interp.appendInterpolation(item.spanID)
             interp.appendLiteral(", ")
-            interp.appendInterpolation(namespaceID)
-            interp.appendLiteral(", (SELECT root_task_id FROM parent_root), ")
             interp.appendInterpolation(item.taskID)
             interp.appendLiteral(", ")
-            interp.appendInterpolation(parentSpanID)
-            interp.appendLiteral(", ")
             try interp.appendInterpolation(item.kind)
-            interp.appendLiteral(", ")
+            interp.appendLiteral("::text, ")
             interp.appendInterpolation(item.name)
             interp.appendLiteral(", ")
-            try interp.appendInterpolation(state)
-            interp.appendLiteral(", 0, NULL, ")
             interp.appendInterpolation(item.maxAttempts)
-            interp.appendLiteral(", ")
+            interp.appendLiteral("::int4, ")  // explicit cast so VALUES infers integer, not text
             interp.appendInterpolation(item.queuedAt)
-            interp.appendLiteral(", NULL, NULL, NULL)")
+            interp.appendLiteral(")")
         }
+        interp.appendLiteral(
+            "\n) AS v(span_id, task_id, kind, name, max_attempts, fallback_queued_at)\n"
+                + "LEFT JOIN strand.tasks t\n"
+                + "       ON t.id = v.task_id AND t.namespace_id = "
+        )
+        interp.appendInterpolation(namespaceID)
         interp.appendLiteral(
             "\nON CONFLICT (id) DO UPDATE\n"
                 + "    SET state       = EXCLUDED.state,\n"
                 + "        attempt     = GREATEST(EXCLUDED.attempt, strand.trace_spans.attempt),\n"
                 + "        worker_id   = COALESCE(EXCLUDED.worker_id,   strand.trace_spans.worker_id),\n"
+                + "        queued_at   = LEAST(EXCLUDED.queued_at,      strand.trace_spans.queued_at),\n"
                 + "        started_at  = COALESCE(EXCLUDED.started_at,  strand.trace_spans.started_at),\n"
                 + "        finished_at = COALESCE(EXCLUDED.finished_at, strand.trace_spans.finished_at),\n"
                 + "        error       = COALESCE(EXCLUDED.error,       strand.trace_spans.error)"

@@ -870,6 +870,56 @@ extension WorkflowStateQueries {
         try await postgres.query(PostgresQuery(stringInterpolation: interp), logger: logger)
     }
 
+    /// Connection overload — used inside `flushWrites()` to avoid a separate transaction.
+    package static func batchWriteVersionMarkers(
+        on conn: PostgresConnection,
+        namespaceID: String,
+        taskID: UUID,
+        markers: [(changeID: String, value: Bool)],
+        logger: Logger
+    ) async throws {
+        guard !markers.isEmpty else { return }
+        if markers.count == 1 {
+            let m = markers[0]
+            try await conn.query(
+                """
+                INSERT INTO strand.workflow_version_markers
+                    (namespace_id, task_id, change_id, value, marked_at)
+                VALUES (\(namespaceID), \(taskID), \(m.changeID), \(m.value), NOW())
+                ON CONFLICT (task_id, change_id)
+                DO UPDATE SET value = EXCLUDED.value, marked_at = NOW()
+                """,
+                logger: logger
+            )
+            return
+        }
+        var interp = PostgresQuery.StringInterpolation(
+            literalCapacity: 120 + markers.count * 60,
+            interpolationCount: markers.count * 3 + 2
+        )
+        interp.appendLiteral(
+            "INSERT INTO strand.workflow_version_markers "
+                + "(namespace_id, task_id, change_id, value, marked_at) VALUES "
+        )
+        for (i, m) in markers.enumerated() {
+            if i > 0 { interp.appendLiteral(", ") }
+            interp.appendLiteral("(")
+            interp.appendInterpolation(namespaceID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(taskID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(m.changeID)
+            interp.appendLiteral(", ")
+            interp.appendInterpolation(m.value)
+            interp.appendLiteral(", NOW())")
+        }
+        interp.appendLiteral(
+            " ON CONFLICT (task_id, change_id) "
+                + "DO UPDATE SET value = EXCLUDED.value, marked_at = NOW()"
+        )
+        try await conn.query(PostgresQuery(stringInterpolation: interp), logger: logger)
+    }
+
     package struct VersionMarkerRow: Sendable {
         package let changeID: String
         package let value: Bool

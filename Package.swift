@@ -1,5 +1,5 @@
 import CompilerPluginSupport
-// swift-tools-version: 6.3
+// swift-tools-version: 6.4
 import PackageDescription
 
 let package = Package(
@@ -66,6 +66,11 @@ let package = Package(
                 // Imports are internal by default — prevents leaking internals to callers.
                 // SE-0409
                 .enableUpcomingFeature("InternalImportsByDefault"),
+                // Require `any` keyword for existential types — SE-0335.
+                // In Swift 6.4 this is stricter than the Swift 6 language mode default.
+                .enableUpcomingFeature("ExistentialAny"),
+                // Symbols from imported modules must be explicitly imported in each file — SE-0444.
+                .enableUpcomingFeature("MemberImportVisibility"),
             ]
         ),
         .target(
@@ -83,7 +88,12 @@ let package = Package(
                 .copy("Resources/ui")
             ],
             swiftSettings: [
-                .enableUpcomingFeature("InternalImportsByDefault")
+                .enableUpcomingFeature("InternalImportsByDefault"),
+                // Require `any` keyword for existential types — SE-0335.
+                // In Swift 6.4 this is stricter than the Swift 6 language mode default.
+                .enableUpcomingFeature("ExistentialAny"),
+                // Symbols from imported modules must be explicitly imported in each file — SE-0444.
+                .enableUpcomingFeature("MemberImportVisibility"),
             ]
         ),
         .target(
@@ -96,7 +106,12 @@ let package = Package(
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ],
             swiftSettings: [
-                .enableUpcomingFeature("InternalImportsByDefault")
+                .enableUpcomingFeature("InternalImportsByDefault"),
+                // Require `any` keyword for existential types — SE-0335.
+                // In Swift 6.4 this is stricter than the Swift 6 language mode default.
+                .enableUpcomingFeature("ExistentialAny"),
+                // Symbols from imported modules must be explicitly imported in each file — SE-0444.
+                .enableUpcomingFeature("MemberImportVisibility"),
             ]
         ),
         .testTarget(

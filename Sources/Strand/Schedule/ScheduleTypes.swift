@@ -23,12 +23,12 @@ public enum ScheduleAccuracy: Sendable, Codable, Equatable {
 
     // MARK: - Codable (stored as plain string: "latest", "all", "last:3")
 
-    public init(from decoder: Decoder) throws {
+    public init(from decoder: any Decoder) throws {
         let container = try decoder.singleValueContainer()
         self.init(dbString: try container.decode(String.self))
     }
 
-    public func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: any Encoder) throws {
         var container = encoder.singleValueContainer()
         try container.encode(dbString)
     }

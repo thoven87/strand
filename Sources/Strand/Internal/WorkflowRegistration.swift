@@ -85,7 +85,7 @@ final class _WorkflowTaskCache<W: Workflow>: Sendable {
     struct CachedState: Sendable {
         let executor: StrandWorkflowExecutor
         let task: Task<Void, Never>
-        let handlerResult: ArcBox<Result<W.Output, Error>?>
+        let handlerResult: ArcBox<Result<W.Output, any Error>?>
         let stateBox: ArcBox<W>
         let activation: _WorkflowActivation<W>
     }
@@ -109,7 +109,7 @@ final class _WorkflowTaskCache<W: Workflow>: Sendable {
     func cancelAll() {
         _mutex.withLock { states in
             for (_, state) in states {
-                state.executor.cancelPending()
+                state.activation.stateMachine.cancelPending()
                 state.executor.drain()
                 state.task.cancel()
             }
@@ -133,7 +133,7 @@ final class _WorkflowTaskCache<W: Workflow>: Sendable {
             return states[taskID]
         }
         guard let cached else { return }
-        cached.executor.cancelPending()
+        cached.activation.stateMachine.cancelPending()
         cached.executor.drain()
         cached.task.cancel()
     }
@@ -282,6 +282,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── 4. Pre-load results the executor needs for fast-path replay ───────────
         let executor = StrandWorkflowExecutor()
+        var stateMachine = WorkflowStateMachine()
 
         // 4a. Terminal child activities — runActivity / runChildWorkflow returns or
         //     throws immediately for these (COMPLETED = return, FAILED = throw).
@@ -290,7 +291,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             parentTaskID: claimed.taskID,
             logger: exec.logger
         )
-        executor.resolveCompleted(completedChildren)
+        stateMachine.resolveCompleted(completedChildren)
         // CHILD_WORKFLOW_COMPLETED history is written by the step-2 loop in
         // applyScheduleCommands when it processes the .childWorkflowCompleted command.
         // runChildWorkflow emits that command exactly once — a checkpoint written
@@ -317,6 +318,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             postgres: exec.postgres,
             logger: exec.logger,
             executor: executor,
+            stateMachine: stateMachine,
             stateBox: stateBox,
             checkpointCache: checkpointCache,
             checkpointNameCache: checkpointNameCache,
@@ -338,7 +340,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // outer activation code through the serial drain() synchronisation point.
         // No concurrent mutations occur in practice: the closure runs only during
         // drain(), which returns before the outer code reads handlerResult.
-        let handlerResult = ArcBox<Result<W.Output, Error>?>(nil)
+        let handlerResult = ArcBox<Result<W.Output, any Error>?>(nil)
         let handlerTask = Task(executorPreference: executor) {
             do {
                 let output = try await stateBox.value.run(context: context, input: input)
@@ -366,7 +368,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         defer {
             if !handlerTaskHandedOff {
                 handlerTask.cancel()
-                executor.cancelPending()
+                activation.stateMachine.cancelPending()
                 executor.drain()
             }
         }
@@ -391,7 +393,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // context.condition — evaluate immediately rather than parking the run.
         // Each resume may unblock more of the handler and emit new commands,
         // so drain after each satisfied condition until none remain.
-        while executor.evaluateAndResumeFirstSatisfiedCondition() {
+        while activation.stateMachine.evaluateAndResumeFirstSatisfiedCondition() {
             executor.drain()
         }
 
@@ -408,7 +410,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── 7. Apply commands, handle result, suspend or complete ─────────────────
         let result = try await applyScheduleCommands(
-            commands: executor.pendingCommands,
+            commands: activation.stateMachine.pendingCommands,
             executor: executor,
             claimed: claimed,
             exec: exec,
@@ -521,13 +523,13 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // feeds ACTIVITY_STARTED history writes in applyScheduleCommands. The preloaded
         // results enable fast-path-2 for any sibling activities that also completed
         // concurrently but whose continuations are not yet parked.
-        executor.resolveCompleted(completedChildren)
+        activation.stateMachine.resolveCompleted(completedChildren)
 
         // CHILD_WORKFLOW_COMPLETED history is written by the step-2 loop — see _activate.
 
         // ── Event/timer checkpoint (before resuming, for durability) ──────────
         if let eventName = claimed.wakeEvent,
-            let seqNum = executor.seqNum(forEventName: eventName),
+            let seqNum = activation.stateMachine.seqNum(forEventName: eventName),
             activation.cachedCheckpoint(for: seqNum) == nil
         {
             if let payload = claimed.eventPayloadBuffer {
@@ -546,12 +548,12 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── Resume parked continuations ───────────────────────────────────────
         // Clear commands from the previous activation before re-draining.
-        executor.clearPendingCommands()
+        activation.stateMachine.clearPendingCommands()
 
         for (seqNum, result, failureReason, state, kind, name, _, _, _) in completedChildren {
             switch state {
             case .completed:
-                if let result { executor.resumeActivity(seqNum: seqNum, result: result) }
+                if let result { activation.stateMachine.resumeActivity(seqNum: seqNum, result: result) }
             case .failed, .cancelled:
                 // Detect timeout: ClaimTimeoutError appears in the failure reason
                 // when the 2x claim-window threshold is exceeded.
@@ -575,14 +577,14 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                         state: state
                     )
                 }
-                executor.resumeActivityFailure(seqNum: seqNum, error: err)
+                activation.stateMachine.resumeActivityFailure(seqNum: seqNum, error: err)
             default:
                 break
             }
         }
 
         if let eventName = claimed.wakeEvent,
-            let seqNum = executor.seqNum(forEventName: eventName)
+            let seqNum = activation.stateMachine.seqNum(forEventName: eventName)
         {
             if let payload = claimed.eventPayloadBuffer {
                 // Resume the parked waitForEvent continuation. The slow-path code
@@ -590,14 +592,14 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                 // continuation returns, which applyScheduleCommands (step-2 loop)
                 // records in workflow_history. Writing it here as well would produce
                 // a duplicate EVENT_RECEIVED entry in the audit log.
-                executor.resumeEvent(seqNum: seqNum, payload: payload)
+                activation.stateMachine.resumeEvent(seqNum: seqNum, payload: payload)
             } else {
-                executor.resumeEventWithTimeout(seqNum: seqNum, eventName: eventName)
+                activation.stateMachine.resumeEventWithTimeout(seqNum: seqNum, eventName: eventName)
             }
         }
 
         // If woken without an event name a sleep timer (or condition deadline) fired.
-        if claimed.wakeEvent == nil { executor.resumeAllTimers() }
+        if claimed.wakeEvent == nil { activation.stateMachine.resumeAllTimers() }
 
         // Deliver cooperative cancel AFTER resuming real results so already-completed
         // continuations are delivered first. Set both the activation flag (for condition
@@ -610,8 +612,8 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── Drain + conditions ────────────────────────────────────────────────
         executor.drain()
-        while executor.resumeExpiredConditions() { executor.drain() }
-        while executor.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
+        while activation.stateMachine.resumeExpiredConditions() { executor.drain() }
+        while activation.stateMachine.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
 
         // ── Local activity execution loop ─────────────────────────────────────
         try await runLocalActivities(
@@ -626,7 +628,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         // ── Apply commands, handle result, suspend or complete ─────────────────
         return try await applyScheduleCommands(
-            commands: executor.pendingCommands,
+            commands: activation.stateMachine.pendingCommands,
             executor: executor,
             claimed: claimed,
             exec: exec,
@@ -746,15 +748,15 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         claimed: ClaimedTask,
         executor: StrandWorkflowExecutor,
         activation: _WorkflowActivation<W>,
-        handlerResult: ArcBox<Result<W.Output, Error>?>,
+        handlerResult: ArcBox<Result<W.Output, any Error>?>,
         claimTimeoutSecs: Int,
         expireConditions: Bool
     ) async throws {
-        localActivityLoop: while !executor.localActivityEntries.isEmpty {
-            let entries = executor.localActivityEntries
+        localActivityLoop: while !activation.stateMachine.localActivityEntries.isEmpty {
+            let entries = activation.stateMachine.localActivityEntries
             for (id, entry) in entries {
                 guard let runner = exec.localActivityLookup[entry.name] else {
-                    executor.failLocalActivity(id: id, error: StrandError.unknownTask(name: entry.name))
+                    activation.stateMachine.failLocalActivity(id: id, error: StrandError.unknownTask(name: entry.name))
                     continue
                 }
                 do {
@@ -814,16 +816,16 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                         logger: exec.logger
                     )
                     activation.cacheCheckpoint(seqNum: entry.seqNum, buffer: result)
-                    executor.resolveLocalActivity(id: id, result: result)
+                    activation.stateMachine.resolveLocalActivity(id: id, result: result)
                 } catch {
-                    executor.failLocalActivity(id: id, error: error)
+                    activation.stateMachine.failLocalActivity(id: id, error: error)
                 }
             }
             executor.drain()
             if expireConditions {
-                while executor.resumeExpiredConditions() { executor.drain() }
+                while activation.stateMachine.resumeExpiredConditions() { executor.drain() }
             }
-            while executor.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
+            while activation.stateMachine.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
             if handlerResult.value != nil { break localActivityLoop }
         }
     }
