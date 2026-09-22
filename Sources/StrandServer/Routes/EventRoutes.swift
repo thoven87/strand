@@ -4,6 +4,7 @@ import Strand
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
+import Foundation  // String.trimmingCharacters(in:) / CharacterSet not in FoundationEssentials on Linux
 #else
 import Foundation
 #endif
