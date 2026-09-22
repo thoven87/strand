@@ -136,6 +136,25 @@ public struct WorkerOptions: Sendable {
     /// Default: `500`.
     public var wakeCompletedWaitingLimit: Int
 
+    /// Maximum number of times the lease-expiry sweep may re-queue a run before
+    /// the worker treats it as a failure and consumes an attempt.
+    ///
+    /// Each lease-expiry re-queue means the previous worker claimed the run but
+    /// crashed or was killed before completing it (not a task-level failure —
+    /// those are counted separately via `maxAttempts`). A task that consistently
+    /// crashes its worker will loop indefinitely without this guard because the
+    /// normal retry budget is only consumed on explicit failures.
+    ///
+    /// When `infraFailureCount` on the claimed run equals or exceeds this limit,
+    /// the worker calls `failRun` immediately — without executing the handler —
+    /// so `maxAttempts` is decremented normally and the task eventually terminates.
+    ///
+    /// Setting this to `Int.max` effectively disables the guard (not recommended
+    /// for production; prefer a large but finite value).
+    ///
+    /// Default: `10`.
+    public var maxInfraFailures: Int
+
     /// Called on every poll error. When `nil`, errors are logged at `.error` level.
     public var onError: (@Sendable (any Error) async -> Void)?
 
@@ -153,6 +172,7 @@ public struct WorkerOptions: Sendable {
         leaseExpiryInterval: Duration = .seconds(5),
         notifyJitter: Duration = .milliseconds(50),
         wakeCompletedWaitingLimit: Int = 500,
+        maxInfraFailures: Int = 10,
         onError: (@Sendable (any Error) async -> Void)? = nil
     ) {
         self.queue = queue
@@ -168,6 +188,7 @@ public struct WorkerOptions: Sendable {
         self.leaseExpiryInterval = leaseExpiryInterval
         self.notifyJitter = notifyJitter
         self.wakeCompletedWaitingLimit = wakeCompletedWaitingLimit
+        self.maxInfraFailures = maxInfraFailures
         self.onError = onError
     }
 }
@@ -779,6 +800,33 @@ public struct StrandWorker: Service {
             ("queue", options.queue),
         ]
 
+        // ── Crash-loop guard ───────────────────────────────────────────────────
+        // If the lease-expiry sweep has re-queued this run more than
+        // maxInfraFailures times it means previous workers consistently crashed
+        // before finishing. Failing immediately consumes an attempt (maxAttempts
+        // still applies) so the task eventually terminates rather than cycling
+        // forever without touching the normal retry budget.
+        if claimed.infraFailureCount >= options.maxInfraFailures {
+            taskLogger.warning(
+                "run exceeded infrastructure failure limit; failing without execution",
+                metadata: [
+                    "strand.infra_failure_count": .string("\(claimed.infraFailureCount)"),
+                    "strand.max_infra_failures": .string("\(options.maxInfraFailures)"),
+                ]
+            )
+            let err = _InfrastructureFailureError(sweepCount: claimed.infraFailureCount)
+            let buf = (try? JSON.encode(FailureReason(error: err))) ?? FailureReason.fallback
+            await failAndRecord(
+                reasonBuffer: buf,
+                claimed: claimed,
+                taskDims: taskDims,
+                taskStart: taskStart,
+                taskStartWall: taskStartWall,
+                logger: taskLogger
+            )
+            return
+        }
+
         // Bind the task-scoped logger to the task-local slot so that any
         // function invoked from this execution path can read `Logger.current`
         // without needing an explicit `logger:` parameter.
@@ -1109,6 +1157,20 @@ final class Registry: Sendable {
     }
     func lookup(_ name: String) -> AnyRegistration? {
         store[name]
+    }
+}
+
+// MARK: - _InfrastructureFailureError
+
+/// Synthesised failure used when a run's `infra_failure_count` exceeds
+/// `WorkerOptions.maxInfraFailures`. The run is failed without executing the
+/// handler so the normal `maxAttempts` budget is consumed and the task
+/// eventually terminates rather than cycling indefinitely.
+private struct _InfrastructureFailureError: Error, CustomStringConvertible {
+    let sweepCount: Int
+    var description: String {
+        "infrastructure failure: run was re-queued by the lease-expiry sweep "
+            + "\(sweepCount) time(s) — the task may be crashing its worker"
     }
 }
 

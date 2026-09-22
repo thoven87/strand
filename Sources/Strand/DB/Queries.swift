@@ -1112,7 +1112,8 @@ enum Queries {
                     started_at       = COALESCE(r.started_at, NOW())
                 FROM candidate c WHERE r.id = c.id
                 RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload,
-                          r.available_at, r.heartbeat_details, c.fairness_key, c.fairness_weight
+                          r.available_at, r.heartbeat_details, c.fairness_key, c.fairness_weight,
+                          r.infra_failure_count
             ),
             task_upd AS (
                 UPDATE strand.tasks t
@@ -1154,7 +1155,7 @@ enum Queries {
                    c.wake_event, c.event_payload,
                    t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
                    t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at,
-                   t.first_task_id, t.cancel_requested
+                   t.first_task_id, t.cancel_requested, c.infra_failure_count
             FROM claimed c
             JOIN strand.tasks t ON t.id = c.task_id,
             advance   -- cross-join forces advance CTE to execute even when claimed is non-empty
@@ -2601,10 +2602,11 @@ enum Queries {
             ),
             requeued_runs AS (
                 UPDATE strand.runs
-                SET state            = \(TaskState.pending),
-                    available_at     = NOW(),
-                    worker_id        = NULL,
-                    lease_expires_at = NULL
+                SET state               = \(TaskState.pending),
+                    available_at        = NOW(),
+                    worker_id           = NULL,
+                    lease_expires_at    = NULL,
+                    infra_failure_count = infra_failure_count + 1
                 FROM expired
                 WHERE strand.runs.id = expired.run_id
                 RETURNING expired.run_id, expired.task_id
@@ -3610,12 +3612,24 @@ enum Queries {
 // MARK: - Internal helpers
 
 /// Computes the retry delay from the task's encoded retry strategy.
+///
+/// Applies decorrelated jitter: the returned value is drawn uniformly from
+/// `[base/2, base)` where `base` is the deterministic exponential backoff.
+/// This breaks up thundering-herd retries (e.g. hundreds of tasks all failing
+/// simultaneously) while keeping the expected delay at ≈ 3/4 × base.
+///
+/// Explicit per-error overrides via `RetryAfterError.nextRetryDelay` bypass
+/// this function entirely and are used verbatim — no jitter is applied to them.
 private func retryDelay(strategy buf: ByteBuffer?, attempt: Int) -> TimeInterval {
     guard let buf, let s = try? JSON.decode(RetryStrategy.self, from: buf) else { return 0 }
     let initial = Double(s.initialDelay.components.seconds)
     let cap = Double(s.maxDelay.components.seconds)
     guard initial > 0 || cap > 0 else { return 0 }
-    return Swift.min(initial * pow(s.multiplier, Double(Swift.max(attempt - 1, 0))), cap)
+    let base = Swift.min(initial * pow(s.multiplier, Double(Swift.max(attempt - 1, 0))), cap)
+    guard base > 0 else { return 0 }
+    // Decorrelated jitter: result is in [base/2, base).
+    let half = base / 2
+    return half + Double.random(in: 0..<half)
 }
 
 struct QueryError: Error, CustomStringConvertible {

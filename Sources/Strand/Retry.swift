@@ -22,6 +22,17 @@
 ///
 /// To disable retries entirely, set `maxAttempts: 1` on the enclosing
 /// `EnqueueOptions` or `ActivityOptions` rather than using a strategy.
+///
+/// ## Jitter
+///
+/// The computed delay has decorrelated jitter applied automatically: the
+/// actual wait is drawn uniformly from `[delay/2, delay)`. This prevents
+/// thundering-herd retries when many tasks fail at the same moment (e.g.
+/// after a downstream outage clears) without significantly increasing
+/// average wait times (expected delay ≈ 3/4 × base).
+///
+/// Explicit per-error delays set via `RetryAfterError.nextRetryDelay` are
+/// used verbatim — no jitter is applied to them.
 public struct RetryStrategy: Sendable, Codable {
 
     // MARK: Stored properties
