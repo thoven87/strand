@@ -420,6 +420,15 @@ CREATE TABLE IF NOT EXISTS strand.runs (
     -- double-execution when multiple workers race (e.g. after lease expiry).
     version      BIGINT  NOT NULL DEFAULT 0,
 
+    -- How many times this specific run has been re-queued by the lease-expiry
+    -- sweep without the task completing (i.e. the claiming worker crashed or was
+    -- killed before finishing). Does NOT count task-level failures — those go
+    -- through failRun and reset this counter to 0 by creating a fresh run at
+    -- attempt+1. Workers fail the run immediately when this reaches
+    -- WorkerOptions.maxInfraFailures, preventing tasks that consistently crash
+    -- workers from looping indefinitely without consuming the retry budget.
+    infra_failure_count SMALLINT NOT NULL DEFAULT 0,
+
     state            TEXT        NOT NULL DEFAULT 'PENDING',
     worker_id        TEXT,
     sdk_version      TEXT,        -- Strand SDK version of the worker that claimed this run
@@ -634,6 +643,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
     ON strand.event_triggers (emission_id, task_id)
     WHERE emission_id IS NOT NULL;
 
+-- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS infra_failure_count SMALLINT NOT NULL DEFAULT 0;
 -- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS heartbeat_details BYTEA;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS heartbeat_timeout_seconds INTEGER;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS backfill_id UUID REFERENCES strand.backfills(id) ON DELETE SET NULL;

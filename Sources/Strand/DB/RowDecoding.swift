@@ -91,6 +91,15 @@ struct ClaimedTask: Sendable {
         guard let max = maxAttempts else { return true }  // no cap → always terminal
         return attempt >= max
     }
+
+    /// Number of times the lease-expiry sweep has re-queued this specific run
+    /// because the claiming worker crashed without completing the task.
+    ///
+    /// Resets to 0 on every new attempt (fresh `strand.runs` row created by
+    /// `failRun`). When this reaches `WorkerOptions.maxInfraFailures`, the
+    /// worker fails the run immediately — consuming an attempt — rather than
+    /// executing and potentially crashing again.
+    let infraFailureCount: Int
 }
 
 extension ClaimedTask {
@@ -99,7 +108,7 @@ extension ClaimedTask {
     /// retry_strategy, max_attempts, headers, wake_event, event_payload,
     /// parent_task_id, kind, timeout_seconds, heartbeat_timeout_seconds,
     /// scheduling_metadata, available_at, heartbeat_details, deadline_at,
-    /// first_task_id, cancel_requested
+    /// first_task_id, cancel_requested, infra_failure_count
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -131,6 +140,7 @@ extension ClaimedTask {
         deadlineAt = try col.next()!.decode(Date?.self, context: .default)
         firstTaskID = try col.next()!.decode(UUID?.self, context: .default)
         cancelRequested = try col.next()!.decode(Bool.self, context: .default)
+        infraFailureCount = try col.next()!.decode(Int.self, context: .default)
     }
 }
 
