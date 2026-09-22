@@ -565,7 +565,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     }.map { $0.name == ClaimTimeoutError.failureName } ?? false
                 let retryState: ActivityRetryState =
                     state == .cancelled ? .cancelled : isTimeout ? .timedOut : .maximumAttemptsReached
-                let err: Error
+                let err: any Error
                 if kind == .workflow {
                     err = WorkflowError(workflowName: name, state: state.taskStatus)
                 } else {

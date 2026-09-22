@@ -1,5 +1,8 @@
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
+import Foundation  // needed for (FormatStyle, Calendar)
+                   // + (String(format:), CharacterSet) not in FoundationEssentials
+                   // TODO: revisit this in the future
 #else
 public import Foundation
 #endif

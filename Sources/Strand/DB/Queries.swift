@@ -3533,6 +3533,7 @@ enum Queries {
         on conn: PostgresConnection,
         namespaceID: String,
         queue: String,
+        limit: Int = 500,
         logger: Logger
     ) async throws {
         let stream = try await conn.query(
@@ -3561,7 +3562,7 @@ enum Queries {
                       )
                   )
                 ORDER BY r.id
-                LIMIT 500
+                LIMIT \(limit)
                 FOR UPDATE SKIP LOCKED
             ),
             woken AS (
@@ -3597,10 +3598,11 @@ enum Queries {
         on client: PostgresClient,
         namespaceID: String,
         queue: String,
+        limit: Int = 500,
         logger: Logger
     ) async throws {
         try await client.withConnection { conn in
-            try await wakeCompletedWaiting(on: conn, namespaceID: namespaceID, queue: queue, logger: logger)
+            try await wakeCompletedWaiting(on: conn, namespaceID: namespaceID, queue: queue, limit: limit, logger: logger)
         }
     }
 }

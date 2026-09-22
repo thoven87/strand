@@ -129,6 +129,13 @@ public struct WorkerOptions: Sendable {
     /// set to `.zero` for development or single-worker setups.
     public var notifyJitter: Duration
 
+    /// Maximum number of WAITING parent runs promoted to PENDING in a single
+    /// `wakeCompletedWaiting` sweep. Raise for workloads with large fan-out
+    /// that complete many parallel children simultaneously.
+    ///
+    /// Default: `500`.
+    public var wakeCompletedWaitingLimit: Int
+
     /// Called on every poll error. When `nil`, errors are logged at `.error` level.
     public var onError: (@Sendable (any Error) async -> Void)?
 
@@ -145,6 +152,7 @@ public struct WorkerOptions: Sendable {
         gracefulShutdownTimeout: Duration = .seconds(10),
         leaseExpiryInterval: Duration = .seconds(5),
         notifyJitter: Duration = .milliseconds(50),
+        wakeCompletedWaitingLimit: Int = 500,
         onError: (@Sendable (any Error) async -> Void)? = nil
     ) {
         self.queue = queue
@@ -159,6 +167,7 @@ public struct WorkerOptions: Sendable {
         self.gracefulShutdownTimeout = gracefulShutdownTimeout
         self.leaseExpiryInterval = leaseExpiryInterval
         self.notifyJitter = notifyJitter
+        self.wakeCompletedWaitingLimit = wakeCompletedWaitingLimit
         self.onError = onError
     }
 }
@@ -519,6 +528,7 @@ public struct StrandWorker: Service {
                                 on: conn,
                                 namespaceID: namespace,
                                 queue: queueName,
+                                limit: options.wakeCompletedWaitingLimit,
                                 logger: logger
                             )
                         }

@@ -2,6 +2,7 @@ import DequeModule
 
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
+import Foundation  // CharacterSet (trimmingCharacters) not in FoundationEssentials on Linux
 #else
 public import Foundation
 #endif

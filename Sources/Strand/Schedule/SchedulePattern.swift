@@ -1,5 +1,6 @@
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
+import Foundation  // String(format:) not in FoundationEssentials on Linux
 #else
 public import Foundation
 #endif
