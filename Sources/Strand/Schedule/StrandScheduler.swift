@@ -567,9 +567,9 @@ public struct StrandScheduler: Service {
             if backfill.allowOverwrite {
                 idKey = nil  // no dedup — always create a fresh task
             } else if let scheduleId = backfill.scheduleId {
-                idKey = "$schedule:\(scheduleId):\(slotAt.timeIntervalSince1970)"
+                idKey = "$schedule:\(scheduleId):\(slotAt.ISO8601Format())"
             } else {
-                idKey = "$backfill:\(backfill.id):\(slotAt.timeIntervalSince1970)"
+                idKey = "$backfill:\(backfill.id):\(slotAt.ISO8601Format())"
             }
 
             _ = try await Queries.enqueueTask(
@@ -743,7 +743,7 @@ public struct StrandScheduler: Service {
                 scheduledBy: row.name
             )
 
-            let idempotencyKey = "$schedule:\(row.id):\(slotAt.timeIntervalSince1970)"
+            let idempotencyKey = "$schedule:\(row.id):\(slotAt.ISO8601Format())"
             let enqueued = try await Queries.enqueueTask(
                 on: postgres,
                 namespaceID: client.namespaceID,
