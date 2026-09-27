@@ -211,7 +211,8 @@ enum Queries {
                         \(cancellationBuffer), \(idempotencyKey), \(description), \(priority),
                         \(fairnessKey), \(fairnessWeight), \(TaskState.pending),
                         \(kind), \(parentTaskID), \(firstTaskID), \(deadlineAt), \(backfillID), \(scheduleID), \(parentClosePolicy))
-                ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING
+                ON CONFLICT (namespace_id, queue, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL DO NOTHING
                 """,
                 logger: logger
             )
@@ -530,7 +531,10 @@ enum Queries {
                 taskInterp.appendInterpolation(deadlineAt)
                 taskInterp.appendLiteral(")")
             }
-            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING RETURNING id")
+            taskInterp.appendLiteral(
+                " ON CONFLICT (namespace_id, queue, idempotency_key)"
+                + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+            )
             // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
             // silently discards conflicts, so only genuinely new task IDs are returned.
             // No separate SELECT round-trip needed.
@@ -768,7 +772,10 @@ enum Queries {
                 taskInterp.appendInterpolation(child.deadlineAt)
                 taskInterp.appendLiteral(")")
             }
-            taskInterp.appendLiteral(" ON CONFLICT (namespace_id, queue, idempotency_key) DO NOTHING RETURNING id")
+            taskInterp.appendLiteral(
+                " ON CONFLICT (namespace_id, queue, idempotency_key)"
+                + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+            )
             // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
             // silently discards conflicts, so only genuinely new task IDs are returned.
             var newIDSet: Set<UUID> = []

@@ -279,7 +279,7 @@ CREATE TABLE IF NOT EXISTS strand.tasks (
     CONSTRAINT strand_tasks_queue_fk        FOREIGN KEY (namespace_id, queue)
                                             REFERENCES strand.queues(namespace_id, name)
                                             ON DELETE CASCADE,
-    CONSTRAINT strand_tasks_idempotency_key UNIQUE (namespace_id, queue, idempotency_key),
+    -- idempotency_key uniqueness is enforced by the partial index below (strand_tasks_idempotency_key).
     CONSTRAINT strand_tasks_kind            CHECK (kind IN ('WORKFLOW', 'ACTIVITY')),
     CONSTRAINT strand_tasks_state           CHECK (state IN (
         'PENDING', 'RUNNING', 'SLEEPING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED',
@@ -309,6 +309,23 @@ CREATE INDEX IF NOT EXISTS strand_tasks_parent_idx
 CREATE INDEX IF NOT EXISTS strand_tasks_deadline_idx
     ON strand.tasks (namespace_id, queue, deadline_at)
     WHERE deadline_at IS NOT NULL AND state = 'PENDING';
+
+-- Partial unique index: tasks without an idempotency_key (the majority) are
+-- excluded from the index entirely. Postgres already allows multiple NULLs in
+-- unique indexes (NULLs are distinct per SQL standard), so indexing NULL rows
+-- enforces nothing and wastes space. ON CONFLICT in enqueueTask still resolves
+-- correctly against this partial index when idempotency_key IS NOT NULL.
+CREATE UNIQUE INDEX IF NOT EXISTS strand_tasks_idempotency_key
+    ON strand.tasks (namespace_id, queue, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+-- Supports sweepStartTimeoutActivities: very sparse (~2–5% of tasks).
+-- Without this, the sweep must join from PENDING/SLEEPING runs through all tasks
+-- and discard the vast majority that have no schedule-to-start timeout.
+-- With this index the planner can enumerate the sparse eligible tasks first.
+CREATE INDEX IF NOT EXISTS strand_tasks_sts_timeout_idx
+    ON strand.tasks (namespace_id, queue)
+    WHERE kind = 'ACTIVITY' AND schedule_to_start_timeout_seconds IS NOT NULL;
 
 -- ── Historic / metrics queries on terminal states ────────────────────────────
 --
@@ -491,6 +508,14 @@ CREATE INDEX IF NOT EXISTS strand_runs_lease_idx
     ON strand.runs (namespace_id, queue, lease_expires_at)
     WHERE state = 'RUNNING'::text AND lease_expires_at IS NOT NULL;
 
+-- Supports wakeCompletedWaiting: SELECT ... FROM strand.runs WHERE state = 'WAITING'
+-- fires every ~200 ms per worker on the poll loop. Without this index the query
+-- scans the full active partition. WAITING is a transient state (~5–20% of live
+-- runs) so the index stays small even under high fan-out workloads.
+CREATE INDEX IF NOT EXISTS strand_runs_waiting_idx
+    ON strand.runs (namespace_id, queue, id)
+    WHERE state = 'WAITING';
+
 -- Supports shutdownWorker: UPDATE strand.runs SET lease_expires_at = NOW()
 -- WHERE worker_id = $1 AND namespace_id = $2 AND state = 'RUNNING'.
 -- Without this, shutdown scans the entire partition to find each worker's
@@ -499,12 +524,12 @@ CREATE INDEX IF NOT EXISTS strand_runs_worker_idx
     ON strand.runs (namespace_id, worker_id)
     WHERE state = 'RUNNING'::text;
 
--- Supports cancelDescendants (run_terminate CTE), resetChildTasks (del_old_runs),
--- and cancelTasksBatch when cancelling non-terminal runs by task_id.
--- Without this index those CTEs perform a full sequential scan across all
--- monthly partitions — observed at 1264 ms on workflows with many descendants.
+-- Partial: cancelDescendants, resetChildTasks, and cancelTasksBatch only ever
+-- query non-terminal runs by task_id. Historical (terminal) runs in aging
+-- partitions account for 90%+ of rows; indexing them wastes significant space.
 CREATE INDEX IF NOT EXISTS strand_runs_task_idx
-    ON strand.runs (task_id);
+    ON strand.runs (task_id)
+    WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
 
 -- Workers detail page — recent task list.
 -- Enables a point scan on (namespace_id, worker_id) sorted by started_at DESC so
@@ -643,6 +668,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
     ON strand.event_triggers (emission_id, task_id)
     WHERE emission_id IS NOT NULL;
 
+-- Partial index migrations (safe to run CONCURRENTLY on a live database):
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS strand_runs_waiting_idx ON strand.runs (namespace_id, queue, id) WHERE state = 'WAITING';
+-- DROP INDEX CONCURRENTLY IF EXISTS strand.strand_event_waits_event_idx; CREATE INDEX CONCURRENTLY IF NOT EXISTS strand_event_waits_event_idx ON strand.event_waits (namespace_id, queue, event_name) WHERE event_name IS NOT NULL;
+-- DROP INDEX CONCURRENTLY IF EXISTS strand.strand_tasks_idempotency_key; CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS strand_tasks_idempotency_key ON strand.tasks (namespace_id, queue, idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS strand_tasks_sts_timeout_idx ON strand.tasks (namespace_id, queue) WHERE kind = 'ACTIVITY' AND schedule_to_start_timeout_seconds IS NOT NULL;
+-- DROP INDEX CONCURRENTLY IF EXISTS strand.strand_runs_task_idx; CREATE INDEX CONCURRENTLY IF NOT EXISTS strand_runs_task_idx ON strand.runs (task_id) WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
+--
 -- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS infra_failure_count SMALLINT NOT NULL DEFAULT 0;
 -- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS heartbeat_details BYTEA;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS heartbeat_timeout_seconds INTEGER;
@@ -686,8 +718,12 @@ CREATE TABLE IF NOT EXISTS strand.event_waits (
 );
 
 -- Wake-up lookup by named event (waitForEvent path).
+-- Partial: ~50% of event_waits rows are task-completion waits with event_name IS NULL
+-- (they are identified by child_task_id instead). Indexing NULL event_name rows is
+-- pure waste — event lookups always filter on a specific non-NULL name.
 CREATE INDEX IF NOT EXISTS strand_event_waits_event_idx
-    ON strand.event_waits (namespace_id, queue, event_name);
+    ON strand.event_waits (namespace_id, queue, event_name)
+    WHERE event_name IS NOT NULL;
 
 -- GIN index on predicate for efficient @> containment lookups at emission time.
 -- Sparse: only non-trivial predicates ({} excluded) benefit from GIN. Rows with
