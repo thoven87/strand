@@ -542,14 +542,26 @@ public struct StrandScheduler: Service {
                 return
             }
 
-            // Compute scheduling metadata (same structure as StrandScheduler.fire).
-            var partitionTime: Date? = nil
-            if let times = try? ScheduleCalculator.calculateExecutionTimes(
-                for: pattern,
-                executingAt: slotAt,
-                timezone: pattern.timezone
-            ) {
-                partitionTime = times.scheduledTime
+            // Compute scheduling metadata using calculatePartitionTime so the
+            // schedule's configured partitionOffset (e.g. P1DT2H) is applied,
+            // producing the correct data-period anchor in partitionTime.
+            // This mirrors exactly what StrandScheduler.fire() does.
+            let backfillPartitionConfig = try PartitionOffsetConfig(
+                offset: pattern.partitionOffset ?? "PT0M"
+            )
+            let partitionTime: Date?
+            do {
+                partitionTime = try ScheduleCalculator.calculatePartitionTime(
+                    executionTime: slotAt,
+                    schedule: pattern,
+                    partitionOffset: backfillPartitionConfig
+                )
+            } catch {
+                logger.info(
+                    "backfill '\(backfill.id)': could not compute partition time for slot \(slotAt.ISO8601Format())",
+                    metadata: ["error": "\(error)"]
+                )
+                partitionTime = nil
             }
             let schedulingMeta = SchedulingMetadata(
                 executionTime: now,
@@ -717,8 +729,17 @@ public struct StrandScheduler: Service {
         // Crash recovery: if the process crashes after enqueueTask but before
         // markScheduleFired, the next poll re-runs enqueueTask with the same key
         // (ON CONFLICT DO NOTHING → no-op) and retries markScheduleFired.
-        let partitionConfig = try PartitionOffsetConfig(offset: "PT0M")
-        var lastTaskID = UUID()
+        //
+        // Use the schedule's configured partition offset (e.g. "P1DT2H" for a
+        // daily cron that should present yesterday-midnight as partitionTime).
+        // Falls back to "PT0M" when no offset is configured.
+        let partitionConfig = try PartitionOffsetConfig(
+            offset: pattern.partitionOffset ?? "PT0M"
+        )
+        // UUID.v7() sentinel — always overwritten inside the loop because
+        // guard !slotsToFire.isEmpty guarantees at least one iteration.
+        // v7 (not v4) keeps the codebase's time-ordered ID convention consistent.
+        var lastTaskID = UUID.v7()
         for slotAt in slotsToFire {
             let partitionTime: Date?
             do {
