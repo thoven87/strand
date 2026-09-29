@@ -76,6 +76,7 @@ public struct StrandClient: Sendable {
             fairnessWeight: enqueueOpts.fairnessWeight,
             rateLimitKey: rlParams?.slotKey,
             rateLimitIntervalMs: rlParams?.intervalMs,
+            rateLimitBurstSlots: rlParams?.burstSlots ?? 0,
             description: enqueueOpts.description
         )
     }
@@ -127,6 +128,7 @@ public struct StrandClient: Sendable {
             parentTaskID: nil,
             rateLimitKey: rlParams?.slotKey,
             rateLimitIntervalMs: rlParams?.intervalMs,
+            rateLimitBurstSlots: rlParams?.burstSlots ?? 0,
             description: options.description
         )
     }
@@ -201,6 +203,7 @@ public struct StrandClient: Sendable {
 
         let queue = options.queue ?? queueName
         let rlParams = options.rateLimit.map { $0.slotParams(for: A.name) }
+        let rlBurstSlots = rlParams?.burstSlots ?? 0
         let maxAttempts = options.maxAttempts ?? A.defaultMaxAttempts ?? self.options.defaultMaxAttempts
         let deadlineAt: Date? = options.maxDuration.map { Date.now.addingDuration($0) }
         let retryStrategyBuffer = try JSON.encode(
@@ -253,6 +256,7 @@ public struct StrandClient: Sendable {
                 kind: .activity,
                 rateLimitKey: rlParams?.slotKey,
                 rateLimitIntervalMs: rlParams?.intervalMs,
+                rateLimitBurstSlots: rlBurstSlots,
                 description: options.description,
                 logger: logger
             )
@@ -336,8 +340,9 @@ public struct StrandClient: Sendable {
                 fairnessKey: options.fairnessKey,
                 fairnessWeight: options.fairnessWeight,
                 kind: .workflow,
-                rateLimitKey: nil,
-                rateLimitIntervalMs: nil,
+                rateLimitKey: options.rateLimit.map { $0.slotParams(for: W.workflowName).slotKey },
+                rateLimitIntervalMs: options.rateLimit.map { $0.slotParams(for: W.workflowName).intervalMs },
+                rateLimitBurstSlots: options.rateLimit.map { $0.slotParams(for: W.workflowName).burstSlots } ?? 0,
                 description: options.description,
                 logger: logger
             )
@@ -397,6 +402,7 @@ public struct StrandClient: Sendable {
             }
             let headersBuffer: ByteBuffer? = h.isEmpty ? nil : try JSON.encode(h)
 
+            let rlParams = options.rateLimit.map { $0.slotParams(for: W.workflowName) }
             let row = try await Queries.enqueueTask(
                 on: postgres,
                 namespaceID: namespaceID,
@@ -415,6 +421,9 @@ public struct StrandClient: Sendable {
                 fairnessWeight: options.fairnessWeight,
                 kind: .workflow,
                 parentTaskID: nil,
+                rateLimitKey: rlParams?.slotKey,
+                rateLimitIntervalMs: rlParams?.intervalMs,
+                rateLimitBurstSlots: rlParams?.burstSlots ?? 0,
                 description: options.description,
                 logger: logger
             )
@@ -531,6 +540,7 @@ public struct StrandClient: Sendable {
         parentTaskID: UUID? = nil,
         rateLimitKey: String? = nil,
         rateLimitIntervalMs: Int? = nil,
+        rateLimitBurstSlots: Int = 0,
         description: String? = nil
     ) async throws -> EnqueueResult {
         let deadlineAt: Date? = maxDuration.map { Date.now.addingDuration($0) }
@@ -573,6 +583,7 @@ public struct StrandClient: Sendable {
                 parentClosePolicy: parentClosePolicy,
                 rateLimitKey: rateLimitKey,
                 rateLimitIntervalMs: rateLimitIntervalMs,
+                rateLimitBurstSlots: rateLimitBurstSlots,
                 description: description,
                 logger: logger
             )

@@ -553,6 +553,11 @@ public struct WorkflowOptions: Sendable {
     /// dashboard.  Stored in the `strand.tasks.description` column; `nil` stores nothing.
     public var description: String?
 
+    /// Optional rate limit applied when this workflow is started.
+    /// Useful when many workflows are started in a batch and you want to
+    /// control the enqueue rate (e.g. max 10 workflow starts per second).
+    public var rateLimit: RateLimit?
+
     public init(
         id: String? = nil,
         queue: String? = nil,
@@ -564,7 +569,8 @@ public struct WorkflowOptions: Sendable {
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
         maxDuration: Duration? = nil,
-        description: String? = nil
+        description: String? = nil,
+        rateLimit: RateLimit? = nil
     ) {
         self.id = id
         self.queue = queue
@@ -577,6 +583,7 @@ public struct WorkflowOptions: Sendable {
         self.fairnessWeight = max(fairnessWeight, 0.001)
         self.maxDuration = maxDuration
         self.description = description
+        self.rateLimit = rateLimit
     }
 }
 

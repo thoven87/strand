@@ -73,6 +73,11 @@ struct ScheduleDetailResponse: Codable, Sendable {
     let createdAt: Date
     let patternType: String
     let patternDescription: String
+    /// IANA timezone identifier for this schedule (e.g. "America/New_York").
+    /// Used by Loom to show the correct timezone hint in the manual-trigger
+    /// partition-time input so users don’t accidentally enter UTC when the
+    /// schedule runs in a different timezone.
+    let patternTimezone: String
     let startsAt: Date?
     let endsAt: Date?
 
@@ -89,6 +94,7 @@ struct ScheduleDetailResponse: Codable, Sendable {
         createdAt = s.createdAt
         patternType = s.pattern.typeName
         patternDescription = s.pattern.description
+        patternTimezone = s.pattern.timezone.identifier
         startsAt = s.startsAt
         endsAt = s.endsAt
     }

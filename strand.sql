@@ -462,6 +462,8 @@ CREATE TABLE IF NOT EXISTS strand.runs (
     -- exactly where it left off. NULL until the activity first calls heartbeat(_:).
     heartbeat_details BYTEA,
 
+    rate_limit_slot_key TEXT,  -- set when run was scheduled via a rate-limit bucket
+
     failure_reason BYTEA,
 
     -- Inherited from strand.tasks at run creation
@@ -1098,10 +1100,11 @@ CREATE INDEX IF NOT EXISTS strand_workers_ns_queue_idx
 -- the GREATEST guard resets them on next use.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS strand.rate_limit_slots (
-    namespace_id  TEXT        NOT NULL REFERENCES strand.namespaces(id) ON DELETE CASCADE,
-    queue         TEXT        NOT NULL,
-    slot_key      TEXT        NOT NULL,  -- activity name (global) or "ActivityName:entityKey"
-    next_slot_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    namespace_id    TEXT        NOT NULL REFERENCES strand.namespaces(id) ON DELETE CASCADE,
+    queue           TEXT        NOT NULL,
+    slot_key        TEXT        NOT NULL,  -- activity name (global) or "ActivityName:entityKey"
+    next_slot_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    burst_remaining INTEGER     NOT NULL DEFAULT 0,
     CONSTRAINT strand_rate_limit_slots_pkey PRIMARY KEY (namespace_id, queue, slot_key)
 );
 

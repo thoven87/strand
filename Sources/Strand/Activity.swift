@@ -110,12 +110,25 @@ public struct RateLimit: Sendable {
     /// type on this queue.  A non-nil value gives each entity its own bucket.
     public var key: String?
 
+    /// When set, this string is used verbatim as the slot key — no activity-name
+    /// prefix is applied. Use this to share a single rate-limit bucket across
+    /// multiple activity types (e.g. all HHAX activities sharing "hhax").
+    /// When both `sharedKey` and `key` are set, `sharedKey` wins.
+    public var sharedKey: String?
+
+    /// Number of tasks that may be dispatched immediately from a cold bucket (or
+    /// from any bucket that still has burst tokens remaining) before the regular
+    /// per-interval drip begins.  Default `0` = no burst.
+    public var burst: Int
+
     /// Returns `nil` when `limit` is not positive; no crash.
-    public init?(limit: Double, period: Duration = .seconds(1), key: String? = nil) {
+    public init?(limit: Double, period: Duration = .seconds(1), key: String? = nil, sharedKey: String? = nil, burst: Int = 0) {
         guard limit > 0 else { return nil }
         self.limit = limit
         self.period = period
         self.key = key
+        self.sharedKey = sharedKey
+        self.burst = burst
     }
 
     // MARK: - Internal
@@ -127,11 +140,12 @@ public struct RateLimit: Sendable {
     ///   or as the prefix in `"ActivityName:entityKey"` (per-entity bucket).
     /// - Returns: `slotKey` — the row key in `strand.rate_limit_slots`;
     ///   `intervalMs` — milliseconds between consecutive slots,
-    ///   derived from `period / limit` and clamped to at least 1 ms.
-    internal func slotParams(for activityName: String) -> (slotKey: String, intervalMs: Int) {
-        let slotKey = key.map { "\(activityName):\($0)" } ?? activityName
+    ///   derived from `period / limit` and clamped to at least 1 ms;
+    ///   `burstSlots` — number of tasks eligible for immediate dispatch.
+    internal func slotParams(for activityName: String) -> (slotKey: String, intervalMs: Int, burstSlots: Int) {
+        let slotKey = sharedKey ?? key.map { "\(activityName):\($0)" } ?? activityName
         let intervalMs = max(1, Int(Double(period.milliseconds) / limit))
-        return (slotKey: slotKey, intervalMs: intervalMs)
+        return (slotKey: slotKey, intervalMs: intervalMs, burstSlots: max(0, burst))
     }
 }
 
@@ -454,6 +468,9 @@ public struct ActivityContext: Sendable {
     // Package-internal: heartbeat implementation — accepts optional progress details.
     package let _heartbeatImpl: @Sendable (ByteBuffer?) async throws -> Void
 
+    // Package-internal: advances the rate-limit cursor for the bucket this run came from.
+    package let _bumpRateLimitImpl: @Sendable (Duration) async throws -> Void
+
     // Shared cancellation flag — set by the heartbeat closure when extendClaim
     // returns no rows (the run is no longer RUNNING).
     private let _cancellationFlag: _ActivityCancellationFlag
@@ -524,7 +541,8 @@ public struct ActivityContext: Sendable {
         deadlineAt: Date? = nil,
         heartbeatDetailsBuffer: ByteBuffer? = nil,
         cancellationFlag: _ActivityCancellationFlag = _ActivityCancellationFlag(),
-        heartbeatImpl: @escaping @Sendable (ByteBuffer?) async throws -> Void = { _ in }  // default no-op
+        heartbeatImpl: @escaping @Sendable (ByteBuffer?) async throws -> Void = { _ in },  // default no-op
+        bumpRateLimitImpl: @escaping @Sendable (Duration) async throws -> Void = { _ in }  // default no-op
     ) {
         self.activityID = activityID
         self.activityName = activityName
@@ -543,6 +561,7 @@ public struct ActivityContext: Sendable {
         self._heartbeatDetailsBuffer = heartbeatDetailsBuffer
         self._cancellationFlag = cancellationFlag
         self._heartbeatImpl = heartbeatImpl
+        self._bumpRateLimitImpl = bumpRateLimitImpl
     }
 
     /// Extends the activity's worker claim lease, signalling that the activity is
@@ -560,6 +579,22 @@ public struct ActivityContext: Sendable {
     /// ```
     public func heartbeat() async throws {
         try await _heartbeatImpl(nil)
+    }
+
+    /// Advances the rate-limit cursor for the bucket this activity was scheduled
+    /// from, preventing peer tasks from being dispatched until the bumped time.
+    ///
+    /// Call this when you receive a 429 / rate-limit response from an external
+    /// API to prevent other queued activities from hitting the same wall:
+    /// ```swift
+    /// } catch where isRateLimitError(error) {
+    ///     try await context.bumpRateLimit(by: .seconds(60))
+    ///     throw error
+    /// }
+    /// ```
+    /// No-op when the activity was not scheduled via a rate-limit bucket.
+    public func bumpRateLimit(by duration: Duration) async throws {
+        try await _bumpRateLimitImpl(duration)
     }
 
     /// Extends the activity's lease **and** persists `details` as the heartbeat
@@ -756,6 +791,21 @@ extension Activity {
         // closure and ActivityContext.isCancelled share the same reference.
         let cancellationFlag = _ActivityCancellationFlag()
 
+        // Build the bumpRateLimit closure. Captures the slot key from the claimed
+        // run; is a no-op when the run was not scheduled via a rate-limit bucket.
+        let rateLimitSlotKey = claimed.rateLimitSlotKey
+        let bumpImpl: @Sendable (Duration) async throws -> Void = { duration in
+            guard let slotKey = rateLimitSlotKey else { return }
+            try await Queries.bumpRateLimitCursor(
+                on: postgres,
+                namespaceID: namespace,
+                queue: exec.queue,
+                slotKey: slotKey,
+                by: duration,
+                logger: heartbeatLogger
+            )
+        }
+
         let ctx = ActivityContext(
             activityID: claimed.taskID,
             activityName: claimed.taskName,
@@ -813,7 +863,8 @@ extension Activity {
                     cancellationFlag.cancel()
                     throw CancellationError()
                 }
-            }
+            },
+            bumpRateLimitImpl: bumpImpl
         )
         // Worker.runTask already opens a .consumer span (with the workflow activation
         // span as its parent) that covers the full claim lifecycle.  Opening a second

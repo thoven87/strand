@@ -332,6 +332,7 @@ function RunDialog({
     namespace,
     scheduleId,
     patternType,
+    patternTimezone,
     onSuccess,
 }: {
     open: boolean;
@@ -339,6 +340,8 @@ function RunDialog({
     namespace: string;
     scheduleId: string;
     patternType: string;
+    /** IANA timezone from the schedule pattern (e.g. "America/New_York"). */
+    patternTimezone?: string;
     onSuccess: (taskId: string) => void;
 }) {
     const [partitionTime, setPartitionTime] = useState("");
@@ -401,8 +404,19 @@ function RunDialog({
                         className="w-full rounded border border-border bg-secondary/20 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/40"
                     />
                     <p className="text-[10px] text-muted-foreground">
-                        ISO 8601 — e.g. {ph}
+                        ISO 8601 UTC — e.g. {ph}
                     </p>
+                    {patternTimezone && patternTimezone !== "UTC" && (
+                        <p className="text-[10px] text-amber-500/80 bg-amber-500/8 rounded px-2 py-1">
+                            ⚠️ Schedule timezone:{" "}
+                            <span className="font-mono font-medium">
+                                {patternTimezone}
+                            </span>
+                            . Partition times are always UTC — convert before
+                            entering. For example, 10:00 AM ET (UTC−04:00) =
+                            14:00 UTC.
+                        </p>
+                    )}
                 </div>
 
                 <label className="flex items-center gap-2 cursor-pointer">
@@ -974,6 +988,7 @@ export function ScheduleDetailPage() {
                 namespace={namespace}
                 scheduleId={scheduleId}
                 patternType={schedule?.patternType ?? "cron"}
+                patternTimezone={schedule?.patternTimezone}
                 onSuccess={(taskId) =>
                     void navigate({
                         to: "/$namespace/tasks/$taskId",

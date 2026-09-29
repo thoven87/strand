@@ -17,6 +17,10 @@ export interface ScheduleEntry {
 export interface ScheduleDetail extends ScheduleEntry {
     startsAt: string | null;
     endsAt: string | null;
+    /** IANA timezone identifier for the schedule (e.g. "America/New_York").
+     *  Use this to show a timezone hint in manual-trigger forms so users
+     *  don't accidentally enter UTC when the schedule runs in a different zone. */
+    patternTimezone: string;
 }
 
 export const listSchedules = (

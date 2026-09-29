@@ -426,6 +426,7 @@ extension WorkflowRegistration {
                             kind: .activity,
                             rateLimitIntervalMs: rlParams?.intervalMs,
                             rateLimitKey: rlParams?.slotKey,
+                            rateLimitBurstSlots: rlParams?.burstSlots ?? 0,
                             description: options.description
                         )
                     )
@@ -696,6 +697,7 @@ extension WorkflowRegistration {
                             kind: .workflow,
                             rateLimitIntervalMs: nil,
                             rateLimitKey: nil,
+                            rateLimitBurstSlots: 0,
                             description: nil
                         )
                     )
