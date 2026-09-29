@@ -204,35 +204,59 @@ export function PartitionGrid({
     queue,
 }: PartitionGridProps) {
     const { uniqueSlots, uniqueDates, grid, columnTotals } = useMemo(() => {
-        // ── Bug fix 1: canonical slots come from `upcoming`, not from run timestamps.
+        // ── Canonical slot derivation ─────────────────────────────────────────────
         //
-        // Deriving columns from run.createdAt includes one-off manual triggers
-        // (e.g. "11:34") that are not part of the cron pattern.  `upcoming` always
-        // reflects exactly what the scheduler will fire next, so its time-of-day
-        // values are the authoritative column set.
+        // Priority 1 — partitionTime of actual runs.
+        // The scheduler writes partitionTime into scheduling_metadata for every
+        // slot it fires. For schedules with a partition offset (e.g. P1DT2H),
+        // partitionTime.slot ≠ upcoming fire-time.slot:
         //
-        // Fallback A: schedule ended (no upcoming) → use slots that appear ≥2 times
-        //             in recent runs (filters one-off manual triggers).
-        // Fallback B: brand-new schedule with <2 runs → use all run slots.
-        const canonicalSlots = new Set<string>();
-        for (const up of upcoming) {
-            const { slot } = splitUTC(up.slot);
-            canonicalSlots.add(slot);
+        //   cron "0 2 * * *" ET  + offset P1DT2H
+        //   fire time:      2026-09-22 06:00 UTC  → slot "06:00"
+        //   partitionTime:  2026-09-21 04:00 UTC  → slot "04:00"
+        //
+        // If we used upcoming fire times as canonical, the "04:00" runs would be
+        // filtered out and all such cells would show MISSING. By preferring
+        // partitionTime we get the true partition-period column set.
+        //
+        // Priority 2 — upcoming fire times (no runs have partitionTime yet, e.g.
+        //              schedule just registered).
+        //
+        // Fallback A — schedule ended (no upcoming): slots appearing ≥2 times in
+        //              recent createdAt values (filters one-off manual triggers).
+        // Fallback B — brand-new schedule with <2 runs: all createdAt slots.
+        const partitionTimeSlots = new Set<string>();
+        for (const run of runs) {
+            if (run.partitionTime) {
+                const { slot } = splitUTC(run.partitionTime);
+                partitionTimeSlots.add(slot);
+            }
         }
-        if (canonicalSlots.size === 0) {
-            const slotCounts = new Map<string, number>();
-            for (const run of runs) {
-                const { slot } = splitUTC(run.createdAt);
-                slotCounts.set(slot, (slotCounts.get(slot) ?? 0) + 1);
+
+        const canonicalSlots = new Set<string>();
+        if (partitionTimeSlots.size > 0) {
+            // Use partitionTime-derived slots — always scheduler-set, always canonical.
+            for (const s of partitionTimeSlots) canonicalSlots.add(s);
+        } else {
+            for (const up of upcoming) {
+                const { slot } = splitUTC(up.slot);
+                canonicalSlots.add(slot);
             }
-            for (const [slot, count] of slotCounts) {
-                if (count >= 2) canonicalSlots.add(slot);
-            }
-            // Fallback B
             if (canonicalSlots.size === 0) {
+                const slotCounts = new Map<string, number>();
                 for (const run of runs) {
                     const { slot } = splitUTC(run.createdAt);
-                    canonicalSlots.add(slot);
+                    slotCounts.set(slot, (slotCounts.get(slot) ?? 0) + 1);
+                }
+                for (const [slot, count] of slotCounts) {
+                    if (count >= 2) canonicalSlots.add(slot);
+                }
+                // Fallback B
+                if (canonicalSlots.size === 0) {
+                    for (const run of runs) {
+                        const { slot } = splitUTC(run.createdAt);
+                        canonicalSlots.add(slot);
+                    }
                 }
             }
         }
@@ -274,11 +298,16 @@ export function PartitionGrid({
         // wall-clock time (e.g. Jun 8 15:00) but belong to a past slot
         // (e.g. Jun 8 00:00).  Using createdAt would lose them entirely.
         // Fall back to createdAt for regular scheduled runs (partitionTime ≈ createdAt).
+        //
+        // The canonical-slot filter is only applied when falling back to createdAt.
+        // Runs with an explicit partitionTime are always scheduler-placed and
+        // therefore always canonical — even when their slot differs from the
+        // upcoming fire-time slot due to a partition offset.
         const runIndex = new Map<string, ScheduleRun>();
         for (const run of runs) {
             const iso = run.partitionTime ?? run.createdAt;
             const { date, slot } = splitUTC(iso);
-            if (!canonicalSlots.has(slot)) continue; // skip non-canonical (manual) runs
+            if (!run.partitionTime && !canonicalSlots.has(slot)) continue;
             const key = `${date}|${slot}`;
             if (!runIndex.has(key)) runIndex.set(key, run);
         }

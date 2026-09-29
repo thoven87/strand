@@ -3446,8 +3446,11 @@ enum Queries {
     // MARK: - Re-run (COMPLETED tasks)
 
     /// Creates a fresh new task from an existing COMPLETED one, copying its
-    /// name, queue, params, priority, and kind. The original task is unchanged.
+    /// name, queue, params, priority, kind, and schedule_id. The original task is unchanged.
     /// Use this when the user wants to re-run a workflow that already succeeded.
+    ///
+    /// `schedule_id` is preserved so the re-run task appears in the schedule's run
+    /// history and partition grid instead of becoming an orphan.
     static func reRunTask(
         on client: PostgresClient,
         namespaceID: String,
@@ -3459,7 +3462,7 @@ enum Queries {
             let src = try await conn.query(
                 """
                 SELECT name, queue, params, headers, scheduling_metadata, retry_strategy, max_attempts,
-                       cancellation, priority, fairness_key, fairness_weight, kind
+                       cancellation, priority, fairness_key, fairness_weight, kind, schedule_id
                 FROM strand.tasks WHERE id = \(taskID) AND state = \(TaskState.completed)
                   AND namespace_id = \(namespaceID)
                 FOR UPDATE
@@ -3484,6 +3487,7 @@ enum Queries {
             let fairnessKey = try col.next()!.decode(String?.self, context: .default)
             let fairnessWeight = try col.next()!.decode(Double.self, context: .default)
             let kind = try col.next()!.decode(TaskKind.self, context: .default)
+            let scheduleID = try col.next()!.decode(UUID?.self, context: .default)
 
             let newTaskID = UUID.v7()
             let newRunID = UUID.v7()
@@ -3496,11 +3500,11 @@ enum Queries {
                 INSERT INTO strand.tasks
                     (id, namespace_id, queue, name, params, headers, scheduling_metadata,
                      retry_strategy, max_attempts, cancellation, priority, fairness_key,
-                     fairness_weight, kind, state)
+                     fairness_weight, kind, state, schedule_id)
                 VALUES (\(newTaskID), \(namespaceID), \(queue), \(name), \(params),
                         \(headers), \(schedulingMetadata), \(retryStrategy), \(maxAttempts),
                         \(cancellation), \(priority), \(fairnessKey), \(fairnessWeight),
-                        \(kind), \(TaskState.pending))
+                        \(kind), \(TaskState.pending), \(scheduleID))
                 """,
                 logger: logger
             )
