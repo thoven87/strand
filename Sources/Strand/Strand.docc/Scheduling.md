@@ -161,7 +161,7 @@ values that a raw string cannot:
 
 ### Pattern summary
 
-| Pattern | `partitionTime` |
+| Pattern | `logicalDate` |
 |---|---|
 | `.daily(hour:minute:)` | Midnight of that day |
 | `.weekdays(hour:)` / `.weekdays(hours:)` | Midnight of that day |
@@ -176,7 +176,7 @@ values that a raw string cannot:
 | `.cron(expr)` | The cron tick itself |
 | `.once(at:)` | The fire date |
 
-See [Partition time](#Partition-time) for why `partitionTime` matters.
+See [Partition time](#Partition-time) for why `logicalDate` matters.
 
 ### Foundation `Calendar` and holiday awareness
 
@@ -195,7 +195,7 @@ For patterns that should skip certain dates, two approaches work today:
 struct DailyTradeWorkflow: Workflow {
     mutating func run(context: WorkflowContext<Self>, input: TradeInput) async throws -> TradeResult {
         guard let meta = context.schedulingMetadata else { return .skipped }
-        let day = meta.partitionTime ?? meta.executionTime
+        let day = meta.logicalDate ?? meta.executionTime
 
         // Skip if today is a known holiday — return early rather than failing.
         // The next scheduled slot fires tomorrow as normal.
@@ -207,7 +207,7 @@ struct DailyTradeWorkflow: Workflow {
 ```
 
 This keeps the schedule running on its normal cadence; the workflow simply
-detects the holiday and exits cleanly. The `partitionTime` anchor makes the
+detects the holiday and exits cleanly. The `logicalDate` anchor makes the
 check stable across retries.
 
 **Future: `BusinessCalendar` protocol**
@@ -244,7 +244,7 @@ control over sub-minute timing or staggered firing:
 
 ```swift
 // Stagger a daily midnight job by 15 minutes to avoid thundering herd
-// partitionTime stays 00:00; executionTime becomes 00:15
+// logicalDate stays 00:00; executionTime becomes 00:15
 .cron("0 0 * * *", offset: "PT15M")
 
 // Fire at 00:45, 01:45, 02:45 … (epoch-aligned hourly, shifted 45 min)
@@ -304,7 +304,7 @@ Pass `timezone:` to `.cron` or any pattern that accepts one:
     // Typed constructor is clearer than cron for a simple weekday+time pattern
     pattern: .weekly(on: .monday,    hour: 9, timezone: nyTZ),  // one line per day
     workflowType: MarketOpenWorkflow.self,
-    input: StrandVoid()
+    input: MarketInput(exchange: "NYSE")
 )
 
 // Or use cron when the schedule has complex day-of-week logic:
@@ -313,7 +313,7 @@ Pass `timezone:` to `.cron` or any pattern that accepts one:
     pattern: .cron("30 9 * * 1-5",
                    timezone: TimeZone(identifier: "America/New_York")!),
     workflowType: MarketOpenWorkflow.self,
-    input: StrandVoid()
+    input: MarketInput(exchange: "NYSE")
 )
 ```
 
@@ -328,23 +328,23 @@ Every task fired by a schedule carries three timestamps inside
 
 | Field | What it is | Example for `.daily(offset: "PT9H")` at 09:00 ET |
 |---|---|---|
-| `partitionTime` | Start of the **period** the task covers (offset stripped) | May 13 00:00 ET (midnight) |
+| `logicalDate` | Start of the **period** the task covers (offset stripped) | May 13 00:00 ET (midnight) |
 | `executionTime` | Wall-clock time the **scheduler actually fired** the task | May 13 09:00:00.123 ET |
 | `scheduleOffset` | The raw offset string from the pattern | `"PT9H"` |
 
-The relationship is: `partitionTime + scheduleOffset ≈ executionTime`.
+The relationship is: `logicalDate + scheduleOffset ≈ executionTime`.
 
-### Why `partitionTime` is the right anchor
+### Why `logicalDate` is the right anchor
 
-Always use `partitionTime` — not `executionTime` — as the canonical date for:
+Always use `logicalDate` — not `executionTime` — as the canonical date for:
 
-- **Fetching data**: "which day's HN stories should I fetch?" → `partitionTime`
+- **Fetching data**: "which day's HN stories should I fetch?" → `logicalDate`
   is May 13 midnight, consistently, whether this is a live run or a backfill
   re-running that slot weeks later.
-- **Idempotency keys**: a retry of the same slot has the same `partitionTime`
+- **Idempotency keys**: a retry of the same slot has the same `logicalDate`
   but a different `executionTime`.
 - **Backfills**: when the scheduler fires a historical slot, `executionTime` is
-  now (the actual firing time) but `partitionTime` is the historical period
+  now (the actual firing time) but `logicalDate` is the historical period
   being re-processed.
 
 `executionTime` is useful for **SLA monitoring** ("did this job run on time?") and
@@ -360,9 +360,9 @@ mutating func run(
         return try await runBriefing(for: context.activationTime)
     }
 
-    // ✓ Correct: partitionTime is the day boundary regardless of when we run.
+    // ✓ Correct: logicalDate is the day boundary regardless of when we run.
     // Works for live runs, retries, and backfill re-runs alike.
-    let briefingDay = meta.partitionTime ?? meta.executionTime
+    let briefingDay = meta.logicalDate ?? meta.executionTime
 
     // ✗ Wrong: executionTime drifts with poll latency and is "now" for backfills.
     // let briefingDay = meta.executionTime
@@ -376,7 +376,7 @@ mutating func run(
 
 ### Partition time by pattern
 
-| Pattern | `partitionTime` |
+| Pattern | `logicalDate` |
 |---|---|
 | `.daily(offset: "PT9H")` — fires 09:00 | Midnight of that day |
 | `.weekly(offset: "P6DT9H")` — fires Friday 09:00 | Saturday 00:00 of that week |
@@ -499,7 +499,7 @@ let handle = try await client.createBackfill(
 ### Running a single historical slot
 
 To fire exactly one past slot — for example, to replay a specific date's
-briefing — use ``StrandClient/runScheduleSlot(scheduleID:partitionTime:allowOverwrite:namespaceID:)``:
+briefing — use ``StrandClient/runScheduleSlot(scheduleID:logicalDate:allowOverwrite:namespaceID:)``:
 
 ```swift
 // Replay the May 12th briefing
@@ -509,7 +509,7 @@ let may12 = cal.date(from: DateComponents(
 
 let (taskID, _) = try await client.runScheduleSlot(
     scheduleID: hnSchedule.id,
-    partitionTime: may12,
+    logicalDate: may12,
     allowOverwrite: true   // re-run even if it previously completed
 )
 ```
@@ -546,4 +546,4 @@ let scheduler = StrandScheduler(
 - ``SchedulingMetadata``
 - ``BackfillOptions``
 - ``StrandClient/createBackfill(_:input:schedule:range:queue:scheduleId:options:)``
-- ``StrandClient/runScheduleSlot(scheduleID:partitionTime:allowOverwrite:namespaceID:)``
+- ``StrandClient/runScheduleSlot(scheduleID:logicalDate:allowOverwrite:namespaceID:)``

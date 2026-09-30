@@ -163,6 +163,8 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
 
     let postgres: PostgresClient
     let logger: Logger
+    /// Codec for serialising user-supplied inputs, outputs, and child workflow payloads.
+    let codec: any StrandCodec
     /// Deterministic serial executor used to drain the handler's job queue during activation.
     let executor: StrandWorkflowExecutor
     /// All mutable workflow state: continuations, pending commands, preloaded results.
@@ -218,6 +220,7 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
         schedulingMetadata: SchedulingMetadata?,
         postgres: PostgresClient,
         logger: Logger,
+        codec: any StrandCodec,
         executor: StrandWorkflowExecutor,
         stateMachine: consuming WorkflowStateMachine,
         stateBox: ArcBox<W>,
@@ -241,6 +244,7 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
         self.schedulingMetadata = schedulingMetadata
         self.postgres = postgres
         self.logger = logger
+        self.codec = codec
         self.executor = executor
         self.stateMachine = stateMachine
         self.stateBox = stateBox
@@ -473,13 +477,13 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// Decoded once when the activation is built — not on every access.
     ///
     /// - `executionTime`: the wall-clock time the schedule fired.
-    /// - `partitionTime`: the data interval start for the fired period.
+    /// - `logicalDate`: the data interval start for the fired period.
     ///   `nil` for one-shot schedules.
     ///
     /// ```swift
     /// mutating func run(context: WorkflowContext<Self>, input: Input) async throws -> Output {
     ///     if let meta = context.schedulingMetadata {
-    ///         let start = meta.partitionTime ?? meta.executionTime
+    ///         let start = meta.logicalDate ?? meta.executionTime
     ///         let end   = start.addingTimeInterval(86_400)
     ///         return try await context.runActivity(ProcessDataActivity.self,
     ///             input: .init(from: start, to: end))
@@ -568,7 +572,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 // Fallback: failure reason not available (edge case in crash recovery).
                 throw ActivityError(activityName: A.name, retryState: .maximumAttemptsReached, cause: nil)
             }
-            return try JSON.decode(A.Output.self, from: cached)
+            return try _decodeOutput(A.Output.self, from: cached, codec: _impl.codec)
         }
 
         // ── Fast path 2a: activity terminated with FAILED or CANCELLED in a prior activation ───
@@ -603,7 +607,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             // Emit a checkpoint write so the worker persists this result after drain.
             _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: preloaded))
             _impl.stateMachine.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
-            return try JSON.decode(A.Output.self, from: preloaded)
+            return try _decodeOutput(A.Output.self, from: preloaded, codec: _impl.codec)
         }
 
         // ── Slow path: activity not yet complete — emit command and suspend ─────────────
@@ -611,7 +615,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // throw CancellationError here rather than scheduling a new activity that would
         // never be needed. Fast paths above are unaffected — already-completed work replays.
         try Task.checkCancellation()
-        let inputBuffer = try JSON.encode(input)
+        let inputBuffer = try _impl.codec.encode(input)
         // Use caller-supplied ID if set; otherwise derive a stable key from
         // the workflow task UUID and call-site sequence number.
         let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
@@ -640,7 +644,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             _impl.cacheCheckpoint(seqNum: seqNum, name: A.name, buffer: resultBuffer)
             _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: A.name, value: resultBuffer))
             _impl.stateMachine.emit(.activityCompleted(name: A.name, seqNum: seqNum, failed: false))
-            return try JSON.decode(A.Output.self, from: resultBuffer)
+            return try _decodeOutput(A.Output.self, from: resultBuffer, codec: _impl.codec)
         } catch let signal as _ActivityFailureSignal {
             // Re-activation delivered a typed failure signal.
             // Write a failure sentinel so fresh-path replays hit fast path 1 (exactly-once guard).
@@ -658,25 +662,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         }
     }
 
-    /// Convenience overload for activities whose `Input` is `StrandVoid` (the codable unit type).
+    /// Convenience overload for void-input activities — omit the `input:` argument.
     ///
     /// ```swift
-    /// let result = try await context.runActivity(SendEmailActivity.self)
+    /// let result = try await context.runActivity(SendWelcomeEmailActivity.self)
     /// ```
     @discardableResult
-    public func runActivity<A: Activity>(
+    package func runActivity<A: Activity>(
         _ type: A.Type,
         options: ActivityOptions = .init(),
         fileID: String = #fileID,
         line: Int = #line
     ) async throws -> A.Output where A.Input == StrandVoid {
-        try await runActivity(
-            type,
-            input: StrandVoid(),
-            options: options,
-            fileID: fileID,
-            line: line
-        )
+        try await runActivity(type, input: .done, options: options, fileID: fileID, line: line)
     }
 
     // MARK: - Deterministic values
@@ -1213,7 +1211,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// - Parameter input: The input for the new workflow instance.
     /// - Returns: Never — always throws `_ContinueAsNewSignal`.
     public func continueAsNew(input: W.Input) throws -> Never {
-        let encoded = try JSON.encode(input)
+        let encoded = try _impl.codec.encode(input)
         throw _ContinueAsNewSignal(
             workflowName: W.workflowName,
             namespaceID: _impl.namespace,
@@ -1252,11 +1250,11 @@ public struct WorkflowContext<W: Workflow>: Sendable {
 
         // Replay fast path: result already persisted in a prior activation.
         if let cached = _impl.checkpointCache[seqNum] {
-            return try JSON.decode(A.Output.self, from: cached)
+            return try _decodeOutput(A.Output.self, from: cached, codec: _impl.codec)
         }
 
         // Schedule for in-process execution post-drain.
-        let inputBuffer = try JSON.encode(input)
+        let inputBuffer = try _impl.codec.encode(input)
         let id = _impl.stateMachine.scheduleLocalActivity(
             name: A.name,
             input: inputBuffer,
@@ -1267,16 +1265,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             (cont: CheckedContinuation<ByteBuffer, any Error>) in
             _impl.stateMachine.linkLocalActivityContinuation(cont, forID: id)
         }
-        return try JSON.decode(A.Output.self, from: result)
-    }
-
-    /// Convenience overload for activities with no input (`StrandVoid`).
-    @discardableResult
-    public func runLocalActivity<A: Activity>(
-        _ type: A.Type,
-        options: LocalActivityOptions = .init()
-    ) async throws -> A.Output where A.Input == StrandVoid {
-        try await runLocalActivity(type, input: .done, options: options)
+        return try _decodeOutput(A.Output.self, from: result, codec: _impl.codec)
     }
 
     // MARK: - version
@@ -1340,12 +1329,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         _ type: CW.Type,
         options: ChildWorkflowOptions = .init(),
         input: CW.Input
-    ) async throws -> CW.Output {
+    ) async throws -> CW.Output where CW.Output: Decodable {
         let seqNum = _impl.nextSeqNum()
 
         // Fast path 1: checkpoint cache (result from a prior activation)
         if let cached = _impl.checkpointCache[seqNum] {
-            return try JSON.decode(CW.Output.self, from: cached)
+            return try _impl.codec.decode(CW.Output.self, from: cached)
         }
 
         // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
@@ -1362,11 +1351,11 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded)
             )
             _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
-            return try JSON.decode(CW.Output.self, from: preloaded)
+            return try _impl.codec.decode(CW.Output.self, from: preloaded)
         }
 
         // Slow path: child not yet complete — emit command and suspend via continuation.
-        let inputBuffer = try JSON.encode(input)
+        let inputBuffer = try _impl.codec.encode(input)
         // Use caller-supplied ID if set; otherwise derive a stable key from
         // the workflow task UUID and call-site sequence number.
         let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
@@ -1404,7 +1393,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
                 .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: resultBuffer)
             )
             _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
-            return try JSON.decode(CW.Output.self, from: resultBuffer)
+            return try _impl.codec.decode(CW.Output.self, from: resultBuffer)
         } catch let signal as _ActivityFailureSignal {
             throw WorkflowError(workflowName: CW.workflowName, state: signal.state.taskStatus)
         }

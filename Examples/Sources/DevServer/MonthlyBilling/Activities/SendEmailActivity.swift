@@ -6,9 +6,9 @@ struct SendEmailActivity: Activity {
         let subject: String
         let failureRate: Double
     }
-    typealias Output = StrandVoid
+    typealias Output = Void
 
-    func run(input: Input, context: ActivityContext) async throws -> StrandVoid {
+    func run(input: Input, context: ActivityContext) async throws -> Output {
         try await Task.sleep(for: .milliseconds(Int64.random(in: 200...700)))
 
         if context.attempt <= 2 && Double.random(in: 0..<1) < input.failureRate {
@@ -23,7 +23,6 @@ struct SendEmailActivity: Activity {
                 "attempt": .stringConvertible(context.attempt),
             ]
         )
-        return StrandVoid()
     }
 }
 

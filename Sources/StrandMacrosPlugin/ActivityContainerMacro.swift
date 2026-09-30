@@ -143,7 +143,7 @@ public struct ActivityContainerMacro: ExtensionMacro {
                 // First parameter labeled 'input:' provides the Input type.
                 let inputType =
                     params.first(where: { $0.firstName.text == "input" })
-                    .map { $0.type.trimmedDescription } ?? "StrandVoid"
+                    .map { $0.type.trimmedDescription } ?? "Void"
 
                 // Presence of a 'context:' parameter controls how we call the method.
                 let hasContextParam = params.contains { $0.firstName.text == "context" }
@@ -152,7 +152,7 @@ public struct ActivityContainerMacro: ExtensionMacro {
                 let returnTypeStr = funcDecl.signature.returnClause?.type.trimmedDescription
                 let isVoidReturn =
                     returnTypeStr == nil || returnTypeStr == "Void" || returnTypeStr == "()"
-                let outputType = isVoidReturn ? "StrandVoid" : returnTypeStr!
+                let outputType = isVoidReturn ? "Void" : returnTypeStr!
 
                 activityMethods.append(
                     ActivityMethodInfo(
@@ -172,15 +172,20 @@ public struct ActivityContainerMacro: ExtensionMacro {
         // 3. Build the inner content of the extension body as a plain string.
         //    Each struct declaration is indented with 4 spaces so it sits correctly
         //    inside `extension \(typeName): ActivityContainerProtocol { ... }`.
+        //    Propagate the container struct's access modifier to generated nested structs
+        //    so that a `public` container yields `public` Activity types.
+        let access =
+            (declaration.as(StructDeclSyntax.self)?.modifiers)
+            .map { leadingAccessModifier(from: $0) } ?? ""
         var innerLines: [String] = []
 
         for method in activityMethods {
-            innerLines.append("    struct \(method.structName): Activity {")
-            innerLines.append("        typealias Input = \(method.inputType)")
-            innerLines.append("        typealias Output = \(method.outputType)")
-            innerLines.append("        let _container: \(typeName)")
+            innerLines.append("    \(access)struct \(method.structName): Activity {")
+            innerLines.append("        \(access)typealias Input = \(method.inputType)")
+            innerLines.append("        \(access)typealias Output = \(method.outputType)")
+            innerLines.append("        \(access)let _container: \(typeName)")
             innerLines.append(
-                "        func run(input: \(method.inputType), context: ActivityContext) async throws -> \(method.outputType) {"
+                "        \(access)func run(input: \(method.inputType), context: ActivityContext) async throws -> \(method.outputType) {"
             )
 
             if method.isVoidReturn {
@@ -193,7 +198,6 @@ public struct ActivityContainerMacro: ExtensionMacro {
                         "            try await _container.\(method.funcName)(input: input)"
                     )
                 }
-                innerLines.append("            return StrandVoid()")
             } else {
                 if method.hasContextParam {
                     innerLines.append(

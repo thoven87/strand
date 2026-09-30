@@ -1,4 +1,3 @@
-import NIOCore
 import Strand
 
 /// Monitors a single room for N cycles.
@@ -12,9 +11,8 @@ import Strand
 /// Durability: kill the process during any cycle and restart —
 /// the workflow resumes from the last completed cycle, not from the start.
 /// Thresholds can be updated in-flight via the `UpdateThresholds` signal.
-struct RoomMonitorWorkflow: Workflow {
-    typealias Input = RoomConfig
-    typealias Output = RoomReport
+@Workflow
+struct RoomMonitorWorkflow {
 
     // ── Mutable state ─────────────────────────────────────────────────────
     var thresholds: RoomThresholds? = nil  // nil = use input thresholds
@@ -29,21 +27,10 @@ struct RoomMonitorWorkflow: Workflow {
     ///     RoomMonitorWorkflow.UpdateThresholds.self,
     ///     payload: ThresholdUpdate(newThresholds: adjusted, reason: "post-incident"))
     /// ```
-    struct UpdateThresholds: WorkflowSignal {
-        typealias W = RoomMonitorWorkflow
-        typealias Input = ThresholdUpdate
-        static func apply(to w: inout RoomMonitorWorkflow, input: ThresholdUpdate) {
-            w.thresholds = input.newThresholds
-            print("  Thresholds updated: \(input.reason)")
-        }
-    }
-
-    mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
-        if name == UpdateThresholds.signalName,
-            let update = try? decodeSignalPayload(ThresholdUpdate.self, from: payload)
-        {
-            UpdateThresholds.apply(to: &self, input: update)
-        }
+    @WorkflowSignal
+    mutating func updateThresholds(_ update: ThresholdUpdate) {
+        thresholds = update.newThresholds
+        print("  Thresholds updated: \(update.reason)")
     }
 
     // ── Orchestration ──────────────────────────────────────────────────────
@@ -60,7 +47,7 @@ struct RoomMonitorWorkflow: Workflow {
         for cycle in 1...input.cycles {
             // Read all sensors for this room and cycle
             let readings = try await context.runActivity(
-                ReadSensorsActivity.self,
+                BuildingActivities.ReadSensors.self,
                 input: ReadSensorsInput(
                     roomId: input.roomId,
                     displayName: input.displayName,
@@ -96,7 +83,7 @@ struct RoomMonitorWorkflow: Workflow {
 
                 if breached {
                     try await context.runActivity(
-                        SendAlertActivity.self,
+                        BuildingActivities.SendAlert.self,
                         input: AlertInput(
                             roomId: input.roomId,
                             displayName: input.displayName,

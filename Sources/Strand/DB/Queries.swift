@@ -611,7 +611,7 @@ enum Queries {
             }
             taskInterp.appendLiteral(
                 " ON CONFLICT (namespace_id, queue, idempotency_key)"
-                + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+                    + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
             )
             // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
             // silently discards conflicts, so only genuinely new task IDs are returned.
@@ -854,7 +854,7 @@ enum Queries {
             }
             taskInterp.appendLiteral(
                 " ON CONFLICT (namespace_id, queue, idempotency_key)"
-                + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+                    + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
             )
             // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
             // silently discards conflicts, so only genuinely new task IDs are returned.
@@ -3312,13 +3312,18 @@ enum Queries {
             --    Every sentinel on this parent encodes to the same fixed byte
             --    sequence, so a direct value match is sufficient — no need to
             --    parse the idempotency key to recover the seq_num.
-            --    (Not needed when resetHistory=true: retryTask calls
-            --    clearWorkflowArtefacts which wipes all parent checkpoints.)
+            --
+            --    Always run this regardless of resetHistory.  When resetHistory=true,
+            --    retryTask also calls clearWorkflowArtefacts which wipes *all* parent
+            --    checkpoints — re-deleting already-gone rows is a no-op, and running
+            --    this step unconditionally eliminates a transactional gap: if
+            --    retryTask (Transaction 2) fails after resetChildTasks (Transaction 1)
+            --    commits, the children are PENDING but the sentinels are already gone,
+            --    so a subsequent requeueTask call can recover cleanly.
             del_parent_sentinels AS (
                 DELETE FROM strand.checkpoints
                 WHERE  task_id      = \(rootTaskID)
                   AND  namespace_id = \(namespaceID)
-                  AND  NOT \(resetHistory)
                   AND  state        = \(sentinelBuf)
             )
             SELECT DISTINCT queue FROM new_runs
@@ -3571,7 +3576,17 @@ enum Queries {
             ins_completion AS (
                 INSERT INTO strand.task_completions (namespace_id, task_id, state, result)
                 VALUES (\(namespaceID), \(taskID), \(state), \(resultBuffer))
-                ON CONFLICT (task_id) DO NOTHING
+                ON CONFLICT (task_id) DO UPDATE
+                    SET state        = EXCLUDED.state,
+                        result       = EXCLUDED.result,
+                        completed_at = NOW()
+                -- Allow a successful manual retry to overwrite a terminal failure.
+                -- In normal flow this conflict never fires (each task completes once).
+                -- When an operator retries an activity that hit maxAttempts, the new
+                -- COMPLETED signal must win so the parent workflow sees the success on
+                -- its next activation instead of replaying the stale FAILED sentinel.
+                WHERE strand.task_completions.state IN (\(TaskState.failed), \(TaskState.cancelled))
+                  AND EXCLUDED.state = \(TaskState.completed)
             ),
             flag_running AS (
                 -- Parent is RUNNING (mid-activation): set has_buffered_completion so

@@ -66,7 +66,7 @@ struct MonthlyBillingWorkflow: Workflow {
         )
 
         // Fan-out: user receipt (60 % transient failure rate) and admin notification in parallel.
-        try await withThrowingTaskGroup(of: StrandVoid.self) { group in
+        try await withThrowingTaskGroup { group in
             group.addTask {
                 try await context.runActivity(
                     SendEmailActivity.self,

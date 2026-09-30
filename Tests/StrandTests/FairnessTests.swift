@@ -34,12 +34,12 @@ private struct ChildFairnessParentWorkflow: Workflow {
     struct Input: Codable, Sendable {
         let heavyCount: Int
     }
-    typealias Output = StrandVoid
+    typealias Output = Void
 
     mutating func run(
         context: WorkflowContext<Self>,
         input: Input
-    ) async throws -> StrandVoid {
+    ) async throws {
         try await withThrowingTaskGroup(of: StrandVoid.self) { group in
             // Heavy children: all enqueued together with fairness key "heavy".
             for _ in 0..<input.heavyCount {
@@ -62,7 +62,6 @@ private struct ChildFairnessParentWorkflow: Workflow {
             }
             try await group.waitForAll()
         }
-        return .done
     }
 }
 

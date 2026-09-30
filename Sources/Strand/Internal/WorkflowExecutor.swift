@@ -319,7 +319,10 @@ struct WorkflowStateMachine: ~Copyable {
             preloadedStartInfo[seqNum] = (startedAt: startedAt, attempt: runAttempt, workerID: workerID)
             switch state {
             case .completed:
-                if let result { preloadedResults[seqNum] = result }
+                // Void-output activities store NULL in Postgres; use an empty sentinel
+                // so the fast-path check (preloadedResult != nil) succeeds and the
+                // continuation-resume path runs correctly.
+                preloadedResults[seqNum] = result ?? ByteBuffer()
             case .failed, .cancelled:
                 preloadedNonCompletions[seqNum] = (state: state, failureReason: failureReason)
             default:
@@ -702,11 +705,13 @@ final class StrandWorkflowExecutor: TaskExecutor & SerialExecutor, Sendable {
     func drain() {
         // Acquire the drain permit. A second concurrent call returns immediately;
         // the running loop will process any newly-enqueued jobs before it exits.
-        guard _state.withLock({ s -> Bool in
-            guard !s.isDraining else { return false }
-            s.isDraining = true
-            return true
-        }) else { return }
+        guard
+            _state.withLock({ s -> Bool in
+                guard !s.isDraining else { return false }
+                s.isDraining = true
+                return true
+            })
+        else { return }
 
         // Release the permit, re-check atomically to prevent stranded jobs.
         // If cancelPending() enqueued jobs and called drain() while we were

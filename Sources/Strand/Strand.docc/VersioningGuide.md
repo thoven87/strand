@@ -64,13 +64,14 @@ new code path. In-flight instances replay the value stored when they first
 encountered that gate.
 
 ```swift
-struct OrderWorkflow: Workflow {
+@Workflow
+struct OrderWorkflow {
     mutating func run(
         context: WorkflowContext<Self>,
         input: OrderInput
     ) async throws -> OrderResult {
         let charge = try await context.runActivity(
-            ChargeCardActivity.self,
+            PaymentActivities.ChargeCard.self,
             input: .init(amount: input.total)
         )
 
@@ -78,13 +79,13 @@ struct OrderWorkflow: Workflow {
         // reach this gate for the first time take the new path.
         if context.version(changeID: "add-fraud-check") {
             try await context.runActivity(
-                FraudCheckActivity.self,
+                ComplianceActivities.FraudCheck.self,
                 input: .init(paymentID: charge.paymentID)
             )
         }
 
         return try await context.runActivity(
-            ShipOrderActivity.self,
+            ShippingActivities.Ship.self,
             input: .init(paymentID: charge.paymentID)
         )
     }

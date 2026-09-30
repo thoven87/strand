@@ -16,11 +16,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.15.1"),
         .package(
             url: "https://github.com/swift-server/swift-service-lifecycle.git",
-            from: "2.11.0"
+            from: "2.12.0"
         ),
-        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.24.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-metrics.git", from: "2.11.0"),
-        .package(url: "https://github.com/apple/swift-distributed-tracing.git", from: "1.4.1"),
+        .package(url: "https://github.com/apple/swift-distributed-tracing.git", from: "1.5.0"),
         .package(
             url: "https://github.com/swift-otel/swift-otel-semantic-conventions.git",
             from: "1.39.0"
@@ -62,7 +62,7 @@ let package = Package(
             swiftSettings: [
                 // Non-isolated async functions run on a generic executor, not the caller's actor.
                 // SE-0461
-                .enableUpcomingFeature("NonIsolatedNonSendingByDefault"),
+                .enableUpcomingFeature("NonisolatedNonSendingByDefault"),
                 // Imports are internal by default — prevents leaking internals to callers.
                 // SE-0409
                 .enableUpcomingFeature("InternalImportsByDefault"),

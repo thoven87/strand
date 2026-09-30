@@ -3,76 +3,79 @@
 Activities are the leaf units of work — the only place where I/O, network
 calls, and database writes live.
 
-## Protocol-based definition
+## Defining activities with `@ActivityContainer`
 
-Implement ``Activity`` to define a dependency-injected, independently
-retried unit of work:
+Group related activities inside a struct annotated with `@ActivityContainer`.
+Each method annotated with `@Activity` becomes a standalone, independently
+retried unit of work. Dependencies (clients, DB connections) are stored as
+properties on the container and shared across all methods:
 
 ```swift
-struct FetchWeatherActivity: Activity {
-    typealias Input  = WeatherInput
-    typealias Output = WeatherResult
+@ActivityContainer
+struct PaymentActivities {
+    let stripe: StripeClient
 
-    struct WeatherInput:  Codable, Sendable { let city: String }
-    struct WeatherResult: Codable, Sendable { let tempC: Double; let conditions: String }
+    @Activity
+    func chargeCard(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
+        let charge = try await stripe.charges.create(
+            amount: input.amountCents,
+            currency: "usd",
+            customer: input.customerID,
+            idempotencyKey: context.taskID.uuidString  // stable across retries
+        )
+        return ChargeResult(chargeID: charge.id)
+    }
 
-    func run(input: WeatherInput, context: ActivityContext) async throws -> WeatherResult {
-        let response = try await weatherAPI.fetch(city: input.city)
-        return WeatherResult(tempC: response.temperature, conditions: response.conditions)
+    @Activity
+    func refund(input: RefundInput, context: ActivityContext) async throws -> RefundResult {
+        let refund = try await stripe.refunds.create(chargeID: input.chargeID)
+        return RefundResult(refundID: refund.id)
     }
 }
 ```
 
-The type system enforces that `Input` and `Output` are `Codable` and `Sendable`.
-Strand serialises them as BYTEA JSON blobs in Postgres.
-
-## Registering activities on a worker
-
-Pass activity instances in the `activities:` array when constructing ``StrandWorker``:
+The generated types are accessed as nested types on the container —
+`PaymentActivities.ChargeCard` and `PaymentActivities.Refund` — and
+registered with the worker via `activityContainers:`:
 
 ```swift
 let worker = StrandWorker(
     postgres: postgres,
     options: WorkerOptions(queue: "default"),
     workflows: [OrderWorkflow.self],
-    activities: [
-        FetchWeatherActivity(),
-        ChargeCardActivity(stripe: stripeClient),
-        ShipOrderActivity(fulfillment: fulfillmentClient),
+    activityContainers: [
+        PaymentActivities(stripe: stripeClient),
+        ShippingActivities(fulfillment: fulfillmentClient),
     ]
 )
 ```
 
-Activities that share dependencies can be grouped via ``ActivityContainerProtocol``:
+Activities with no return value omit the return type:
 
 ```swift
-struct PaymentActivities: ActivityContainerProtocol {
-    let stripe: StripeClient
+@ActivityContainer
+struct EmailActivities {
+    let smtp: SMTPClient
 
-    var activities: [any Activity] {
-        [ChargeCardActivity(stripe: stripe),
-         RefundCardActivity(stripe: stripe)]
+    @Activity
+    func send(input: EmailInput, context: ActivityContext) async throws {
+        try await smtp.send(to: input.address, body: input.body)
+        // no return statement needed
     }
 }
-
-let worker = StrandWorker(
-    postgres: postgres,
-    options: WorkerOptions(queue: "default"),
-    activityContainers: [PaymentActivities(stripe: stripe)]
-)
 ```
 
 ## Retries and timeouts
 
-All `ActivityOptions` fields are optional — omit any you don’t need and the
+All `ActivityOptions` fields are optional — omit any you don't need and the
 worker default applies.
 
 Control retry behaviour per call-site via ``ActivityOptions``:
 
 ```swift
-let weather = try await context.runActivity(
-    FetchWeatherActivity.self,
-    input: .init(city: "Paris"),
+let result = try await context.runActivity(
+    PaymentActivities.ChargeCard.self,
+    input: .init(amountCents: 1000, customerID: id),
     options: ActivityOptions(
         timeout: .seconds(30),           // max time per attempt
         maxAttempts: 5,
@@ -87,16 +90,6 @@ very short `claimTimeout`. For example, `timeout: .hours(2), heartbeatTimeout: .
 gives the activity two hours to complete per attempt but re-queues it within 30 s
 if it stops heartbeating — useful for catching infinite loops or blocked I/O long
 before the StartToClose deadline would fire.
-
-Set defaults on the activity type itself to avoid repeating options at every call-site:
-
-```swift
-struct FetchWeatherActivity: Activity {
-    static var defaultMaxAttempts: Int? { 5 }
-    static var defaultTimeout: Duration? { .seconds(10) }
-    // ...
-}
-```
 
 ## Idempotency — activities run at least once
 
@@ -127,23 +120,17 @@ the same activity. Use it as the idempotency key when calling external APIs
 that support one:
 
 ```swift
-struct ChargeCardActivity: Activity {
-    typealias Input  = ChargeInput
-    typealias Output = ChargeResult
-
-    let stripe: StripeClient
-
-    func run(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
-        // Stripe deduplicates by idempotency key within 24 h.
-        // Using taskID means retries never create duplicate charges.
-        let charge = try await stripe.charges.create(
-            amount: input.amountCents,
-            currency: "usd",
-            customer: input.customerID,
-            idempotencyKey: context.taskID.uuidString   // ← stable across retries
-        )
-        return ChargeResult(chargeID: charge.id)
-    }
+@Activity
+func chargeCard(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
+    // Stripe deduplicates by idempotency key within 24 h.
+    // Using taskID means retries never create duplicate charges.
+    let charge = try await stripe.charges.create(
+        amount: input.amountCents,
+        currency: "usd",
+        customer: input.customerID,
+        idempotencyKey: context.taskID.uuidString   // ← stable across retries
+    )
+    return ChargeResult(chargeID: charge.id)
 }
 ```
 
@@ -153,20 +140,14 @@ When the external system doesn't support idempotency keys, query whether the
 work was already done before performing it:
 
 ```swift
-struct ProvisionDatabaseActivity: Activity {
-    typealias Input  = ProvisionInput
-    typealias Output = ProvisionResult
-
-    let cloud: CloudClient
-
-    func run(input: ProvisionInput, context: ActivityContext) async throws -> ProvisionResult {
-        // Safe to call on retry: returns the existing DB if already provisioned.
-        if let existing = try await cloud.databases.find(name: input.dbName) {
-            return ProvisionResult(host: existing.host)
-        }
-        let db = try await cloud.databases.create(name: input.dbName, tier: input.tier)
-        return ProvisionResult(host: db.host)
+@Activity
+func provisionDatabase(input: ProvisionInput, context: ActivityContext) async throws -> ProvisionResult {
+    // Safe to call on retry: returns the existing DB if already provisioned.
+    if let existing = try await cloud.databases.find(name: input.dbName) {
+        return ProvisionResult(host: existing.host)
     }
+    let db = try await cloud.databases.create(name: input.dbName, tier: input.tier)
+    return ProvisionResult(host: db.host)
 }
 ```
 
@@ -177,23 +158,19 @@ after each stage. On retry, `context.heartbeatDetails(as:)` returns the last
 checkpoint so already-completed stages are skipped entirely:
 
 ```swift
-struct MigrateDataActivity: Activity {
-    typealias Input  = MigrationInput
-    typealias Output = MigrationResult
+@Activity
+func migrateData(input: MigrationInput, context: ActivityContext) async throws -> MigrationResult {
+    // Pick up from the last committed batch on retry.
+    var cursor = context.heartbeatDetails(as: String.self) ?? input.startCursor
+    var totalMigrated = 0
 
-    func run(input: MigrationInput, context: ActivityContext) async throws -> MigrationResult {
-        // Pick up from the last committed batch on retry.
-        var cursor = context.heartbeatDetails(as: String.self) ?? input.startCursor
-        var totalMigrated = 0
-
-        while let page = try await db.fetchPage(after: cursor, limit: 500) {
-            try await db.writePage(page)   // idempotent upsert
-            cursor = page.nextCursor
-            totalMigrated += page.rows.count
-            try await context.heartbeat(cursor)  // checkpoint: retry resumes here
-        }
-        return MigrationResult(totalMigrated: totalMigrated)
+    while let page = try await db.fetchPage(after: cursor, limit: 500) {
+        try await db.writePage(page)   // idempotent upsert
+        cursor = page.nextCursor
+        totalMigrated += page.rows.count
+        try await context.heartbeat(cursor)  // checkpoint: retry resumes here
     }
+    return MigrationResult(totalMigrated: totalMigrated)
 }
 ```
 
@@ -209,16 +186,13 @@ enum ValidationError: Error, Codable, NonRetryableError {
     case amountBelowMinimum(Int)
 }
 
-struct ChargeCardActivity: Activity {
-    typealias Failure = ValidationError
-
-    func run(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
-        guard input.amountCents >= 50 else {
-            throw ValidationError.amountBelowMinimum(input.amountCents)
-            // Strand marks this failed immediately — no retries attempted.
-        }
-        // ...
+@Activity
+func chargeCard(input: ChargeInput, context: ActivityContext) async throws -> ChargeResult {
+    guard input.amountCents >= 50 else {
+        throw ValidationError.amountBelowMinimum(input.amountCents)
+        // Strand marks this failed immediately — no retries attempted.
     }
+    // ...
 }
 ```
 
@@ -226,7 +200,7 @@ struct ChargeCardActivity: Activity {
 
 | Guarantee | Status |
 |---|---|
-| Activity result applied to workflow exactly once | ✅ `version` CAS + `task_completions ON CONFLICT DO NOTHING` |
+| Activity result applied to workflow exactly once | ✅ `version` CAS + `task_completions ON CONFLICT DO UPDATE` |
 | Activity `run()` body executes exactly once | ❌ At-least-once — use idempotency keys or check-then-act |
 | `maxAttempts` is respected | ✅ Attempts counter incremented only on explicit failure, not lease expiry |
 | Lease expiry does not count as a failed attempt | ✅ `sweepExpiredLeases` re-queues as PENDING at the same attempt number |
@@ -238,11 +212,12 @@ struct ChargeCardActivity: Activity {
 
 For activities that take more than `claimTimeout` to complete, call
 `context.heartbeat()` periodically. Each call extends the Postgres lease
-(`lease_expires_at`) so the expiry sweep doesn’t re-queue the task while
+(`lease_expires_at`) so the expiry sweep doesn't re-queue the task while
 it is still running:
 
 ```swift
-func run(input: ProcessInput, context: ActivityContext) async throws -> ProcessResult {
+@Activity
+func processLargeDataset(input: ProcessInput, context: ActivityContext) async throws -> ProcessResult {
     for chunk in largeDataset.chunked(by: 1000) {
         try await process(chunk)
         try await context.heartbeat()   // extend lease; no progress stored
@@ -259,24 +234,19 @@ returns that value so the activity can resume mid-stream instead of restarting
 from the beginning:
 
 ```swift
-struct IngestFileActivity: Activity {
-    typealias Input  = FileInput
-    typealias Output = StrandVoid
+@Activity
+func ingestFile(input: FileInput, context: ActivityContext) async throws {
+    // Pick up from the last checkpoint on retry; start at 0 on the first attempt.
+    let startLine = context.heartbeatDetails(as: Int.self) ?? 0
 
-    func run(input: FileInput, context: ActivityContext) async throws -> StrandVoid {
-        // Pick up from the last checkpoint on retry; start at 0 on the first attempt.
-        let startLine = context.heartbeatDetails(as: Int.self) ?? 0
+    for (index, line) in file.lines.dropFirst(startLine).enumerated() {
+        let lineNumber = startLine + index + 1
+        try parseLine(line)
 
-        for (index, line) in file.lines.dropFirst(startLine).enumerated() {
-            let lineNumber = startLine + index + 1
-            try parseLine(line)
-
-            // Every 500 lines: extend the lease AND store progress.
-            if lineNumber.isMultiple(of: 500) {
-                try await context.heartbeat(lineNumber)
-            }
+        // Every 500 lines: extend the lease AND store progress.
+        if lineNumber.isMultiple(of: 500) {
+            try await context.heartbeat(lineNumber)
         }
-        return .done
     }
 }
 ```
@@ -295,25 +265,8 @@ Enqueue an activity directly without wrapping it in a workflow:
 
 ```swift
 let result = try await client.enqueueActivity(
-    SendEmailActivity.self,
+    EmailActivities.Send.self,
     input: .init(to: "alice@example.com", subject: "Welcome!")
 )
 // result.taskID lets you poll for completion later
-```
-
-## No-output activities
-
-Use ``StrandVoid`` as the `Output` type when the activity performs a side effect
-and returns no meaningful value:
-
-```swift
-struct SendEmailActivity: Activity {
-    typealias Input  = EmailInput
-    typealias Output = StrandVoid
-
-    func run(input: EmailInput, context: ActivityContext) async throws -> StrandVoid {
-        try await smtp.send(to: input.address, body: input.body)
-        return .done
-    }
-}
 ```

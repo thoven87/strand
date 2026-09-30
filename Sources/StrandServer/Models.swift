@@ -15,9 +15,10 @@ struct SchedulingInfoResponse: Codable, Sendable {
     let scheduleName: String?
     let scheduleId: String?
     let executionTime: Date
-    let partitionTime: Date?
+    let logicalDate: Date?
     /// ISO 8601 offset from the schedule pattern (e.g. "PT15M"). nil when offset is zero.
     let scheduleOffset: String?
+
 }
 extension SchedulingInfoResponse: ResponseCodable {}
 
@@ -146,7 +147,7 @@ struct TaskDetailResponse: Codable, Sendable {
                 scheduleName: $0.scheduledBy,
                 scheduleId: $0.scheduleId,
                 executionTime: $0.executionTime,
-                partitionTime: $0.partitionTime,
+                logicalDate: $0.logicalDate,
                 scheduleOffset: $0.scheduleOffset
             )
         }

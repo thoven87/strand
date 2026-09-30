@@ -24,7 +24,7 @@ public struct StrandClient: Sendable {
     /// The namespace this client operates in.
     public let namespaceID: String
     public let logger: Logger
-    let options: StrandOptions
+    package let options: StrandOptions
 
     public init(
         postgres: PostgresClient,
@@ -162,7 +162,8 @@ public struct StrandClient: Sendable {
             let retryState: ActivityRetryState = snap.state == .cancelled ? .cancelled : .maximumAttemptsReached
             throw ActivityError(activityName: A.name, retryState: retryState, cause: af)
         }
-        return try snap.decodeResult(as: A.Output.self)
+        // _resultBuffer is nil for Void outputs; _decodeOutput handles nil → Void directly.
+        return try _decodeOutput(A.Output.self, from: snap._resultBuffer ?? ByteBuffer(), codec: self.options.codec)
     }
 
     // MARK: - enqueueActivities
@@ -230,7 +231,7 @@ public struct StrandClient: Sendable {
                 return Queries.BatchEnqueueItem(
                     taskID: UUID.v7(),
                     runID: UUID.v7(),
-                    paramsBuffer: try JSON.encode(input),
+                    paramsBuffer: try self.options.codec.encode(input),
                     idempotencyKey: resolvedKey
                 )
             }
@@ -316,7 +317,7 @@ public struct StrandClient: Sendable {
                 return Queries.BatchEnqueueItem(
                     taskID: UUID.v7(),
                     runID: UUID.v7(),
-                    paramsBuffer: try JSON.encode(input),
+                    paramsBuffer: try self.options.codec.encode(input),
                     idempotencyKey: resolvedID
                 )
             }
@@ -380,7 +381,7 @@ public struct StrandClient: Sendable {
     ) async throws -> WorkflowHandle<W> {
         let queue = options.queue ?? queueName
         let taskName = W.workflowName
-        let paramsBuffer = try JSON.encode(input)
+        let paramsBuffer = try self.options.codec.encode(input)
         // Use the caller-supplied ID when provided; otherwise delegate to the workflow
         // type's own ID generator (overridable per type via WorkflowRegistrable).
         let resolvedID = options.id ?? W.generateWorkflowID()
@@ -565,7 +566,7 @@ public struct StrandClient: Sendable {
                 namespaceID: namespaceID,
                 queue: queue,
                 taskName: taskName,
-                paramsBuffer: try JSON.encode(params),
+                paramsBuffer: try options.codec.encode(params),
                 headersBuffer: h.isEmpty ? nil : try JSON.encode(h),
                 retryStrategyBuffer: try JSON.encode(retryStrategy),
                 maxAttempts: maxAttempts,
@@ -639,7 +640,7 @@ public struct StrandClient: Sendable {
             namespaceID: namespaceID ?? self.namespaceID,
             queue: queue ?? queueName,
             eventName: name,
-            payloadBuffer: try JSON.encode(payload),
+            payloadBuffer: try options.codec.encode(payload),
             logger: logger
         )
     }
@@ -786,13 +787,16 @@ public struct StrandClient: Sendable {
     /// // or explicit:
     /// let result = try await client.awaitTaskResult(id: enq.taskID, as: OrderOutput.self)
     /// ```
-    public func awaitTaskResult<T: Decodable>(
+    public func awaitTaskResult<T: Decodable & Sendable>(
         id taskID: UUID,
         as type: T.Type = T.self,
         options: AwaitTaskResultOptions = .init()
     ) async throws -> T {
         let snap = try await pollTerminalSnapshot(id: taskID, options: options)
-        return try snap.decodeResult(as: type)
+        guard let buf = snap._resultBuffer else {
+            throw StrandError.serialization(underlying: MissingTaskResultError())
+        }
+        return try self.options.codec.decode(type, from: buf)
     }
 
     // MARK: - Helpers
@@ -832,7 +836,7 @@ public struct StrandClient: Sendable {
         return TaskResultSnapshot(
             taskID: row.taskID,
             state: row.state.taskStatus,
-            resultJSON: row.resultBuffer.map { String(buffer: $0) },
+            resultBuffer: row.resultBuffer,
             failure: failure,
             activityFailure: af
         )
@@ -1071,7 +1075,7 @@ public struct StrandClient: Sendable {
         now: Date = .now
     ) async throws -> UUID {
         let targetQueue = queue ?? queueName
-        let paramsBuffer = try JSON.encode(params)
+        let paramsBuffer = try self.options.codec.encode(params)
         let patternBuf = try JSON.encode(pattern)
         let headersBuf = options.headers.isEmpty ? nil : try JSON.encode(options.headers)
         let retryBuf = try options.retryStrategy.map { try JSON.encode($0) }
@@ -1207,6 +1211,7 @@ public struct StrandClient: Sendable {
             retryStrategyBuffer: retryBuf,
             cancellationBuffer: cancelBuf,
             accuracy: options.accuracy,
+            overlapPolicy: options.overlapPolicy,
             kind: kind,
             startsAt: startsAt,
             endsAt: endsAt,
@@ -1299,7 +1304,7 @@ public struct StrandClient: Sendable {
     @discardableResult
     public func runScheduleSlot(
         scheduleID: UUID,
-        partitionTime: Date,
+        logicalDate: Date,
         allowOverwrite: Bool = false,
         namespaceID overrideNS: String? = nil
     ) async throws -> (taskID: UUID, runID: UUID) {
@@ -1317,10 +1322,10 @@ public struct StrandClient: Sendable {
         let idempotencyKey: String? =
             allowOverwrite
             ? nil
-            : "$schedule:\(scheduleID):\(partitionTime.timeIntervalSince1970)"
+            : "$schedule:\(scheduleID):\(logicalDate.timeIntervalSince1970)"
         let meta = SchedulingMetadata(
             executionTime: Date(),
-            partitionTime: partitionTime,
+            logicalDate: logicalDate,
             scheduleId: scheduleID.uuidString,
             scheduledBy: schedule.name
         )
@@ -1409,7 +1414,7 @@ public struct StrandClient: Sendable {
         options: BackfillOptions = .init()
     ) async throws -> BackfillHandle where W.Input: Codable & Sendable {
         let q = overrideQueue ?? queueName
-        let paramsBuffer = try JSON.encode(input)
+        let paramsBuffer = try self.options.codec.encode(input)
         let patternBuffer = try JSON.encode(schedule)
         let id = UUID.v7()
         let totalSlots = ScheduleCalculator.countSlots(for: schedule, in: range)
@@ -1449,7 +1454,7 @@ public struct StrandClient: Sendable {
         options: BackfillOptions = .init()
     ) async throws -> BackfillHandle where A.Input: Codable & Sendable {
         let q = overrideQueue ?? queueName
-        let paramsBuffer = try JSON.encode(input)
+        let paramsBuffer = try self.options.codec.encode(input)
         let patternBuffer = try JSON.encode(schedule)
         let id = UUID.v7()
         let totalSlots = ScheduleCalculator.countSlots(for: schedule, in: range)
@@ -1580,6 +1585,10 @@ public struct StrandOptions: Sendable {
     public var logger: Logger
     public var onTaskStarted: (@Sendable (TaskInfo) async -> Void)?
     public var onTaskFinished: (@Sendable (TaskInfo, Result<Void, any Error>) async -> Void)?
+    /// Codec used to serialise and deserialise all user-supplied payload bytes
+    /// (workflow/activity inputs and outputs, signal payloads, workflow state).
+    /// Default: ``JSONCodec`` (plain JSON, no encryption).
+    public var codec: any StrandCodec
 
     public init(
         defaultMaxAttempts: Int = 5,
@@ -1590,14 +1599,22 @@ public struct StrandOptions: Sendable {
         ),
         logger: Logger = Logger(label: "dev.strand"),
         onTaskStarted: (@Sendable (TaskInfo) async -> Void)? = nil,
-        onTaskFinished: (@Sendable (TaskInfo, Result<Void, any Error>) async -> Void)? = nil
+        onTaskFinished: (@Sendable (TaskInfo, Result<Void, any Error>) async -> Void)? = nil,
+        codec: any StrandCodec = JSONCodec()
     ) {
         self.defaultMaxAttempts = defaultMaxAttempts
         self.defaultRetryStrategy = defaultRetryStrategy
         self.logger = logger
         self.onTaskStarted = onTaskStarted
         self.onTaskFinished = onTaskFinished
+        self.codec = codec
     }
+}
+
+// MARK: - Private helpers
+
+private struct MissingTaskResultError: Error, CustomStringConvertible {
+    var description: String { "Task completed but has no result payload" }
 }
 
 // MARK: - TaskInfo

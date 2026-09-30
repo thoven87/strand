@@ -32,14 +32,14 @@ public struct PartitionOffsetConfig: Codable, Sendable {
         useDefaultOffsets: Bool = true,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) throws {
-        self.offset = try ISO8601Duration(offset)
+        self.offset = try ISO8601Duration(parsing: offset)
         self.useDefaultOffsets = useDefaultOffsets
         self.timezone = timezone
     }
 
     /// Create with ISO 8601 duration string and timezone
     public init(offset: String, timezone: TimeZone) throws {
-        self.offset = try ISO8601Duration(offset)
+        self.offset = try ISO8601Duration(parsing: offset)
         self.useDefaultOffsets = true
         self.timezone = timezone
     }

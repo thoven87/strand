@@ -12,21 +12,20 @@ public import Foundation
 
 // MARK: - StrandVoid
 
-/// A `Codable`, `Sendable` unit type used as the `Output` of an ``Activity``
-/// that performs a side effect and returns no meaningful value.
+/// Codable unit type for void-input activities.
 ///
-/// ```swift
-/// struct SendEmailActivity: Activity {
-///     func run(input: EmailInput, context: ActivityContext) async throws -> StrandVoid {
-///         try await smtp.send(to: input.address, body: input.body)
-///         return .done
-///     }
-/// }
-/// ```
-public struct StrandVoid: Codable, Sendable, Equatable {
-    /// The single shared instance. Return this from your activity handler.
-    public static let done = StrandVoid()
-    public init() {}
+/// `Activity.Input` requires `Codable & Sendable`. Swift’s `Void` (`()`) is
+/// `Sendable` but not `Codable`, so activities that take no meaningful input
+/// use `StrandVoid` as their `Input` associated type.  The `@ActivityContainer`
+/// macro generates `typealias Input = StrandVoid` automatically when an
+/// `@Activity` method has no `input:` parameter.
+///
+/// You never construct or inspect `StrandVoid` directly — it is purely a
+/// generic-constraint placeholder.  Library users write `func run(input: Input)`
+/// and ignore the parameter.
+package struct StrandVoid: Codable, Sendable, Equatable {
+    package static let done = StrandVoid()
+    package init() {}
 }
 
 // MARK: - ActivityCancellationType
@@ -417,18 +416,18 @@ public struct ActivityContext: Sendable {
     /// the activity was enqueued via ``StrandClient/enqueueActivity(_:input:options:)``
     /// or spawned as a child of a workflow.
     ///
-    /// Use `partitionTime` as the canonical anchor for what data period this
+    /// Use `logicalDate` as the canonical anchor for what data period this
     /// execution covers — it is stable across retries and backfill re-runs:
     ///
     /// ```swift
-    /// func run(input: Input, context: ActivityContext) async throws -> StrandVoid {
+    /// func run(input: Input, context: ActivityContext) async throws {
     ///     guard let meta = context.schedulingMetadata else {
     ///         // Directly enqueued — use queuedAt or input-supplied date
     ///         return try await processDay(input.date)
     ///     }
-    ///     // Scheduled execution: partitionTime = data interval start (stable across retries)
+    ///     // Scheduled execution: logicalDate = data interval start (stable across retries)
     ///     // executionTime        = when the scheduler actually fired (wall-clock)
-    ///     let day = meta.partitionTime ?? meta.executionTime
+    ///     let day = meta.logicalDate ?? meta.executionTime
     ///     return try await processDay(day)
     /// }
     /// ```
@@ -604,7 +603,7 @@ public struct ActivityContext: Sendable {
     /// value and resume exactly where you left off:
     ///
     /// ```swift
-    /// func run(input: FileInput, context: ActivityContext) async throws -> StrandVoid {
+    /// func run(input: FileInput, context: ActivityContext) async throws {
     ///     let startLine = context.heartbeatDetails(as: Int.self) ?? 0
     ///     for line in startLine ..< input.totalLines {
     ///         process(line)
@@ -612,7 +611,6 @@ public struct ActivityContext: Sendable {
     ///             try await context.heartbeat(line)   // survive any crash here
     ///         }
     ///     }
-    ///     return .done
     /// }
     /// ```
     public func heartbeat<T: Codable & Sendable>(_ details: T) async throws {
@@ -657,7 +655,7 @@ public struct ActivityContext: Sendable {
 /// ```
 public protocol Activity: Sendable {
     associatedtype Input: Codable & Sendable
-    associatedtype Output: Codable & Sendable
+    associatedtype Output: Sendable
     /// The typed error this activity can throw.
     ///
     /// Declare a concrete `Codable` error type to get direct typed propagation in
@@ -732,8 +730,8 @@ extension Activity {
         input: ByteBuffer,
         exec: _WorkerExec,
         parentWorkflowID: UUID?
-    ) async throws -> ByteBuffer {
-        let decodedInput = try JSON.decode(Input.self, from: input)
+    ) async throws -> ByteBuffer? {
+        let decodedInput = try exec.options.codec.decode(Input.self, from: input)
         let ctx = ActivityContext(
             activityID: UUID.v7(),
             activityName: Self.name,
@@ -750,7 +748,7 @@ extension Activity {
                 try await self.run(input: decodedInput, context: ctx)
             }
         }
-        return try JSON.encode(output)
+        return try _encodeOutput(output, codec: exec.options.codec)
     }
 
     /// Decode → run → encode. Called by `_addActivityRegistration` and local-activity dispatch.
@@ -759,9 +757,9 @@ extension Activity {
         exec: _WorkerExec,
         fatalDeadline: TaskDeadline? = nil
     )
-        async throws -> ByteBuffer
+        async throws -> ByteBuffer?
     {
-        let input = try JSON.decode(Input.self, from: claimed.paramsBuffer)
+        let input = try exec.options.codec.decode(Input.self, from: claimed.paramsBuffer)
 
         // Capture values needed by the heartbeat closure (must be Sendable).
         let postgres = exec.postgres
@@ -877,7 +875,7 @@ extension Activity {
                     try await self.run(input: input, context: ctx)
                 }
             }
-            return try JSON.encode(output)
+            return try _encodeOutput(output, codec: exec.options.codec)
         } catch let typedFailure as Failure {
             // Typed failure declared by the activity — encode the full Codable value.
             let payloadBuffer = try? JSON.encode(typedFailure)

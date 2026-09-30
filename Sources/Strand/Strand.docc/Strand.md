@@ -7,27 +7,25 @@ Postgres-native durable workflow engine for Swift.
 Strand runs workflows to completion even when worker processes crash. All state
 lives in Postgres — no separate coordination service, no message broker.
 
-A workflow is a Swift struct. When it calls `context.runActivity(...)` the
-activity is enqueued as an independent task, the workflow suspends, and a worker
-picks up the activity. When the activity completes the workflow resumes from
-where it left off. Already-completed steps return instantly from a checkpoint
-cache and never re-execute.
+A workflow is a Swift struct annotated with `@Workflow`. When it calls
+`context.runActivity(...)` the activity is enqueued as an independent task,
+the workflow suspends, and a worker picks up the activity. When the activity
+completes the workflow resumes from where it left off. Already-completed steps
+return instantly from a checkpoint cache and never re-execute.
 
 ```swift
-struct OrderWorkflow: Workflow {
-    typealias Input  = OrderInput
-    typealias Output = ShipResult
-
+@Workflow
+struct OrderWorkflow {
     mutating func run(
         context: WorkflowContext<Self>,
         input: OrderInput
     ) async throws -> ShipResult {
         let charge = try await context.runActivity(
-            ChargeCardActivity.self,
+            PaymentActivities.ChargeCard.self,
             input: .init(amount: input.amount)
         )
         return try await context.runActivity(
-            ShipOrderActivity.self,
+            ShippingActivities.Ship.self,
             input: .init(paymentID: charge.paymentID)
         )
     }
@@ -57,6 +55,13 @@ struct OrderWorkflow: Workflow {
 
 ### Examples
 - <doc:Examples>
+
+### Serialisation
+- <doc:Codecs>
+- ``StrandCodec``
+- ``JSONCodec``
+- ``StrandByteTransformingCodec``
+- ``StrandPayload``
 
 ### Operations
 - <doc:WorkerTuning>

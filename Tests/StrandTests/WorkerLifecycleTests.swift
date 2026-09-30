@@ -66,11 +66,10 @@ private struct WltHungActivity: Activity {
 
 private struct WltSlowActivity: Activity {
     typealias Input = StrandVoid
-    typealias Output = StrandVoid
+    typealias Output = Void
 
-    func run(input: StrandVoid, context: ActivityContext) async throws -> StrandVoid {
+    func run(input: StrandVoid, context: ActivityContext) async throws {
         try await Task.sleep(for: .seconds(30))
-        return .done
     }
 }
 
@@ -83,16 +82,15 @@ private struct WltSlowActivity: Activity {
 
 private struct WltCancellableWorkflow: Workflow {
     typealias Input = StrandVoid
-    typealias Output = StrandVoid
+    typealias Output = Void
 
     mutating func run(
         context: WorkflowContext<Self>,
         input: StrandVoid
-    ) async throws -> StrandVoid {
-        async let a: StrandVoid = context.runActivity(WltSlowActivity.self)
-        async let b: StrandVoid = context.runActivity(WltSlowActivity.self)
+    ) async throws {
+        async let a = context.runActivity(WltSlowActivity.self)
+        async let b = context.runActivity(WltSlowActivity.self)
         _ = try await (a, b)
-        return .done
     }
 }
 

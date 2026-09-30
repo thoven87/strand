@@ -3,9 +3,9 @@ import NIOFoundationCompat
 import PostgresNIO
 
 #if canImport(FoundationEssentials)
-import FoundationEssentials
+package import FoundationEssentials
 #else
-import Foundation
+package import Foundation
 #endif
 
 /// Namespace for JSON helpers that encode and decode directly to/from
@@ -54,6 +54,20 @@ package enum JSON {
     ) throws(StrandError) -> T {
         do {
             return try decoder.decode(type, from: buffer)
+        } catch {
+            throw StrandError.serialization(underlying: error)
+        }
+    }
+
+    /// Decode `type` from a `Foundation.Data` value.
+    ///
+    /// Used by `TaskResultSnapshot.decodeResult` which holds `Data` as its
+    /// primary result storage. No copy occurs when the `Data` was obtained via
+    /// `NIOFoundationCompat.Data(buffer:)` — the decoder reads directly from
+    /// the shared backing storage.
+    package static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws(StrandError) -> T {
+        do {
+            return try decoder.decode(type, from: data)
         } catch {
             throw StrandError.serialization(underlying: error)
         }

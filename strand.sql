@@ -974,8 +974,9 @@ CREATE TABLE IF NOT EXISTS strand.schedules (
     retry_strategy BYTEA,
     cancellation   BYTEA,
     max_attempts   INTEGER,
-    accuracy       TEXT        NOT NULL DEFAULT 'latest',
-    kind           TEXT        NOT NULL DEFAULT 'WORKFLOW',  -- 'WORKFLOW' or 'ACTIVITY'
+    accuracy        TEXT        NOT NULL DEFAULT 'latest',
+    overlap_policy  TEXT        NOT NULL DEFAULT 'ALLOW_ALL', -- 'ALLOW_ALL' | 'SKIP' | 'CANCEL_OTHER'
+    kind            TEXT        NOT NULL DEFAULT 'WORKFLOW',  -- 'WORKFLOW' or 'ACTIVITY'
 
     -- Airflow-style lifecycle
     starts_at TIMESTAMPTZ,  -- NULL = active immediately

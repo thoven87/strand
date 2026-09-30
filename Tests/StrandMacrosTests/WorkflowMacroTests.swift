@@ -22,7 +22,7 @@ import Testing
                         mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
                             switch name {
                             case Pause.signalName:
-                                Pause.apply(to: &self, input: .done)
+                                Pause.apply(to: &self, input: ())
                             default:
                                 break
                             }
@@ -61,9 +61,9 @@ import Testing
                         mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
                             switch name {
                             case Pause.signalName:
-                                Pause.apply(to: &self, input: .done)
+                                Pause.apply(to: &self, input: ())
                             case Resume.signalName:
-                                Resume.apply(to: &self, input: .done)
+                                Resume.apply(to: &self, input: ())
                             case SetPriority.signalName:
                                 if let p = try decodeSignalPayload(ShippingPriority.self, from: payload) {
                                     SetPriority.apply(to: &self, input: p)
@@ -103,7 +103,7 @@ import Testing
                         mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
                             switch name {
                             case Pause.signalName:
-                                Pause.apply(to: &self, input: .done)
+                                Pause.apply(to: &self, input: ())
                             default:
                                 break
                             }
@@ -131,6 +131,119 @@ import Testing
                         mutating func run() {}
                     }
                     extension EmptyWorkflow: Workflow {}
+                    """
+                )
+        )
+    }
+
+    // MARK: - Type inference
+
+    @Test func infersCodableOutputTypealias() {
+        // @Workflow generates typealias Input / Output from the run() signature
+        // when they are not already declared by the user.
+        #expect(
+            expand(
+                """
+                @Workflow
+                struct OrderWorkflow {
+                    mutating func run(context: WorkflowContext<Self>, input: OrderInput) async throws -> ShipResult {}
+                }
+                """
+            )
+                == expand(
+                    """
+                    struct OrderWorkflow {
+                        mutating func run(context: WorkflowContext<Self>, input: OrderInput) async throws -> ShipResult {}
+                        typealias Input = OrderInput
+                        typealias Output = ShipResult
+                    }
+                    extension OrderWorkflow: Workflow {}
+                    """
+                )
+        )
+    }
+
+    @Test func infersVoidOutputTypealias() {
+        // A run() with no return type gets typealias Output = Void.
+        // No StrandVoid wrapper is generated — Void satisfies Output: Sendable directly.
+        #expect(
+            expand(
+                """
+                @Workflow
+                struct NotifyWorkflow {
+                    mutating func run(context: WorkflowContext<Self>, input: String) async throws {}
+                }
+                """
+            )
+                == expand(
+                    """
+                    struct NotifyWorkflow {
+                        mutating func run(context: WorkflowContext<Self>, input: String) async throws {}
+                        typealias Input = String
+                        typealias Output = Void
+                    }
+                    extension NotifyWorkflow: Workflow {}
+                    """
+                )
+        )
+    }
+
+    @Test func skipsTypealiasWhenUserDeclaresExplicitly() {
+        // If the user already declares typealias Input/Output, the macro must not
+        // generate duplicates — that would cause a compile error.
+        #expect(
+            expand(
+                """
+                @Workflow
+                struct OrderWorkflow {
+                    typealias Input = OrderInput
+                    typealias Output = ShipResult
+                    mutating func run(context: WorkflowContext<Self>, input: OrderInput) async throws -> ShipResult {}
+                }
+                """
+            )
+                == expand(
+                    """
+                    struct OrderWorkflow {
+                        typealias Input = OrderInput
+                        typealias Output = ShipResult
+                        mutating func run(context: WorkflowContext<Self>, input: OrderInput) async throws -> ShipResult {}
+                    }
+                    extension OrderWorkflow: Workflow {}
+                    """
+                )
+        )
+    }
+
+    @Test func typeInferenceWithSignals() {
+        // Type inference and signal dispatch can coexist.
+        #expect(
+            expand(
+                """
+                @Workflow
+                struct OrderWorkflow {
+                    @WorkflowSignal mutating func pause() {}
+                    mutating func run(context: WorkflowContext<Self>, input: OrderInput) async throws -> ShipResult {}
+                }
+                """
+            )
+                == expand(
+                    """
+                    struct OrderWorkflow {
+                        @WorkflowSignal mutating func pause() {}
+                        mutating func run(context: WorkflowContext<Self>, input: OrderInput) async throws -> ShipResult {}
+                        typealias Input = OrderInput
+                        typealias Output = ShipResult
+                        mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
+                            switch name {
+                            case Pause.signalName:
+                                Pause.apply(to: &self, input: ())
+                            default:
+                                break
+                            }
+                        }
+                    }
+                    extension OrderWorkflow: Workflow {}
                     """
                 )
         )

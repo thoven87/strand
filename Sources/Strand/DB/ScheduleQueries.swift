@@ -26,7 +26,10 @@ package struct ScheduleRow: Sendable {
     let retryStrategyBuffer: ByteBuffer?
     let cancellationBuffer: ByteBuffer?
     let accuracy: ScheduleAccuracy  // catch-up behaviour
+    let overlapPolicy: ScheduleOverlapPolicy  // concurrent-run policy
     let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
+    /// Task ID of the most recently fired slot — used by `skip` and `cancel_other` policies.
+    let lastTaskID: UUID?
 }
 
 /// A schedule summary row returned by ``ScheduleQueries/listSchedules``.
@@ -55,11 +58,11 @@ package struct ScheduleRunRow: Sendable {
     package let attempt: Int
     package let createdAt: Date
     package let completedAt: Date?
-    /// Canonical slot time from `scheduling_metadata.partitionTime`.
+    /// Canonical slot time from `scheduling_metadata.logicalDate`.
     /// `nil` for tasks enqueued before this field was added or without scheduling metadata.
     /// Use this (not `createdAt`) to place runs in a partition grid: backfill tasks
     /// are created at wall-clock time but their partition is in the past.
-    package let partitionTime: Date?
+    package let logicalDate: Date?
 }
 
 /// Full schedule row returned by ``ScheduleQueries/getSchedule(on:namespaceID:id:logger:)``.
@@ -120,7 +123,8 @@ package enum ScheduleQueries {
             """
             SELECT id, queue, name, task_name, params, headers,
                    pattern, next_run_at, ends_at,
-                   max_attempts, retry_strategy, cancellation, accuracy, kind
+                   max_attempts, retry_strategy, cancellation,
+                   accuracy, COALESCE(overlap_policy, 'allow_all'), kind, last_task_id
             FROM strand.schedules
             WHERE namespace_id = \(namespaceID)
               AND is_active = TRUE
@@ -158,7 +162,9 @@ package enum ScheduleQueries {
                         context: .default
                     ),
                     accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
-                    kind: try col.next()!.decode(TaskKind.self, context: .default)
+                    overlapPolicy: try col.next()!.decode(ScheduleOverlapPolicy.self, context: .default),
+                    kind: try col.next()!.decode(TaskKind.self, context: .default),
+                    lastTaskID: try col.next()!.decode(UUID?.self, context: .default)
                 )
             )
         }
@@ -271,6 +277,63 @@ package enum ScheduleQueries {
         return try await stream.first(where: { _ in true }) != nil
     }
 
+    /// Advances `next_run_at` for a slot that was intentionally skipped by the
+    /// `.skip` overlap policy without enqueuing a task.
+    ///
+    /// Unlike ``markScheduleFired``, this does **not** update `last_task_id`,
+    /// `last_run_at`, `last_slot_at`, or `run_count` — skipped slots are not
+    /// counted as runs and must not clobber the ID of the still-running task.
+    ///
+    /// - Returns: `true` when this instance won the CAS race; `false` when
+    ///   another instance already advanced the schedule.
+    package static func markScheduleSlotSkipped(
+        on client: PostgresClient,
+        namespaceID: String,
+        id: UUID,
+        scheduledAt: Date,
+        nextRunAt: Date?,
+        logger: Logger
+    ) async throws -> Bool {
+        let stream = try await client.query(
+            """
+            UPDATE strand.schedules
+            SET next_run_at = \(nextRunAt),
+                is_active   = \(nextRunAt != nil),
+                updated_at  = NOW()
+            WHERE namespace_id = \(namespaceID)
+              AND id           = \(id)
+              AND next_run_at  = \(scheduledAt)
+            RETURNING id
+            """,
+            logger: logger
+        )
+        return try await stream.first(where: { _ in true }) != nil
+    }
+
+    /// Returns `true` when the task is in an active (non-terminal) state —
+    /// PENDING, RUNNING, SLEEPING, or WAITING.  Used by overlap policies to
+    /// determine whether the previous slot is still executing before deciding
+    /// whether to skip or cancel it.
+    package static func isTaskNonTerminal(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> Bool {
+        let stream = try await client.query(
+            """
+            SELECT 1 FROM strand.tasks
+            WHERE id           = \(taskID)
+              AND namespace_id = \(namespaceID)
+              AND state IN (\(TaskState.pending), \(TaskState.running),
+                            \(TaskState.sleeping), \(TaskState.waiting))
+            LIMIT 1
+            """,
+            logger: logger
+        )
+        return try await stream.first(where: { _ in true }) != nil
+    }
+
     // MARK: Management operations
 
     /// Inserts or replaces a schedule (upsert on `namespace_id + queue + name`).
@@ -288,22 +351,25 @@ package enum ScheduleQueries {
         retryStrategyBuffer: ByteBuffer?,
         cancellationBuffer: ByteBuffer?,
         accuracy: ScheduleAccuracy,
+        overlapPolicy: ScheduleOverlapPolicy,
         kind: TaskKind,
         startsAt: Date?,
         endsAt: Date?,
         nextRunAt: Date?,
         logger: Logger
     ) async throws -> UUID {
+        let overlapPolicyRaw = overlapPolicy.rawValue
         let stream = try await client.query(
             """
             INSERT INTO strand.schedules
                 (namespace_id, id, queue, name, task_name, params, headers, pattern,
-                 max_attempts, retry_strategy, cancellation, accuracy, kind,
+                 max_attempts, retry_strategy, cancellation, accuracy, overlap_policy, kind,
                  starts_at, ends_at, next_run_at, is_active)
             VALUES
                 (\(namespaceID), \(id), \(queue), \(name), \(taskName),
                  \(paramsBuffer), \(headersBuffer), \(patternBuffer),
-                 \(maxAttempts), \(retryStrategyBuffer), \(cancellationBuffer), \(accuracy.dbString), \(kind.rawValue),
+                 \(maxAttempts), \(retryStrategyBuffer), \(cancellationBuffer),
+                 \(accuracy.dbString), \(overlapPolicyRaw), \(kind.rawValue),
                  \(startsAt), \(endsAt), \(nextRunAt), \(nextRunAt != nil))
             ON CONFLICT (namespace_id, queue, name) DO UPDATE SET
                 task_name       = EXCLUDED.task_name,
@@ -314,6 +380,7 @@ package enum ScheduleQueries {
                 retry_strategy  = EXCLUDED.retry_strategy,
                 cancellation    = EXCLUDED.cancellation,
                 accuracy        = EXCLUDED.accuracy,
+                overlap_policy  = EXCLUDED.overlap_policy,
                 kind            = EXCLUDED.kind,
                 starts_at       = EXCLUDED.starts_at,
                 -- Preserve an existing deadline when the caller omits endsAt:.
@@ -584,7 +651,7 @@ package enum ScheduleQueries {
             let attempt = try col.next()!.decode(Int.self, context: .default)
             let createdAt = try col.next()!.decode(Date.self, context: .default)
             let completedAt = try col.next()!.decode(Date?.self, context: .default)
-            let partitionTime = try col.next()!.decode(SchedulingMetadata?.self, context: .default)?.partitionTime
+            let logicalDate = try col.next()!.decode(SchedulingMetadata?.self, context: .default)?.logicalDate
             rows.append(
                 ScheduleRunRow(
                     id: id,
@@ -592,7 +659,7 @@ package enum ScheduleQueries {
                     attempt: attempt,
                     createdAt: createdAt,
                     completedAt: completedAt,
-                    partitionTime: partitionTime
+                    logicalDate: logicalDate
                 )
             )
         }

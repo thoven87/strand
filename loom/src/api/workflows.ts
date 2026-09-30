@@ -1,4 +1,5 @@
 import { api } from "./client";
+import { codecEncode } from "./codec";
 import type { HistoryEvent, WorkflowState } from "./types";
 
 import type { TaskKind } from "./types";
@@ -44,22 +45,23 @@ export const getWorkflowState = (
         )
         .then((r) => r.data);
 
-export const sendSignal = (
+export const sendSignal = async (
     namespace: string,
     queue: string,
     taskId: string,
     name: string,
     payload?: string,
-) =>
-    api
-        .post<{
-            message: string;
-            id: string;
-        }>(`/api/${namespace}/queues/${queue}/tasks/${taskId}/signal`, {
-            name,
-            payload: payload ?? null,
-        })
+): Promise<{ message: string; id: string }> => {
+    const encodedPayload = payload != null
+        ? await codecEncode(namespace, payload)
+        : null;
+    return api
+        .post<{ message: string; id: string }>(
+            `/api/${namespace}/queues/${queue}/tasks/${taskId}/signal`,
+            { name, payload: encodedPayload },
+        )
         .then((r) => r.data);
+};
 
 export interface UpdateResult {
     correlationID: string;
@@ -68,20 +70,24 @@ export interface UpdateResult {
     timedOut: boolean;
 }
 
-export const sendUpdate = (
+export const sendUpdate = async (
     namespace: string,
     queue: string,
     taskId: string,
     name: string,
     payload?: string,
     timeoutSeconds?: number,
-): Promise<UpdateResult> =>
-    api
+): Promise<UpdateResult> => {
+    const encodedPayload = payload != null
+        ? await codecEncode(namespace, payload)
+        : null;
+    return api
         .post<UpdateResult>(
             `/api/${namespace}/queues/${queue}/tasks/${taskId}/update`,
-            { name, payload: payload ?? null, timeout: timeoutSeconds ?? 10 },
+            { name, payload: encodedPayload, timeout: timeoutSeconds ?? 10 },
         )
         .then((r) => r.data);
+};
 
 export interface VersionMarker {
     changeId: string;
@@ -136,34 +142,38 @@ export const getTaskKinds = (
         .then((r) => r.data)
         .catch(() => [] as TaskKindEntry[]);
 
-export const triggerWorkflow = (
+export const triggerWorkflow = async (
     namespace: string,
     workflowName: string,
     input: string,
     queue?: string,
     description?: string,
-): Promise<{ taskID: string; runID: string; attempt: number }> =>
-    api
+): Promise<{ taskID: string; runID: string; attempt: number }> => {
+    const encodedInput = await codecEncode(namespace, input);
+    return api
         .post(`/api/${namespace}/workflows/run`, {
             workflowName,
             queue,
-            input,
+            input: encodedInput,
             description,
         })
         .then((r) => r.data);
+};
 
-export const enqueueActivity = (
+export const enqueueActivity = async (
     namespace: string,
     activityName: string,
     input: string,
     queue?: string,
     description?: string,
-): Promise<{ taskID: string; runID: string; attempt: number }> =>
-    api
+): Promise<{ taskID: string; runID: string; attempt: number }> => {
+    const encodedInput = await codecEncode(namespace, input);
+    return api
         .post(`/api/${namespace}/activities/enqueue`, {
             activityName,
             queue,
-            input,
+            input: encodedInput,
             description,
         })
         .then((r) => r.data);
+};

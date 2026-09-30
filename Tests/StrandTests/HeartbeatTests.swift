@@ -190,7 +190,7 @@ struct HeartbeatTests {
 
                 // Workflow must complete (attempt 2 processes items 6-10 successfully).
                 #expect(snap.state == .completed)
-                let output = try #require(snap.resultJSON.flatMap { try? JSON.decode(Int.self, from: ByteBuffer(string: $0)) })
+                let output = try snap.decodeResult(as: Int.self)
                 #expect(output == 10)
 
                 // Attempt 1 must have seen nil (first attempt, no prior heartbeat).

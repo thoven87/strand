@@ -18,13 +18,12 @@ import Foundation
 
 private struct SitSimpleWorkflow: Workflow {
     typealias Input = StrandVoid
-    typealias Output = StrandVoid
+    typealias Output = Void
 
     mutating func run(
         context: WorkflowContext<Self>,
         input: StrandVoid
-    ) async throws -> StrandVoid {
-        .done
+    ) async throws {
     }
 }
 

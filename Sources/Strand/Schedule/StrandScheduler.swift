@@ -542,30 +542,30 @@ public struct StrandScheduler: Service {
                 return
             }
 
-            // Compute scheduling metadata using calculatePartitionTime so the
+            // Compute scheduling metadata using calculateLogicalDate so the
             // schedule's configured partitionOffset (e.g. P1DT2H) is applied,
-            // producing the correct data-period anchor in partitionTime.
+            // producing the correct data-period anchor in logicalDate.
             // This mirrors exactly what StrandScheduler.fire() does.
             let backfillPartitionConfig = try PartitionOffsetConfig(
                 offset: pattern.partitionOffset ?? "PT0M"
             )
-            let partitionTime: Date?
+            let logicalDate: Date?
             do {
-                partitionTime = try ScheduleCalculator.calculatePartitionTime(
+                logicalDate = try ScheduleCalculator.calculateLogicalDate(
                     executionTime: slotAt,
                     schedule: pattern,
                     partitionOffset: backfillPartitionConfig
                 )
             } catch {
                 logger.info(
-                    "backfill '\(backfill.id)': could not compute partition time for slot \(slotAt.ISO8601Format())",
+                    "backfill '\(backfill.id)': could not compute logical date for slot \(slotAt.ISO8601Format())",
                     metadata: ["error": "\(error)"]
                 )
-                partitionTime = nil
+                logicalDate = nil
             }
             let schedulingMeta = SchedulingMetadata(
                 executionTime: now,
-                partitionTime: partitionTime ?? slotAt,
+                logicalDate: logicalDate ?? slotAt,
                 scheduleOffset: pattern.partitionOffset,
                 backfillId: backfill.id
             )
@@ -721,6 +721,69 @@ public struct StrandScheduler: Service {
 
         guard !slotsToFire.isEmpty else { return }
 
+        // ── Overlap policy ─────────────────────────────────────────────────────────
+        // Evaluate whether the previous task from this schedule is still running
+        // before deciding whether to enqueue the new slots.
+        switch row.overlapPolicy {
+        case .allowAll:
+            break  // default — always fire
+
+        case .skip:
+            // If the most recent task is in a non-terminal state, skip all slots
+            // in this fire() call and advance next_run_at without enqueuing.
+            if let lastTaskID = row.lastTaskID {
+                let isStillRunning = try await Self.isTaskNonTerminal(
+                    client: client,
+                    taskID: lastTaskID
+                )
+                if isStillRunning {
+                    logger.info(
+                        "schedule '\(row.name)': skipping \(slotsToFire.count) slot(s) — previous task still active",
+                        metadata: [
+                            "strand.schedule_id": .stringConvertible(row.id),
+                            "strand.last_task_id": .stringConvertible(lastTaskID),
+                        ]
+                    )
+                    // Compute next_run_at past the last skipped slot, then advance.
+                    let lastSlot = slotsToFire.last!
+                    let nextRunAt = nextSlotTime(after: lastSlot)
+                    _ = try await ScheduleQueries.markScheduleSlotSkipped(
+                        on: postgres,
+                        namespaceID: client.namespaceID,
+                        id: row.id,
+                        scheduledAt: row.scheduledAt,
+                        nextRunAt: nextRunAt,
+                        logger: logger
+                    )
+                    return
+                }
+            }
+
+        case .cancelOther:
+            // Cancel the still-running task (if any) before firing the new slot.
+            if let lastTaskID = row.lastTaskID {
+                let isStillRunning = try await Self.isTaskNonTerminal(
+                    client: client,
+                    taskID: lastTaskID
+                )
+                if isStillRunning {
+                    logger.info(
+                        "schedule '\(row.name)': cancelling previous task before firing new slot",
+                        metadata: [
+                            "strand.schedule_id": .stringConvertible(row.id),
+                            "strand.last_task_id": .stringConvertible(lastTaskID),
+                        ]
+                    )
+                    try await Queries.cancelTask(
+                        on: postgres,
+                        namespaceID: client.namespaceID,
+                        taskID: lastTaskID,
+                        logger: logger
+                    )
+                }
+            }
+        }
+
         // ── Enqueue one task per slot ─────────────────────────────────────────────
         // Idempotency keys are slot-specific ("$schedule:<id>:<epochSecs>") so
         // concurrent scheduler instances that both observe the same slot produce
@@ -731,7 +794,7 @@ public struct StrandScheduler: Service {
         // (ON CONFLICT DO NOTHING → no-op) and retries markScheduleFired.
         //
         // Use the schedule's configured partition offset (e.g. "P1DT2H" for a
-        // daily cron that should present yesterday-midnight as partitionTime).
+        // daily cron that should present yesterday-midnight as logicalDate).
         // Falls back to "PT0M" when no offset is configured.
         let partitionConfig = try PartitionOffsetConfig(
             offset: pattern.partitionOffset ?? "PT0M"
@@ -741,24 +804,24 @@ public struct StrandScheduler: Service {
         // v7 (not v4) keeps the codebase's time-ordered ID convention consistent.
         var lastTaskID = UUID.v7()
         for slotAt in slotsToFire {
-            let partitionTime: Date?
+            let logicalDate: Date?
             do {
-                partitionTime = try ScheduleCalculator.calculatePartitionTime(
+                logicalDate = try ScheduleCalculator.calculateLogicalDate(
                     executionTime: slotAt,
                     schedule: pattern,
                     partitionOffset: partitionConfig
                 )
             } catch {
                 logger.info(
-                    "schedule '\(row.name)': could not compute partition time for slot \(slotAt.ISO8601Format())",
+                    "schedule '\(row.name)': could not compute logical date for slot \(slotAt.ISO8601Format())",
                     metadata: ["error": "\(error)", "strand.schedule_id": "\(row.id)"]
                 )
-                partitionTime = nil
+                logicalDate = nil
             }
 
             let schedulingMeta = SchedulingMetadata(
                 executionTime: now,
-                partitionTime: partitionTime,
+                logicalDate: logicalDate,
                 scheduleOffset: pattern.partitionOffset,
                 scheduleId: row.id.uuidString,
                 scheduledBy: row.name
@@ -846,6 +909,22 @@ public struct StrandScheduler: Service {
                 "strand.queue": .string(row.queue),
                 "strand.scheduled_at": .string(row.scheduledAt.ISO8601Format()),
             ]
+        )
+    }
+
+    // MARK: - Overlap policy helper
+
+    /// Returns `true` when the given task is in a non-terminal state
+    /// (PENDING, RUNNING, SLEEPING, or WAITING) — i.e. still actively executing.
+    private static func isTaskNonTerminal(
+        client: StrandClient,
+        taskID: UUID
+    ) async throws -> Bool {
+        try await ScheduleQueries.isTaskNonTerminal(
+            on: client.postgres,
+            namespaceID: client.namespaceID,
+            taskID: taskID,
+            logger: client.logger
         )
     }
 }
