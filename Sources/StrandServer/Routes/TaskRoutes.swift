@@ -1,4 +1,5 @@
 import Hummingbird
+import NIOCore
 import PostgresNIO
 import Strand
 
@@ -21,7 +22,9 @@ struct TaskRoutes {
 
     private struct SignalBody: Decodable {
         let name: String
-        let payload: String?  // optional JSON string; forwarded as raw bytes
+        /// Optional serialised payload (JSON when using ``JSONCodec``).
+        /// Transformed through the configured codec before storage.
+        let payload: String?
     }
 
     private struct UpdateBody: Decodable {

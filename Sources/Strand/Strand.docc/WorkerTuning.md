@@ -283,6 +283,27 @@ Postgres's `max_connections` limit (default 100 per instance).
 
 ---
 
+## Codec
+
+Every payload stored in Postgres (workflow inputs, activity results, signal
+payloads, workflow state) is serialised through the configured codec. The
+default is ``JSONCodec``. Pass a custom codec via ``WorkerOptions`` and
+``StrandOptions`` to add encryption-at-rest or a different wire format.
+
+```swift
+// Encryption-at-rest with a custom AES codec
+let aes = AESCodec(key: masterKey, keyId: "key-2026-01")
+
+StrandOptions(codec: aes)          // client — encodes inputs
+WorkerOptions(queue: "default",     // worker — decodes inputs, encodes outputs
+              codec: aes)
+```
+
+See <doc:Codecs> for how to implement ``StrandCodec`` and
+``StrandByteTransformingCodec``.
+
+---
+
 ## Retry strategy reference
 
 ```swift

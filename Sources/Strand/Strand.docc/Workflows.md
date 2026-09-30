@@ -3,15 +3,15 @@
 Workflows orchestrate activities. They are durable: if the process crashes
 mid-execution the next worker replays from the last checkpoint.
 
-## Struct-based definition
+## Defining a workflow
 
-Conform to ``Workflow`` and implement `run(context:input:)`:
+Apply `@Workflow` to a struct and implement `run(context:input:)`. The macro
+infers `Input` and `Output` from the method signature — no `typealias`
+declarations needed:
 
 ```swift
-struct OrderFulfillmentWorkflow: Workflow {
-    typealias Input  = OrderInput
-    typealias Output = FulfillmentResult
-
+@Workflow
+struct OrderFulfillmentWorkflow {
     mutating func run(
         context: WorkflowContext<Self>,
         input: OrderInput
@@ -19,11 +19,11 @@ struct OrderFulfillmentWorkflow: Workflow {
         // Each activity is a checkpoint.
         // If the process restarts here, chargeResult loads from the checkpoint cache.
         let chargeResult = try await context.runActivity(
-            ChargeCardActivity.self,
+            PaymentActivities.ChargeCard.self,
             input: .init(amount: input.total)
         )
         let shipResult = try await context.runActivity(
-            ShipOrderActivity.self,
+            ShippingActivities.Ship.self,
             input: .init(paymentID: chargeResult.paymentID)
         )
         return FulfillmentResult(
@@ -34,13 +34,24 @@ struct OrderFulfillmentWorkflow: Workflow {
 }
 ```
 
+Workflows with no meaningful return value omit the return type entirely:
+
+```swift
+@Workflow
+struct NotifyWorkflow {
+    mutating func run(context: WorkflowContext<Self>, input: NotifyInput) async throws {
+        try await context.runActivity(EmailActivities.Send.self, input: input.email)
+    }
+}
+```
+
 ## Parallel activities
 
 Use Swift's structured concurrency to fan out:
 
 ```swift
-async let invoice = context.runActivity(GenerateInvoiceActivity.self, input: orderID)
-async let email   = context.runActivity(SendConfirmationActivity.self, input: orderID)
+async let invoice = context.runActivity(BillingActivities.GenerateInvoice.self, input: orderID)
+async let email   = context.runActivity(EmailActivities.SendConfirmation.self, input: orderID)
 let (inv, _)      = try await (invoice, email)
 ```
 
@@ -51,7 +62,7 @@ var results: [ChunkResult] = []
 try await withThrowingTaskGroup(of: ChunkResult.self) { group in
     for chunk in chunks {
         group.addTask {
-            try await context.runActivity(ProcessChunkActivity.self, input: chunk)
+            try await context.runActivity(ProcessingActivities.ProcessChunk.self, input: chunk)
         }
     }
     for try await result in group { results.append(result) }
@@ -86,21 +97,20 @@ try await client.emitEvent("payment.confirmed",
                             queue: "orders")
 ```
 
-## Mutable workflow state
+## Mutable workflow state and signals
 
-Declare `var` properties on the struct to carry state across activations:
+Declare `var` properties on the struct to carry state across activations.
+Use `@WorkflowSignal` to let external callers mutate that state without
+blocking the workflow — the macro generates a typed nested struct and wires
+the dispatch automatically:
 
 ```swift
-struct ApprovalWorkflow: Workflow {
-    typealias Input  = ApprovalRequest
-    typealias Output = ApprovalDecision
-
+@Workflow
+struct ApprovalWorkflow {
     var approved: Bool = false
 
-    mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
-        if name == "approve" { approved = true  }
-        if name == "reject"  { approved = false }
-    }
+    @WorkflowSignal mutating func approve() { approved = true  }
+    @WorkflowSignal mutating func reject()  { approved = false }
 
     mutating func run(
         context: WorkflowContext<Self>,
@@ -112,11 +122,12 @@ struct ApprovalWorkflow: Workflow {
 }
 ```
 
-Signal from a web handler:
+Send a typed signal from a web handler — no raw string names:
 
 ```swift
 let handle = try await client.workflow(id: "approval-\(requestID)", as: ApprovalWorkflow.self)
-try await handle?.signal(name: "approve")
+try await handle?.signal(ApprovalWorkflow.Approve.self)
+try await handle?.signal(ApprovalWorkflow.Reject.self)
 ```
 
 ## Versioning (safe deploys)
@@ -127,7 +138,7 @@ the updated path:
 
 ```swift
 if try context.version(changeID: "add-fraud-check") {
-    _ = try await context.runActivity(FraudCheckActivity.self, input: input)
+    _ = try await context.runActivity(ComplianceActivities.FraudCheck.self, input: input)
 }
 ```
 
@@ -149,9 +160,12 @@ Reset the workflow's history to prevent unbounded checkpoint growth in
 long-running loops:
 
 ```swift
-mutating func run(context: WorkflowContext<Self>, input: LoopInput) async throws -> Never {
-    _ = try await context.runActivity(ProcessBatchActivity.self, input: input)
-    try context.continueAsNew(input: LoopInput(cursor: input.nextCursor))
+@Workflow
+struct IngestWorkflow {
+    mutating func run(context: WorkflowContext<Self>, input: LoopInput) async throws -> Never {
+        _ = try await context.runActivity(IngestionActivities.ProcessBatch.self, input: input)
+        try context.continueAsNew(input: LoopInput(cursor: input.nextCursor))
+    }
 }
 ```
 
@@ -179,9 +193,9 @@ arrives. Three patterns cover the common cases:
 Poll `isCancelRequested` between sequential steps — no suspension overhead:
 
 ```swift
-let invoice = try await context.runActivity(CalculateInvoice.self, input: ...)
+let invoice = try await context.runActivity(BillingActivities.Calculate.self, input: ...)
 if context.isCancelRequested { return .cancelled }
-let charge  = try await context.runActivity(ChargeCard.self, input: ...)
+let charge  = try await context.runActivity(PaymentActivities.ChargeCard.self, input: ...)
 ```
 
 ### Automatic via `CancellationError` (zero boilerplate)
@@ -195,7 +209,7 @@ transitions to CANCELLED naturally:
 // runActivity / sleep / waitForEvent throw CancellationError automatically
 // when cancel_requested is set — no explicit check needed if you're OK
 // with the run ending as CANCELLED rather than returning a specific value.
-let result = try await context.runActivity(SomeActivity.self, input: ...)
+let result = try await context.runActivity(WorkActivities.DoWork.self, input: ...)
 ```
 
 ### `waitForCancellation()` (idle workflows or racing inside a task group)
@@ -210,7 +224,7 @@ return .cleanedUp
 
 // Or: race cancellation against other conditions inside a task group
 try await withThrowingTaskGroup(of: Void.self) { group in
-    group.addTask { try await context.runActivity(LongTask.self, input: ...) }
+    group.addTask { try await context.runActivity(WorkActivities.LongTask.self, input: ...) }
     group.addTask {
         try await context.waitForCancellation()
         throw CancellationError()
@@ -231,19 +245,10 @@ heartbeat so it can wrap up at a natural checkpoint:
 ```swift
 // Parent workflow
 let result = try await context.runActivity(
-    AuditActivity.self,
+    ComplianceActivities.Audit.self,
     input: auditInput,
     options: ActivityOptions(cancellationType: .waitCancellationCompleted)
 )
-
-// AuditActivity — checks isCancelled at natural checkpoints
-func run(input: AuditInput, context: ActivityContext) async throws -> AuditResult {
-    for record in input.records {
-        if context.isCancelled { break }   // finish the current batch cleanly
-        try await process(record)
-    }
-    return AuditResult(processed: count)
-}
 ```
 
 ## Deterministic helpers

@@ -62,6 +62,55 @@ public enum ScheduleAccuracy: Sendable, Codable, Equatable {
     }
 }
 
+// MARK: - ScheduleOverlapPolicy
+
+/// Controls what happens when a new scheduled slot fires while the previous
+/// run from the same schedule is still executing.
+///
+/// The default is ``allowAll``, which matches the behaviour of traditional cron:
+/// each slot starts regardless of prior runs.  For data pipelines and any
+/// workflow that writes to a shared destination, ``skip`` is almost always safer.
+///
+/// ```swift
+/// strand.addSchedule(.workflow(
+///     "nightly-ingestion",
+///     pattern: .daily(hour: 2),
+///     workflowType: IngestionPipeline.self,
+///     input: PipelineInput(datasetID: "orders"),
+///     options: ScheduleOptions(
+///         accuracy:      .latest,
+///         overlapPolicy: .skip   // ← tonight's run is skipped if last night's is still going
+///     )
+/// ))
+/// ```
+public enum ScheduleOverlapPolicy: String, Sendable, Codable, Equatable {
+    /// Start a new run regardless of whether the previous slot is still executing.
+    ///
+    /// This is the default.  Use when runs are naturally idempotent, short, and
+    /// independent — for example, a read-only reporting query or an HTTP ping.
+    case allowAll = "ALLOW_ALL"
+
+    /// Drop the new slot if the previous run from this schedule is still in a
+    /// non-terminal state (PENDING, RUNNING, or SLEEPING).
+    ///
+    /// The skipped slot is recorded in `strand.schedules.last_slot_at` so the
+    /// Loom dashboard shows it as intentionally skipped.  The next scheduled
+    /// slot will fire normally when it becomes due.
+    ///
+    /// **Recommended for data pipelines** — prevents two instances from writing
+    /// the same partition concurrently.
+    case skip = "SKIP"
+
+    /// Cancel the still-running task and immediately start the new slot.
+    ///
+    /// The running task receives a cooperative cancellation request.  The new
+    /// slot is enqueued without waiting for the cancellation to complete.
+    ///
+    /// Use when "latest data" matters more than finishing older work — e.g. a
+    /// live-dashboard refresh where a stale run is actively misleading.
+    case cancelOther = "CANCEL_OTHER"
+}
+
 // MARK: - ScheduleOptions
 
 /// Task-level options applied to each run fired by a ``StrandScheduler``.
@@ -74,19 +123,24 @@ public struct ScheduleOptions: Sendable {
     public var headers: [String: String]
     /// How to handle missed schedule slots on catch-up. Defaults to `.latest`.
     public var accuracy: ScheduleAccuracy
+    /// What to do when a new slot fires while the previous run is still executing.
+    /// Defaults to `.allowAll` (standard cron behaviour).
+    public var overlapPolicy: ScheduleOverlapPolicy
 
     public init(
         maxAttempts: Int? = 25,
         retryStrategy: RetryStrategy? = nil,
         cancellation: CancellationPolicy? = nil,
         headers: [String: String] = [:],
-        accuracy: ScheduleAccuracy = .latest
+        accuracy: ScheduleAccuracy = .latest,
+        overlapPolicy: ScheduleOverlapPolicy = .allowAll
     ) {
         self.maxAttempts = maxAttempts
         self.retryStrategy = retryStrategy
         self.cancellation = cancellation
         self.headers = headers
         self.accuracy = accuracy
+        self.overlapPolicy = overlapPolicy
     }
 }
 

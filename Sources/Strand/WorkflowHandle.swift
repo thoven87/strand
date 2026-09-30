@@ -85,7 +85,7 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
     ///   - name: Registered signal name.
     ///   - payload: Any `Codable & Sendable` value. Decoded inside the workflow handler.
     public func signal<P: Codable & Sendable>(name: String, payload: P) async throws {
-        let buf = try JSON.encode(payload)
+        let buf = try client.options.codec.encode(payload)
         try await client._sendSignal(name: name, payload: buf, toWorkflowTaskID: taskID)
     }
 
@@ -101,7 +101,7 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
     /// carry data.
     public func signal<S: WorkflowSignal>(
         _ definition: S.Type
-    ) async throws where S.W == W, S.Input == StrandVoid {
+    ) async throws where S.W == W, S.Input == Void {
         try await client._sendSignal(name: S.signalName, payload: nil, toWorkflowTaskID: taskID)
     }
 
@@ -114,8 +114,8 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
     public func signal<S: WorkflowSignal>(
         _ definition: S.Type,
         payload: S.Input
-    ) async throws where S.W == W {
-        let buf = try JSON.encode(payload)
+    ) async throws where S.W == W, S.Input: Encodable {
+        let buf = try client.options.codec.encode(payload)
         try await client._sendSignal(name: S.signalName, payload: buf, toWorkflowTaskID: taskID)
     }
 
@@ -141,7 +141,7 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
     /// - Throws: `StrandError.timeout` on deadline exceeded.
     ///           `WorkflowError` when the workflow reached FAILED or CANCELLED state.
     ///           `StrandError.serialization` when the result payload cannot be decoded as `W.Output`.
-    public func result(timeout: Duration? = nil) async throws -> W.Output {
+    public func result(timeout: Duration? = nil) async throws -> W.Output where W.Output: Codable {
         let start = ContinuousClock.now
         var delay: Duration = .milliseconds(100)
 
@@ -150,7 +150,10 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
             if let snap = try await client.fetchTaskResult(id: taskID) {
                 switch snap.state {
                 case .completed:
-                    return try snap.decodeResult(as: W.Output.self)
+                    guard let buf = snap._resultBuffer else {
+                        throw StrandError.serialization(underlying: MissingResultError())
+                    }
+                    return try client.options.codec.decode(W.Output.self, from: buf)
                 case .failed, .cancelled:
                     throw WorkflowError(workflowName: W.workflowName, state: snap.state)
                 case .continuedAsNew:
@@ -176,6 +179,40 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
             if delay < .seconds(2) {
                 delay = min(delay * 2, .seconds(2))
             }
+        }
+    }
+
+    /// Polls until a `Void`-output workflow reaches a terminal state.
+    ///
+    /// Identical polling behaviour to the `Codable` overload but skips result decoding
+    /// since there is no serialised output to read back.
+    ///
+    /// - Parameter timeout: Optional upper bound on total wait time. Pass `nil` to wait indefinitely.
+    /// - Throws: `StrandError.timeout` on deadline exceeded.
+    ///           `WorkflowError` when the workflow reached FAILED or CANCELLED state.
+    @discardableResult
+    public func result(timeout: Duration? = nil) async throws -> W.Output where W.Output == Void {
+        let start = ContinuousClock.now
+        var delay: Duration = .milliseconds(100)
+        while true {
+            if let snap = try await client.fetchTaskResult(id: taskID) {
+                switch snap.state {
+                case .completed, .continuedAsNew:
+                    return ()
+                case .failed, .cancelled:
+                    throw WorkflowError(workflowName: W.workflowName, state: snap.state)
+                default:
+                    break  // Still in progress — keep polling.
+                }
+            }
+            if let t = timeout, ContinuousClock.now - start >= t {
+                throw StrandError.timeout(
+                    message:
+                        "Workflow \(W.workflowName) (\(workflowID)) did not complete within timeout"
+                )
+            }
+            try await Task.sleep(for: delay)
+            if delay < .seconds(2) { delay = min(delay * 2, .seconds(2)) }
         }
     }
 
@@ -232,7 +269,7 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
         // protocol requires init() and all properties must have default values.
         // JSON.decode(W.self, from: "{}") would throw keyNotFound for every
         // non-optional property even when defaults are declared.
-        let state = if let buf { try JSON.decode(W.self, from: buf) } else { W() }
+        let state = if let buf { try client.options.codec.decode(W.self, from: buf) } else { W() }
         return try fn(state)
     }
 
@@ -258,9 +295,9 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
         _ updateType: U.Type,
         payload: U.Input,
         timeout: Duration = .seconds(30)
-    ) async throws -> U.Output where U.W == W {
+    ) async throws -> U.Output where U.W == W, U.Output: Decodable {
         let correlationID = UUID().uuidString
-        let signalPayload = try JSON.encode(payload)
+        let signalPayload = try client.options.codec.encode(payload)
 
         // Send as a regular signal row but with update_correlation_id populated.
         // The worker reads that column to route to handleUpdate instead of handleSignal.
@@ -294,13 +331,17 @@ public struct WorkflowHandle<W: Workflow>: Sendable {
                 guard let resultBuf = row.result else {
                     throw WorkflowUpdateError("Update '\(U.updateName)' produced no result")
                 }
-                return try JSON.decode(U.Output.self, from: resultBuf)
+                return try client.options.codec.decode(U.Output.self, from: resultBuf)
             }
 
             try await Task.sleep(for: delay)
             delay = min(delay * 2, .seconds(1))
         }
     }
+}
+
+private struct MissingResultError: Error, CustomStringConvertible {
+    var description: String { "Workflow completed but has no result payload" }
 }
 
 // MARK: - StrandClient public signal API
@@ -328,8 +369,8 @@ extension StrandClient {
         _ definition: S.Type,
         taskID: UUID,
         payload: S.Input
-    ) async throws {
-        let buf = try JSON.encode(payload)
+    ) async throws where S.Input: Encodable {
+        let buf = try options.codec.encode(payload)
         try await _sendSignal(name: S.signalName, payload: buf, toWorkflowTaskID: taskID)
     }
 }

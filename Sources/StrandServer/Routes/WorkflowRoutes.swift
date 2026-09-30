@@ -20,7 +20,9 @@ struct WorkflowRoutes {
     private struct TriggerBody: Decodable {
         let workflowName: String
         let queue: String?
-        /// Raw JSON string forwarded verbatim as the task's `params` column.
+        /// Raw serialised input (JSON when using the default ``JSONCodec``).
+        /// Transformed through the configured codec before storage so that
+        /// custom codecs (AES, compression) apply transparently.
         let input: String
         /// Optional human-readable description stored as `"strand-description"` in headers.
         let description: String?
@@ -29,7 +31,7 @@ struct WorkflowRoutes {
     private struct EnqueueActivityBody: Decodable {
         let activityName: String
         let queue: String?
-        /// Raw JSON string forwarded verbatim as the task's `params` column.
+        /// Raw serialised input — see `TriggerBody.input`.
         let input: String
         /// Optional human-readable description stored as `"strand-description"` in headers.
         let description: String?
@@ -43,13 +45,11 @@ struct WorkflowRoutes {
         router.post("workflows/run") { req, ctx -> EnqueueResultResponse in
             let body = try await req.decode(as: TriggerBody.self, context: ctx)
             let targetQueue = body.queue ?? "default"
-            let inputBuffer = ByteBuffer(string: body.input)
-
             let result = try await self.client.enqueueRaw(
                 queue: targetQueue,
                 namespaceID: ctx.namespaceID,
                 taskName: body.workflowName,
-                paramsBuffer: inputBuffer,
+                paramsBuffer: ByteBuffer(string: body.input),
                 description: body.description
             )
             return EnqueueResultResponse(from: result)

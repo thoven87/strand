@@ -10,29 +10,29 @@ public import Foundation
 /// Scheduling metadata injected into every task fired by ``StrandScheduler``.
 ///
 /// Fields:
-/// - `partitionTime`: the period boundary the task covers (e.g. midnight for a
+/// - `logicalDate`: the period boundary the task covers (e.g. midnight for a
 ///   daily job) — the offset has already been stripped.
 /// - `scheduleOffset`: the raw ISO 8601 offset string from the pattern
 ///   (e.g. `"PT15M"` for `.daily(offset: "PT15M")`). `nil` when the offset
 ///   is zero (`"PT0M"` / `"PT0H"`).
 /// - `executionTime`: when the scheduler actually fired the task (wall clock).
 ///
-/// The relationship is: `executionTime ≈ partitionTime + scheduleOffset`.
+/// The relationship is: `executionTime ≈ logicalDate + scheduleOffset`.
 /// Small gaps are possible due to scheduler poll latency.
 public struct SchedulingMetadata: Codable, Sendable {
     /// Wall-clock time when the scheduler fired the task.
     public let executionTime: Date
 
     /// Period boundary this task covers.
-    /// For `.daily(offset: "PT15M")` firing at 00:15 UTC: `partitionTime = 00:00 UTC`.
-    /// For `.weekly(offset: "P6DT9H")` firing Friday 09:00: `partitionTime = Sunday 00:00`.
-    /// For `.interval(90 min)` firing at 01:45: `partitionTime = 01:30`.
-    public let partitionTime: Date?
+    /// For `.daily(offset: "PT15M")` firing at 00:15 UTC: `logicalDate = 00:00 UTC`.
+    /// For `.weekly(offset: "P6DT9H")` firing Friday 09:00: `logicalDate = Sunday 00:00`.
+    /// For `.interval(90 min)` firing at 01:45: `logicalDate = 01:30`.
+    public let logicalDate: Date?
 
     /// The schedule pattern's own offset, verbatim from the pattern.
     /// `nil` when the offset is zero ("PT0M" / "PT0H") — no shift was applied.
-    /// Together with `partitionTime` this lets consumers reconstruct the exact
-    /// fire time: `partitionTime + scheduleOffset ≈ executionTime`.
+    /// Together with `logicalDate` this lets consumers reconstruct the exact
+    /// fire time: `logicalDate + scheduleOffset ≈ executionTime`.
     public let scheduleOffset: String?
 
     /// UUID of the schedule that triggered this task.
@@ -50,7 +50,7 @@ public struct SchedulingMetadata: Codable, Sendable {
 
     public init(
         executionTime: Date,
-        partitionTime: Date? = nil,
+        logicalDate: Date? = nil,
         scheduleOffset: String? = nil,
         scheduleId: String? = nil,
         scheduledBy: String? = nil,
@@ -58,7 +58,7 @@ public struct SchedulingMetadata: Codable, Sendable {
         version: Int = 1
     ) {
         self.executionTime = executionTime
-        self.partitionTime = partitionTime
+        self.logicalDate = logicalDate
         self.scheduleOffset = scheduleOffset
         self.scheduleId = scheduleId
         self.scheduledBy = scheduledBy

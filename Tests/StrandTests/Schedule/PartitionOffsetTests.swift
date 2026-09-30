@@ -14,23 +14,23 @@ struct PartitionOffsetCoreTests {
     func testISO8601DurationParsing() throws {
 
         // Simple durations
-        let oneHour = try ISO8601Duration("PT1H")
+        let oneHour = try ISO8601Duration(parsing: "PT1H")
         #expect(oneHour.hours == 1 && oneHour.minutes == 0)
 
-        let oneDay = try ISO8601Duration("P1D")
+        let oneDay = try ISO8601Duration(parsing: "P1D")
         #expect(oneDay.days == 1 && oneDay.hours == 0)
 
         // Complex durations
-        let complex = try ISO8601Duration("P1DT2H30M")
+        let complex = try ISO8601Duration(parsing: "P1DT2H30M")
         #expect(complex.days == 1)
         #expect(complex.hours == 2)
         #expect(complex.minutes == 30)
 
         // Month and year durations
-        let monthly = try ISO8601Duration("P1M")
+        let monthly = try ISO8601Duration(parsing: "P1M")
         #expect(monthly.months == 1)
 
-        let yearly = try ISO8601Duration("P1Y2M3DT4H5M6S")
+        let yearly = try ISO8601Duration(parsing: "P1Y2M3DT4H5M6S")
         #expect(yearly.years == 1)
         #expect(yearly.months == 2)
         #expect(yearly.days == 3)
@@ -43,19 +43,19 @@ struct PartitionOffsetCoreTests {
     func testInvalidISO8601DurationParsing() throws {
 
         #expect(throws: PartitionOffsetError.self) {
-            try ISO8601Duration("invalid")
+            try ISO8601Duration(parsing: "invalid")
         }
 
         #expect(throws: PartitionOffsetError.self) {
-            try ISO8601Duration("1DT2H")  // Missing P prefix
+            try ISO8601Duration(parsing: "1DT2H")  // Missing P prefix
         }
 
         #expect(throws: PartitionOffsetError.self) {
-            try ISO8601Duration("PT1")  // Missing unit after number
+            try ISO8601Duration(parsing: "PT1")  // Missing unit after number
         }
 
         #expect(throws: PartitionOffsetError.self) {
-            try ISO8601Duration("P1XT2H")  // Invalid unit
+            try ISO8601Duration(parsing: "P1XT2H")  // Invalid unit
         }
     }
 
@@ -236,21 +236,21 @@ struct PartitionOffsetCoreTests {
         // Test getting default offsets for well-known schedules
 
         let dailySchedule = SchedulePattern.daily(
-            offset: "PT2H",
+            offset: ISO8601Duration(hours: 2),
             timezone: TimeZone(identifier: "UTC")!
         )
         let dailyOffset = ScheduleCalculator.getDefaultPartitionOffset(for: dailySchedule)
         #expect(dailyOffset == .oneDay)
 
         let weeklySchedule = SchedulePattern.weekly(
-            offset: "PT0H",
+            offset: .zero,
             timezone: TimeZone(identifier: "UTC")!
         )
         let weeklyOffset = ScheduleCalculator.getDefaultPartitionOffset(for: weeklySchedule)
         #expect(weeklyOffset == ISO8601Duration(days: 7))
 
         let monthlySchedule = SchedulePattern.monthly(
-            offset: "PT0H",
+            offset: .zero,
             timezone: TimeZone(identifier: "UTC")!
         )
         let monthlyOffset = ScheduleCalculator.getDefaultPartitionOffset(for: monthlySchedule)
@@ -258,7 +258,7 @@ struct PartitionOffsetCoreTests {
 
         let intervalSchedule = SchedulePattern.interval(
             .hours(2),
-            offset: "PT0H",
+            offset: .zero,
             timezone: TimeZone(identifier: "UTC")!
         )
         let intervalOffset = ScheduleCalculator.getDefaultPartitionOffset(for: intervalSchedule)
@@ -269,12 +269,12 @@ struct PartitionOffsetCoreTests {
     func testSchedulePartitionOffsetSupport() async throws {
         // Test that all schedule patterns support partition offsets
         let schedules: [SchedulePattern] = [
-            .daily(offset: "PT2H", timezone: TimeZone(identifier: "UTC")!),
-            .weekly(offset: "PT0H", timezone: TimeZone(identifier: "UTC")!),
-            .monthly(offset: "PT0H", timezone: TimeZone(identifier: "UTC")!),
-            .interval(.hours(1), offset: "PT0H", timezone: TimeZone(identifier: "UTC")!),
-            .cron("0 2 * * *", offset: "PT0H", timezone: TimeZone(identifier: "UTC")!),
-            .once(at: Date(), offset: "PT0H", timezone: TimeZone(identifier: "UTC")!),
+            .daily(offset: ISO8601Duration(hours: 2), timezone: TimeZone(identifier: "UTC")!),
+            .weekly(offset: .zero, timezone: TimeZone(identifier: "UTC")!),
+            .monthly(offset: .zero, timezone: TimeZone(identifier: "UTC")!),
+            .interval(.hours(1), offset: .zero, timezone: TimeZone(identifier: "UTC")!),
+            .cron("0 2 * * *", offset: .zero, timezone: TimeZone(identifier: "UTC")!),
+            .once(at: Date(), offset: .zero, timezone: TimeZone(identifier: "UTC")!),
         ]
 
         for schedule in schedules {
@@ -307,8 +307,8 @@ struct PartitionOffsetCoreTests {
             )
         )
 
-        // Data partition time should be: 2025-07-29T01:00 (the data period being processed)
-        let expectedPartitionTime = try #require(
+        // Logical date should be: 2025-07-29T01:00 (the data period being processed)
+        let expectedLogicalDate = try #require(
             Calendar(identifier: .gregorian).date(
                 from: DateComponents(
                     timeZone: TimeZone(identifier: "UTC"),
@@ -321,9 +321,9 @@ struct PartitionOffsetCoreTests {
             )
         )
 
-        // Apply the offset: execution time - PT1H = partition time
-        let partitionTime = config.offset.subtract(from: executionTime, calendar: Calendar(identifier: .gregorian))
+        // Apply the offset: execution time - PT1H = logical date
+        let logicalDate = config.offset.subtract(from: executionTime, calendar: Calendar(identifier: .gregorian))
 
-        #expect(partitionTime == expectedPartitionTime)
+        #expect(logicalDate == expectedLogicalDate)
     }
 }

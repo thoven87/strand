@@ -28,7 +28,7 @@ package struct _WorkerExec: Sendable {
     let options: WorkerOptions
     /// Runners for local activities registered on this worker.
     /// Keyed by activity name; each closure executes the activity in-process.
-    let localActivityLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer]
+    let localActivityLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer?]
 }
 
 // MARK: - WorkerOptions
@@ -158,6 +158,11 @@ public struct WorkerOptions: Sendable {
     /// Called on every poll error. When `nil`, errors are logged at `.error` level.
     public var onError: (@Sendable (any Error) async -> Void)?
 
+    /// Codec used to serialise and deserialise all user-supplied payload bytes
+    /// (workflow/activity inputs and outputs, signal payloads, workflow state).
+    /// Default: ``JSONCodec`` (plain JSON, no encryption).
+    public var codec: any StrandCodec
+
     public init(
         queue: String = "default",
         namespace: String = "default",
@@ -173,7 +178,8 @@ public struct WorkerOptions: Sendable {
         notifyJitter: Duration = .milliseconds(50),
         wakeCompletedWaitingLimit: Int = 500,
         maxInfraFailures: Int = 10,
-        onError: (@Sendable (any Error) async -> Void)? = nil
+        onError: (@Sendable (any Error) async -> Void)? = nil,
+        codec: any StrandCodec = JSONCodec()
     ) {
         self.queue = queue
         self.namespace = namespace
@@ -190,6 +196,7 @@ public struct WorkerOptions: Sendable {
         self.wakeCompletedWaitingLimit = wakeCompletedWaitingLimit
         self.maxInfraFailures = maxInfraFailures
         self.onError = onError
+        self.codec = codec
     }
 }
 
@@ -309,7 +316,7 @@ public struct StrandWorker: Service {
         // Build local-activity lookup FIRST so it can be embedded in exec.
         // The lookup maps activity name → in-process runner closure (no DB row).
         let allActivities = activityContainers.flatMap { $0.activities } + activities
-        var localLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer] = [:]
+        var localLookup: [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer?] = [:]
         // SE-0352: opens any Activity → A: Activity, capturing the concrete _runLocal.
         for activity in allActivities {
             _addActivityLocalLookup(activity, into: &localLookup)
@@ -832,275 +839,276 @@ public struct StrandWorker: Service {
         // without needing an explicit `logger:` parameter.
         await withLogger(taskLogger) { taskLogger in
 
-        // ── Race execution against 2× timeout ─────────────────────────
-        // Execution and deadline enforcement run as structured children of the
-        // same group — whichever finishes first cancels the other cleanly.
-        do {
-            let resultBuf: ByteBuffer? = try await withThrowingTaskGroup(of: ByteBuffer?.self) {
-                group in
+            // ── Race execution against 2× timeout ─────────────────────────
+            // Execution and deadline enforcement run as structured children of the
+            // same group — whichever finishes first cancels the other cleanly.
+            do {
+                let resultBuf: ByteBuffer? = try await withThrowingTaskGroup(of: ByteBuffer?.self) {
+                    group in
 
-                // Task 1: actual task execution.
-                group.addTask {
-                    defer {
-                        let elapsed = ContinuousClock.now - taskStart
-                        self._metrics.value
-                            .makeTimer(label: StrandMetrics.taskDuration, dimensions: taskDims)
-                            .recordNanoseconds(elapsed.nanoseconds)
-                        // execMs is read after the task group exits via
-                        // (ContinuousClock.now - taskStart).  The ~1-2 ms overhead
-                        // from group teardown is negligible for p50/p95/p99.
-                    }
-                    // OTel span: one span per task execution attempt.
-                    //
-                    // Extract the W3C trace context from the task headers and use it
-                    // as the *parent* span.  This creates a proper parent-child
-                    // relationship in Jaeger / OTLP collectors:
-                    //
-                    //   • Activities / child-workflows enqueued by a workflow carry the
-                    //     workflow activation’s span (injected in applyScheduleCommands)
-                    //     → they appear nested under the workflow span.
-                    //
-                    //   • Root tasks enqueued directly (e.g. from an HTTP handler) carry
-                    //     the producer span (injected by StrandClient._enqueue)
-                    //     → they appear nested under the HTTP request span.
-                    //
-                    // OTel parent-child is causal, not temporal: the child span may start
-                    // after the parent ends.  This is standard async-messaging propagation
-                    // (Kafka, SQS, AMQP) and is handled correctly by all major collectors.
-                    //
-                    // Zero-cost no-op when no tracing backend is bootstrapped.
-                    var parentCtx = ServiceContext.topLevel
-                    InstrumentationSystem.tracer.extract(
-                        claimed.headers,
-                        into: &parentCtx,
-                        using: DictionaryExtractor()
-                    )
-
-                    // ── Trace continuity (zero DB cost) ──────────────────────────
-                    // Workflows enqueued outside an HTTP context (seeders, cron)
-                    // have NULL headers — no traceparent at enqueue time — so
-                    // each activation creates a fresh root span in a different
-                    // Jaeger trace. The user sees one span per trace instead of
-                    // the full workflow history.
-                    //
-                    // Fix: derive a synthetic traceparent directly from the task
-                    // UUID (128 bits ≡ OTel trace ID). Because the UUID is stable
-                    // across every activation, all activations and their spawned
-                    // activities share the same trace ID → one complete trace in
-                    // Jaeger. No DB write, no extra round-trip.
-                    //
-                    // Workflows enqueued from an HTTP handler already have a real
-                    // traceparent extracted above; this block is skipped for them.
-                    if claimed.kind == .workflow && claimed.headers.isEmpty {
-                        // UUIDv7 hex (32 chars) = OTel trace ID (16 bytes).
-                        // Span ID (8 bytes) = first 16 hex chars of the UUID.
-                        // The synthetic “parent” span does not physically exist in
-                        // Jaeger; collectors treat these spans as trace roots while
-                        // still grouping them under the shared trace ID.
-                        let hex = claimed.taskID.uuidString
-                            .lowercased()
-                            .replacing("-", with: "")
-                        let syntheticParent = "00-\(hex)-\(hex.prefix(16))-01"
+                    // Task 1: actual task execution.
+                    group.addTask {
+                        defer {
+                            let elapsed = ContinuousClock.now - taskStart
+                            self._metrics.value
+                                .makeTimer(label: StrandMetrics.taskDuration, dimensions: taskDims)
+                                .recordNanoseconds(elapsed.nanoseconds)
+                            // execMs is read after the task group exits via
+                            // (ContinuousClock.now - taskStart).  The ~1-2 ms overhead
+                            // from group teardown is negligible for p50/p95/p99.
+                        }
+                        // OTel span: one span per task execution attempt.
+                        //
+                        // Extract the W3C trace context from the task headers and use it
+                        // as the *parent* span.  This creates a proper parent-child
+                        // relationship in Jaeger / OTLP collectors:
+                        //
+                        //   • Activities / child-workflows enqueued by a workflow carry the
+                        //     workflow activation’s span (injected in applyScheduleCommands)
+                        //     → they appear nested under the workflow span.
+                        //
+                        //   • Root tasks enqueued directly (e.g. from an HTTP handler) carry
+                        //     the producer span (injected by StrandClient._enqueue)
+                        //     → they appear nested under the HTTP request span.
+                        //
+                        // OTel parent-child is causal, not temporal: the child span may start
+                        // after the parent ends.  This is standard async-messaging propagation
+                        // (Kafka, SQS, AMQP) and is handled correctly by all major collectors.
+                        //
+                        // Zero-cost no-op when no tracing backend is bootstrapped.
+                        var parentCtx = ServiceContext.topLevel
                         InstrumentationSystem.tracer.extract(
-                            ["traceparent": syntheticParent],
+                            claimed.headers,
                             into: &parentCtx,
                             using: DictionaryExtractor()
                         )
-                    }
 
-                    return try await withSpan(claimed.taskName, context: parentCtx, ofKind: .consumer) { span in
-                        span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(
-                            claimed.taskName
-                        )
-                        span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
-                            claimed.kind.rawValue
-                        )
-                        span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
-                            claimed.taskID.uuidString.lowercased()
-                        )
-                        span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
-                            claimed.runID.uuidString.lowercased()
-                        )
-                        span.attributes[StrandLogKeys.queue] = SpanAttribute.string(options.queue)
-                        span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(
-                            Int64(claimed.attempt)
-                        )
-
-                        return try await reg.run(claimed, fatalDeadline)
-                    }
-                }
-
-                // Task 2: deadline poller — two escalating thresholds:
-                //   1× claimTimeout → log a warning (task is running long)
-                //   2× claimTimeout → cancel execution (fatalDeadline expired)
-                group.addTask {
-                    var warnedSlow = false
-                    do {
-                        while true {
-                            try Task.checkCancellation()
-                            try await Task.sleep(for: .milliseconds(500))
-                            let elapsed = ContinuousClock.now - taskStart
-                            // 1× warning — fires once when task exceeds claimTimeout
-                            if !warnedSlow, elapsed > options.claimTimeout {
-                                warnedSlow = true
-                                taskLogger.warning(
-                                    "task \(claimed.taskName) (\(claimed.taskID)) exceeded claim timeout (\(options.claimTimeout)) — still running"
-                                )
-                            }
-                            // 2× fatal — cancel execution
-                            if fatalDeadline.isExpired {
-                                taskLogger.critical(
-                                    "task \(claimed.taskName) (\(claimed.taskID)) exceeded 2× claim timeout — cancelling"
-                                )
-                                throw ClaimTimeoutError()
-                            }
+                        // ── Trace continuity (zero DB cost) ──────────────────────────
+                        // Workflows enqueued outside an HTTP context (seeders, cron)
+                        // have NULL headers — no traceparent at enqueue time — so
+                        // each activation creates a fresh root span in a different
+                        // Jaeger trace. The user sees one span per trace instead of
+                        // the full workflow history.
+                        //
+                        // Fix: derive a synthetic traceparent directly from the task
+                        // UUID (128 bits ≡ OTel trace ID). Because the UUID is stable
+                        // across every activation, all activations and their spawned
+                        // activities share the same trace ID → one complete trace in
+                        // Jaeger. No DB write, no extra round-trip.
+                        //
+                        // Workflows enqueued from an HTTP handler already have a real
+                        // traceparent extracted above; this block is skipped for them.
+                        if claimed.kind == .workflow && claimed.headers.isEmpty {
+                            // UUIDv7 hex (32 chars) = OTel trace ID (16 bytes).
+                            // Span ID (8 bytes) = first 16 hex chars of the UUID.
+                            // The synthetic “parent” span does not physically exist in
+                            // Jaeger; collectors treat these spans as trace roots while
+                            // still grouping them under the shared trace ID.
+                            let hex = claimed.taskID.uuidString
+                                .lowercased()
+                                .replacing("-", with: "")
+                            let syntheticParent = "00-\(hex)-\(hex.prefix(16))-01"
+                            InstrumentationSystem.tracer.extract(
+                                ["traceparent": syntheticParent],
+                                into: &parentCtx,
+                                using: DictionaryExtractor()
+                            )
                         }
-                    } catch is CancellationError {
-                        return nil  // Task 1 won the race — exit cleanly
+
+                        return try await withSpan(claimed.taskName, context: parentCtx, ofKind: .consumer) { span in
+                            span.attributes[StrandLogKeys.taskName] = SpanAttribute.string(
+                                claimed.taskName
+                            )
+                            span.attributes[StrandLogKeys.taskKind] = SpanAttribute.string(
+                                claimed.kind.rawValue
+                            )
+                            span.attributes[StrandLogKeys.taskID] = SpanAttribute.string(
+                                claimed.taskID.uuidString.lowercased()
+                            )
+                            span.attributes[StrandLogKeys.runID] = SpanAttribute.string(
+                                claimed.runID.uuidString.lowercased()
+                            )
+                            span.attributes[StrandLogKeys.queue] = SpanAttribute.string(options.queue)
+                            span.attributes[StrandLogKeys.attempt] = SpanAttribute.int(
+                                Int64(claimed.attempt)
+                            )
+
+                            return try await reg.run(claimed, fatalDeadline)
+                        }
                     }
-                    // ClaimTimeoutError propagates out to the group
+
+                    // Task 2: deadline poller — two escalating thresholds:
+                    //   1× claimTimeout → log a warning (task is running long)
+                    //   2× claimTimeout → cancel execution (fatalDeadline expired)
+                    group.addTask {
+                        var warnedSlow = false
+                        do {
+                            while true {
+                                try Task.checkCancellation()
+                                try await Task.sleep(for: .milliseconds(500))
+                                let elapsed = ContinuousClock.now - taskStart
+                                // 1× warning — fires once when task exceeds claimTimeout
+                                if !warnedSlow, elapsed > options.claimTimeout {
+                                    warnedSlow = true
+                                    taskLogger.warning(
+                                        "task \(claimed.taskName) (\(claimed.taskID)) exceeded claim timeout (\(options.claimTimeout)) — still running"
+                                    )
+                                }
+                                // 2× fatal — cancel execution
+                                if fatalDeadline.isExpired {
+                                    taskLogger.critical(
+                                        "task \(claimed.taskName) (\(claimed.taskID)) exceeded 2× claim timeout — cancelling"
+                                    )
+                                    throw ClaimTimeoutError()
+                                }
+                            }
+                        } catch is CancellationError {
+                            return nil  // Task 1 won the race — exit cleanly
+                        }
+                        // ClaimTimeoutError propagates out to the group
+                    }
+
+                    // First child to finish wins; cancel the other.
+                    let result = try await group.next()
+                    group.cancelAll()
+                    return result ?? nil
                 }
 
-                // First child to finish wins; cancel the other.
-                let result = try await group.next()
-                group.cancelAll()
-                return result ?? nil
-            }
-
-            if let buf = resultBuf {
-                // Run produced a result — mark COMPLETED with CAS on version.
-                try await Queries.completeRun(
-                    on: postgres,
-                    namespaceID: namespace,
-                    runID: claimed.runID,
-                    version: claimed.version,
-                    resultBuffer: buf,
-                    logger: logger
-                )
-            }
-            _metrics.value.makeCounter(label: StrandMetrics.tasksCompleted, dimensions: taskDims)
-                .increment(by: 1)
-            // Record to DDSketch buffer with known state.
-            // nil result means the workflow suspended cleanly — still a "completed" execution
-            // from the worker’s perspective (it ran and handed off cleanly).
-            metricsBuffer?.record(
-                queue: options.queue,
-                taskName: claimed.taskName,
-                state: .completed,
-                execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
-                waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
-            )
-        } catch is CancellationError {
-            // Worker is shutting down (graceful SIGTERM or forced cancellation).
-            // Leave the run in RUNNING state — the leaseExpiryLoop sweep will
-            // call failRun when lease_expires_at elapses (within leaseExpiryInterval).
-            // This avoids incrementing the attempt counter for a shutdown that is
-            // not a task failure.
-        } catch InternalError.cancelled {
-            _metrics.value.makeCounter(label: StrandMetrics.tasksSuspended, dimensions: taskDims)
-                .increment(by: 1)
-            // Task was cancelled externally (e.g. heartbeat found state != RUNNING).
-        } catch let signal as _ContinueAsNewSignal {
-            _metrics.value.makeCounter(
-                label: StrandMetrics.tasksContinuedAsNew,
-                dimensions: taskDims
-            ).increment(by: 1)
-            do {
-                if claimed.parentWorkflowID != nil {
-                    // ── Child workflow ────────────────────────────────────────────────
-                    // Reuse the same task_id so the parent's event_wait (child_task_id)
-                    // keeps tracking this task. The parent stays
-                    // WAITING; when the chain terminates with a real result, completeRun
-                    // fires emitTaskCompletionSignal and the parent receives it.
-                    try await Queries.continueChildWorkflowAsNew(
-                        on: postgres,
-                        namespaceID: signal.namespaceID,
-                        taskID: claimed.taskID,
-                        currentRunID: claimed.runID,
-                        currentVersion: claimed.version,
-                        newInput: signal.input,
-                        newRunID: UUID.v7(),
-                        logger: logger
-                    )
-                } else {
-                    // ── Root workflow ─────────────────────────────────────────────────
-                    // No parent is tracking this task_id, so a fresh task is fine.
-                    // Propagate first_task_id so the full continueAsNew chain is
-                    // navigable: if this task was itself a continuation, carry the
-                    // original chain root forward; otherwise this task IS the root.
-                    let firstTaskID = claimed.firstTaskID ?? claimed.taskID
-                    _ = try await Queries.enqueueTask(
-                        on: postgres,
-                        namespaceID: signal.namespaceID,
-                        queue: signal.queue,
-                        taskName: signal.workflowName,
-                        paramsBuffer: signal.input,
-                        headersBuffer: nil,
-                        retryStrategyBuffer: nil,
-                        maxAttempts: nil,
-                        cancellationBuffer: nil,
-                        idempotencyKey: nil,
-                        priority: .normal,
-                        scheduledAt: nil,
-                        fairnessKey: nil,
-                        fairnessWeight: 1.0,
-                        kind: .workflow,
-                        parentTaskID: nil,
-                        firstTaskID: firstTaskID,
-                        logger: logger
-                    )
-                    // completeRun transitions strand.tasks.state → COMPLETED and sets
-                    // completed_at. We immediately overwrite to CONTINUED_AS_NEW so the
-                    // old task is distinguishable from a naturally-completed workflow.
+                // Activities must always be marked COMPLETED even when the result is nil
+                // (Void-output activities). Workflows use nil to signal suspension.
+                if resultBuf != nil || claimed.kind == .activity {
                     try await Queries.completeRun(
                         on: postgres,
-                        namespaceID: signal.namespaceID,
+                        namespaceID: namespace,
                         runID: claimed.runID,
                         version: claimed.version,
-                        resultBuffer: nil,
+                        resultBuffer: resultBuf,
                         logger: logger
                     )
-                    // Override the task state set by completeRun.
-                    // This is a separate statement — there is no race: the old run is
-                    // COMPLETED after completeRun and can never be claimed again, so
-                    // no worker can concurrently transition it to a different state.
-                    try await postgres.query(
-                        """
-                        UPDATE strand.tasks
-                        SET state = \(TaskState.continuedAsNew)
-                        WHERE id           = \(claimed.taskID)
-                          AND namespace_id = \(signal.namespaceID)
-                        """,
-                        logger: taskLogger
-                    )
                 }
+                _metrics.value.makeCounter(label: StrandMetrics.tasksCompleted, dimensions: taskDims)
+                    .increment(by: 1)
+                // Record to DDSketch buffer with known state.
+                // nil result means the workflow suspended cleanly — still a "completed" execution
+                // from the worker’s perspective (it ran and handed off cleanly).
+                metricsBuffer?.record(
+                    queue: options.queue,
+                    taskName: claimed.taskName,
+                    state: .completed,
+                    execMs: Double((ContinuousClock.now - taskStart).nanoseconds) / 1_000_000.0,
+                    waitMs: max(0, taskStartWall.timeIntervalSince(claimed.availableAt) * 1000)
+                )
+            } catch is CancellationError {
+                // Worker is shutting down (graceful SIGTERM or forced cancellation).
+                // Leave the run in RUNNING state — the leaseExpiryLoop sweep will
+                // call failRun when lease_expires_at elapses (within leaseExpiryInterval).
+                // This avoids incrementing the attempt counter for a shutdown that is
+                // not a task failure.
+            } catch InternalError.cancelled {
+                _metrics.value.makeCounter(label: StrandMetrics.tasksSuspended, dimensions: taskDims)
+                    .increment(by: 1)
+                // Task was cancelled externally (e.g. heartbeat found state != RUNNING).
+            } catch let signal as _ContinueAsNewSignal {
+                _metrics.value.makeCounter(
+                    label: StrandMetrics.tasksContinuedAsNew,
+                    dimensions: taskDims
+                ).increment(by: 1)
+                do {
+                    if claimed.parentWorkflowID != nil {
+                        // ── Child workflow ────────────────────────────────────────────────
+                        // Reuse the same task_id so the parent's event_wait (child_task_id)
+                        // keeps tracking this task. The parent stays
+                        // WAITING; when the chain terminates with a real result, completeRun
+                        // fires emitTaskCompletionSignal and the parent receives it.
+                        try await Queries.continueChildWorkflowAsNew(
+                            on: postgres,
+                            namespaceID: signal.namespaceID,
+                            taskID: claimed.taskID,
+                            currentRunID: claimed.runID,
+                            currentVersion: claimed.version,
+                            newInput: signal.input,
+                            newRunID: UUID.v7(),
+                            logger: logger
+                        )
+                    } else {
+                        // ── Root workflow ─────────────────────────────────────────────────
+                        // No parent is tracking this task_id, so a fresh task is fine.
+                        // Propagate first_task_id so the full continueAsNew chain is
+                        // navigable: if this task was itself a continuation, carry the
+                        // original chain root forward; otherwise this task IS the root.
+                        let firstTaskID = claimed.firstTaskID ?? claimed.taskID
+                        _ = try await Queries.enqueueTask(
+                            on: postgres,
+                            namespaceID: signal.namespaceID,
+                            queue: signal.queue,
+                            taskName: signal.workflowName,
+                            paramsBuffer: signal.input,
+                            headersBuffer: nil,
+                            retryStrategyBuffer: nil,
+                            maxAttempts: nil,
+                            cancellationBuffer: nil,
+                            idempotencyKey: nil,
+                            priority: .normal,
+                            scheduledAt: nil,
+                            fairnessKey: nil,
+                            fairnessWeight: 1.0,
+                            kind: .workflow,
+                            parentTaskID: nil,
+                            firstTaskID: firstTaskID,
+                            logger: logger
+                        )
+                        // completeRun transitions strand.tasks.state → COMPLETED and sets
+                        // completed_at. We immediately overwrite to CONTINUED_AS_NEW so the
+                        // old task is distinguishable from a naturally-completed workflow.
+                        try await Queries.completeRun(
+                            on: postgres,
+                            namespaceID: signal.namespaceID,
+                            runID: claimed.runID,
+                            version: claimed.version,
+                            resultBuffer: nil,
+                            logger: logger
+                        )
+                        // Override the task state set by completeRun.
+                        // This is a separate statement — there is no race: the old run is
+                        // COMPLETED after completeRun and can never be claimed again, so
+                        // no worker can concurrently transition it to a different state.
+                        try await postgres.query(
+                            """
+                            UPDATE strand.tasks
+                            SET state = \(TaskState.continuedAsNew)
+                            WHERE id           = \(claimed.taskID)
+                              AND namespace_id = \(signal.namespaceID)
+                            """,
+                            logger: taskLogger
+                        )
+                    }
+                } catch {
+                    taskLogger.error("continue-as-new failed", metadata: .forError(error))
+                }
+            } catch let typed as _TypedActivityFailure {
+                // Pre-encoded failure reason from Activity._run — use verbatim.
+                await failAndRecord(
+                    reasonBuffer: typed.reasonBuffer,
+                    claimed: claimed,
+                    taskDims: taskDims,
+                    taskStart: taskStart,
+                    taskStartWall: taskStartWall,
+                    logger: taskLogger
+                )
             } catch {
-                taskLogger.error("continue-as-new failed", metadata: .forError(error))
+                let reason = FailureReason(error: error)
+                let buf = (try? JSON.encode(reason)) ?? FailureReason.fallback
+                await failAndRecord(
+                    reasonBuffer: buf,
+                    claimed: claimed,
+                    taskDims: taskDims,
+                    taskStart: taskStart,
+                    taskStartWall: taskStartWall,
+                    logger: taskLogger
+                )
             }
-        } catch let typed as _TypedActivityFailure {
-            // Pre-encoded failure reason from Activity._run — use verbatim.
-            await failAndRecord(
-                reasonBuffer: typed.reasonBuffer,
-                claimed: claimed,
-                taskDims: taskDims,
-                taskStart: taskStart,
-                taskStartWall: taskStartWall,
-                logger: taskLogger
-            )
-        } catch {
-            let reason = FailureReason(error: error)
-            let buf = (try? JSON.encode(reason)) ?? FailureReason.fallback
-            await failAndRecord(
-                reasonBuffer: buf,
-                claimed: claimed,
-                taskDims: taskDims,
-                taskStart: taskStart,
-                taskStartWall: taskStartWall,
-                logger: taskLogger
-            )
-        }
 
-        } // end withLogger
+        }  // end withLogger
     }
 
     // MARK: - Shared activation helpers

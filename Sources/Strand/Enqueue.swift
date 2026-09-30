@@ -406,6 +406,29 @@ extension ScheduleAccuracy: PostgresCodable {
     }
 }
 
+extension ScheduleOverlapPolicy: PostgresCodable {
+    public static var psqlType: PostgresDataType { .text }
+    public static var psqlFormat: PostgresFormat { .binary }
+
+    public func encode<E: PostgresJSONEncoder>(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<E>
+    ) throws {
+        rawValue.encode(into: &byteBuffer, context: context)
+    }
+
+    public init<D: PostgresJSONDecoder>(
+        from byteBuffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<D>
+    ) throws {
+        let raw = try String(from: &byteBuffer, type: type, format: format, context: context)
+        // Unknown / future values fall back to .allowAll so old rows stay safe.
+        self = ScheduleOverlapPolicy(rawValue: raw) ?? .allowAll
+    }
+}
+
 extension TaskPriority: PostgresCodable {
     public static var psqlType: PostgresDataType { .int8 }
     public static var psqlFormat: PostgresFormat { .binary }
@@ -555,36 +578,45 @@ public struct TaskFailure: Sendable, Codable {
 public struct TaskResultSnapshot: Sendable, Codable {
     public let taskID: UUID
     public let state: TaskStatus
-    /// Raw JSON string of the result value; `nil` if not yet completed.
-    public let resultJSON: String?
     public let failure: TaskFailure?
+
+    /// Raw codec output bytes for this task result, or `nil` for Void-output
+    /// tasks and incomplete runs.
+    ///
+    /// This is the `ByteBuffer` written to `strand.runs.result` by the worker
+    /// and read back from Postgres without copying. All internal Strand decode
+    /// paths (``WorkflowHandle/result(timeout:)``, ``StrandClient/runActivity(_:input:options:)``,
+    /// ``StrandClient/awaitTaskResult(id:as:options:)``) consume this directly.
+    ///
+    /// The field is excluded from `Codable` serialisation: it is a runtime
+    /// value keyed to the NIO event loop, not a wire-format field.
+    package let _resultBuffer: ByteBuffer?
+
     /// Decoded failure — populated from `strand.runs.failure_reason` by
     /// `StrandClient.taskSnapshot(from:)` when a DB row is decoded.  Used by
     /// `StrandClient.runActivity` to throw `A.Failure` directly without a
     /// second round of JSON decoding.
     ///
     /// Not part of the `Codable` representation: the failure IS durable in the
-    /// DB, but this field is not serialised to JSON (e.g. over an HTTP API) and
-    /// is set back to `nil` on `init(from decoder:)`.  External callers should
-    /// read `TaskResultSnapshot.failure` instead.
+    /// DB, but this field is not serialised to JSON and is set back to `nil` on
+    /// `init(from decoder:)`. External callers read `failure` instead.
     package let _activityFailure: ActivityFailure?
 
-    // Codable only encodes the four public fields; _failureBuffer is runtime-only.
+    // _resultBuffer and _activityFailure are runtime-only; exclude from Codable.
     private enum CodingKeys: String, CodingKey {
-        case taskID, state, resultJSON, failure
+        case taskID, state, failure
     }
 
-    /// Public memberwise initialiser (for external callers — no runtime failure data).
+    /// Public memberwise initialiser (for external callers).
     public init(
         taskID: UUID,
         state: TaskStatus,
-        resultJSON: String?,
         failure: TaskFailure?
     ) {
         self.taskID = taskID
         self.state = state
-        self.resultJSON = resultJSON
         self.failure = failure
+        self._resultBuffer = nil
         self._activityFailure = nil
     }
 
@@ -592,37 +624,41 @@ public struct TaskResultSnapshot: Sendable, Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.taskID = try c.decode(UUID.self, forKey: .taskID)
         self.state = try c.decode(TaskStatus.self, forKey: .state)
-        self.resultJSON = try c.decodeIfPresent(String.self, forKey: .resultJSON)
         self.failure = try c.decodeIfPresent(TaskFailure.self, forKey: .failure)
-        self._activityFailure = nil  // not in JSON wire format; see _activityFailure doc comment
+        self._resultBuffer = nil
+        self._activityFailure = nil
     }
 
-    /// Package-internal initialiser that carries the already-decoded `ActivityFailure`
-    /// for typed-failure propagation in `StrandClient.runActivity`.
+    /// Package-internal initialiser carrying the raw result buffer and the
+    /// decoded `ActivityFailure` for typed-failure propagation.
     package init(
         taskID: UUID,
         state: TaskStatus,
-        resultJSON: String?,
+        resultBuffer: ByteBuffer?,
         failure: TaskFailure?,
         activityFailure: ActivityFailure?
     ) {
         self.taskID = taskID
         self.state = state
-        self.resultJSON = resultJSON
+        self._resultBuffer = resultBuffer
         self.failure = failure
         self._activityFailure = activityFailure
     }
 
-    /// Decodes the result JSON into `T`.
+    /// Decodes the result payload into `T` using the default ``JSONCodec``.
     ///
-    /// Prefer `StrandClient.awaitTaskResult(id:as:)` for the common async-polling
-    /// pattern. Use this method when you already hold a `TaskResultSnapshot` and
-    /// want to decode it synchronously without an additional network round-trip.
+    /// This method always uses plain JSON regardless of the codec configured on
+    /// the worker or client — it is a convenience for external callers who hold
+    /// a snapshot and want to synchronously decode a JSON result without an
+    /// additional DB round-trip.
+    ///
+    /// For codec-aware decoding (e.g. when using a custom ``StrandCodec``)
+    /// prefer ``StrandClient/awaitTaskResult(id:as:options:)``.
     public func decodeResult<T: Decodable>(as type: T.Type = T.self) throws -> T {
-        guard let json = resultJSON else {
+        guard let buf = _resultBuffer else {
             throw StrandError.serialization(underlying: MissingResultError())
         }
-        return try JSON.decode(type, from: json)
+        return try JSON.decode(type, from: buf)
     }
 }
 

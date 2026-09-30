@@ -100,6 +100,11 @@ struct ClaimedTask: Sendable {
     /// worker fails the run immediately — consuming an attempt — rather than
     /// executing and potentially crashing again.
     let infraFailureCount: Int
+
+    /// The rate-limit slot key this run was assigned to (`strand.runs.rate_limit_slot_key`).
+    /// `nil` when the run was not scheduled via a rate-limit bucket.
+    /// Used by `ActivityContext.bumpRateLimit(by:)` to advance the cursor on 429s.
+    let rateLimitSlotKey: String?
 }
 
 extension ClaimedTask {
@@ -108,7 +113,7 @@ extension ClaimedTask {
     /// retry_strategy, max_attempts, headers, wake_event, event_payload,
     /// parent_task_id, kind, timeout_seconds, heartbeat_timeout_seconds,
     /// scheduling_metadata, available_at, heartbeat_details, deadline_at,
-    /// first_task_id, cancel_requested, infra_failure_count
+    /// first_task_id, cancel_requested, infra_failure_count, rate_limit_slot_key
     init(row: PostgresRow) throws {
         var col = row.makeIterator()
         runID = try col.next()!.decode(UUID.self, context: .default)
@@ -141,6 +146,7 @@ extension ClaimedTask {
         firstTaskID = try col.next()!.decode(UUID?.self, context: .default)
         cancelRequested = try col.next()!.decode(Bool.self, context: .default)
         infraFailureCount = try col.next()!.decode(Int.self, context: .default)
+        rateLimitSlotKey = try col.next()!.decode(String?.self, context: .default)
     }
 }
 

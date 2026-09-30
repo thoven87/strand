@@ -113,6 +113,7 @@ public struct StrandServer: Service {
         TaskRoutes(client: client, postgres: postgres).register(on: nsGroup)
         RunRoutes(postgres: postgres, logger: client.logger).register(on: nsGroup)
         EventRoutes(client: client, postgres: postgres).register(on: nsGroup)
+        CodecRoutes(client: client).register(on: nsGroup)
         WorkflowRoutes(client: client).register(on: nsGroup)
         ScheduleRoutes(client: client).register(on: nsGroup)
         BackfillRoutes(client: client, postgres: postgres).register(on: nsGroup)

@@ -18,9 +18,9 @@ import Testing
                         mutating func pause() {}
                         struct Pause: WorkflowSignal {
                             typealias W = OrderWorkflow
-                            typealias Input = StrandVoid
+                            typealias Input = Void
                             static var signalName: String { "pause" }
-                            static func apply(to w: inout OrderWorkflow, input: StrandVoid) { w.pause() }
+                            static func apply(to w: inout OrderWorkflow, input: Void) { w.pause() }
                         }
                     }
                     """

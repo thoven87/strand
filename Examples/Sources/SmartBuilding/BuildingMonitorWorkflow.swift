@@ -10,9 +10,8 @@ import Strand
 /// The workflow also accepts an ``UpdateThresholds`` signal mid-run (forwarded
 /// from ops tooling via the client handle), storing the update in durable state
 /// and reporting it in the final summary.
-struct BuildingMonitorWorkflow: Workflow {
-    typealias Input = BuildingInput
-    typealias Output = BuildingReport
+@Workflow
+struct BuildingMonitorWorkflow {
 
     // ── Mutable state ─────────────────────────────────────────────────────
 
@@ -27,13 +26,10 @@ struct BuildingMonitorWorkflow: Workflow {
     // signal the parent workflow to demonstrate the signal API — the update
     // is recorded in the parent's durable state and reported in the summary.
 
-    mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
-        if name == RoomMonitorWorkflow.UpdateThresholds.signalName,
-            let update = try? decodeSignalPayload(ThresholdUpdate.self, from: payload)
-        {
-            pendingThresholdUpdate = update
-            print("  Ops signal received: \(update.reason)")
-        }
+    @WorkflowSignal
+    mutating func updateThresholds(_ update: ThresholdUpdate) {
+        pendingThresholdUpdate = update
+        print("  Ops signal received: \(update.reason)")
     }
 
     // ── Orchestration ──────────────────────────────────────────────────────

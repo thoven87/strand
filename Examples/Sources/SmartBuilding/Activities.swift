@@ -12,14 +12,22 @@ struct ReadSensorsInput: Codable, Sendable {
     let cycle: Int
 }
 
-/// Simulates reading all sensors in a room.
-/// The server room (roomId == "server-room") has a temperature spike on cycle 3.
-struct ReadSensorsActivity: Activity {
-    typealias Input = ReadSensorsInput
-    typealias Output = [SensorReading]
-    static let name = "iot.read-sensors"
+struct AlertInput: Codable, Sendable {
+    let roomId: String
+    let displayName: String
+    let sensor: SensorType
+    let value: Double
+    let threshold: Double
+    let cycle: Int
+}
 
-    func run(input: Input, context: ActivityContext) async throws -> Output {
+@ActivityContainer
+struct BuildingActivities {
+
+    /// Simulates reading all sensors in a room.
+    /// The server room (roomId == "server-room") has a temperature spike on cycle 3.
+    @Activity
+    func readSensors(input: ReadSensorsInput, context: ActivityContext) async throws -> [SensorReading] {
         // Simulate sensor polling latency
         try await Task.sleep(for: .milliseconds(400))
 
@@ -47,25 +55,11 @@ struct ReadSensorsActivity: Activity {
             SensorReading(sensorType: .humidity, value: humidity, unit: "%"),
         ]
     }
-}
 
-struct AlertInput: Codable, Sendable {
-    let roomId: String
-    let displayName: String
-    let sensor: SensorType
-    let value: Double
-    let threshold: Double
-    let cycle: Int
-}
-
-/// Handles a sensor threshold breach — in production this would page on-call,
-/// trigger HVAC adjustments, etc. Here it logs the alert clearly.
-struct SendAlertActivity: Activity {
-    typealias Input = AlertInput
-    typealias Output = String  // alert description
-    static let name = "iot.send-alert"
-
-    func run(input: Input, context: ActivityContext) async throws -> Output {
+    /// Handles a sensor threshold breach — in production this would page on-call,
+    /// trigger HVAC adjustments, etc. Here it logs the alert clearly.
+    @Activity
+    func sendAlert(input: AlertInput, context: ActivityContext) async throws -> String {
         try await Task.sleep(for: .milliseconds(200))
         let unit = input.sensor == .temperature ? "°C" : input.sensor == .co2 ? " ppm" : "%"
         let desc =

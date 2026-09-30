@@ -45,7 +45,7 @@ func _registerWorkflow<W: Workflow>(
 
 func _addActivityLocalLookup<A: Activity>(
     _ activity: A,
-    into localLookup: inout [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer]
+    into localLookup: inout [String: @Sendable (ByteBuffer, _WorkerExec, UUID?) async throws -> ByteBuffer?]
 ) {
     localLookup[A.name] = { [activity] input, exec, parentID in
         try await activity._runLocal(input: input, exec: exec, parentWorkflowID: parentID)
@@ -258,7 +258,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         var workflowState: W
         if let buf = storedStateBuf {
             // Restore the struct exactly as it was at the end of the previous activation.
-            workflowState = try JSON.decode(W.self, from: buf)
+            workflowState = try exec.options.codec.decode(W.self, from: buf)
         } else {
             // First activation — no stored state yet. Use the protocol-required
             // `init()` so non-optional stored properties work without any
@@ -332,6 +332,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             schedulingMetadata: claimed.schedulingMetadata,
             postgres: exec.postgres,
             logger: exec.logger,
+            codec: exec.options.codec,
             executor: executor,
             stateMachine: stateMachine,
             stateBox: stateBox,
@@ -343,7 +344,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             historyEventCount: historyEventCount
         )
         let context = WorkflowContext<W>(activation: activation)
-        let input = try JSON.decode(W.Input.self, from: claimed.paramsBuffer)
+        let input = try exec.options.codec.decode(W.Input.self, from: claimed.paramsBuffer)
 
         // ── 6. Run handler on the executor ─────────────────────────────────────────
         // All WorkflowContext operations (runActivity, sleep, waitForEvent, uuid, random)
@@ -568,7 +569,9 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         for (seqNum, result, failureReason, state, kind, name, _, _, _) in completedChildren {
             switch state {
             case .completed:
-                if let result { activation.stateMachine.resumeActivity(seqNum: seqNum, result: result) }
+                // Void-output activities have nil result; resume with empty sentinel
+                // so _decodeOutput(from:) can reconstruct () on the workflow side.
+                activation.stateMachine.resumeActivity(seqNum: seqNum, result: result ?? ByteBuffer())
             case .failed, .cancelled:
                 // Detect timeout: ClaimTimeoutError appears in the failure reason
                 // when the 2x claim-window threshold is exceeded.
@@ -681,13 +684,19 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         var updateResults: [(correlationID: String, result: ByteBuffer)] = []
         var updateErrors: [(correlationID: String, error: String)] = []
 
+        let codec = exec.options.codec
         for signal in signals {
             if let correlationID = signal.updateCorrelationID {
                 do {
-                    if let result = try state.handleUpdate(
-                        name: signal.name,
-                        correlationID: correlationID,
-                        payload: signal.payload
+                    if let result = try _StrandCodecContext.$codec.withValue(
+                        codec,
+                        operation: {
+                            try state.handleUpdate(
+                                name: signal.name,
+                                correlationID: correlationID,
+                                payload: signal.payload
+                            )
+                        }
                     ) {
                         updateResults.append((correlationID, result))
                     } else {
@@ -697,7 +706,9 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                     updateErrors.append((correlationID, strandErrorMessage(error)))
                 }
             } else {
-                try state.handleSignal(name: signal.name, payload: signal.payload)
+                try _StrandCodecContext.$codec.withValue(codec) {
+                    try state.handleSignal(name: signal.name, payload: signal.payload)
+                }
             }
         }
 
@@ -712,7 +723,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             historySeq += 1
             historyBatch.append((seq: seq, eventType: eventType, eventData: sigData))
         }
-        let stateBuf = try JSON.encode(state)
+        let stateBuf = try exec.options.codec.encode(state)
         let signalIDs = signals.map { $0.id }
         // Wrap all writes in one transaction — one pool checkout, properly atomic.
         // A crash between batchAppendHistory and deleteSignals is safe via idempotency
@@ -803,10 +814,10 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                         }
                     }
                     defer { heartbeat.cancel() }
-                    let result: ByteBuffer
+                    let resultOptional: ByteBuffer?
                     if let timeout = entry.options.timeout {
                         // Race the runner against a per-attempt timeout from LocalActivityOptions.
-                        result = try await withThrowingTaskGroup(of: ByteBuffer.self) { tg in
+                        resultOptional = try await withThrowingTaskGroup(of: ByteBuffer?.self) { tg in
                             tg.addTask { try await runner(entry.input, exec, claimed.taskID) }
                             tg.addTask {
                                 try await Task.sleep(for: timeout)
@@ -817,8 +828,11 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
                             return r
                         }
                     } else {
-                        result = try await runner(entry.input, exec, claimed.taskID)
+                        resultOptional = try await runner(entry.input, exec, claimed.taskID)
                     }
+                    // Void-output activities produce nil; use an empty sentinel so the
+                    // checkpoint and continuation paths (which require ByteBuffer) work.
+                    let result = resultOptional ?? ByteBuffer()
                     try await Queries.setCheckpointState(
                         on: exec.postgres,
                         namespaceID: exec.namespace,

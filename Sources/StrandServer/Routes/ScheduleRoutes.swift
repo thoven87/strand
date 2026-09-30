@@ -73,6 +73,11 @@ struct ScheduleDetailResponse: Codable, Sendable {
     let createdAt: Date
     let patternType: String
     let patternDescription: String
+    /// IANA timezone identifier for this schedule (e.g. "America/New_York").
+    /// Used by Loom to show the correct timezone hint in the manual-trigger
+    /// partition-time input so users don’t accidentally enter UTC when the
+    /// schedule runs in a different timezone.
+    let patternTimezone: String
     let startsAt: Date?
     let endsAt: Date?
 
@@ -89,6 +94,7 @@ struct ScheduleDetailResponse: Codable, Sendable {
         createdAt = s.createdAt
         patternType = s.pattern.typeName
         patternDescription = s.pattern.description
+        patternTimezone = s.pattern.timezone.identifier
         startsAt = s.startsAt
         endsAt = s.endsAt
     }
@@ -103,10 +109,11 @@ struct ScheduleRunResponse: Codable, Sendable {
     let attempt: Int
     let createdAt: Date
     let completedAt: Date?
-    /// Canonical slot time from `scheduling_metadata.partitionTime`.
+    /// Canonical slot time from `scheduling_metadata.logicalDate`.
     /// Use this (not `createdAt`) for partition grids: backfill tasks are
     /// created at wall-clock time but belong to a past partition.
-    let partitionTime: Date?
+    let logicalDate: Date?
+
 }
 extension ScheduleRunResponse: ResponseCodable {}
 
@@ -122,7 +129,7 @@ extension UpcomingSlotResponse: ResponseCodable {}
 // MARK: - Routes
 
 private struct RunScheduleBody: Decodable {
-    let partitionTime: Date
+    let logicalDate: Date
     let allowOverwrite: Bool?
 }
 
@@ -207,7 +214,7 @@ struct ScheduleRoutes {
                     attempt: row.attempt,
                     createdAt: row.createdAt,
                     completedAt: row.completedAt,
-                    partitionTime: row.partitionTime
+                    logicalDate: row.logicalDate
                 )
             }
         }
@@ -258,7 +265,7 @@ struct ScheduleRoutes {
             let body = try await req.decode(as: RunScheduleBody.self, context: ctx)
             let result = try await self.client.runScheduleSlot(
                 scheduleID: scheduleID,
-                partitionTime: body.partitionTime,
+                logicalDate: body.logicalDate,
                 allowOverwrite: body.allowOverwrite ?? false,
                 namespaceID: ctx.namespaceID
             )

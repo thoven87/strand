@@ -52,7 +52,7 @@ import Foundation
                         name: "iot-building",
                         namespace: "iot-demo",
                         workflows: [BuildingMonitorWorkflow.self, RoomMonitorWorkflow.self],
-                        activities: [ReadSensorsActivity(), SendAlertActivity()],
+                        activityContainers: [BuildingActivities()],
                         workflowConcurrency: 8,
                         activityConcurrency: 16,
                         pollInterval: .milliseconds(100)
@@ -101,7 +101,7 @@ import Foundation
                     try await Task.sleep(for: .seconds(9))
                     print("\nOps team: raising server-room temp ceiling after spike investigation")
                     try await handle.signal(
-                        name: RoomMonitorWorkflow.UpdateThresholds.signalName,
+                        BuildingMonitorWorkflow.UpdateThresholds.self,
                         payload: ThresholdUpdate(
                             newThresholds: RoomThresholds(
                                 maxTemperatureCelsius: 90.0,

@@ -89,7 +89,7 @@ struct ScheduleCalculatorTests {
 
     @Test("Handle daily schedule patterns")
     func testDailySchedulePattern() async throws {
-        let pattern = SchedulePattern.daily(offset: "PT9H")  // 9:00 AM daily
+        let pattern = SchedulePattern.daily(offset: ISO8601Duration(hours: 9))  // 9:00 AM daily
 
         let calendar = Calendar(identifier: .gregorian)
         var utcCalendar = calendar
@@ -116,7 +116,7 @@ struct ScheduleCalculatorTests {
 
     @Test("Test weekly schedule pattern")
     func testWeeklySchedulePattern() async throws {
-        let pattern = SchedulePattern.weekly(offset: "PT10H")  // Weekly at 10:00 AM
+        let pattern = SchedulePattern.weekly(offset: ISO8601Duration(hours: 10))  // Weekly at 10:00 AM
 
         // Start from a Friday
         let calendar = Calendar(identifier: .gregorian)
@@ -147,7 +147,7 @@ struct ScheduleCalculatorTests {
 
     @Test("Test monthly schedule pattern")
     func testMonthlySchedulePattern() async throws {
-        let pattern = SchedulePattern.monthly(offset: "PT12H")  // Monthly at noon
+        let pattern = SchedulePattern.monthly(offset: ISO8601Duration(hours: 12))  // Monthly at noon
 
         let calendar = Calendar(identifier: .gregorian)
         var utcCalendar = calendar
@@ -186,7 +186,7 @@ struct ScheduleCalculatorTests {
         let intervalNext = try validInterval.nextRunTime(after: Date())
         #expect(intervalNext != nil)
 
-        let validDaily = SchedulePattern.daily(offset: "PT9H")
+        let validDaily = SchedulePattern.daily(offset: ISO8601Duration(hours: 9))
         let dailyNext = try validDaily.nextRunTime(after: Date())
         #expect(dailyNext != nil)
 
@@ -197,7 +197,7 @@ struct ScheduleCalculatorTests {
     @Test("Test timezone handling")
     func testTimezoneHandling() async throws {
         let nyTimezone = TimeZone(identifier: "America/New_York")!
-        let pattern = SchedulePattern.daily(offset: "PT9H", timezone: nyTimezone)
+        let pattern = SchedulePattern.daily(offset: ISO8601Duration(hours: 9), timezone: nyTimezone)
 
         let utcDate = Date()
         let nextExecution = try pattern.nextRunTime(after: utcDate, timezone: nyTimezone)
@@ -253,7 +253,7 @@ struct ScheduleCalculatorTests {
     func testInterval90MinOffset45FromBefore() throws {
         // Bug: old code found boundary 1:30 then applied +45 min → 2:15, skipping 0:45.
         let from = Date(timeIntervalSince1970: 600)  // 00:10:00 UTC
-        let pattern = SchedulePattern.interval(.seconds(5400), offset: "PT45M")
+        let pattern = SchedulePattern.interval(.seconds(5400), offset: ISO8601Duration(minutes: 45))
         let next = try pattern.nextRunTime(after: from)
         #expect(next?.timeIntervalSince1970 == 2700, "expected 00:45:00 UTC (2700 s)")
     }
@@ -262,7 +262,7 @@ struct ScheduleCalculatorTests {
     func testInterval90MinOffset45FromSlot() throws {
         // From exactly the slot time, epsilon ensures we advance to the next slot.
         let from = Date(timeIntervalSince1970: 2700)  // 00:45:00 UTC
-        let pattern = SchedulePattern.interval(.seconds(5400), offset: "PT45M")
+        let pattern = SchedulePattern.interval(.seconds(5400), offset: ISO8601Duration(minutes: 45))
         let next = try pattern.nextRunTime(after: from)
         #expect(next?.timeIntervalSince1970 == 8100, "expected 02:15:00 UTC (8100 s)")
     }
@@ -281,7 +281,7 @@ struct ScheduleCalculatorTests {
     @Test("1h interval + PT45M offset: from 0:10 → 1:45")
     func testInterval1HourOffset45FromBefore() throws {
         let from = Date(timeIntervalSince1970: 600)  // 00:10:00 UTC
-        let pattern = SchedulePattern.interval(.seconds(3600), offset: "PT45M")
+        let pattern = SchedulePattern.interval(.seconds(3600), offset: ISO8601Duration(minutes: 45))
         let next = try pattern.nextRunTime(after: from)
         #expect(next?.timeIntervalSince1970 == 6300, "expected 01:45:00 UTC (6300 s)")
     }
@@ -289,36 +289,36 @@ struct ScheduleCalculatorTests {
     @Test("1h interval + PT45M offset: from 1:45 (on the slot) → 2:45")
     func testInterval1HourOffset45FromSlot() throws {
         let from = Date(timeIntervalSince1970: 6300)  // 01:45:00 UTC
-        let pattern = SchedulePattern.interval(.seconds(3600), offset: "PT45M")
+        let pattern = SchedulePattern.interval(.seconds(3600), offset: ISO8601Duration(minutes: 45))
         let next = try pattern.nextRunTime(after: from)
         #expect(next?.timeIntervalSince1970 == 9900, "expected 02:45:00 UTC (9900 s)")
     }
 
     @Test("Test partition offset calculation")
     func testPartitionOffsetCalculation() async throws {
-        let pattern = SchedulePattern.daily(offset: "PT9H")  // 9 AM daily
+        let pattern = SchedulePattern.daily(offset: ISO8601Duration(hours: 9))  // 9 AM daily
 
         let executionTime = Date()
         let partitionConfig = try PartitionOffsetConfig(offset: "PT0M")  // No partition offset
 
-        let partitionTime = try ScheduleCalculator.calculatePartitionTime(
+        let logicalDate = try ScheduleCalculator.calculateLogicalDate(
             executionTime: executionTime,
             schedule: pattern,
             partitionOffset: partitionConfig
         )
 
-        #expect(partitionTime <= executionTime)
+        #expect(logicalDate <= executionTime)
 
         // Test with 1-day partition offset (more significant difference)
         let offsetConfig = try PartitionOffsetConfig(offset: "P1D")
-        let offsetPartitionTime = try ScheduleCalculator.calculatePartitionTime(
+        let offsetLogicalDate = try ScheduleCalculator.calculateLogicalDate(
             executionTime: executionTime,
             schedule: pattern,
             partitionOffset: offsetConfig
         )
 
-        #expect(offsetPartitionTime != partitionTime)
-        #expect(offsetPartitionTime < partitionTime)  // Should be one day earlier
+        #expect(offsetLogicalDate != logicalDate)
+        #expect(offsetLogicalDate < logicalDate)  // Should be one day earlier
     }
 
     // MARK: - countSlots

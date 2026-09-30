@@ -55,7 +55,7 @@ public macro WorkflowSignal(name: String? = nil) =
 /// let status = try await handle.query(OrderWorkflow.GetStatus.self)
 /// ```
 @attached(peer, names: arbitrary)
-public macro WorkflowQuery() =
+public macro WorkflowQuery(name: String? = nil) =
     #externalMacro(module: "StrandMacrosPlugin", type: "WorkflowQueryMacro")
 
 // MARK: - @WorkflowUpdate
@@ -117,8 +117,8 @@ public macro WorkflowUpdate() =
 /// // }
 /// ```
 @attached(extension, conformances: Workflow, names: arbitrary)
-@attached(member, names: named(handleSignal), named(handleUpdate), named(init))
-public macro Workflow() =
+@attached(member, names: named(handleSignal), named(handleUpdate), named(init), named(Input), named(Output))
+public macro Workflow(name: String? = nil) =
     #externalMacro(module: "StrandMacrosPlugin", type: "WorkflowMacro")
 
 // MARK: - @ContainerActivity

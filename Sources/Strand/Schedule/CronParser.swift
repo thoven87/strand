@@ -204,8 +204,44 @@ public struct CronExpression: Sendable, CustomStringConvertible, Codable {
         let year: CronField?
     }
 
+    // MARK: - Alias expansion
+
+    /// Expands a standard cron alias (e.g. `@daily`) to its equivalent 5-field
+    /// cron expression.  Returns the original string unchanged for non-aliases.
+    static func expandAlias(_ expression: String) -> String {
+        switch expression.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "@yearly", "@annually": return "0 0 1 1 *"  // 1 Jan midnight
+        case "@monthly": return "0 0 1 * *"  // 1st of month midnight
+        case "@weekly": return "0 0 * * 0"  // Sunday midnight
+        case "@daily", "@midnight": return "0 0 * * *"  // midnight every day
+        case "@hourly": return "0 * * * *"  // top of every hour
+        case "@quarterly": return "0 0 1 */3 *"  // 1st of Jan/Apr/Jul/Oct (non-standard)
+        default: return expression
+        }
+    }
+
+    /// Returns the natural period-default partition offset for a well-known cron
+    /// alias, or `nil` for standard 5/6-field expressions.
+    ///
+    /// When a user writes `.cron("@daily")` without an explicit offset, the
+    /// scheduler applies this default so `logicalDate` equals the previous
+    /// period's start — matching the behaviour of the named `.daily(hour:)` factory.
+    static func defaultPartitionOffset(for expression: String) -> ISO8601Duration? {
+        switch expression.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "@yearly", "@annually": return ISO8601Duration(years: 1)  // P1Y
+        case "@monthly": return ISO8601Duration(months: 1)  // P1M
+        case "@weekly": return ISO8601Duration(days: 7)  // P1W
+        case "@daily", "@midnight": return ISO8601Duration(days: 1)  // P1D
+        case "@hourly": return ISO8601Duration(hours: 1)  // PT1H
+        case "@quarterly": return ISO8601Duration(months: 3)  // P3M
+        default: return nil
+        }
+    }
+
     private static func parseCronExpression(_ expression: String) throws -> ParsedCron {
-        let fields = expression.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+        // Expand well-known aliases before splitting into fields.
+        let expanded = expandAlias(expression)
+        let fields = expanded.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
 
         // Support both 5-field and 6-field cron expressions
         guard fields.count == 5 || fields.count == 6 else {

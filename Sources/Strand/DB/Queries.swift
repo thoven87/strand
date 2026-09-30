@@ -189,6 +189,7 @@ enum Queries {
         parentClosePolicy: ParentClosePolicy? = nil,
         rateLimitKey: String? = nil,
         rateLimitIntervalMs: Int? = nil,
+        rateLimitBurstSlots: Int = 0,
         description: String? = nil,
         logger: Logger
     ) async throws -> EnqueueRow {
@@ -250,6 +251,7 @@ enum Queries {
                         slotKeys: [rateLimitKey ?? taskName],
                         runIDs: [runID],
                         intervalMses: [intervalMs],
+                        burstSlotses: [rateLimitBurstSlots],
                         logger: logger
                     )
                 }
@@ -303,29 +305,33 @@ enum Queries {
     /// Used by both `enqueueTask` (N=1) and `enqueueChildTasksBatch` (N≥1);
     /// the same batch CTE handles both cases correctly.
     ///
-    /// **Algorithm** (three CTE steps):
+    /// **Algorithm** (four CTE steps):
     ///
     /// 1. `ranked` — `UNNEST … WITH ORDINALITY` assigns each run its position
     ///    (`rank 0…cnt-1`) within its `(queue, slot_key)` group.
     ///
-    /// 2. `advanced` — one upsert per distinct `(queue, slot_key)` advances the
-    ///    cursor by `cnt × interval`.  The INSERT seeds new buckets at
-    ///    `NOW() + cnt × I` (task 0 is immediately available).  The
-    ///    `ON CONFLICT` arm applies `GREATEST(cursor, NOW())` before advancing,
-    ///    resetting a stale cursor on an idle queue to `NOW()`.
+    /// 2. `pre` — snapshot of existing `burst_remaining` values before the
+    ///    upsert, used to compute the effective burst for each group in step 4.
+    ///    Cold buckets (no existing row) resolve to `burst_slots` from the parameter.
     ///
-    /// 3. Final `UPDATE` sets each run's `available_at` using closed-form offsets:
-    ///    `cursor − (cnt − rank) × I = base + rank × I`
-    ///    where `base = GREATEST(old_cursor, NOW())`.
+    /// 3. `advanced` — one upsert per distinct `(queue, slot_key)`.  Cold INSERT
+    ///    seeds `burst_remaining = burst_slots`.  Active ON CONFLICT UPDATE depletes
+    ///    `burst_remaining` before advancing the cursor.
+    ///
+    /// 4. Final `UPDATE` sets each run’s `available_at`: tasks with
+    ///    `rank < effective_burst` (cold: `burst_slots`; active: pre-upsert
+    ///    `burst_remaining`) get `NOW()`; the rest use the leaky-drip formula
+    ///    `cursor − (cnt − rank) × I`.  Also writes `rate_limit_slot_key`.
     ///
     /// - Parameters:
     ///   - queues:       Queue name for each run (`text[]`).
     ///   - slotKeys:     Rate-limit bucket key for each run (`text[]`).
     ///   - runIDs:       `strand.runs.id` for each run (`uuid[]`).
     ///   - intervalMses: Slot interval in milliseconds for each run (`int8[]`).
+    ///   - burstSlotses: Burst capacity for each run’s bucket (`int[]`). 0 = no burst.
     ///
-    /// All four arrays must be the same length and non-empty; the caller is
-    /// responsible for the guard (both call sites already check `!isEmpty`).
+    /// All five arrays must be the same length and non-empty; the caller is
+    /// responsible for the guard.
     static func applyRateLimitSlots(
         on conn: PostgresConnection,
         namespaceID: String,
@@ -333,6 +339,7 @@ enum Queries {
         slotKeys: [String],
         runIDs: [UUID],
         intervalMses: [Int],
+        burstSlotses: [Int],
         logger: Logger
     ) async throws {
         try await conn.query(
@@ -340,44 +347,111 @@ enum Queries {
             WITH
             ranked AS (
                 SELECT
-                    queue, slot_key, run_id, interval_ms,
+                    queue, slot_key, run_id, interval_ms, burst_slots,
                     (ROW_NUMBER() OVER (PARTITION BY queue, slot_key ORDER BY ord)
                      - 1)::int AS rank,
                     COUNT(*) OVER (PARTITION BY queue, slot_key)::int AS cnt
-                FROM UNNEST(\(queues), \(slotKeys), \(runIDs), \(intervalMses))
-                     WITH ORDINALITY AS t(queue, slot_key, run_id, interval_ms, ord)
+                FROM UNNEST(\(queues), \(slotKeys), \(runIDs), \(intervalMses), \(burstSlotses))
+                     WITH ORDINALITY AS t(queue, slot_key, run_id, interval_ms, burst_slots, ord)
+            ),
+            -- Snapshot burst_remaining before the upsert. Cold buckets (no existing
+            -- row) are absent here; the final UPDATE falls back to burst_slots.
+            pre AS MATERIALIZED (
+                SELECT rls.queue, rls.slot_key, rls.burst_remaining
+                FROM strand.rate_limit_slots rls
+                WHERE rls.namespace_id = \(namespaceID)
+                  AND EXISTS (
+                      SELECT 1 FROM ranked r
+                      WHERE r.queue = rls.queue AND r.slot_key = rls.slot_key
+                  )
             ),
             advanced AS (
                 INSERT INTO strand.rate_limit_slots
-                    (namespace_id, queue, slot_key, next_slot_at)
+                    (namespace_id, queue, slot_key, next_slot_at, burst_remaining)
                 SELECT DISTINCT ON (queue, slot_key)
                     \(namespaceID), queue, slot_key,
-                    NOW() + cnt * interval_ms * INTERVAL '1 millisecond'
+                    -- Cold: cursor = NOW() + max(0, cnt − burst_slots) × interval_ms
+                    NOW() + GREATEST(0, cnt - burst_slots) * interval_ms * INTERVAL '1 millisecond',
+                    -- Cold: seed burst_remaining, immediately depleted by this batch
+                    GREATEST(0, burst_slots - cnt)
                 FROM ranked
                 ORDER BY queue, slot_key
                 ON CONFLICT (namespace_id, queue, slot_key) DO UPDATE
-                    SET next_slot_at = GREATEST(
+                    -- Active: deplete burst_remaining first, advance cursor for remainder
+                    SET next_slot_at  = GREATEST(
                             strand.rate_limit_slots.next_slot_at, NOW()
-                        ) + (
-                            SELECT r2.cnt * r2.interval_ms FROM ranked r2
+                        ) + GREATEST(0, (
+                            SELECT r2.cnt FROM ranked r2
                             WHERE  r2.queue    = excluded.queue
                               AND  r2.slot_key = excluded.slot_key
                             LIMIT  1
-                        ) * INTERVAL '1 millisecond'
+                        ) - strand.rate_limit_slots.burst_remaining) * (
+                            SELECT r2.interval_ms FROM ranked r2
+                            WHERE  r2.queue    = excluded.queue
+                              AND  r2.slot_key = excluded.slot_key
+                            LIMIT  1
+                        ) * INTERVAL '1 millisecond',
+                        burst_remaining = GREATEST(
+                            0,
+                            strand.rate_limit_slots.burst_remaining - (
+                                SELECT r2.cnt FROM ranked r2
+                                WHERE  r2.queue    = excluded.queue
+                                  AND  r2.slot_key = excluded.slot_key
+                                LIMIT  1
+                            )
+                        )
                 RETURNING queue, slot_key, next_slot_at AS cursor
             )
             UPDATE strand.runs
             SET    available_at = GREATEST(
                        available_at,
-                       a.cursor
-                           - (r.cnt - r.rank) * r.interval_ms
-                           * INTERVAL '1 millisecond'
-                   )
+                       CASE
+                           -- Burst window: immediate dispatch for tasks within effective_burst.
+                           -- Cold bucket (no pre row): effective_burst = burst_slots.
+                           -- Active bucket (pre row exists): effective_burst = pre.burst_remaining.
+                           WHEN r.rank < COALESCE(p.burst_remaining, r.burst_slots)
+                           THEN NOW()
+                           ELSE a.cursor
+                                - (r.cnt - r.rank) * r.interval_ms
+                                * INTERVAL '1 millisecond'
+                       END
+                   ),
+                   rate_limit_slot_key = r.slot_key
             FROM   ranked r
+            LEFT JOIN pre p
+                   ON  p.queue    = r.queue
+                   AND p.slot_key = r.slot_key
             JOIN   advanced a
                    ON  a.queue    = r.queue
                    AND a.slot_key = r.slot_key
             WHERE  strand.runs.id = r.run_id
+            """,
+            logger: logger
+        )
+    }
+
+    /// Advances the rate-limit cursor for a given bucket, delaying subsequent
+    /// tasks until `duration` after the current cursor.
+    ///
+    /// Called by `ActivityContext.bumpRateLimit(by:)` when the activity receives
+    /// a 429 or similar back-pressure signal, so peer tasks queued in the same
+    /// bucket are not dispatched until the bumped time.
+    static func bumpRateLimitCursor(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        queue: String,
+        slotKey: String,
+        by duration: Duration,
+        logger: Logger
+    ) async throws {
+        try await postgres.query(
+            """
+            UPDATE strand.rate_limit_slots
+               SET next_slot_at = GREATEST(next_slot_at, NOW())
+                                + \(Int(duration.milliseconds)) * INTERVAL '1 millisecond'
+             WHERE namespace_id = \(namespaceID)
+               AND queue        = \(queue)
+               AND slot_key     = \(slotKey)
             """,
             logger: logger
         )
@@ -416,6 +490,9 @@ enum Queries {
         /// Rate-limit slot key.  `nil` falls back to `taskName` in the SQL.
         /// Set to `"ActivityName:entityKey"` for per-entity buckets.
         let rateLimitKey: String?
+        /// Number of burst slots for this child’s rate-limit bucket.
+        /// 0 = no burst.  Only meaningful when `rateLimitIntervalMs` is non-nil.
+        let rateLimitBurstSlots: Int
         /// Optional human-readable label set via `ActivityOptions.description`.
         let description: String?
     }
@@ -463,6 +540,7 @@ enum Queries {
         kind: TaskKind,
         rateLimitKey: String?,
         rateLimitIntervalMs: Int?,
+        rateLimitBurstSlots: Int = 0,
         description: String? = nil,
         logger: Logger
     ) async throws -> [EnqueueRow] {
@@ -533,7 +611,7 @@ enum Queries {
             }
             taskInterp.appendLiteral(
                 " ON CONFLICT (namespace_id, queue, idempotency_key)"
-                + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+                    + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
             )
             // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
             // silently discards conflicts, so only genuinely new task IDs are returned.
@@ -605,6 +683,7 @@ enum Queries {
                 let rlSlotKeys = Array(repeating: rateLimitKey ?? taskName, count: newItems.count)
                 let rlRunIDs = newItems.map { $0.runID }
                 let rlIntervalMses = Array(repeating: intervalMs, count: newItems.count)
+                let rlBurstSlotses = Array(repeating: rateLimitBurstSlots, count: newItems.count)
                 try await applyRateLimitSlots(
                     on: conn,
                     namespaceID: namespaceID,
@@ -612,6 +691,7 @@ enum Queries {
                     slotKeys: rlSlotKeys,
                     runIDs: rlRunIDs,
                     intervalMses: rlIntervalMses,
+                    burstSlotses: rlBurstSlotses,
                     logger: logger
                 )
             }
@@ -774,7 +854,7 @@ enum Queries {
             }
             taskInterp.appendLiteral(
                 " ON CONFLICT (namespace_id, queue, idempotency_key)"
-                + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+                    + " WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
             )
             // RETURNING id gives us the inserted rows directly — ON CONFLICT DO NOTHING
             // silently discards conflicts, so only genuinely new task IDs are returned.
@@ -852,11 +932,13 @@ enum Queries {
             var rlSlotKeys: [String] = []
             var rlRunIDs: [UUID] = []
             var rlIntervalMses: [Int] = []
+            var rlBurstSlotses: [Int] = []
             for child in newChildren where child.rateLimitIntervalMs != nil {
                 rlQueues.append(child.queue)
                 rlSlotKeys.append(child.rateLimitKey ?? child.taskName)
                 rlRunIDs.append(child.runID)
                 rlIntervalMses.append(child.rateLimitIntervalMs!)
+                rlBurstSlotses.append(child.rateLimitBurstSlots)
             }
             if !rlRunIDs.isEmpty {
                 try await applyRateLimitSlots(
@@ -866,6 +948,7 @@ enum Queries {
                     slotKeys: rlSlotKeys,
                     runIDs: rlRunIDs,
                     intervalMses: rlIntervalMses,
+                    burstSlotses: rlBurstSlotses,
                     logger: logger
                 )
             }
@@ -1120,7 +1203,7 @@ enum Queries {
                 FROM candidate c WHERE r.id = c.id
                 RETURNING r.id, r.task_id, r.attempt, r.version, r.wake_event, r.event_payload,
                           r.available_at, r.heartbeat_details, c.fairness_key, c.fairness_weight,
-                          r.infra_failure_count
+                          r.infra_failure_count, r.rate_limit_slot_key
             ),
             task_upd AS (
                 UPDATE strand.tasks t
@@ -1162,7 +1245,7 @@ enum Queries {
                    c.wake_event, c.event_payload,
                    t.parent_task_id, t.kind, t.timeout_seconds, t.heartbeat_timeout_seconds,
                    t.scheduling_metadata, c.available_at, c.heartbeat_details, t.deadline_at,
-                   t.first_task_id, t.cancel_requested, c.infra_failure_count
+                   t.first_task_id, t.cancel_requested, c.infra_failure_count, c.rate_limit_slot_key
             FROM claimed c
             JOIN strand.tasks t ON t.id = c.task_id,
             advance   -- cross-join forces advance CTE to execute even when claimed is non-empty
@@ -3229,13 +3312,18 @@ enum Queries {
             --    Every sentinel on this parent encodes to the same fixed byte
             --    sequence, so a direct value match is sufficient — no need to
             --    parse the idempotency key to recover the seq_num.
-            --    (Not needed when resetHistory=true: retryTask calls
-            --    clearWorkflowArtefacts which wipes all parent checkpoints.)
+            --
+            --    Always run this regardless of resetHistory.  When resetHistory=true,
+            --    retryTask also calls clearWorkflowArtefacts which wipes *all* parent
+            --    checkpoints — re-deleting already-gone rows is a no-op, and running
+            --    this step unconditionally eliminates a transactional gap: if
+            --    retryTask (Transaction 2) fails after resetChildTasks (Transaction 1)
+            --    commits, the children are PENDING but the sentinels are already gone,
+            --    so a subsequent requeueTask call can recover cleanly.
             del_parent_sentinels AS (
                 DELETE FROM strand.checkpoints
                 WHERE  task_id      = \(rootTaskID)
                   AND  namespace_id = \(namespaceID)
-                  AND  NOT \(resetHistory)
                   AND  state        = \(sentinelBuf)
             )
             SELECT DISTINCT queue FROM new_runs
@@ -3363,8 +3451,11 @@ enum Queries {
     // MARK: - Re-run (COMPLETED tasks)
 
     /// Creates a fresh new task from an existing COMPLETED one, copying its
-    /// name, queue, params, priority, and kind. The original task is unchanged.
+    /// name, queue, params, priority, kind, and schedule_id. The original task is unchanged.
     /// Use this when the user wants to re-run a workflow that already succeeded.
+    ///
+    /// `schedule_id` is preserved so the re-run task appears in the schedule's run
+    /// history and partition grid instead of becoming an orphan.
     static func reRunTask(
         on client: PostgresClient,
         namespaceID: String,
@@ -3376,7 +3467,7 @@ enum Queries {
             let src = try await conn.query(
                 """
                 SELECT name, queue, params, headers, scheduling_metadata, retry_strategy, max_attempts,
-                       cancellation, priority, fairness_key, fairness_weight, kind
+                       cancellation, priority, fairness_key, fairness_weight, kind, schedule_id
                 FROM strand.tasks WHERE id = \(taskID) AND state = \(TaskState.completed)
                   AND namespace_id = \(namespaceID)
                 FOR UPDATE
@@ -3401,6 +3492,7 @@ enum Queries {
             let fairnessKey = try col.next()!.decode(String?.self, context: .default)
             let fairnessWeight = try col.next()!.decode(Double.self, context: .default)
             let kind = try col.next()!.decode(TaskKind.self, context: .default)
+            let scheduleID = try col.next()!.decode(UUID?.self, context: .default)
 
             let newTaskID = UUID.v7()
             let newRunID = UUID.v7()
@@ -3413,11 +3505,11 @@ enum Queries {
                 INSERT INTO strand.tasks
                     (id, namespace_id, queue, name, params, headers, scheduling_metadata,
                      retry_strategy, max_attempts, cancellation, priority, fairness_key,
-                     fairness_weight, kind, state)
+                     fairness_weight, kind, state, schedule_id)
                 VALUES (\(newTaskID), \(namespaceID), \(queue), \(name), \(params),
                         \(headers), \(schedulingMetadata), \(retryStrategy), \(maxAttempts),
                         \(cancellation), \(priority), \(fairnessKey), \(fairnessWeight),
-                        \(kind), \(TaskState.pending))
+                        \(kind), \(TaskState.pending), \(scheduleID))
                 """,
                 logger: logger
             )
@@ -3484,7 +3576,17 @@ enum Queries {
             ins_completion AS (
                 INSERT INTO strand.task_completions (namespace_id, task_id, state, result)
                 VALUES (\(namespaceID), \(taskID), \(state), \(resultBuffer))
-                ON CONFLICT (task_id) DO NOTHING
+                ON CONFLICT (task_id) DO UPDATE
+                    SET state        = EXCLUDED.state,
+                        result       = EXCLUDED.result,
+                        completed_at = NOW()
+                -- Allow a successful manual retry to overwrite a terminal failure.
+                -- In normal flow this conflict never fires (each task completes once).
+                -- When an operator retries an activity that hit maxAttempts, the new
+                -- COMPLETED signal must win so the parent workflow sees the success on
+                -- its next activation instead of replaying the stale FAILED sentinel.
+                WHERE strand.task_completions.state IN (\(TaskState.failed), \(TaskState.cancelled))
+                  AND EXCLUDED.state = \(TaskState.completed)
             ),
             flag_running AS (
                 -- Parent is RUNNING (mid-activation): set has_buffered_completion so

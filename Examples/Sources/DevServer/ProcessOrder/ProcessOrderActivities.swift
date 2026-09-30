@@ -134,7 +134,7 @@ struct ProcessOrderActivities {
     func sendConfirmation(
         input: SendConfirmationInput,
         context: ActivityContext
-    ) async throws -> StrandVoid {
+    ) async throws {
         try await Task.sleep(for: .milliseconds(Int.random(in: 300...700)))
         if Double.random(in: 0...1) < 0.08 {
             struct Err: Error, CustomStringConvertible {
@@ -143,6 +143,5 @@ struct ProcessOrderActivities {
             }
             throw Err(to: input.customerEmail)
         }
-        return StrandVoid()
     }
 }

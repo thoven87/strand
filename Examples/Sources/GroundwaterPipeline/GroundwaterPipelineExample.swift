@@ -57,7 +57,7 @@ import Foundation
         // use; reference them here just to trigger eager initialisation so they
         // appear in the startup banner below.
         let downloadRPS = CNRA.cnraDownloadRPS
-        let ollamaRPS   = CNRA.ollamaRPS
+        let ollamaRPS = CNRA.ollamaRPS
         // RESUME_ONLY=true: start workers to continue existing in-flight
         // pipelines without spawning a new one. Use after a crash or Ctrl+C.
         let resumeOnly = (env["RESUME_ONLY"] ?? "false").lowercased() == "true"

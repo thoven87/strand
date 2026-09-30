@@ -71,7 +71,7 @@ extension WorkflowRegistrable {
 /// ```
 public protocol Workflow: WorkflowRegistrable, Codable & Sendable {
     associatedtype Input: Codable & Sendable
-    associatedtype Output: Codable & Sendable
+    associatedtype Output: Sendable
 
     /// Creates a workflow instance in its initial state.
     ///
@@ -110,6 +110,7 @@ public protocol Workflow: WorkflowRegistrable, Codable & Sendable {
         correlationID: String,
         payload: ByteBuffer?
     ) throws -> ByteBuffer?
+
 }
 
 extension Workflow {
@@ -143,7 +144,7 @@ extension Workflow {
         from buffer: ByteBuffer?
     ) throws -> T? {
         guard let buf = buffer else { return nil }
-        return try JSON.decode(type, from: buf)
+        return try _StrandCodecContext.codec.decode(type, from: buf)
     }
 
 }
@@ -316,9 +317,9 @@ public func == <Root, Value: Codable & Sendable>(
 ///
 ///     // Manual equivalent of @WorkflowSignal
 ///     struct Pause: WorkflowSignal {
-///         typealias Input = StrandVoid
+///         typealias Input = Void
 ///         typealias W     = OrderWorkflow
-///         static func apply(to workflow: inout OrderWorkflow, input: StrandVoid) {
+///         static func apply(to workflow: inout OrderWorkflow, input: Void) {
 ///             workflow.isPaused = true
 ///         }
 ///     }
@@ -327,7 +328,7 @@ public func == <Root, Value: Codable & Sendable>(
 ///     // generates this automatically.
 ///     mutating func handleSignal(name: String, payload: ByteBuffer?) throws {
 ///         if name == Pause.signalName {
-///             Pause.apply(to: &self, input: .done)
+///             Pause.apply(to: &self, input: ())
 ///         }
 ///     }
 /// }
@@ -335,12 +336,13 @@ public func == <Root, Value: Codable & Sendable>(
 /// // Type-safe call site:
 /// try await handle.signal(OrderWorkflow.Pause.self)
 /// ```
+@_documentation(visibility: internal)
 public protocol WorkflowSignal {
     /// The workflow type that owns this signal.
     associatedtype W: Workflow
 
-    /// Payload type. Use `StrandVoid` for no-payload signals.
-    associatedtype Input: Codable & Sendable
+    /// Payload type. Use `Void` for no-payload signals.
+    associatedtype Input: Sendable
 
     /// Signal name used for dispatch. Defaults to the type name lowercased.
     static var signalName: String { get }
@@ -380,13 +382,24 @@ extension WorkflowSignal {
 ///
 /// Queries are **read-only** and execute synchronously against the last persisted
 /// state in `strand.workflow_state`. They never create a new workflow activation.
+@_documentation(visibility: internal)
 public protocol WorkflowQuery: Sendable {
     /// The workflow type this query belongs to.
     associatedtype W: Workflow
     /// The value returned by the query.
     associatedtype Output: Sendable
+    /// Wire name used for display and introspection. Defaults to the struct name
+    /// with the first letter lowercased (e.g. `GetStatus` → `"getStatus"`).
+    static var queryName: String { get }
     /// Evaluates the query against a snapshot of the workflow state.
     static func run(workflow: W) throws -> Output
+}
+
+extension WorkflowQuery {
+    public static var queryName: String {
+        let s = String(describing: Self.self)
+        return s.prefix(1).lowercased() + s.dropFirst()
+    }
 }
 
 // MARK: - WorkflowUpdateDefinition
@@ -416,13 +429,14 @@ public protocol WorkflowQuery: Sendable {
 /// // Call site:
 /// let msg = try await handle.executeUpdate(OrderWorkflow.SetPriority.self, payload: "expedited")
 /// ```
+@_documentation(visibility: internal)
 public protocol WorkflowUpdateDefinition {
     /// The workflow type that owns this update.
     associatedtype W: Workflow
     /// Input type. Must be `Codable & Sendable`.
     associatedtype Input: Codable & Sendable
-    /// Output type. Must be `Codable & Sendable`.
-    associatedtype Output: Codable & Sendable
+    /// Output type.
+    associatedtype Output: Sendable
     /// Update name used for dispatch. Defaults to the function name (camelCase).
     static var updateName: String { get }
     /// Applies the update to the workflow struct and returns a result.
@@ -457,10 +471,10 @@ public struct WorkflowUpdateError: Error, LocalizedError, Sendable {
 /// Only macro-generated code should call these methods directly.
 public enum _StrandCoder {
     public static func decode<T: Decodable & Sendable>(_ type: T.Type, from buf: ByteBuffer) throws -> T {
-        try JSON.decode(type, from: buf)
+        try _StrandCodecContext.codec.decode(type, from: buf)
     }
     public static func encode<T: Encodable & Sendable>(_ value: T) throws -> ByteBuffer {
-        try JSON.encode(value)
+        try _StrandCodecContext.codec.encode(value)
     }
 }
 
@@ -478,6 +492,7 @@ public enum _StrandCoder {
 ///     }
 /// }
 /// ```
+@_documentation(visibility: internal)
 public protocol ActivityContainerProtocol: Sendable {
     var activities: [any Activity] { get }
 }
@@ -553,6 +568,11 @@ public struct WorkflowOptions: Sendable {
     /// dashboard.  Stored in the `strand.tasks.description` column; `nil` stores nothing.
     public var description: String?
 
+    /// Optional rate limit applied when this workflow is started.
+    /// Useful when many workflows are started in a batch and you want to
+    /// control the enqueue rate (e.g. max 10 workflow starts per second).
+    public var rateLimit: RateLimit?
+
     public init(
         id: String? = nil,
         queue: String? = nil,
@@ -564,7 +584,8 @@ public struct WorkflowOptions: Sendable {
         fairnessKey: String? = nil,
         fairnessWeight: Double = 1.0,
         maxDuration: Duration? = nil,
-        description: String? = nil
+        description: String? = nil,
+        rateLimit: RateLimit? = nil
     ) {
         self.id = id
         self.queue = queue
@@ -577,6 +598,7 @@ public struct WorkflowOptions: Sendable {
         self.fairnessWeight = max(fairnessWeight, 0.001)
         self.maxDuration = maxDuration
         self.description = description
+        self.rateLimit = rateLimit
     }
 }
 

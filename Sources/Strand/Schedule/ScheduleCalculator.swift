@@ -1,8 +1,8 @@
 #if canImport(FoundationEssentials)
 public import FoundationEssentials
 import Foundation  // needed for (FormatStyle, Calendar)
-                   // + (String(format:), CharacterSet) not in FoundationEssentials
-                   // TODO: revisit this in the future
+// + (String(format:), CharacterSet) not in FoundationEssentials
+// TODO: revisit this in the future
 #else
 public import Foundation
 #endif
@@ -48,99 +48,42 @@ public struct ScheduleCalculator {
         case .timetable:
             return nil
         case .daily(let offset, let tz):
-            // Parse offset to extract hour and minute; forward the pattern timezone
-            // so day-boundary extraction uses UTC (or whatever the schedule specifies)
-            // rather than the server's local system timezone.
-            do {
-                let duration = try ISO8601Duration(offset)
-                let totalMinutes = duration.hours * 60 + duration.minutes
-                let hour = (totalMinutes / 60) % 24
-                let minute = totalMinutes % 60
-                return calculateDailyScheduledTime(
-                    hour: hour,
-                    minute: minute,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            } catch {
-                return calculateDailyScheduledTime(
-                    hour: 0,
-                    minute: 0,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            }
+            // offset is already a parsed ISO8601Duration — extract hour/minute directly.
+            let totalMinutes = offset.hours * 60 + offset.minutes
+            return calculateDailyScheduledTime(
+                hour: (totalMinutes / 60) % 24,
+                minute: totalMinutes % 60,
+                executionTime: executionTime,
+                timezone: tz
+            )
         case .weekly(let offset, let tz):
-            do {
-                let duration = try ISO8601Duration(offset)
-                let totalMinutes = duration.days * 24 * 60 + duration.hours * 60 + duration.minutes
-                let dayOfWeek = (totalMinutes / (24 * 60)) % 7
-                let remainingMinutes = totalMinutes % (24 * 60)
-                let hour = remainingMinutes / 60
-                let minute = remainingMinutes % 60
-                return calculateWeeklyScheduledTime(
-                    dayOfWeek: dayOfWeek,
-                    hour: hour,
-                    minute: minute,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            } catch {
-                return calculateWeeklyScheduledTime(
-                    dayOfWeek: 0,
-                    hour: 0,
-                    minute: 0,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            }
+            let totalMinutes = offset.days * 24 * 60 + offset.hours * 60 + offset.minutes
+            let dayOfWeek = (totalMinutes / (24 * 60)) % 7
+            let remainingMinutes = totalMinutes % (24 * 60)
+            return calculateWeeklyScheduledTime(
+                dayOfWeek: dayOfWeek,
+                hour: remainingMinutes / 60,
+                minute: remainingMinutes % 60,
+                executionTime: executionTime,
+                timezone: tz
+            )
         case .monthly(let offset, let tz):
-            do {
-                let duration = try ISO8601Duration(offset)
-                let day = duration.days + 1  // 1-indexed
-                let hour = duration.hours
-                let minute = duration.minutes
-                return calculateMonthlyScheduledTime(
-                    day: day,
-                    hour: hour,
-                    minute: minute,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            } catch {
-                return calculateMonthlyScheduledTime(
-                    day: 1,
-                    hour: 0,
-                    minute: 0,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            }
+            return calculateMonthlyScheduledTime(
+                day: offset.days + 1,  // 1-indexed
+                hour: offset.hours,
+                minute: offset.minutes,
+                executionTime: executionTime,
+                timezone: tz
+            )
         case .yearly(let offset, let tz):
-            do {
-                let duration = try ISO8601Duration(offset)
-                let month = duration.months + 1
-                let day = duration.days + 1
-                let hour = duration.hours
-                let minute = duration.minutes
-                return calculateYearlyScheduledTime(
-                    month: month,
-                    day: day,
-                    hour: hour,
-                    minute: minute,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            } catch {
-                return calculateYearlyScheduledTime(
-                    month: 1,
-                    day: 1,
-                    hour: 0,
-                    minute: 0,
-                    executionTime: executionTime,
-                    timezone: tz
-                )
-            }
+            return calculateYearlyScheduledTime(
+                month: offset.months + 1,
+                day: offset.days + 1,
+                hour: offset.hours,
+                minute: offset.minutes,
+                executionTime: executionTime,
+                timezone: tz
+            )
         }
     }
 
@@ -400,58 +343,28 @@ public struct ScheduleCalculator {
     /// Validate that a schedule configuration is valid
     public static func validateSchedule(_ schedule: SchedulePattern, now: Date = .now) throws {
         switch schedule {
-        case .cron(let expression, let offset, _):
+        case .cron(let expression, _, _):
             guard !expression.isEmpty else {
                 throw SchedulingError.invalidSchedule("Cron expression cannot be empty")
             }
-            try validateOffset(offset)
             // Try to parse the cron expression to ensure it's valid
             _ = try CronExpression(expression)
-        case .daily(let offset, _):
-            try validateOffset(offset)
-        case .weekly(let offset, _):
-            try validateOffset(offset)
-        case .monthly(let offset, _):
-            try validateOffset(offset)
-        case .yearly(let offset, _):
-            try validateOffset(offset)
-        case .interval(let duration, let offset, _):
+        case .daily, .weekly, .monthly, .yearly:
+            break  // offset is already a validated ISO8601Duration
+        case .interval(let duration, _, _):
             guard duration.components.seconds > 0 else {
                 throw SchedulingError.invalidSchedule("Interval must be greater than 0 seconds")
             }
-            try validateOffset(offset)
-        case .once(let date, let offset, _):
+        case .once(let date, _, _):
             guard date > now else {
                 throw SchedulingError.invalidSchedule("One-time schedule must be in the future")
             }
-            try validateOffset(offset)
         case .timetable:
             break  // timetable schedules are always valid (logic lives in the StrandTimeTable instance)
         }
 
         // Try to calculate a next run time to validate the schedule works
         _ = try nextRunTime(for: schedule, after: now, timezone: TimeZone(identifier: "UTC")!)
-    }
-
-    /// Validate that an offset string is valid
-    private static func validateOffset(_ offset: String) throws {
-        guard !offset.isEmpty else {
-            throw SchedulingError.invalidSchedule("Offset cannot be empty")
-        }
-
-        // Basic ISO 8601 duration format validation
-        guard offset.hasPrefix("P") || offset.hasPrefix("PT") else {
-            throw SchedulingError.invalidSchedule(
-                "Offset must be in ISO 8601 duration format (e.g., PT2H, P1D)"
-            )
-        }
-
-        // Try to parse the offset to ensure it's valid
-        do {
-            _ = try ISO8601Duration(offset)
-        } catch {
-            throw SchedulingError.invalidSchedule("Invalid offset format: \(offset)")
-        }
     }
 
     /// Get a human-readable description of when a schedule will next run
@@ -481,9 +394,9 @@ public struct ScheduleCalculator {
         }
     }
 
-    /// Calculate partition time for a given execution time and schedule
+    /// Calculate logical date for a given execution time and schedule
     ///
-    /// **Partition Time Logic:**
+    /// **Logical Date Logic:**
     /// - Daily jobs process previous day's data (midnight to midnight)
     /// - Hourly jobs process previous hour's data
     /// - Weekly jobs process previous week's data
@@ -492,14 +405,14 @@ public struct ScheduleCalculator {
     /// **Example:**
     /// ```swift
     /// let config = PartitionOffsetConfig(offset: ISO8601Duration(days: 1, hours: 2))
-    /// let partitionTime = try scheduler.calculatePartitionTime(
+    /// let logicalDate = try ScheduleCalculator.calculateLogicalDate(
     ///     executionTime: Date(), // 2017-06-30T02:00
     ///     schedule: .daily(hour: 2, minute: 0),
     ///     partitionOffset: config
     /// )
     /// // Result: 2017-06-29T00:00 (midnight of previous day)
     /// ```
-    public static func calculatePartitionTime(
+    public static func calculateLogicalDate(
         executionTime: Date,
         schedule: SchedulePattern,
         partitionOffset: PartitionOffsetConfig
@@ -507,20 +420,20 @@ public struct ScheduleCalculator {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = partitionOffset.timezone
 
-        // Calculate partition time based on schedule type and offset
-        let partitionTime = try calculatePartitionTime(
+        // Calculate logical date based on schedule type and offset
+        let logicalDate = try calculateLogicalDate(
             executionTime: executionTime,
             schedule: schedule,
             partitionOffset: partitionOffset,
             calendar: calendar
         )
 
-        return partitionTime
+        return logicalDate
     }
 
-    /// Calculate partition time for a given execution time
+    /// Calculate logical date for a given execution time
     /// This determines the data period that the job should process
-    private static func calculatePartitionTime(
+    private static func calculateLogicalDate(
         executionTime: Date,
         schedule: SchedulePattern,
         partitionOffset: PartitionOffsetConfig,
@@ -532,15 +445,15 @@ public struct ScheduleCalculator {
         switch schedule {
         case .daily(_, _):
             // For daily schedules, apply partition offset to get the data period
-            // Example: Job runs 2017-06-30T02:00 with PT0M -> partition time is 2017-06-29T00:00
-            // Example: Job runs 2017-06-30T02:00 with P1D -> partition time is 2017-06-28T00:00
-            let basePartitionTime = partitionOffset.offset.subtract(
+            // Example: Job runs 2017-06-30T02:00 with PT0M -> logical date is 2017-06-29T00:00
+            // Example: Job runs 2017-06-30T02:00 with P1D -> logical date is 2017-06-28T00:00
+            let baseLogicalDate = partitionOffset.offset.subtract(
                 from: executionTime,
                 calendar: utcCalendar
             )
             let dayComponents = utcCalendar.dateComponents(
                 [.year, .month, .day],
-                from: basePartitionTime
+                from: baseLogicalDate
             )
             guard let result = utcCalendar.date(from: dayComponents) else {
                 throw SchedulingError.invalidSchedule(
@@ -551,13 +464,13 @@ public struct ScheduleCalculator {
 
         case .weekly(_, _):
             // For weekly schedules, apply partition offset then get start of that week
-            let basePartitionTime = partitionOffset.offset.subtract(
+            let baseLogicalDate = partitionOffset.offset.subtract(
                 from: executionTime,
                 calendar: utcCalendar
             )
             let weekComponents = utcCalendar.dateComponents(
                 [.yearForWeekOfYear, .weekOfYear],
-                from: basePartitionTime
+                from: baseLogicalDate
             )
             var startOfWeek = weekComponents
             startOfWeek.weekday = 1  // Sunday
@@ -573,13 +486,13 @@ public struct ScheduleCalculator {
 
         case .monthly(_, _):
             // For monthly schedules, apply partition offset then get start of that month
-            let basePartitionTime = partitionOffset.offset.subtract(
+            let baseLogicalDate = partitionOffset.offset.subtract(
                 from: executionTime,
                 calendar: utcCalendar
             )
             let monthComponents = utcCalendar.dateComponents(
                 [.year, .month],
-                from: basePartitionTime
+                from: baseLogicalDate
             )
             var startOfMonth = monthComponents
             startOfMonth.day = 1
@@ -595,19 +508,33 @@ public struct ScheduleCalculator {
 
         case .interval(let duration, _, _):
             // For interval schedules, apply partition offset then round to interval boundary
-            let basePartitionTime = partitionOffset.offset.subtract(
+            let baseLogicalDate = partitionOffset.offset.subtract(
                 from: executionTime,
                 calendar: utcCalendar
             )
             let intervalSeconds = duration.components.seconds
             // Round down to the nearest interval boundary
             let intervalsSinceEpoch = Int(
-                basePartitionTime.timeIntervalSince1970 / Double(intervalSeconds)
+                baseLogicalDate.timeIntervalSince1970 / Double(intervalSeconds)
             )
             return Date(timeIntervalSince1970: Double(intervalsSinceEpoch * Int(intervalSeconds)))
 
-        case .cron(_, _, _), .once(_, _, _), .yearly(_, _):
-            // For cron, once, and yearly schedules, use simple offset subtraction if available
+        case .cron(let expression, let storedOffset, _):
+            // For well-known aliases (@daily, @weekly, @monthly, @yearly, @hourly,
+            // @quarterly) with no explicit stored offset, apply the alias's natural
+            // period default so logicalDate equals the previous period's start.
+            // An explicit stored offset always takes priority.
+            let effectiveOffset: ISO8601Duration
+            if storedOffset.isZero,
+                let aliasDefault = CronExpression.defaultPartitionOffset(for: expression)
+            {
+                effectiveOffset = aliasDefault
+            } else {
+                effectiveOffset = partitionOffset.offset
+            }
+            return effectiveOffset.subtract(from: executionTime, calendar: utcCalendar)
+
+        case .once(_, _, _), .yearly(_, _):
             return partitionOffset.offset.subtract(from: executionTime, calendar: utcCalendar)
         case .timetable:
             // Timetable schedules don't have partition offset support; return execution time as-is.
@@ -615,22 +542,24 @@ public struct ScheduleCalculator {
         }
     }
 
-    /// Get default partition offset for well-known schedules
-    /// These offsets determine the data period that recurring jobs should process
-    /// - Daily jobs process previous day's data (midnight to midnight)
-    /// - Hourly jobs process previous hour's data
-    /// - Weekly jobs process previous week's data
-    /// - Monthly jobs process previous month's data
+    /// Returns the natural period-default partition offset for a well-known named schedule.
+    ///
+    /// The period default ensures `logicalDate` equals the **start of the completed
+    /// period**, not the period the job fires in.  A daily job running at 2 AM sees
+    /// yesterday's midnight; a weekly job on Monday sees the previous Sunday midnight.
+    ///
+    /// > Note: The static factory methods `SchedulePattern.daily(hour:)`,
+    /// > `.weekly(on:hour:)`, `.monthly(day:hour:)`, `.yearly(month:day:hour:)`, and
+    /// > `.hourly(minute:)` already bake this offset into the stored `offset` component.
+    /// > This function is useful when inspecting a raw enum case whose offset was
+    /// > supplied directly (e.g. from the database) and you need the period default.
     public static func getDefaultPartitionOffset(for schedule: SchedulePattern) -> ISO8601Duration? {
         switch schedule {
-        case .daily(_, _):
-            return .oneDay  // P1D - daily jobs process previous day's data
-        case .weekly(_, _):
-            return ISO8601Duration(days: 7)  // P7D - weekly jobs process previous week's data
-        case .monthly(_, _):
-            return .oneMonth  // P1M - monthly jobs process previous month's data
+        case .daily: return ISO8601Duration(days: 1)  // P1D
+        case .weekly: return ISO8601Duration(days: 7)  // P1W
+        case .monthly: return ISO8601Duration(months: 1)  // P1M
+        case .yearly: return ISO8601Duration(years: 1)  // P1Y
         case .interval(let duration, _, _):
-            // For intervals, offset by one interval period to process previous period's data
             let seconds = duration.components.seconds
             if seconds >= 3600 {
                 return ISO8601Duration(hours: Int(seconds / 3600))
@@ -639,8 +568,8 @@ public struct ScheduleCalculator {
             } else {
                 return ISO8601Duration(seconds: Int(seconds))
             }
-        case .cron(_, _, _), .once(_, _, _), .yearly(_, _), .timetable:
-            return nil  // No default offset for cron/once/yearly/timetable schedules
+        case .cron, .once, .timetable:
+            return nil  // Raw cron/once schedules carry no implicit period default.
         }
     }
 }

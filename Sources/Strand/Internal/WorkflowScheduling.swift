@@ -262,7 +262,7 @@ extension WorkflowRegistration {
             // Handler completed — persist final state and return the encoded result.
             // The caller (runTask) writes COMPLETED to the run.
             teardownHandler(cache: cache, taskID: claimed.taskID, handlerTask: handlerTask, executor: executor, activation: activation)
-            let finalStateBuf = try JSON.encode(stateBox.value)
+            let finalStateBuf = try exec.options.codec.encode(stateBox.value)
             try await WorkflowStateQueries.saveState(
                 on: exec.postgres,
                 taskID: claimed.taskID,
@@ -272,7 +272,7 @@ extension WorkflowRegistration {
             )
             record(.workflowCompleted, nil)
             try await flushWrites()
-            return try JSON.encode(output)
+            return try _encodeOutput(output, codec: exec.options.codec)
 
         case .failure(let error):
             // InternalError.cancelled is the internal suspension signal — not a real failure.
@@ -426,6 +426,7 @@ extension WorkflowRegistration {
                             kind: .activity,
                             rateLimitIntervalMs: rlParams?.intervalMs,
                             rateLimitKey: rlParams?.slotKey,
+                            rateLimitBurstSlots: rlParams?.burstSlots ?? 0,
                             description: options.description
                         )
                     )
@@ -696,6 +697,7 @@ extension WorkflowRegistration {
                             kind: .workflow,
                             rateLimitIntervalMs: nil,
                             rateLimitKey: nil,
+                            rateLimitBurstSlots: 0,
                             description: nil
                         )
                     )

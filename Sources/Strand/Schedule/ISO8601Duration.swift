@@ -9,7 +9,7 @@ public import Foundation
 
 /// ISO 8601 Duration parser for partition offsets
 /// Supports durations like: P1D, PT1H, P1DT2H, PT30M, P1Y2M3DT4H5M6S
-public struct ISO8601Duration: Codable, Sendable, Equatable {
+public struct ISO8601Duration: Codable, Sendable, Equatable, Hashable, CustomStringConvertible, ExpressibleByStringLiteral {
     public let years: Int
     public let months: Int
     public let days: Int
@@ -33,8 +33,19 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
         self.seconds = seconds
     }
 
-    /// Parse ISO 8601 duration string (e.g., "P1DT2H", "PT1H", "P1D")
-    public init(_ string: String) throws {
+    /// Parses an ISO 8601 duration string (e.g. `"P1DT2H"`, `"PT1H"`, `"P1D"`).
+    ///
+    /// Use this for **runtime-provided** strings (user input, config files, DB values).
+    /// For compile-time string literals use `ExpressibleByStringLiteral` coercion:
+    ///
+    /// ```swift
+    /// // Runtime string — throws on invalid input:
+    /// let d = try ISO8601Duration(parsing: userInput)
+    ///
+    /// // Compile-time literal — traps on invalid input (acceptable for constants):
+    /// let offset: ISO8601Duration = "P1DT2H"
+    /// ```
+    public init(parsing string: String) throws {
         let duration = try Self.parse(string)
         self.years = duration.years
         self.months = duration.months
@@ -179,7 +190,10 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
         return calendar.date(byAdding: components, to: date) ?? date
     }
 
-    /// Get human-readable description
+    // MARK: - CustomStringConvertible
+
+    /// ISO 8601 representation (e.g. `"P1DT2H"`, `"PT30M"`).
+    /// Zero duration serialises as `"P0D"`.
     public var description: String {
         var parts: [String] = []
 
@@ -209,7 +223,63 @@ public struct ISO8601Duration: Codable, Sendable, Equatable {
         return c
     }()
 
-    /// Common duration shortcuts
+    // MARK: - ExpressibleByStringLiteral
+
+    /// Initialises from a compile-time ISO 8601 string literal.
+    ///
+    /// Traps on invalid input — string literals are compile-time constants, so a
+    /// bad value is caught immediately in development or CI, not silently in
+    /// production with user data.
+    ///
+    /// ```swift
+    /// let offset: ISO8601Duration = "P1DT2H"   // ✓
+    /// let bad:    ISO8601Duration = "P1DX"     // ✗ fatal error at launch
+    /// ```
+    ///
+    /// For runtime strings use `init(parsing:)` which throws instead.
+    public init(stringLiteral value: StringLiteralType) {
+        // Using `init(parsing:)` instead of `init(_ string:)` avoids the
+        // overload-resolution ambiguity that caused Swift to silently pick this
+        // non-throwing path even when the call site wrote `try ISO8601Duration("...")`.
+        self = try! ISO8601Duration(parsing: value)  // swiftlint:disable:this force_try
+    }
+
+    // MARK: - Zero and helpers
+
+    /// A duration of zero (identity element for `+`).
+    public static let zero = ISO8601Duration()
+
+    /// `true` when all components are 0.
+    public var isZero: Bool {
+        years == 0 && months == 0 && days == 0
+            && hours == 0 && minutes == 0 && seconds == 0
+    }
+
+    // MARK: - Convenience factories
+
+    public static func years(_ n: Int) -> ISO8601Duration { ISO8601Duration(years: n) }
+    public static func months(_ n: Int) -> ISO8601Duration { ISO8601Duration(months: n) }
+    public static func days(_ n: Int) -> ISO8601Duration { ISO8601Duration(days: n) }
+    public static func hours(_ n: Int) -> ISO8601Duration { ISO8601Duration(hours: n) }
+    public static func minutes(_ n: Int) -> ISO8601Duration { ISO8601Duration(minutes: n) }
+    public static func seconds(_ n: Int) -> ISO8601Duration { ISO8601Duration(seconds: n) }
+
+    // MARK: - Arithmetic
+
+    /// Combines two durations by summing each component.
+    public static func + (lhs: ISO8601Duration, rhs: ISO8601Duration) -> ISO8601Duration {
+        ISO8601Duration(
+            years: lhs.years + rhs.years,
+            months: lhs.months + rhs.months,
+            days: lhs.days + rhs.days,
+            hours: lhs.hours + rhs.hours,
+            minutes: lhs.minutes + rhs.minutes,
+            seconds: lhs.seconds + rhs.seconds
+        )
+    }
+
+    // MARK: - Common shortcuts
+
     public static let oneHour = ISO8601Duration(hours: 1)
     public static let oneDay = ISO8601Duration(days: 1)
     public static let oneWeek = ISO8601Duration(days: 7)

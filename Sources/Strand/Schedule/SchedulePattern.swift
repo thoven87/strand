@@ -7,17 +7,17 @@ public import Foundation
 
 /// Core schedule enumeration supporting various scheduling patterns
 public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
-    case cron(String, offset: String = "PT0M", timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case cron(String, offset: ISO8601Duration = .zero, timezone: TimeZone = TimeZone(identifier: "UTC")!)
     case interval(
         Duration,
-        offset: String = "PT0M",
+        offset: ISO8601Duration = .zero,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     )
-    case daily(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
-    case weekly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
-    case monthly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
-    case yearly(offset: String = "PT0H", timezone: TimeZone = TimeZone(identifier: "UTC")!)
-    case once(at: Date, offset: String = "PT0M", timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case daily(offset: ISO8601Duration = .zero, timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case weekly(offset: ISO8601Duration = .zero, timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case monthly(offset: ISO8601Duration = .zero, timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case yearly(offset: ISO8601Duration = .zero, timezone: TimeZone = TimeZone(identifier: "UTC")!)
+    case once(at: Date, offset: ISO8601Duration = .zero, timezone: TimeZone = TimeZone(identifier: "UTC")!)
     /// A fully custom schedule driven by a ``StrandTimeTable`` implementation.
     ///
     /// The `description` string is stored in the database and shown in the
@@ -57,15 +57,12 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             let cronExpr = try CronExpression(expression)
             return try cronExpr.nextRunTime(after: date, in: scheduleTimezone)
 
-        case .interval(let duration, let offset, let scheduleTimezone):
+        case .interval(let duration, let scheduleOffset, let scheduleTimezone):
             // For intervals, align to calendar boundaries then apply the schedule offset.
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = scheduleTimezone
 
             let seconds = duration.components.seconds
-
-            // Parse the schedule offset
-            let scheduleOffset = try ISO8601Duration(offset)
 
             // For common intervals, align to natural boundaries in the specified timezone
             if seconds == 3600 {  // 1 hour
@@ -174,7 +171,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
     /// Helper methods for offset-based schedule calculations
     private func calculateDailyNextRunTime(
-        offset: String,
+        offset: ISO8601Duration,
         after date: Date,
         timezone: TimeZone
     )
@@ -182,8 +179,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timezone
-        let duration = try ISO8601Duration(offset)
-        let totalMinutes = duration.days * 24 * 60 + duration.hours * 60 + duration.minutes
+        let totalMinutes = offset.days * 24 * 60 + offset.hours * 60 + offset.minutes
         var comps = DateComponents()
         comps.hour = (totalMinutes / 60) % 24
         comps.minute = totalMinutes % 60
@@ -192,7 +188,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     }
 
     private func calculateWeeklyNextRunTime(
-        offset: String,
+        offset: ISO8601Duration,
         after date: Date,
         timezone: TimeZone
     )
@@ -200,8 +196,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timezone
-        let duration = try ISO8601Duration(offset)
-        let totalMinutes = duration.days * 24 * 60 + duration.hours * 60 + duration.minutes
+        let totalMinutes = offset.days * 24 * 60 + offset.hours * 60 + offset.minutes
         let dayIndex = (totalMinutes / (24 * 60)) % 7
         let calWeekday = dayIndex == 0 ? 7 : dayIndex  // 0→Sat(7), 1→Sun(1) … 6→Fri(6)
         let remainingMins = totalMinutes % (24 * 60)
@@ -214,7 +209,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     }
 
     private func calculateMonthlyNextRunTime(
-        offset: String,
+        offset: ISO8601Duration,
         after date: Date,
         timezone: TimeZone
     )
@@ -222,30 +217,28 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
     {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timezone
-        let duration = try ISO8601Duration(offset)
         var comps = DateComponents()
-        comps.day = duration.days + 1  // P0D → day 1, P14D → day 15
-        comps.hour = duration.hours
-        comps.minute = duration.minutes
+        comps.day = offset.days + 1  // P0D → day 1, P14D → day 15
+        comps.hour = offset.hours
+        comps.minute = offset.minutes
         comps.second = 0
         return cal.nextDate(after: date, matching: comps, matchingPolicy: .nextTime)
     }
 
     private func calculateYearlyNextRunTime(
-        offset: String,
+        offset: ISO8601Duration,
         after date: Date,
         timezone: TimeZone
     ) throws -> Date? {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timezone
-        let duration = try ISO8601Duration(offset)
-        let month = duration.months + 1  // 0-indexed → 1-indexed Calendar month
-        let day = duration.days + 1  // 0-indexed → 1-indexed Calendar day
+        let month = offset.months + 1  // 0-indexed → 1-indexed Calendar month
+        let day = offset.days + 1  // 0-indexed → 1-indexed Calendar day
         var comps = DateComponents()
         comps.month = month
         comps.day = day
-        comps.hour = duration.hours
-        comps.minute = duration.minutes
+        comps.hour = offset.hours
+        comps.minute = offset.minutes
         comps.second = 0
         return cal.nextDate(after: date, matching: comps, matchingPolicy: .nextTime)
     }
@@ -267,24 +260,21 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
 
         switch self {
         case .cron(let expression, let offset, let timezone):
-            let offsetDesc = (offset == "PT0M" || offset == "PT0H") ? "" : " offset \(offset)"
+            let offsetDesc = offset.isZero ? "" : " offset \(offset)"
             return "Cron \(expression)\(offsetDesc)\(tzSuffix(timezone))"
 
         case .interval(let duration, let offset, let timezone):
-            let offsetDesc = (offset == "PT0M" || offset == "PT0H") ? "" : " offset \(offset)"
+            let offsetDesc = offset.isZero ? "" : " offset \(offset)"
             return "Every \(duration.humanReadable)\(offsetDesc)\(tzSuffix(timezone))"
 
         case .daily(let offset, let timezone):
-            // offset encodes the time-of-day: PT15M = 00:15, PT9H = 09:00.
-            guard let d = try? ISO8601Duration(offset) else { return "Daily (offset: \(offset))" }
-            let totalMin = d.hours * 60 + d.minutes
+            // offset encodes the time-of-day: hours=9, minutes=0 → 09:00.
+            let totalMin = offset.hours * 60 + offset.minutes
             return "Daily at \(hhmm(totalMin / 60, totalMin % 60))\(tzSuffix(timezone))"
 
         case .weekly(let offset, let timezone):
-            // offset encodes weekday + time: P6DT9H = Calendar weekday 6 (Friday) at 09:00.
-            // days component is a Calendar weekday index (1=Sun … 7=Sat).
-            guard let d = try? ISO8601Duration(offset) else { return "Weekly (offset: \(offset))" }
-            let totalMin = d.days * 24 * 60 + d.hours * 60 + d.minutes
+            // offset encodes weekday + time: days=5 (Friday), hours=9 → Friday 09:00.
+            let totalMin = offset.days * 24 * 60 + offset.hours * 60 + offset.minutes
             let dayIndex = (totalMin / (24 * 60)) % 7  // 0–6
             let weekday = dayIndex == 0 ? 7 : dayIndex  // Calendar weekday 1–7
             let timeMin = totalMin % (24 * 60)
@@ -296,10 +286,9 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             return "Every \(day) at \(hhmm(timeMin / 60, timeMin % 60))\(tzSuffix(timezone))"
 
         case .monthly(let offset, let timezone):
-            // offset encodes day-of-month + time: P0D = day 1, P14D = day 15.
-            guard let d = try? ISO8601Duration(offset) else { return "Monthly (offset: \(offset))" }
-            let dayOfMonth = d.days + 1  // 1-indexed
-            let timeMin = d.hours * 60 + d.minutes
+            // offset encodes day-of-month + time: days=0 → day 1, days=14 → day 15.
+            let dayOfMonth = offset.days + 1  // 1-indexed
+            let timeMin = offset.hours * 60 + offset.minutes
             let suffix: String
             switch dayOfMonth {
             case 1: suffix = "st"
@@ -311,16 +300,13 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
                 "Monthly on the \(dayOfMonth)\(suffix) at \(hhmm(timeMin / 60, timeMin % 60))\(tzSuffix(timezone))"
 
         case .yearly(let offset, let timezone):
-            guard let d = try? ISO8601Duration(offset) else {
-                return "Yearly (offset: \(offset))\(tzSuffix(timezone))"
-            }
             let monthNames = [
                 "January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November", "December",
             ]
-            let monthIdx = max(0, min(d.months, 11))
-            let dayOfMonth = d.days + 1
-            let timeMin = d.hours * 60 + d.minutes
+            let monthIdx = max(0, min(offset.months, 11))
+            let dayOfMonth = offset.days + 1
+            let timeMin = offset.hours * 60 + offset.minutes
             let suffix: String
             switch dayOfMonth {
             case 1: suffix = "st"
@@ -365,7 +351,7 @@ public enum SchedulePattern: Sendable, Codable, Equatable, Hashable {
             .monthly(let offset, _),
             .yearly(let offset, _),
             .once(_, let offset, _):
-            return offset != "PT0M" && offset != "PT0H" ? offset : nil
+            return offset.isZero ? nil : offset.description
         case .timetable:
             return nil
         }
@@ -631,30 +617,77 @@ extension SchedulePattern {
         return .cron("\(m) * * * *", timezone: timezone)
     }
 
+    // MARK: - Hourly
+
+    /// Fires once per hour at the specified minute past the hour.
+    ///
+    /// `logicalDate` is the **previous hour's UTC start** — the top of the hour
+    /// that just completed.  Use it to scope queries to the last hour's data:
+    ///
+    /// ```swift
+    /// // Fires at :00 of every hour (01:00, 02:00, …).
+    /// // context.schedulingMetadata?.logicalDate == previous hour T:00:00Z
+    /// .hourly()
+    ///
+    /// // Fires at :30 past every hour.
+    /// .hourly(minute: 30)
+    /// ```
+    public static func hourly(
+        minute: Int = 0,
+        timezone: TimeZone = TimeZone(identifier: "UTC")!
+    ) -> SchedulePattern {
+        // PT1H (period default) + PT{minute}M (intra-hour fire time).
+        // calculateDailyNextRunTime absorbs PT1H via (totalMinutes / 60) % 24
+        // — but hourly schedules use .interval(.hours(1)) internally, not .daily.
+        // Use a 1-hour interval so the partition offset machinery for .interval
+        // correctly rounds to the previous hour boundary.
+        .interval(.seconds(3600), offset: ISO8601Duration(hours: 1, minutes: minute), timezone: timezone)
+    }
+
     // MARK: - Daily
 
     /// Fires every day at the specified hour and minute.
     ///
+    /// `logicalDate` (available via ``WorkflowContext/schedulingMetadata``) is the
+    /// **previous day's UTC midnight** — the start of the completed day, not the day
+    /// the job runs on.  Use it to scope queries to yesterday's data without
+    /// computing offsets inside the workflow:
+    ///
     /// ```swift
-    /// .daily(hour: 9, minute: 30)    // 09:30 UTC every day
-    /// .daily(hour: 0, timezone: .init(identifier: "America/New_York")!)
+    /// // Fires at 02:00 UTC every day.
+    /// // context.schedulingMetadata?.logicalDate == yesterday T00:00:00Z
+    /// .daily(hour: 2)
+    ///
+    /// // Same, but fires at 09:30 Eastern time.
+    /// .daily(hour: 9, minute: 30, timezone: .et)
     /// ```
     public static func daily(
         hour: Int,
         minute: Int = 0,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> SchedulePattern {
-        let offset = minute == 0 ? "PT\(hour)H" : "PT\(hour)H\(minute)M"
-        return .daily(offset: offset, timezone: timezone)
+        // P1D (period default) + PT{hour}H{minute}M (intra-day fire time).
+        // calculateDailyNextRunTime absorbs P1D via (totalMinutes / 60) % 24 so
+        // the fire time stays at `hour:minute`.  The full subtraction crosses into
+        // the previous day before being truncated to midnight.
+        .daily(offset: ISO8601Duration(days: 1, hours: hour, minutes: minute), timezone: timezone)
     }
 
     // MARK: Weekly
 
     /// Fires once per week on the specified day at the specified hour and minute.
     ///
+    /// `logicalDate` is the **previous week's UTC Sunday midnight** — the start
+    /// of the week that just completed.  Use it to scope queries to last week's
+    /// data without computing offsets inside the workflow:
+    ///
     /// ```swift
-    /// .weekly(on: .monday, hour: 9)             // Monday 09:00 UTC
-    /// .weekly(on: .friday, hour: 17, minute: 30) // Friday 17:30 UTC
+    /// // Fires every Monday at 09:00 UTC.
+    /// // context.schedulingMetadata?.logicalDate == previous Sunday T00:00:00Z
+    /// .weekly(on: .monday, hour: 9)
+    ///
+    /// // Same, but fires Friday at 17:30 Eastern.
+    /// .weekly(on: .friday, hour: 17, minute: 30, timezone: .et)
     /// ```
     public static func weekly(
         on day: Weekday,
@@ -662,9 +695,14 @@ extension SchedulePattern {
         minute: Int = 0,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> SchedulePattern {
-        let d = day.rawValue  // matches the internal P{n}D dayIndex encoding
-        let offset = minute == 0 ? "P\(d)DT\(hour)H" : "P\(d)DT\(hour)H\(minute)M"
-        return .weekly(offset: offset, timezone: timezone)
+        // P7D (period default) + P{day}DT{hour}H{minute}M (intra-week fire time).
+        // calculateWeeklyNextRunTime absorbs P7D via dayIndex % 7, so the fire
+        // weekday is unchanged.  The full offset crosses into the previous week
+        // before truncating to its Sunday midnight.
+        .weekly(
+            offset: ISO8601Duration(days: 7 + day.rawValue, hours: hour, minutes: minute),
+            timezone: timezone
+        )
     }
 
     // MARK: Monthly
@@ -673,9 +711,17 @@ extension SchedulePattern {
     ///
     /// `day` is 1-indexed (1 = first of month, 28 = 28th of month).
     ///
+    /// `logicalDate` is the **previous month's UTC first-of-month midnight** — the
+    /// start of the month that just completed.  Use it to scope queries to last
+    /// month's data:
+    ///
     /// ```swift
-    /// .monthly(day: 1, hour: 0)          // 1st of each month at midnight UTC
-    /// .monthly(day: 15, hour: 10, minute: 30) // 15th of each month at 10:30 UTC
+    /// // Fires on the 1st at midnight UTC.
+    /// // context.schedulingMetadata?.logicalDate == previous month's T00:00:00Z
+    /// .monthly(day: 1, hour: 0)
+    ///
+    /// // Fires on the 15th at 10:30 UTC; same logicalDate convention.
+    /// .monthly(day: 15, hour: 10, minute: 30)
     /// ```
     public static func monthly(
         day: Int,
@@ -683,9 +729,14 @@ extension SchedulePattern {
         minute: Int = 0,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> SchedulePattern {
-        let d = day - 1  // convert 1-indexed day to 0-indexed P{n}D offset
-        let offset = minute == 0 ? "P\(d)DT\(hour)H" : "P\(d)DT\(hour)H\(minute)M"
-        return .monthly(offset: offset, timezone: timezone)
+        // P1M (period default) + P{day-1}DT{hour}H{minute}M (intra-month fire time).
+        // calculateMonthlyNextRunTime ignores the months component (uses offset.days + 1
+        // for the calendar day), so the fire day is still `day`.  The full offset
+        // crosses into the previous month before truncating to its first-of-month midnight.
+        .monthly(
+            offset: ISO8601Duration(months: 1, days: day - 1, hours: hour, minutes: minute),
+            timezone: timezone
+        )
     }
 
     // MARK: Yearly
@@ -711,9 +762,14 @@ extension SchedulePattern {
         minute: Int = 0,
         timezone: TimeZone = TimeZone(identifier: "UTC")!
     ) -> SchedulePattern {
-        let m = month.rawValue - 1  // Month.rawValue is 1-indexed; P{m}M is 0-indexed
-        let d = day - 1  // day is 1-indexed; P{d}D is 0-indexed
-        let offset = minute == 0 ? "P\(m)M\(d)DT\(hour)H" : "P\(m)M\(d)DT\(hour)H\(minute)M"
-        return .yearly(offset: offset, timezone: timezone)
+        // P1Y (period default) + P{month-1}M{day-1}DT{hour}H{minute}M (within-year
+        // fire time).  calculateYearlyNextRunTime ignores offset.years and uses
+        // offset.months+1 / offset.days+1 for the calendar month/day, so the fire
+        // date is unchanged.  The full offset crosses into the previous year before
+        // the partition truncates to its start (Jan 1 T00:00:00Z).
+        .yearly(
+            offset: ISO8601Duration(years: 1, months: month.rawValue - 1, days: day - 1, hours: hour, minutes: minute),
+            timezone: timezone
+        )
     }
 }

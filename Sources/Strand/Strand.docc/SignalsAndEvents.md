@@ -16,7 +16,14 @@ Use `@WorkflowSignal` on a `mutating func` inside a `@Workflow` struct. The
 @Workflow
 struct OrderWorkflow {
     var isPaused = false
-    var priority = "standard"
+    enum Priority {
+        highest = 1
+        higher = 2
+        standard = 3
+        low = 4
+        lowest = 5
+    }
+    var priority: Priority = .standard
 
     @WorkflowSignal mutating func pause()          { isPaused = true  }
     @WorkflowSignal mutating func resume()         { isPaused = false }
@@ -34,7 +41,7 @@ Send a signal from your application:
 ```swift
 try await handle.signal(OrderWorkflow.Pause.self)           // no payload
 try await handle.signal(OrderWorkflow.SetPriority.self,
-                         payload: "expedited")               // typed payload
+                         payload: .expedited.)               // typed payload
 ```
 
 The signal name defaults to the function name (camelCase): `"pause"`, `"setPriority"`.
@@ -52,12 +59,25 @@ validation error). Use `@WorkflowUpdate` on a `mutating func(input:) throws -> O
 ```swift
 @Workflow
 struct OrderWorkflow {
-    var priority = "standard"
-    var currentState = "processing"
+    enum Priority {
+        highest = 1
+        higher = 2
+        standard = 3
+        low = 4
+        lowest = 5
+    }
+    var priority: Priority = .standard
+    enum OrderState {
+        pending
+        processing
+        shipped
+        cancelled
+    }
+    var currentState: OrderState = .processing
 
     @WorkflowUpdate
     mutating func setPriority(input: String) throws -> String {
-        guard currentState != "shipping" else {
+        guard currentState != .shipping else {
             throw WorkflowUpdateError("Cannot change priority after shipping has started")
         }
         let old = priority
@@ -71,21 +91,49 @@ Await the result from your application:
 
 ```swift
 let message = try await handle.update(OrderWorkflow.SetPriority.self,
-                                       payload: "expedited")
+                                       payload: .expedited)
 print(message)  // "Priority changed from standard to expedited"
+```
+
+### Void-returning updates
+
+When the update performs a side effect and the caller needs no return value,
+omit the return type entirely. The macro handles the Void mapping; callers receive no return value:
+
+```swift
+@WorkflowUpdate
+mutating func markAsReviewed(input: ReviewerID) throws {
+    guard !isLocked else { throw WorkflowUpdateError("already locked") }
+    reviewers.append(input)
+    // no return statement needed
+}
+```
+
+```swift
+try await handle.update(OrderWorkflow.MarkAsReviewed.self, payload: reviewerID)
+// result is discarded — the update has no meaningful return value
 ```
 
 ## Queries — read-only state inspection
 
 A **query** reads the last persisted workflow state without blocking or
-activating the workflow. Use `@WorkflowQuery` on a no-parameter function that
-returns a value:
+activating the workflow.
+
+### Function queries
+
+Use `@WorkflowQuery` on a no-parameter function that returns a value:
 
 ```swift
 @Workflow
 struct OrderWorkflow {
     var isPaused = false
-    var currentState = "processing"
+    enum OrderState {
+        pending
+        processing
+        shipped
+        cancelled
+    }
+    var currentState: OrderState = .processing
 
     struct OrderStatus: Codable, Sendable {
         let isPaused: Bool
@@ -99,12 +147,40 @@ struct OrderWorkflow {
 }
 ```
 
-Read the state from your application:
+### Property queries
+
+Apply `@WorkflowQuery` directly to a stored property for zero-boilerplate
+read access:
+
+```swift
+@Workflow
+struct OrderWorkflow {
+    enum OrderState {
+        pending
+        processing
+        shipped
+        cancelled
+    }
+    @WorkflowQuery var currentState: OrderState = .processing
+    @WorkflowQuery var itemCount: Int = 0
+}
+```
+
+Both forms are called identically from the client:
 
 ```swift
 let status = try await handle.query(OrderWorkflow.GetStatus.self)
-print(status.isPaused)      // false
-print(status.currentState)  // "processing"
+let state  = try await handle.query(OrderWorkflow.CurrentState.self)
+```
+
+### Custom query names
+
+Override the default wire name (camelCase function or property name) with
+`@WorkflowQuery(name:)`:
+
+```swift
+@WorkflowQuery(name: "order-status")
+func getStatus() -> OrderStatus { ... }
 ```
 
 Queries read from `strand.workflow_state` — the last snapshot saved when signals

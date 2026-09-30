@@ -3,14 +3,15 @@ import SwiftSyntaxMacros
 
 // MARK: - WorkflowSignalMacro
 
-/// PeerMacro: applied to a `mutating func` inside a workflow struct.
+/// PeerMacro: applied to a `mutating func` inside a `@Workflow` struct.
 ///
 /// For a 0-parameter signal `@WorkflowSignal mutating func pause()` it generates:
 /// ```swift
 /// struct Pause: WorkflowSignal {
 ///     typealias W = OwningWorkflow
-///     typealias Input = StrandVoid
-///     static func apply(to w: inout OwningWorkflow, input: StrandVoid) {
+///     typealias Input = Void
+///     static var signalName: String { "pause" }
+///     static func apply(to w: inout OwningWorkflow, input: Void) {
 ///         w.pause()
 ///     }
 /// }
@@ -21,11 +22,14 @@ import SwiftSyntaxMacros
 /// struct SetPriority: WorkflowSignal {
 ///     typealias W = OwningWorkflow
 ///     typealias Input = Priority
+///     static var signalName: String { "setPriority" }
 ///     static func apply(to w: inout OwningWorkflow, input: Priority) {
 ///         w.setPriority(input)
 ///     }
 /// }
 /// ```
+///
+/// The generated struct carries the same access modifier as the annotated function.
 public struct WorkflowSignalMacro: PeerMacro {
 
     public static func expansion(
@@ -34,12 +38,11 @@ public struct WorkflowSignalMacro: PeerMacro {
         in context: some MacroExpansionContext
     ) throws -> [DeclSyntax] {
 
-        // --- Validate: must be a function declaration ---
         guard let funcDecl = declaration.as(FunctionDeclSyntax.self) else {
             throw MacroError("@WorkflowSignal must be applied to a mutating func, not \(declaration.kind)")
         }
 
-        // --- Find enclosing struct name ---
+        // Find the enclosing struct to derive the parent type name.
         var parentName: String? = nil
         for contextNode in context.lexicalContext {
             if let structDecl = contextNode.as(StructDeclSyntax.self) {
@@ -55,88 +58,65 @@ public struct WorkflowSignalMacro: PeerMacro {
         let structName = funcName.prefix(1).uppercased() + funcName.dropFirst()
         let params = Array(funcDecl.signature.parameterClause.parameters)
 
-        // --- Validate: 0 or 1 parameter only ---
-        if params.count > 1 {
+        guard params.count <= 1 else {
             throw MacroError(
                 "@WorkflowSignal function must have 0 or 1 parameters, got \(params.count)"
             )
         }
 
-        // --- Extract optional custom signal name: @WorkflowSignal(name: "my-name") ---
-        var customSignalName: String? = nil
-        if let arguments = node.arguments,
-            case .argumentList(let argList) = arguments
-        {
-            for arg in argList {
-                if arg.label?.text == "name",
-                    let strLit = arg.expression.as(StringLiteralExprSyntax.self),
-                    let segment = strLit.segments.first?.as(StringSegmentSyntax.self)
-                {
-                    customSignalName = segment.content.text
-                }
-            }
-        }
+        let customSignalName = stringLiteralArg(named: "name", from: node)
+        let access = leadingAccessModifier(from: funcDecl.modifiers)
 
-        // --- Generate the nested struct ---
         return [
             generateStruct(
                 structName: structName,
                 parentName: parentName,
                 funcName: funcName,
                 params: params,
-                customSignalName: customSignalName
+                customSignalName: customSignalName,
+                access: access
             )
         ]
     }
 
-    // MARK: - Code generation helpers
+    // MARK: - Code generation
 
     private static func generateStruct(
         structName: String,
         parentName: String,
         funcName: String,
         params: [FunctionParameterSyntax],
-        customSignalName: String?
+        customSignalName: String?,
+        access: String
     ) -> DeclSyntax {
-        // The wire name: explicit @WorkflowSignal(name:) wins; otherwise the
-        // function name (camelCase) is used — e.g. `func setPriority` → "setPriority".
-        // Callers never need (name:) to get a readable wire name.
         let wireName = customSignalName ?? funcName
 
         if params.isEmpty {
-            // 0-parameter signal — Input = StrandVoid
             return """
-                struct \(raw: structName): WorkflowSignal {
-                    typealias W = \(raw: parentName)
-                    typealias Input = StrandVoid
-                    static var signalName: String { \(literal: wireName) }
-                    static func apply(to w: inout \(raw: parentName), input: StrandVoid) {
+                \(raw: access)struct \(raw: structName): WorkflowSignal {
+                    \(raw: access)typealias W = \(raw: parentName)
+                    \(raw: access)typealias Input = Void
+                    \(raw: access)static var signalName: String { \(literal: wireName) }
+                    \(raw: access)static func apply(to w: inout \(raw: parentName), input: Void) {
                         w.\(raw: funcName)()
                     }
                 }
                 """
         } else {
-            // 1-parameter signal — Input = first parameter's type
             let param = params[0]
             let paramType = param.type.trimmedDescription
             let firstName = param.firstName.text
-
-            // Determine the call-site label:
-            //   _ p: T  → w.func(input)
-            //   label p: T → w.func(label: input)
-            let callSite: String
-            if firstName == "_" {
-                callSite = "w.\(funcName)(input)"
-            } else {
-                callSite = "w.\(funcName)(\(firstName): input)"
-            }
+            let callSite =
+                firstName == "_"
+                ? "w.\(funcName)(input)"
+                : "w.\(funcName)(\(firstName): input)"
 
             return """
-                struct \(raw: structName): WorkflowSignal {
-                    typealias W = \(raw: parentName)
-                    typealias Input = \(raw: paramType)
-                    static var signalName: String { \(literal: wireName) }
-                    static func apply(to w: inout \(raw: parentName), input: \(raw: paramType)) {
+                \(raw: access)struct \(raw: structName): WorkflowSignal {
+                    \(raw: access)typealias W = \(raw: parentName)
+                    \(raw: access)typealias Input = \(raw: paramType)
+                    \(raw: access)static var signalName: String { \(literal: wireName) }
+                    \(raw: access)static func apply(to w: inout \(raw: parentName), input: \(raw: paramType)) {
                         \(raw: callSite)
                     }
                 }
