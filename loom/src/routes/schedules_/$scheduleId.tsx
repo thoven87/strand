@@ -358,7 +358,7 @@ function RunDialog({
             }
             setError(null);
             return runSchedulePartition(namespace, scheduleId, {
-                partitionTime: pt.toISOString(),
+                logicalDate: pt.toISOString(),
                 allowOverwrite,
             });
         },

@@ -116,8 +116,9 @@ export interface TaskDetail {
         scheduleName: string | null;
         scheduleId: string | null;
         executionTime: string;
-        partitionTime: string | null;
-        /** ISO 8601 offset string from the pattern, e.g. "PT15M". null when offset is zero. */
+        /** Canonical logical/partition date for this scheduled slot (e.g. the Friday for a weekly payroll run). */
+        logicalDate: string | null;
+        /** ISO 8601 offset string from the schedule pattern, e.g. "P3DT15H". null when offset is zero. */
         scheduleOffset: string | null;
     } | null;
 }

@@ -206,40 +206,43 @@ export function PartitionGrid({
     const { uniqueSlots, uniqueDates, grid, columnTotals } = useMemo(() => {
         // ── Canonical slot derivation ─────────────────────────────────────────────
         //
-        // Priority 1 — partitionTime of actual runs.
-        // The scheduler writes partitionTime into scheduling_metadata for every
+        // Priority 1 — logicalDate of actual runs.
+        // The scheduler writes logicalDate into scheduling_metadata for every
         // slot it fires. For schedules with a partition offset (e.g. P1DT2H),
-        // partitionTime.slot ≠ upcoming fire-time.slot:
+        // logicalDate.slot ≠ upcoming fire-time.slot:
         //
         //   cron "0 2 * * *" ET  + offset P1DT2H
         //   fire time:      2026-09-22 06:00 UTC  → slot "06:00"
-        //   partitionTime:  2026-09-21 04:00 UTC  → slot "04:00"
+        //   logicalDate:    2026-09-21 04:00 UTC  → slot "04:00"
         //
         // If we used upcoming fire times as canonical, the "04:00" runs would be
         // filtered out and all such cells would show MISSING. By preferring
-        // partitionTime we get the true partition-period column set.
+        // logicalDate we get the true partition-period column set.
         //
-        // Priority 2 — upcoming fire times (no runs have partitionTime yet, e.g.
+        // Priority 2 — upcoming fire times (no runs have logicalDate yet, e.g.
         //              schedule just registered).
         //
         // Fallback A — schedule ended (no upcoming): slots appearing ≥2 times in
         //              recent createdAt values (filters one-off manual triggers).
         // Fallback B — brand-new schedule with <2 runs: all createdAt slots.
-        const partitionTimeSlots = new Set<string>();
+        const logicalDateSlots = new Set<string>();
         for (const run of runs) {
-            if (run.partitionTime) {
-                const { slot } = splitUTC(run.partitionTime);
-                partitionTimeSlots.add(slot);
+            if (run.logicalDate) {
+                const { slot } = splitUTC(run.logicalDate);
+                logicalDateSlots.add(slot);
             }
         }
 
         const canonicalSlots = new Set<string>();
-        if (partitionTimeSlots.size > 0) {
-            // Use partitionTime-derived slots — always scheduler-set, always canonical.
-            for (const s of partitionTimeSlots) canonicalSlots.add(s);
+        if (logicalDateSlots.size > 0) {
+            // Use logicalDate-derived slots — always scheduler-set, always canonical.
+            for (const s of logicalDateSlots) canonicalSlots.add(s);
         } else {
             for (const up of upcoming) {
-                const { slot } = splitUTC(up.slot);
+                // Use logicalDate so the canonical slot matches the partition
+                // column, not the fire-time column.
+                const anchor = up.logicalDate ?? up.slot;
+                const { slot } = splitUTC(anchor);
                 canonicalSlots.add(slot);
             }
             if (canonicalSlots.size === 0) {
@@ -269,24 +272,39 @@ export function PartitionGrid({
         // can be off by up to ±12 hours.  Use the ISO string slice instead.
         const nowUTC = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD" UTC
 
-        // Collect dates from runs + upcoming.
-        // Upcoming dates are capped at today: a partition health grid shows
-        // completeness of past slots — dates beyond today have no health to
-        // measure and would appear as an all-"upcoming" row at the top.
+        // Collect dates from actual runs + upcoming logicalDates.
+        //
+        // Upcoming slots carry logicalDate (the data-window anchor, slot − offset)
+        // so we place them in the grid by partition date, not fire time. This
+        // keeps offset schedules (e.g. weekly cron + P3DT15H) aligned with the
+        // same column that completed runs appear in.
+        //
+        // Past dates beyond today are excluded: the health grid measures
+        // completeness of past slots, and future-only rows would always appear
+        // as "upcoming" with nothing to measure.
+        //
+        // The old unconditional 7-day baseline is intentionally gone. It created
+        // spurious MISSING rows for non-daily schedules (weekly, monthly) where
+        // most days in any 7-day window have no expected slot at all. Now the
+        // date set is built entirely from scheduler-sourced data — runs the
+        // scheduler actually fired, and upcoming logicalDates the scheduler will
+        // fire next — so every MISSING cell represents a slot the schedule truly
+        // missed, not an arbitrary calendar day.
+        //
+        // Daily schedules that skip a day: the gap still shows as MISSING because
+        // the surrounding run dates are already in the set, and the grid renders
+        // every date between the earliest and latest in uniqueDates.
         const dateSet = new Set<string>();
         for (const run of runs) {
-            const { date } = splitUTC(run.partitionTime ?? run.createdAt);
+            const { date } = splitUTC(run.logicalDate ?? run.createdAt);
             dateSet.add(date);
         }
         for (const up of upcoming) {
-            const { date } = splitUTC(up.slot);
-            if (date <= nowUTC) dateSet.add(date); // today's future slots only
-        }
-        // Always include last 7 calendar days (UTC) for a full-week baseline
-        for (let i = 0; i < 7; i++) {
-            const d = new Date();
-            d.setUTCDate(d.getUTCDate() - i);
-            dateSet.add(d.toISOString().slice(0, 10));
+            // Prefer logicalDate; fall back to slot (fire time) for schedules
+            // whose pattern the server couldn't parse (logicalDate === null).
+            const anchor = up.logicalDate ?? up.slot;
+            const { date } = splitUTC(anchor);
+            if (date <= nowUTC) dateSet.add(date);
         }
         const uniqueDates = Array.from(dateSet).sort((a, b) =>
             b.localeCompare(a),
@@ -294,28 +312,30 @@ export function PartitionGrid({
 
         // Index runs by "YYYY-MM-DD|HH:MM".
         //
-        // Use partitionTime when available — backfill tasks are created at
+        // Use logicalDate when available — backfill tasks are created at
         // wall-clock time (e.g. Jun 8 15:00) but belong to a past slot
         // (e.g. Jun 8 00:00).  Using createdAt would lose them entirely.
-        // Fall back to createdAt for regular scheduled runs (partitionTime ≈ createdAt).
+        // Fall back to createdAt for regular scheduled runs (logicalDate ≈ createdAt).
         //
         // The canonical-slot filter is only applied when falling back to createdAt.
-        // Runs with an explicit partitionTime are always scheduler-placed and
+        // Runs with an explicit logicalDate are always scheduler-placed and
         // therefore always canonical — even when their slot differs from the
         // upcoming fire-time slot due to a partition offset.
         const runIndex = new Map<string, ScheduleRun>();
         for (const run of runs) {
-            const iso = run.partitionTime ?? run.createdAt;
+            const iso = run.logicalDate ?? run.createdAt;
             const { date, slot } = splitUTC(iso);
-            if (!run.partitionTime && !canonicalSlots.has(slot)) continue;
+            if (!run.logicalDate && !canonicalSlots.has(slot)) continue;
             const key = `${date}|${slot}`;
             if (!runIndex.has(key)) runIndex.set(key, run);
         }
 
-        // Index upcoming by "YYYY-MM-DD|HH:MM"
+        // Index upcoming by "YYYY-MM-DD|HH:MM" using logicalDate so upcoming
+        // cells appear in the same column as completed runs for the same slot.
         const upcomingSet = new Set<string>();
         for (const up of upcoming) {
-            const { date, slot } = splitUTC(up.slot);
+            const anchor = up.logicalDate ?? up.slot;
+            const { date, slot } = splitUTC(anchor);
             upcomingSet.add(`${date}|${slot}`);
         }
 

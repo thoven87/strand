@@ -947,9 +947,9 @@ function fmtScheduleTime(iso: string): string {
     return new Date(iso).toISOString().slice(0, 16);
 }
 
-function fmtOffset(executionIso: string, partitionIso: string): string {
+function fmtOffset(executionIso: string, logicalIso: string): string {
     const ms =
-        new Date(executionIso).getTime() - new Date(partitionIso).getTime();
+        new Date(executionIso).getTime() - new Date(logicalIso).getTime();
     const sign = ms >= 0 ? "+" : "-";
     const totalMins = Math.round(Math.abs(ms) / 60_000);
     // Don't show (+0m) — sub-minute offsets are noise from scheduler jitter
@@ -965,8 +965,8 @@ function ScheduleCard({
 }: {
     scheduling: NonNullable<import("@/api/types").TaskDetail["scheduling"]>;
 }) {
-    const offset = scheduling.partitionTime
-        ? fmtOffset(scheduling.executionTime, scheduling.partitionTime)
+    const offset = scheduling.logicalDate
+        ? fmtOffset(scheduling.executionTime, scheduling.logicalDate)
         : "";
 
     return (
@@ -990,13 +990,13 @@ function ScheduleCard({
                         {fmtScheduleTime(scheduling.executionTime)}
                     </span>
                 </span>
-                {scheduling.partitionTime && (
+                {scheduling.logicalDate && (
                     <>
                         <span className="text-muted-foreground/30">·</span>
                         <span>
-                            Partition{" "}
+                            Logical date{" "}
                             <span className="font-mono text-foreground">
-                                {fmtScheduleTime(scheduling.partitionTime)}
+                                {fmtScheduleTime(scheduling.logicalDate)}
                             </span>
                         </span>
                         {scheduling.scheduleOffset && (
