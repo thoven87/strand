@@ -55,10 +55,10 @@ export interface ScheduleRun {
     attempt: number;
     createdAt: string;
     completedAt: string | null;
-    /** Canonical slot time from scheduling_metadata.partitionTime.
+    /** Canonical logical/partition date from scheduling_metadata.logicalDate.
      *  Use this (not createdAt) to place runs in the partition grid:
      *  backfill tasks are created at wall-clock time but belong to a past slot. */
-    partitionTime: string | null;
+    logicalDate: string | null;
 }
 
 export const getScheduleRuns = (
@@ -73,13 +73,18 @@ export const getScheduleRuns = (
         .then((r) => r.data);
 
 export interface UpcomingSlot {
-    slot: string; // ISO 8601 UTC datetime
+    /** Wall-clock UTC fire time. */
+    slot: string;
+    /** Logical/partition date for this slot (slot − scheduleOffset).
+     *  Use this (not slot) to place upcoming runs in the partition health grid.
+     *  Null for schedules whose pattern cannot be parsed server-side. */
+    logicalDate: string | null;
 }
 
 export const runSchedulePartition = (
     namespace: string,
     scheduleId: string,
-    body: { partitionTime: string; allowOverwrite?: boolean },
+    body: { logicalDate: string; allowOverwrite?: boolean },
 ): Promise<{ taskId: string; runId: string }> =>
     api
         .post<{

@@ -123,6 +123,10 @@ extension ScheduleRunResponse: ResponseCodable {}
 struct UpcomingSlotResponse: Codable, Sendable {
     /// The wall-clock UTC time when this slot will fire.
     let slot: Date
+    /// The logical/partition date for this slot — the data window the run will process.
+    /// Equals `slot − scheduleOffset`. Nil when the offset cannot be computed.
+    /// Use this (not `slot`) to place the upcoming run in the partition health grid.
+    let logicalDate: Date?
 }
 extension UpcomingSlotResponse: ResponseCodable {}
 
@@ -238,6 +242,13 @@ struct ScheduleRoutes {
             // If the schedule has no nextRunAt (e.g. paused before ever firing, or
             // endsAt has passed), return an empty list rather than an error.
             guard let nextRunAt = s.nextRunAt else { return [] }
+            // Compute logicalDate for each slot using the same
+            // ScheduleCalculator.calculateLogicalDate path the scheduler uses
+            // when firing — so the grid always sees the correct partition anchor.
+            // ScheduleSummary already carries the decoded pattern; no buffer decode needed.
+            let partitionConfig = try? PartitionOffsetConfig(
+                offset: s.pattern.partitionOffset ?? "PT0M"
+            )
             var slots: [UpcomingSlotResponse] = []
             // Start the iteration one millisecond before nextRunAt so that
             // nextRunTime(after:) returns nextRunAt itself as the first result.
@@ -250,7 +261,14 @@ struct ScheduleRoutes {
                         timezone: s.pattern.timezone
                     )
                 else { break }
-                slots.append(UpcomingSlotResponse(slot: next))
+                let logicalDate: Date? = partitionConfig.flatMap { cfg in
+                    try? ScheduleCalculator.calculateLogicalDate(
+                        executionTime: next,
+                        schedule: s.pattern,
+                        partitionOffset: cfg
+                    )
+                }
+                slots.append(UpcomingSlotResponse(slot: next, logicalDate: logicalDate))
                 cursor = next
             }
             return slots

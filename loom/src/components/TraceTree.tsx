@@ -589,6 +589,11 @@ function fmtRelative(iso: string): string {
 
 function fmtGap(fromIso: string, toIso: string): string {
     const ms = new Date(toIso).getTime() - new Date(fromIso).getTime();
+    // Negative gap means the two timestamps are out of order (data anomaly —
+    // e.g. a host clock jumped after a sleep/resume cycle).  Show the absolute
+    // value with a leading '−' so the display is readable instead of returning
+    // a raw large negative integer like "-8483000ms".
+    if (ms < 0) return `\u2212${fmtGap(toIso, fromIso)}`;
     if (ms < 1000) return `${ms}ms`;
     if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
     return `${Math.round(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
