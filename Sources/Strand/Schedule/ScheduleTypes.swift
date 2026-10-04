@@ -126,6 +126,7 @@ public struct ScheduleOptions: Sendable {
     /// What to do when a new slot fires while the previous run is still executing.
     /// Defaults to `.allowAll` (standard cron behaviour).
     public var overlapPolicy: ScheduleOverlapPolicy
+    public var sloLimit: Duration?
 
     public init(
         maxAttempts: Int? = 25,
@@ -133,7 +134,8 @@ public struct ScheduleOptions: Sendable {
         cancellation: CancellationPolicy? = nil,
         headers: [String: String] = [:],
         accuracy: ScheduleAccuracy = .latest,
-        overlapPolicy: ScheduleOverlapPolicy = .allowAll
+        overlapPolicy: ScheduleOverlapPolicy = .allowAll,
+        sloLimit: Duration? = nil
     ) {
         self.maxAttempts = maxAttempts
         self.retryStrategy = retryStrategy
@@ -141,6 +143,7 @@ public struct ScheduleOptions: Sendable {
         self.headers = headers
         self.accuracy = accuracy
         self.overlapPolicy = overlapPolicy
+        self.sloLimit = sloLimit
     }
 }
 
@@ -169,6 +172,7 @@ public struct ScheduleSummary: Sendable, Codable {
     public let accuracy: ScheduleAccuracy
     public let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
     public let createdAt: Date
+    public let sloLimitSeconds: Int?
 }
 
 // MARK: - SchedulerOptions

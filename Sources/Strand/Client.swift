@@ -1216,6 +1216,7 @@ public struct StrandClient: Sendable {
             startsAt: startsAt,
             endsAt: endsAt,
             nextRunAt: nextRunAt,
+            sloLimitSeconds: options.sloLimit.map { Int($0.components.seconds) },
             logger: logger
         )
     }
@@ -1292,7 +1293,8 @@ public struct StrandClient: Sendable {
             runCount: row.runCount,
             accuracy: row.accuracy,
             kind: row.kind,
-            createdAt: row.createdAt
+            createdAt: row.createdAt,
+            sloLimitSeconds: row.sloLimitSeconds
         )
     }
 
@@ -1389,7 +1391,8 @@ public struct StrandClient: Sendable {
                 runCount: row.runCount,
                 accuracy: row.accuracy,
                 kind: row.kind,
-                createdAt: row.createdAt
+                createdAt: row.createdAt,
+                sloLimitSeconds: row.sloLimitSeconds
             )
         }
     }

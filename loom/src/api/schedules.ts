@@ -12,6 +12,8 @@ export interface ScheduleEntry {
     createdAt: string;
     patternType: string;
     patternDescription: string;
+    /** SLO: expected max seconds from logicalDate to partition completion. null = no SLO. */
+    sloLimitSeconds: number | null;
 }
 
 export interface ScheduleDetail extends ScheduleEntry {
