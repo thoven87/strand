@@ -682,6 +682,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS heartbeat_timeout_seconds INTEGER;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS backfill_id UUID REFERENCES strand.backfills(id) ON DELETE SET NULL;
 -- ALTER TABLE strand.backfills ADD COLUMN IF NOT EXISTS schedule_id UUID REFERENCES strand.schedules(id) ON DELETE SET NULL;
+-- ALTER TABLE strand.schedules ADD COLUMN IF NOT EXISTS slo_limit_seconds INTEGER;
 
 -- Migration for existing databases:
 -- ALTER TABLE strand.events DROP CONSTRAINT strand_events_pkey;
@@ -989,6 +990,11 @@ CREATE TABLE IF NOT EXISTS strand.schedules (
     last_slot_at TIMESTAMPTZ,   -- scheduled slot time of the most recent fire (for catch-up base)
     last_task_id UUID,
     run_count    INTEGER     NOT NULL DEFAULT 0,
+
+    -- SLO: expected maximum time from logicalDate to partition completion (seconds).
+    -- NULL = no SLO defined. When now() > logicalDate + slo_limit_seconds and the
+    -- partition is not complete, the schedule is in breach.
+    slo_limit_seconds INTEGER,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

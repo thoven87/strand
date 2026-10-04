@@ -39,6 +39,7 @@ struct ScheduleSummaryResponse: Codable, Sendable {
     let createdAt: Date
     let patternType: String
     let patternDescription: String
+    let sloLimitSeconds: Int?
 
     init(from s: ScheduleSummary) {
         id = s.id.uuidString
@@ -53,6 +54,7 @@ struct ScheduleSummaryResponse: Codable, Sendable {
         createdAt = s.createdAt
         patternType = s.pattern.typeName
         patternDescription = s.pattern.description
+        sloLimitSeconds = s.sloLimitSeconds
     }
 }
 extension ScheduleSummaryResponse: ResponseCodable {}
@@ -80,6 +82,7 @@ struct ScheduleDetailResponse: Codable, Sendable {
     let patternTimezone: String
     let startsAt: Date?
     let endsAt: Date?
+    let sloLimitSeconds: Int?
 
     init(from s: ScheduleSummary) {
         id = s.id.uuidString
@@ -97,6 +100,7 @@ struct ScheduleDetailResponse: Codable, Sendable {
         patternTimezone = s.pattern.timezone.identifier
         startsAt = s.startsAt
         endsAt = s.endsAt
+        sloLimitSeconds = s.sloLimitSeconds
     }
 }
 extension ScheduleDetailResponse: ResponseCodable {}

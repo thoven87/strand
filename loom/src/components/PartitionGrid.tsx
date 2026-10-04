@@ -12,6 +12,8 @@ export interface PartitionGridProps {
     namespace: string;
     scheduleId: string;
     queue: string;
+    /** SLO limit in seconds. When set, MISSING cells past this deadline are coloured red. */
+    sloLimitSeconds?: number | null;
 }
 
 type CellState =
@@ -24,7 +26,8 @@ type CellState =
     | "WAITING"
     | "CONTINUED_AS_NEW"
     | "UPCOMING"
-    | "MISSING";
+    | "MISSING"
+    | "MISSING_SLO";  // past SLO limit — breach
 
 interface CellData {
     state: CellState;
@@ -148,6 +151,12 @@ const CELL_CONFIG: Record<
         border: "border-amber-500/30 border-dashed",
         glyph: "!",
     },
+    MISSING_SLO: {
+        bg: "bg-red-500/20 hover:bg-red-500/30",
+        text: "text-red-400",
+        border: "border-red-500/40 border-dashed",
+        glyph: "✕",
+    },
 };
 
 // ── Cell component ────────────────────────────────────────────────────────────
@@ -202,6 +211,7 @@ export function PartitionGrid({
     upcoming,
     namespace,
     queue,
+    sloLimitSeconds,
 }: PartitionGridProps) {
     const { uniqueSlots, uniqueDates, grid, columnTotals } = useMemo(() => {
         // ── Canonical slot derivation ─────────────────────────────────────────────
@@ -368,6 +378,14 @@ export function PartitionGrid({
                     // Past date, OR today but the slot time has already elapsed
                     // (e.g. 00:00 when it is now 14:00 UTC) — should have run.
                     state = "MISSING";
+                    // Upgrade to MISSING_SLO if logicalDate + sloLimit has elapsed.
+                    if (sloLimitSeconds) {
+                        const logicalMs = new Date(`${date}T${slot}:00Z`).getTime();
+                        const sloDeadlineMs = logicalMs + sloLimitSeconds * 1000;
+                        if (Date.now() > sloDeadlineMs) {
+                            state = "MISSING_SLO";
+                        }
+                    }
                 } else {
                     // Future slot not yet known to the scheduler (beyond the
                     // upcoming window). Treat as upcoming for display purposes.
@@ -398,13 +416,15 @@ export function PartitionGrid({
                 (row) => row[colIdx].state === "COMPLETED",
             ).length;
             const total = grid.filter(
-                (row) => row[colIdx].state !== "MISSING",
+                (row) =>
+                    row[colIdx].state !== "MISSING" &&
+                    row[colIdx].state !== "MISSING_SLO",
             ).length;
             return { completed, total };
         });
 
         return { uniqueSlots, uniqueDates, grid, columnTotals };
-    }, [runs, upcoming]);
+    }, [runs, upcoming, sloLimitSeconds]);
 
     // Default: show 14 rows (two weeks). User can expand.
     const DEFAULT_ROWS = 14;
@@ -467,7 +487,9 @@ export function PartitionGrid({
                                     (c) => c.state === "UPCOMING",
                                 );
                                 const hasMissingCell = row.some(
-                                    (c) => c.state === "MISSING",
+                                    (c) =>
+                                        c.state === "MISSING" ||
+                                        c.state === "MISSING_SLO",
                                 );
                                 const hasNonFutureCell = row.some(
                                     (c) =>

@@ -845,6 +845,11 @@ export function ScheduleDetailPage() {
                         <DetailRow label="Ends at">
                             <OptionalTime iso={schedule.endsAt} />
                         </DetailRow>
+                        {schedule.sloLimitSeconds && (
+                            <DetailRow label="SLO limit">
+                                {Math.round(schedule.sloLimitSeconds / 3600)}h
+                            </DetailRow>
+                        )}
                     </section>
 
                     {/* Upcoming fire times */}
@@ -893,6 +898,7 @@ export function ScheduleDetailPage() {
                             namespace={namespace}
                             scheduleId={scheduleId}
                             queue={schedule.queue}
+                            sloLimitSeconds={schedule.sloLimitSeconds}
                         />
                     )}
 

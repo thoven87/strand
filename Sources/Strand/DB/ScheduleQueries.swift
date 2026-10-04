@@ -49,6 +49,7 @@ package struct ScheduleSummaryRow: Sendable {
     package let accuracy: ScheduleAccuracy
     package let kind: TaskKind  // 'WORKFLOW' or 'ACTIVITY'
     package let createdAt: Date
+    package let sloLimitSeconds: Int?
 }
 
 /// A task row fired by a specific schedule, returned by ``ScheduleQueries/listScheduleRuns``.
@@ -96,6 +97,7 @@ package struct ScheduleFullRow: Sendable {
     package let retryStrategyBuffer: ByteBuffer?
     package let maxAttempts: Int?
     package let cancellationBuffer: ByteBuffer?
+    package let sloLimitSeconds: Int?
 }
 
 // MARK: - Queries
@@ -356,6 +358,7 @@ package enum ScheduleQueries {
         startsAt: Date?,
         endsAt: Date?,
         nextRunAt: Date?,
+        sloLimitSeconds: Int?,
         logger: Logger
     ) async throws -> UUID {
         let overlapPolicyRaw = overlapPolicy.rawValue
@@ -364,13 +367,13 @@ package enum ScheduleQueries {
             INSERT INTO strand.schedules
                 (namespace_id, id, queue, name, task_name, params, headers, pattern,
                  max_attempts, retry_strategy, cancellation, accuracy, overlap_policy, kind,
-                 starts_at, ends_at, next_run_at, is_active)
+                 starts_at, ends_at, next_run_at, is_active, slo_limit_seconds)
             VALUES
                 (\(namespaceID), \(id), \(queue), \(name), \(taskName),
                  \(paramsBuffer), \(headersBuffer), \(patternBuffer),
                  \(maxAttempts), \(retryStrategyBuffer), \(cancellationBuffer),
                  \(accuracy.dbString), \(overlapPolicyRaw), \(kind.rawValue),
-                 \(startsAt), \(endsAt), \(nextRunAt), \(nextRunAt != nil))
+                 \(startsAt), \(endsAt), \(nextRunAt), \(nextRunAt != nil), \(sloLimitSeconds))
             ON CONFLICT (namespace_id, queue, name) DO UPDATE SET
                 task_name       = EXCLUDED.task_name,
                 params          = EXCLUDED.params,
@@ -412,6 +415,7 @@ package enum ScheduleQueries {
                                   END,
                 is_active       = COALESCE(strand.schedules.next_run_at,
                                             EXCLUDED.next_run_at) IS NOT NULL,
+                slo_limit_seconds = EXCLUDED.slo_limit_seconds,
                 updated_at      = NOW()
             RETURNING id
             """,
@@ -526,7 +530,8 @@ package enum ScheduleQueries {
             SELECT id, queue, name, task_name, pattern, is_active,
                    starts_at, ends_at, next_run_at, last_run_at, last_task_id,
                    run_count, accuracy, kind, created_at,
-                   params, headers, retry_strategy, max_attempts, cancellation
+                   params, headers, retry_strategy, max_attempts, cancellation,
+                   slo_limit_seconds
             FROM strand.schedules
             WHERE namespace_id = \(namespaceID)
               AND id           = \(id)
@@ -556,7 +561,8 @@ package enum ScheduleQueries {
             headersBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default),
             retryStrategyBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default),
             maxAttempts: try col.next()!.decode(Int?.self, context: .default),
-            cancellationBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default)
+            cancellationBuffer: try col.next()!.decode(ByteBuffer?.self, context: .default),
+            sloLimitSeconds: try col.next()!.decode(Int?.self, context: .default)
         )
     }
 
@@ -581,7 +587,8 @@ package enum ScheduleQueries {
         let stream = try await client.query(
             """
             SELECT id, queue, name, task_name, pattern, is_active,
-                   starts_at, ends_at, next_run_at, last_run_at, last_task_id, run_count, accuracy, kind, created_at
+                   starts_at, ends_at, next_run_at, last_run_at, last_task_id, run_count, accuracy, kind, created_at,
+                   slo_limit_seconds
             FROM strand.schedules
             WHERE namespace_id = \(namespaceID)
               AND (\(queue)::text IS NULL OR queue = \(queue))
@@ -614,7 +621,8 @@ package enum ScheduleQueries {
                     runCount: try col.next()!.decode(Int.self, context: .default),
                     accuracy: try col.next()!.decode(ScheduleAccuracy.self, context: .default),
                     kind: try col.next()!.decode(TaskKind.self, context: .default),
-                    createdAt: try col.next()!.decode(Date.self, context: .default)
+                    createdAt: try col.next()!.decode(Date.self, context: .default),
+                    sloLimitSeconds: try col.next()!.decode(Int?.self, context: .default)
                 )
             )
         }

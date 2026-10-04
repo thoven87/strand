@@ -534,6 +534,88 @@ let scheduler = StrandScheduler(
 | `maxCatchupSlots` | `1 000` | Maximum missed slots enqueued in a single `fire()` invocation when `accuracy` is `.all` or `.last(n)`. After this limit the remaining slots are picked up on the next poll cycle, bounding per-call latency regardless of backlog size. |
 | `pollLimit` | `100` | Maximum due schedules claimed per poll cycle. When more schedules fire simultaneously than this limit (e.g. after a long outage), the remainder are left for the next cycle, preventing burst overload. |
 
+## SLO limits
+
+An **SLO limit** (`sloLimit` on ``ScheduleOptions``) declares the maximum time
+allowed between a slot’s `logicalDate` and the moment its workflow completes.
+When the limit elapses and the partition is still not done, the slot is
+consider an SLO breach.
+
+```swift
+strand.addSchedule(
+    .workflow(
+        "nightly-warehouse-sync",
+        pattern: .cron("0 2 * * *", offset: ISO8601Duration(days: 1, hours: 2),
+                       timezone: TimeZone(identifier: "America/New_York")!),
+        workflowType: NightlyWarehouseSyncWorkflow.self,
+        input: .scheduled,
+        options: ScheduleOptions(
+            accuracy: .all,
+            sloLimit: .hours(8)   // fires 02:00 ET; must finish by 10:00 ET
+        )
+    )
+)
+```
+
+### What Strand does with the SLO
+
+**Partition health grid (Loom)** — the dashboard colours each cell by its
+status. A slot that has no completed run is normally shown in grey
+(“MISSING”). Once `now > logicalDate + sloLimit` the cell turns red
+(“MISSING\_SLO”) so operators can see at a glance which partitions are in
+breach without digging through logs.
+
+**Consumer workflows** — a workflow that depends on another schedule’s data can
+use the upstream SLO to size its own retry budget instead of hard-coding a
+magic number:
+
+```swift
+// In the consumer workflow’s freshness guard:
+let upstreamSLOHours = 8          // matches NightlyWarehouseSyncWorkflow.sloLimit
+let baseSleepSeconds = 10 * 60    // 10 min initial sleep
+let capSleepSeconds  = 30 * 60    // 30 min ceiling
+// Exponential backoff: 10 → 20 → 30 → 30 … min
+// Max attempts sized so total wait ≈ upstream SLO (8h).
+let maxAttempts = 17
+for attempt in 1...maxAttempts {
+    let check = try await context.runActivity(CheckFreshness, ...)
+    if check.isReady { break }
+    if attempt == maxAttempts { throw FreshnessError.sloBreached }
+    let shift = min(attempt - 1, 10)
+    let sleep = min(baseSleepSeconds * (1 << shift), capSleepSeconds)
+    try await context.sleep(for: .seconds(sleep))
+}
+```
+
+Exponential backoff (doubling each retry, capped at 30 min) is preferable to a
+fixed interval: it catches a “sync just finished” scenario on the first wakeup
+while staying quiet during a genuine outage.
+
+### SLO limit vs. `maxDuration`
+
+| | `sloLimit` | `ActivityOptions.maxDuration` |
+|---|---|---|
+| Level | Schedule (partition) | Single activity |
+| Measured from | Slot’s `logicalDate` | Activity’s first attempt |
+| Effect when breached | Visual alert in Loom | Activity immediately fails |
+| Enforced by | Dashboard + consumer logic | Strand runtime |
+
+Use `sloLimit` for end-to-end data availability contracts (“this feed must
+be ready by X”). Use `maxDuration` for per-activity execution budgets
+(“this API call must not run longer than 5 minutes”).
+
+### Choosing a value
+
+Set `sloLimit` to the latest acceptable completion time measured from
+`logicalDate`, not from the wall-clock fire time. Common patterns:
+
+| Schedule cadence | Typical SLO | Rationale |
+|---|---|---|
+| Nightly ETL (2 AM fire) | `PT8H` | Done by 10 AM ET at the latest |
+| Weekly batch (Monday morning) | `PT12H` | Done by Monday evening |
+| Weekly scorecard | `PT24H` | Done before next business day |
+| Near-real-time (hourly) | `PT2H` | Within two cadences of the slot |
+
 ## Topics
 
 ### Reference
@@ -542,6 +624,7 @@ let scheduler = StrandScheduler(
 ### Related
 - <doc:Timetables>
 - ``ScheduleOptions``
+- ``ScheduleOptions/sloLimit``
 - ``ScheduleAccuracy``
 - ``SchedulingMetadata``
 - ``BackfillOptions``
