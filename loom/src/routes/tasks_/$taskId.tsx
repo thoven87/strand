@@ -17,6 +17,7 @@ import {
     cancelTask,
     requeueTask,
     getChildTasks,
+    getTaskChain,
     getTaskTrace,
 } from "@/api/tasks";
 import { getEventTriggerForTask } from "@/api/events";
@@ -51,9 +52,10 @@ import {
     ArrowUpRight,
     Send,
     Zap,
+    GitBranch,
 } from "lucide-react";
 import { TriggerDialog } from "@/components/TriggerDialog";
-import type { Checkpoint, Run, TaskState, HistoryEvent } from "@/api/types";
+import type { Checkpoint, Run, TaskState, HistoryEvent, ChainMember } from "@/api/types";
 import { fmtDuration } from "@/lib/utils";
 import { TraceTree } from "@/components/TraceTree";
 
@@ -783,13 +785,20 @@ function RunRow({
     run,
     queue,
     taskId,
+    isActive = false,
+    hopNumber,
+    totalHops,
 }: {
     namespace: string;
     run: Run;
     queue: string;
     taskId: string;
+    isActive?: boolean;
+    /** 1-based hop number within a continueAsNew chain (undefined for plain retries). */
+    hopNumber?: number;
+    totalHops?: number;
 }) {
-    const [open, setOpen] = useState(false);
+    const [open, setOpen] = useState(isActive);
 
     const ms =
         run.startedAt && run.finishedAt
@@ -799,8 +808,15 @@ function RunRow({
 
     const duration = ms !== null ? fmtDuration(ms) : null;
 
+    // For continueAsNew chains, label by hop number; for plain retries, by attempt.
+    const label = hopNumber !== undefined
+        ? totalHops !== undefined
+            ? `Hop ${hopNumber} of ${totalHops}`
+            : `Hop ${hopNumber}`
+        : `Attempt ${run.attempt}`;
+
     return (
-        <div className="rounded border border-border/60 overflow-hidden">
+        <div className={`rounded border overflow-hidden ${isActive ? "border-brand/40 bg-brand/5" : "border-border/60"}`}>
             <button
                 onClick={() => setOpen((o) => !o)}
                 className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-secondary/20 transition-colors"
@@ -817,7 +833,7 @@ function RunRow({
                     />
                 )}
                 <span className="text-xs text-muted-foreground">
-                    Attempt {run.attempt}
+                    {label}
                 </span>
                 <StatusBadge state={run.state as TaskState} />
                 {duration && (
@@ -1025,9 +1041,11 @@ function ScheduleCard({
 // ── TaskDetailPage ────────────────────────────────────────────────────────
 
 export function TaskDetailPage() {
-    const { taskId, namespace } = useParams({ strict: false }) as {
+    const { taskId, namespace, runId: pathRunId } = useParams({ strict: false }) as {
         taskId: string;
         namespace: string;
+        /** Present only when on the tasks/$taskId/runs/$runId route. */
+        runId?: string;
     };
     const search = useSearch({ strict: false }) as {
         queue?: string;
@@ -1035,6 +1053,8 @@ export function TaskDetailPage() {
         nextId?: string;
         tab?: string;
     };
+    // Canonical source for the active hop: path param (clean URL) only.
+    const activeRunId = pathRunId;
     const queue = search.queue ?? "";
     const prevId = search.prevId;
     const nextId = search.nextId;
@@ -1117,12 +1137,32 @@ export function TaskDetailPage() {
         },
     });
 
+    // continueAsNew chain — fetch for all workflows; run-based chains (child
+    // workflow continueAsNew) are only detectable after the data arrives.
+    const { data: chain = [] } = useQuery<ChainMember[]>({
+        queryKey: qk.tasks.chain(namespace, queue, taskId),
+        queryFn: () => getTaskChain(namespace, queue, taskId),
+        enabled:
+            !!task &&
+            task.kind === "WORKFLOW" &&
+            (task.firstTaskId !== null ||
+                task.state === "CONTINUED_AS_NEW" ||
+                true), // always fetch for workflows — run-based chains only visible after fetch
+        staleTime: 30_000,
+    });
+
     const [runsOpen, setRunsOpen] = useState(false);
     const [stateOpen, setStateOpen] = useState(false);
     const [retryDialogOpen, setRetryDialogOpen] = useState(false);
     const [signalDialogOpen, setSignalDialogOpen] = useState(false);
     const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
     const [triggerOpen, setTriggerOpen] = useState(false);
+
+    // Auto-open the Runs section when navigating to a specific hop so the
+    // highlighted run is immediately visible without a manual click.
+    useEffect(() => {
+        if (activeRunId) setRunsOpen(true);
+    }, [activeRunId]);
 
     const signalMutation = useMutation({
         mutationFn: ({ name, payload }: { name: string; payload?: string }) =>
@@ -1213,11 +1253,38 @@ export function TaskDetailPage() {
     // of the duration clock. Falling back to createdAt is only correct for
     // brand-new tasks that have never been queued; for retried tasks it would
     // include all the idle time between creation and the eventual retry.
-    const durationMs = taskDurationMs(
-        task.firstRunAt ?? task.createdAt,
-        task.completedAt,
-    );
+    // When a specific hop runId is in the URL, show that run's own timing
+    // instead of the task-aggregate timing.
+    const currentRun = activeRunId
+        ? runs.find((r) => r.id.toLowerCase() === activeRunId!.toLowerCase())
+        : null;
+    const durationMs = currentRun
+        ? taskDurationMs(currentRun.startedAt ?? task.createdAt, currentRun.finishedAt)
+        : taskDurationMs(task.firstRunAt ?? task.createdAt, task.completedAt);
     const isWorkflow = task.kind === "WORKFLOW";
+
+    // Chain membership: true when this task is part of a continueAsNew chain.
+    // Also true when the fetched chain has >1 entry (run-based child continueAsNew).
+    const isChainMember =
+        task.firstTaskId !== null ||
+        task.state === "CONTINUED_AS_NEW" ||
+        chain.length > 1; // run-based chain detected after fetch
+
+    // For run-based chains: honour the runId search param; default to the last
+    // (most recent) hop. For task-based chains: match by task id as before.
+    const myChainEntry = chain.length > 0
+        ? (activeRunId
+            ? chain.find((m) => m.runID?.toLowerCase() === activeRunId!.toLowerCase())
+            : chain[chain.length - 1])
+        : undefined;
+    const chainRunNumber = myChainEntry?.runNumber;
+    const prevHop = chainRunNumber && chainRunNumber > 1
+        ? chain.find((m) => m.runNumber === chainRunNumber - 1)
+        : null;
+    const nextHop = chainRunNumber && chainRunNumber < chain.length
+        ? chain.find((m) => m.runNumber === chainRunNumber + 1)
+        : null;
+
 
     return (
         <div className="px-6 py-5 space-y-4">
@@ -1312,6 +1379,49 @@ export function TaskDetailPage() {
                                 </Link>
                             </>
                         )}
+                        {isChainMember && chainRunNumber && (
+                            <>
+                                <span>·</span>
+                                {/* ← previous hop */}
+                                {prevHop && (
+                                    <Link
+                                        to={prevHop.runID
+                                            ? "/$namespace/tasks/$taskId/runs/$runId"
+                                            : "/$namespace/tasks/$taskId"}
+                                        params={prevHop.runID
+                                            ? { namespace, taskId: prevHop.id, runId: prevHop.runID }
+                                            : { namespace, taskId: prevHop.id }}
+                                        search={{ queue: prevHop.queue }}
+                                        className="hover:text-foreground transition-colors"
+                                        title={`Run ${prevHop.runNumber}`}
+                                    >
+                                        ←
+                                    </Link>
+                                )}
+                                <span className="flex items-center gap-0.5 not-font-mono">
+                                    <GitBranch size={11} />
+                                    {chain.length > 1
+                                        ? `Run ${chainRunNumber} of ${chain.length}`
+                                        : `Run ${chainRunNumber}`}
+                                </span>
+                                {/* → next hop */}
+                                {nextHop && (
+                                    <Link
+                                        to={nextHop.runID
+                                            ? "/$namespace/tasks/$taskId/runs/$runId"
+                                            : "/$namespace/tasks/$taskId"}
+                                        params={nextHop.runID
+                                            ? { namespace, taskId: nextHop.id, runId: nextHop.runID }
+                                            : { namespace, taskId: nextHop.id }}
+                                        search={{ queue: nextHop.queue }}
+                                        className="hover:text-foreground transition-colors"
+                                        title={`Run ${nextHop.runNumber}`}
+                                    >
+                                        →
+                                    </Link>
+                                )}
+                            </>
+                        )}
                     </div>
 
                     {/* Timing strip */}
@@ -1340,20 +1450,20 @@ export function TaskDetailPage() {
                             </span>
                             <RelativeTime iso={task.createdAt} />
                         </span>
-                        {task.firstRunAt && (
+                        {(currentRun?.startedAt ?? task.firstRunAt) && (
                             <span className="flex items-center gap-1 text-muted-foreground">
                                 <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
                                     Started
                                 </span>
-                                <RelativeTime iso={task.firstRunAt} />
+                                <RelativeTime iso={currentRun?.startedAt ?? task.firstRunAt!} />
                             </span>
                         )}
-                        {task.completedAt && (
+                        {(currentRun?.finishedAt ?? task.completedAt) && (
                             <span className="flex items-center gap-1 text-muted-foreground">
                                 <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60 font-medium">
                                     Finished
                                 </span>
-                                <RelativeTime iso={task.completedAt} />
+                                <RelativeTime iso={currentRun?.finishedAt ?? task.completedAt!} />
                             </span>
                         )}
                         {task.attempt > 1 && (
@@ -1439,11 +1549,12 @@ export function TaskDetailPage() {
                 </div>
             </div>
 
-            {/* ── Tab bar ──────────────────────────────────────────────────────── */}
+            {/* ── Tab bar ────────────────────────────────────────────────────────────────── */}
             <div className="flex items-center gap-6 border-b border-border/50">
-                {(isWorkflow
-                    ? (["overview", "trace", "logs"] as const)
-                    : (["overview", "logs"] as const)
+                {(
+                    isWorkflow
+                        ? ["overview", "trace", "logs"]
+                        : ["overview", "logs"]
                 ).map((t) => (
                     <button
                         key={t}
@@ -1454,11 +1565,7 @@ export function TaskDetailPage() {
                                 : "text-muted-foreground border-transparent hover:text-foreground hover:border-border"
                         }`}
                     >
-                        {t === "trace"
-                            ? "Traces"
-                            : t === "logs"
-                              ? "Logs"
-                              : "Overview"}
+                        {t === "trace" ? "Traces" : t === "logs" ? "Logs" : "Overview"}
                     </button>
                 ))}
             </div>
@@ -1613,7 +1720,10 @@ export function TaskDetailPage() {
                             <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
                                 Input
                             </p>
-                            <JsonView value={task.params} />
+                            {/* Use the run-level params (stored per-hop since schema migration)
+                                when viewing a specific hop; fall back to task.params for the
+                                task-level view or pre-migration runs that have no run params. */}
+                            <JsonView value={currentRun?.params ?? task.params} />
                         </div>
                         <div className="rounded-lg border border-border bg-card/40 p-4">
                             <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-2">
@@ -1721,15 +1831,30 @@ export function TaskDetailPage() {
                                                 No runs yet.
                                             </p>
                                         )}
-                                        {[...runs].reverse().map((run) => (
-                                            <RunRow
-                                                key={run.id}
-                                                namespace={namespace}
-                                                run={run}
-                                                queue={queue}
-                                                taskId={taskId}
-                                            />
-                                        ))}
+                                        {[...runs].reverse().map((run) => {
+                                            // For run-based continueAsNew chains, map each
+                                            // run to its hop number using the chain data.
+                                            const hopEntry = chain.length > 1 && chain[0]?.isRunEntry
+                                                ? chain.find((m) => m.runID?.toLowerCase() === run.id.toLowerCase())
+                                                : undefined;
+                                            return (
+                                                <RunRow
+                                                    key={run.id}
+                                                    namespace={namespace}
+                                                    run={run}
+                                                    queue={queue}
+                                                    taskId={taskId}
+                                                    isActive={
+                                                        activeRunId
+                                                            ? run.id.toLowerCase() ===
+                                                              activeRunId.toLowerCase()
+                                                            : false
+                                                    }
+                                                    hopNumber={hopEntry?.runNumber}
+                                                    totalHops={hopEntry ? chain.length : undefined}
+                                                />
+                                            );
+                                        })}
                                     </>
                                 )}
                             </div>

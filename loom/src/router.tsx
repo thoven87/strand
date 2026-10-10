@@ -90,6 +90,15 @@ const taskDetailRoute = createRoute({
     component: TaskDetailPage,
 });
 
+// ── /$namespace/tasks/$taskId/runs/$runId ────────────────────────────────
+// Hop-specific view: run UUID is in the path (no ?runId= search param).
+
+const taskRunDetailRoute = createRoute({
+    getParentRoute: () => namespaceRoute,
+    path: "tasks/$taskId/runs/$runId",
+    component: TaskDetailPage,
+});
+
 // ── /$namespace/tasks/$taskId/trace ───────────────────────────────────────
 
 const taskTraceRoute = createRoute({
@@ -189,6 +198,7 @@ const routeTree = rootRoute.addChildren([
         tasksRoute,
         runsRoute,
         taskDetailRoute,
+        taskRunDetailRoute,
         taskTraceRoute,
         eventsRoute,
         schedulesRoute,

@@ -1,5 +1,6 @@
 import DequeModule
 import NIOCore
+import OrderedCollections
 import Synchronization
 
 #if canImport(FoundationEssentials)
@@ -101,13 +102,24 @@ enum WorkflowCommand: Sendable {
     /// version gates. Does not consume a sequence number.
     case recordVersionMarker(changeID: String, value: Bool)
 
+    /// Sends a signal to an external workflow identified by its task UUID.
+    ///
+    /// Non-suspending — inserts into `strand.workflow_signals` and returns immediately.
+    /// At-least-once: re-executes on replay if the activation crashes before committing.
+    /// Signal handlers must be idempotent.
+    case signalExternalWorkflow(
+        targetTaskID: UUID,
+        signalName: String,
+        payload: ByteBuffer
+    )
+
     /// Schedule a child workflow and suspend until it completes.
     case scheduleChildWorkflow(
         name: String,
         queue: String?,  // nil = inherit orchestrator's queue
         input: ByteBuffer,
         seqNum: Int,  // monotonic activation counter — unique per command within this activation
-        idempotencyKey: String,
+        idempotencyKey: String,  // always "<parentTaskUUID>:<seqNum>" — used by loadCompletedChildActivities
         priority: TaskPriority,  // .normal when unspecified
         maxAttempts: Int?,  // nil = worker default
         fairnessKey: String?,  // nil = no per-tenant isolation
@@ -115,7 +127,8 @@ enum WorkflowCommand: Sendable {
         retryStrategy: RetryStrategy?,  // nil = worker default
         scheduledAt: Date?,  // nil = immediately
         deadlineAt: Date?,  // nil = no total execution budget
-        parentClosePolicy: ParentClosePolicy  // what happens to child when parent closes
+        parentClosePolicy: ParentClosePolicy,  // what happens to child when parent closes
+        description: String?  // human-readable display name from ChildWorkflowOptions.id
     )
 }
 
@@ -287,7 +300,7 @@ struct WorkflowStateMachine: ~Copyable {
     /// predicate closure and (after the task suspends) its continuation.
     /// Predicates are evaluated POST-drain so `stateBox.value` is never read
     /// while `run()` holds exclusive access.
-    private var conditionEntries: [Int: ConditionEntry] = [:]
+    private var conditionEntries: OrderedDictionary<Int, ConditionEntry> = [:]
     private var nextConditionID: Int = 0
 
     // MARK: - Local activity tracking

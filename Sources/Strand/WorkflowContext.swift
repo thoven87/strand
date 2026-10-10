@@ -12,6 +12,14 @@ public import Foundation
 
 /// Checkpoint sentinel persisted when a `waitForEvent` call times out.
 /// Detected on the next activation to immediately re-throw the timeout error.
+/// Result type for `WorkflowContext.timeout(for:body:)` — private to this file.
+private enum _TimeoutResult<T: Sendable>: Sendable {
+    case timerFired
+    case timerCancelled
+    case bodyReturned(T)
+    case bodyThrew(any Error)
+}
+
 struct TimeoutSentinel: Codable {
     let timeout: Bool
     init() { self.timeout = true }
@@ -159,10 +167,18 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
     // historyEventCount is mutated between activations to reflect accumulated history.
     nonisolated(unsafe) var historyEventCount: Int
 
+    /// `true` when the history has grown large enough that calling
+    /// `context.continueAsNew(input:)` is advisable.
+    /// Updated at the start of every activation alongside `historyEventCount`.
+    nonisolated(unsafe) var suggestContinueAsNew: Bool
+
     // MARK: - Dependencies (set once in init, never mutated)
 
     let postgres: PostgresClient
     let logger: Logger
+    /// Replay-aware logger returned by `WorkflowContext.logger`.
+    /// Drops records while `isReplaying` is `true` unless `enableLoggingInReplay` is set.
+    let workflowLogger: Logger
     /// Codec for serialising user-supplied inputs, outputs, and child workflow payloads.
     let codec: any StrandCodec
     /// Deterministic serial executor used to drain the handler's job queue during activation.
@@ -204,6 +220,27 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
     /// in `runActivity`/`sleep`/`waitForEvent` throw natively inside the handler Task.
     nonisolated(unsafe) var isCancelRequested: Bool = false
 
+    /// Counter for in-flight signal and update handlers.
+    /// Incremented by `WorkflowContext.trackHandlerStart()`, decremented by
+    /// `WorkflowContext.trackHandlerEnd()`.  Used by `allHandlersFinished`.
+    nonisolated(unsafe) var pendingHandlerCount: Int = 0
+
+    /// In-memory cache for `WorkflowContext.now` — populated on first access,
+    /// reused for every subsequent read within the same activation.
+    /// `nil` until the first call to `context.now` this activation.
+    nonisolated(unsafe) var _nowCache: Date? = nil
+
+    /// Whether the workflow is currently replaying past history.
+    ///
+    /// Starts `true` when the activation loads checkpoint history from the DB.
+    /// Transitions to `false` the moment `nextSeqNum()` produces a sequence number
+    /// that has no cached value — meaning the workflow is executing new work beyond
+    /// any previously persisted state.
+    nonisolated(unsafe) var isReplaying: Bool
+    /// Shared replay-state box given to `ReplayAwareLogHandler`.
+    /// Kept in sync with `isReplaying` in `nextSeqNum()`.
+    let replayState: ArcBox<Bool>
+
     // MARK: - Init
 
     init(
@@ -221,6 +258,7 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
         postgres: PostgresClient,
         logger: Logger,
         codec: any StrandCodec,
+        enableLoggingInReplay: Bool = false,
         executor: StrandWorkflowExecutor,
         stateMachine: consuming WorkflowStateMachine,
         stateBox: ArcBox<W>,
@@ -229,7 +267,8 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
         versionMarkerCache: [String: Bool],
         namespace: String,
         activationTime: Date,
-        historyEventCount: Int
+        historyEventCount: Int,
+        suggestContinueAsNew: Bool
     ) {
         self.taskUUID = taskUUID
         self.runUUID = runUUID
@@ -245,6 +284,15 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
         self.postgres = postgres
         self.logger = logger
         self.codec = codec
+        let replayState = ArcBox(!checkpointCache.isEmpty)
+        self.replayState = replayState
+        if enableLoggingInReplay {
+            self.workflowLogger = logger
+        } else {
+            var wfLogger = logger
+            wfLogger.handler = WorkflowReplayLogHandler(underlying: logger.handler, replayState: replayState)
+            self.workflowLogger = wfLogger
+        }
         self.executor = executor
         self.stateMachine = stateMachine
         self.stateBox = stateBox
@@ -255,13 +303,25 @@ final class _WorkflowActivation<W: Workflow>: Sendable {
         self.namespace = namespace
         self.activationTime = activationTime
         self.historyEventCount = historyEventCount
+        self.suggestContinueAsNew = suggestContinueAsNew
+        self.isReplaying = !checkpointCache.isEmpty
     }
 
     // MARK: - Activation sequence counter
 
     /// Returns the next monotonic sequence number, advancing the counter.
+    ///
+    /// Also flips `isReplaying` to `false` the first time it produces a
+    /// seqNum that is absent from `checkpointCache` — that absence means
+    /// all prior history has been consumed and the activation is now
+    /// executing new (non-replay) work.
     func nextSeqNum() -> Int {
-        activationCounter.next()
+        let seq = activationCounter.next()
+        if isReplaying && checkpointCache[seq] == nil {
+            isReplaying = false
+            replayState.value = false
+        }
+        return seq
     }
 
     // MARK: - Checkpoint cache
@@ -367,7 +427,12 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     public var attempt: Int { _impl.attempt }
 
     /// Logger scoped to this workflow activation.
-    public var logger: Logger { _impl.logger }
+    ///
+    /// Log records emitted while `isReplaying` is `true` are silently dropped so
+    /// each statement appears exactly once across all activations of a run.
+    /// Set `WorkerOptions.enableLoggingInReplay` to `true` to disable this
+    /// suppression when debugging replay behaviour.
+    public var logger: Logger { _impl.workflowLogger }
 
     /// Wall-clock time captured at the start of this activation.
     ///
@@ -377,11 +442,20 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// `context.activationTime` must never drive conditional branches whose
     /// outcome needs to be the same on replay.
     ///
+    /// **Prefer ``now`` for most use cases.**
+    /// `context.now` is checkpointed on first read, so replays return the same
+    /// instant as the original run. Use `activationTime` only when you
+    /// explicitly want the current wall-clock time without a checkpoint
+    /// (e.g., as the argument to `sleep(until:)`, which checkpoints its own
+    /// deadline internally).
+    ///
     /// **Safe use — computing a one-shot sleep deadline:**
     /// ```swift
-    /// // On the first activation `sleep(until:)` checkpoints the target date;
-    /// // on replay it reads the checkpoint, so the deadline is stable.
+    /// // sleep(until:) checkpoints the target date itself; activationTime
+    /// // is not persisted but the sleep deadline is, so this is stable.
     /// try await context.sleep(until: context.activationTime.addingTimeInterval(3_600))
+    /// // Equivalent and also correct:
+    /// try await context.sleep(until: context.now.addingTimeInterval(3_600))
     /// ```
     ///
     /// **Unsafe use — branching on time:**
@@ -389,11 +463,67 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// // WRONG: activationTime changes between activations; the branch may
     /// // take a different path on replay, breaking determinism.
     /// if context.activationTime > cutoffDate { ... }
+    ///
+    /// // CORRECT: context.now is checkpointed, same value on every replay.
+    /// if context.now > cutoffDate { ... }
     /// ```
-    /// For time-dependent branching that must survive replays, store the
-    /// relevant timestamp as an activity result or a `sleep(until:)` target
-    /// so it is durably checkpointed.
     public var activationTime: Date { _impl.activationTime }
+
+    /// The workflow’s current time — deterministic and replay-safe.
+    ///
+    /// `context.now` is:
+    /// - **Stable**: every read within the same activation returns the same `Date`.
+    /// - **Checkpointed**: replays return the same instant as the original run, so
+    ///   time-dependent branches produce the same result every time.
+    ///
+    /// Use `context.now` wherever you would normally write `Date.now` or `Date()`
+    /// inside a workflow. Calling `Date.now` directly is a determinism bug — it
+    /// drifts between the original execution and replay, breaking idempotency.
+    ///
+    /// ```swift
+    /// // ✅ Deterministic — same deadline on every replay
+    /// let deadline = context.now.addingTimeInterval(1_800)
+    /// timer.deadline = context.now.addingTimeInterval(30)
+    ///
+    /// // ❌ Non-deterministic — breaks on replay
+    /// let deadline = Date.now.addingTimeInterval(1_800)
+    /// ```
+    ///
+    /// **How it differs from ``activationTime``**
+    ///
+    /// `activationTime` is also stable within an activation but is *not* checkpointed,
+    /// so it varies between the original run and any subsequent replay. `context.now`
+    /// checkpoints the timestamp the first time it is read and returns the stored value
+    /// on all future reads — including replay activations.
+    ///
+    /// **Implementation note**
+    ///
+    /// The value is backed by `activationTime` (captured at activation start). The
+    /// first call consumes one checkpoint slot and persists the timestamp. All later
+    /// calls in the same activation return the in-memory cache without touching the DB.
+    public var now: Date {
+        // Fast path: already checkpointed this activation.
+        if let cached = _impl._nowCache { return cached }
+
+        // Slow path: first call — checkpoint the activation timestamp.
+        let seqNum = _impl.nextSeqNum()
+        let result: Date
+        if let stored = _impl.checkpointCache[seqNum],
+            let ts = try? JSON.decode(Double.self, from: stored)
+        {
+            // Replay path: return the value written during the original run.
+            result = Date(timeIntervalSince1970: ts)
+        } else {
+            // Fresh path: record activationTime so future replays see the same instant.
+            result = _impl.activationTime
+            if let buf = try? JSON.encode(result.timeIntervalSince1970) {
+                _impl.cacheCheckpoint(seqNum: seqNum, name: "now", buffer: buf)
+                _impl.stateMachine.emit(.writeCheckpoint(seqNum: seqNum, name: "now", value: buf))
+            }
+        }
+        _impl._nowCache = result
+        return result
+    }
 
     /// The number of history events recorded before this activation started.
     ///
@@ -411,6 +541,57 @@ public struct WorkflowContext<W: Workflow>: Sendable {
     /// }
     /// ```
     public var historyEventCount: Int { _impl.historyEventCount }
+
+    /// `true` when the workflow's history has grown large enough that calling
+    /// `continueAsNew(input:)` at the next safe point is advisable.
+    ///
+    /// Strand sets this when `historyEventCount` exceeds half the worker's
+    /// `historyWarningThreshold` (default: 5,000 events). A worker-level
+    /// warning is logged when the count reaches the full threshold (10,000).
+    ///
+    /// Typical use:
+    /// ```swift
+    /// if context.suggestContinueAsNew {
+    ///     try await context.condition { _ in context.allHandlersFinished }
+    ///     try context.continueAsNew(input: .continuing(from: accumulatedState))
+    /// }
+    /// ```
+    public var suggestContinueAsNew: Bool { _impl.suggestContinueAsNew }
+
+    /// `true` while the workflow is replaying past history, `false` once it
+    /// begins executing new (non-checkpointed) work.
+    ///
+    /// - Important: Do **not** branch on `isReplaying` for logic that affects
+    ///   activity scheduling or state changes — the workflow must produce the
+    ///   same sequence of operations whether replaying or executing fresh.
+    ///   Use ``logger`` and ``metrics`` (which are suppressed automatically during
+    ///   replay) rather than guarding on this property directly.
+    public var isReplaying: Bool { _impl.isReplaying }
+
+    /// `true` when all in-flight signal and update handlers have finished executing.
+    ///
+    /// Use this to drain pending handlers before calling `continueAsNew` so
+    /// no in-progress work is interrupted:
+    ///
+    /// ```swift
+    /// if context.historyEventCount > 5_000 {
+    ///     try await context.condition { _ in context.allHandlersFinished }
+    ///     try context.continueAsNew(input: accumulatedState)
+    /// }
+    /// ```
+    ///
+    /// When no handlers are running this is always `true` (a no-op check).
+    public var allHandlersFinished: Bool { _impl.pendingHandlerCount == 0 }
+
+    /// Tracks the start of a signal or update handler for ``allHandlersFinished``.
+    ///
+    /// Call this at the top of each signal/update handler body and pair it
+    /// with a `trackHandlerEnd()` call (e.g. via `defer`) so the counter
+    /// stays accurate even when a handler throws.
+    public func trackHandlerStart() { _impl.pendingHandlerCount += 1 }
+
+    /// Tracks the completion of a signal or update handler for ``allHandlersFinished``.
+    public func trackHandlerEnd() { _impl.pendingHandlerCount -= 1 }
 
     /// Returns `true` when this workflow has received a cooperative cancellation request
     /// from its parent workflow (i.e. the parent closed with
@@ -469,6 +650,112 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // value of `isCancelRequested` on each evaluation, not a snapshot.
         let impl = _impl
         try await condition { _ in impl.isCancelRequested }
+    }
+
+    /// Runs `body` in a cancellation-shielded scope.
+    ///
+    /// Inside `body`, `Task.isCancelled` reports `false` even if the surrounding
+    /// workflow has been cancelled. Use this for cleanup work that must complete
+    /// regardless of cancellation — for example, rolling back a transaction or
+    /// releasing an external resource:
+    ///
+    /// ```swift
+    /// if context.isCancelRequested {
+    ///     try await context.nonCancellable {
+    ///         try await context.runActivity(ReleaseReservation.self, input: id,
+    ///             options: .init(cancellationType: .abandon))
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// **Implementation note**: delegates to `withTaskCancellationShield` (SE-0504,
+    /// Swift 6.4). The task remains cancelled after `body` returns — the shield
+    /// only masks `Task.isCancelled` inside `body`, it does not undo cancellation.
+    ///
+    /// - Note: Does not override explicit `cancellationType` on ``ActivityOptions``.
+    ///   Activities that must survive a cancelled parent should also set
+    ///   `cancellationType: .abandon`.
+    @discardableResult
+    public func nonCancellable<T: Sendable>(
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        try await withTaskCancellationShield(operation: body)
+    }
+
+    /// Runs `body` and cancels it if `duration` elapses first.
+    ///
+    /// Unlike a plain `Task.sleep`, the underlying timer is **durable**: it is
+    /// checkpointed by ``sleep(for:)`` so the deadline survives worker restarts
+    /// and replays correctly.
+    ///
+    /// When the timeout fires, the task running `body` is cancelled and the
+    /// error thrown by `body` in response to that cancellation is re-thrown
+    /// by this method — typically `CancellationError`:
+    ///
+    /// ```swift
+    /// // Run an activity with a hard 30-second wall-clock budget:
+    /// let result = try await context.timeout(for: .seconds(30)) {
+    ///     try await context.runActivity(SlowActivity.self, ...)
+    /// }
+    ///
+    /// // Catch the timeout and substitute a default:
+    /// let value = try await context.timeout(for: .minutes(2)) {
+    ///     do {
+    ///         return try await context.runActivity(ExternalCall.self, ...)
+    ///     } catch is CancellationError {
+    ///         return .defaultValue
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - duration: Maximum time to wait before cancelling `body`.
+    ///   - body: The work to run. Receives standard Swift task cancellation
+    ///     when the timeout fires; handle `CancellationError` inside `body`
+    ///     to return a graceful default instead of re-throwing.
+    public func timeout<Return: Sendable>(
+        for duration: Duration,
+        body: @escaping @Sendable () async throws -> Return
+    ) async throws -> Return {
+        // Race a durable sleep (checkpointed, replay-safe) against the body.
+        // whichever task finishes first cancels the other.
+        try await withThrowingTaskGroup(of: _TimeoutResult<Return>.self) { group in
+            group.addTask {
+                do {
+                    try await self.sleep(for: duration)
+                    return .timerFired
+                } catch {
+                    return .timerCancelled
+                }
+            }
+            group.addTask {
+                do {
+                    return .bodyReturned(try await body())
+                } catch {
+                    return .bodyThrew(error)
+                }
+            }
+            let first = try await group.next()!
+            switch first {
+            case .timerFired, .timerCancelled:
+                // Timeout elapsed (or parent was cancelled) — cancel the body.
+                group.cancelAll()
+                let second = try await group.next()!
+                switch second {
+                case .bodyReturned(let v): return v
+                case .bodyThrew(let e): throw e
+                default: fatalError("timer task already returned")
+                }
+            case .bodyReturned(let v):
+                group.cancelAll()
+                _ = try await group.next()  // drain the sleep task
+                return v
+            case .bodyThrew(let e):
+                group.cancelAll()
+                _ = try await group.next()  // drain the sleep task
+                throw e
+            }
+        }
     }
 
     /// Scheduling metadata injected by ``StrandScheduler`` when this workflow was
@@ -616,9 +903,19 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // never be needed. Fast paths above are unaffected — already-completed work replays.
         try Task.checkCancellation()
         let inputBuffer = try _impl.codec.encode(input)
-        // Use caller-supplied ID if set; otherwise derive a stable key from
-        // the workflow task UUID and call-site sequence number.
-        let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
+        // Idempotency key is always derived from the run UUID and sequence number.
+        // Run UUID (not task UUID) scopes the key to this run so that continueAsNew
+        // runs — which share the task UUID but get a fresh run UUID — never collide
+        // with children from prior runs when loadCompletedChildActivities filters
+        // by this prefix.
+        //
+        // options.id is NOT used as the idempotency key here (unlike
+        // StrandClient.enqueueActivity). A custom id wouldn’t start with the
+        // runUUID: prefix so loadCompletedChildActivities would silently miss it,
+        // breaking fast-path-2 and causing re-dispatch or a stuck parent after
+        // a crash. Instead, options.id flows to the description column (display
+        // label) — the same role it plays for ChildWorkflowOptions.id.
+        let idempotencyKey = "\(_impl.runUUID):\(seqNum)"
 
         _impl.stateMachine.emit(
             .scheduleActivity(
@@ -1051,6 +1348,69 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         _impl.stateMachine.emit(.emitEvent(name: name, payload: buf))
     }
 
+    // MARK: - signalExternalWorkflow
+
+    /// Sends a typed signal to any workflow identified by its task UUID.
+    ///
+    /// Non-suspending — emits a ``WorkflowCommand/signalExternalWorkflow`` that is
+    /// processed by `applyScheduleCommands` after `drain()` returns. The actual
+    /// `INSERT INTO strand.workflow_signals` executes without suspending the handler.
+    ///
+    /// **At-least-once delivery**: if the workflow crashes between inserting the signal
+    /// and committing the activation's history, the insert will re-execute on the next
+    /// activation (replay). Signal handlers must be idempotent to handle duplicates safely.
+    ///
+    /// ```swift
+    /// // In RecordProcessorWorkflow — signal the parent without an activity:
+    /// try context.signalExternalWorkflow(
+    ///     SlidingWindowWorkflow.RecordCompleted.self,
+    ///     taskID: input.parentTaskID,
+    ///     payload: input.recordID
+    /// )
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - signalType: The `WorkflowSignal` definition to send.
+    ///   - taskID: The `strand.tasks.id` of the target workflow. For child workflows
+    ///     this is stable across `continueAsNew` hops (preserved by `continueChildWorkflowAsNew`).
+    ///   - payload: The signal payload. Encoded with the workflow's codec.
+    public func signalExternalWorkflow<S: WorkflowSignal>(
+        _ signalType: S.Type,
+        taskID: UUID,
+        payload: S.Input
+    ) throws where S.Input: Encodable {
+        let buf = try _impl.codec.encode(payload)
+        _impl.stateMachine.emit(
+            .signalExternalWorkflow(
+                targetTaskID: taskID,
+                signalName: S.signalName,
+                payload: buf
+            )
+        )
+    }
+
+    /// Sends a typed no-payload signal to any workflow identified by its task UUID.
+    ///
+    /// Convenience overload for signals whose `Input` is `Void`. Sends a nil payload.
+    ///
+    /// - Parameters:
+    ///   - signalType: The `WorkflowSignal` definition to send.
+    ///   - taskID: The `strand.tasks.id` of the target workflow.
+    public func signalExternalWorkflow<S: WorkflowSignal>(
+        _ signalType: S.Type,
+        taskID: UUID
+    ) where S.Input == Void {
+        // Void signals carry no payload. Use an empty ByteBuffer so the DB column
+        // receives a consistent empty bytes value rather than NULL.
+        _impl.stateMachine.emit(
+            .signalExternalWorkflow(
+                targetTaskID: taskID,
+                signalName: S.signalName,
+                payload: ByteBuffer()
+            )
+        )
+    }
+
     // MARK: - condition
 
     /// Suspends the workflow until the predicate on current workflow state evaluates `true`.
@@ -1310,7 +1670,153 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         return true
     }
 
-    // MARK: - runChildWorkflow
+    // MARK: - retireVersion
+
+    /// Declares a ``version(changeID:)`` gate permanently closed on the new path.
+    ///
+    /// Call this once **every** in-flight workflow has already encountered and
+    /// stored `true` for `changeID`. After calling `retireVersion`:
+    ///
+    /// - The gate always returns `true`, even for workflows that previously
+    ///   stored `false` (i.e. old workflows that took the pre-change path).
+    /// - The `else` branch is unreachable and safe to delete.
+    /// - ``migrationStatus(changeID:)`` on ``StrandClient`` will confirm when
+    ///   it is safe to remove the guard entirely.
+    ///
+    /// ```swift
+    /// // Phase 1 — guarded rollout (new and old workflows coexist):
+    /// if context.version(changeID: "v2-parallel-charge") {
+    ///     try await context.runActivity(NewChargeActivity.self, ...)
+    /// } else {
+    ///     try await context.runActivity(LegacyChargeActivity.self, ...)
+    /// }
+    ///
+    /// // Phase 2 — all old workflows have completed; retire the gate:
+    /// context.retireVersion(changeID: "v2-parallel-charge")
+    /// // Delete the else branch. Every execution takes the new path.
+    /// ```
+    ///
+    /// - Parameter changeID: Must match exactly what was passed to
+    ///   ``version(changeID:)``.
+    public func retireVersion(changeID: String) {
+        // Overwrite any previously stored false with true so old in-flight
+        // workflows that took the pre-change path now move to the new path.
+        _impl.versionMarkerCache[changeID] = true
+        _impl.stateMachine.emit(.recordVersionMarker(changeID: changeID, value: true))
+    }
+
+    // MARK: - startChildWorkflow / runChildWorkflow
+
+    /// Enqueues a child workflow and returns a handle immediately (non-blocking).
+    ///
+    /// Unlike ``runChildWorkflow(_:options:input:)``, this method does **not** suspend
+    /// the parent handler. Call ``ChildWorkflowHandle/result()`` on the returned handle
+    /// to await the child's terminal result, or discard the handle entirely for
+    /// fire-and-forget semantics (the child still runs to completion).
+    ///
+    /// Fire-and-forget children should use `parentClosePolicy: .abandon` so they
+    /// survive the parent calling `continueAsNew`.
+    ///
+    /// - Parameters:
+    ///   - type: The `Workflow` conforming type to enqueue as a child.
+    ///   - options: Queue, priority, and concurrency overrides.
+    ///   - input: Forwarded verbatim to the child workflow handler.
+    /// - Returns: A ``ChildWorkflowHandle`` whose ``ChildWorkflowHandle/result()`` method
+    ///   can be awaited later (or ignored for fire-and-forget).
+    /// - Throws: Only if encoding `input` fails.
+    public func startChildWorkflow<CW: Workflow>(
+        _ type: CW.Type,
+        options: ChildWorkflowOptions = .init(),
+        input: CW.Input
+    ) throws -> ChildWorkflowHandle<CW> {
+        let seqNum = _impl.nextSeqNum()
+        // Run UUID (not task UUID) scopes the key to THIS run so continueAsNew
+        // runs never collide with children from prior runs at the same seqNum.
+        let idempotencyKey = "\(_impl.runUUID):\(seqNum)"
+
+        // Fast path 1: checkpoint cache (result from a prior activation).
+        if let cached = _impl.checkpointCache[seqNum] {
+            return ChildWorkflowHandle(
+                idempotencyKey: idempotencyKey,
+                _result: { [codec = _impl.codec] in
+                    try _decodeOutput(CW.Output.self, from: cached, codec: codec)
+                }
+            )
+        }
+
+        // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
+        if let nonSuccess = _impl.stateMachine.preloadedNonCompletion(for: seqNum) {
+            let state = nonSuccess.state
+            let name = CW.workflowName
+            return ChildWorkflowHandle(
+                idempotencyKey: idempotencyKey,
+                _result: { throw WorkflowError(workflowName: name, state: state.taskStatus) }
+            )
+        }
+
+        // Fast path 2: pre-loaded result (child completed in a prior activation).
+        if let preloaded = _impl.stateMachine.preloadedResult(for: seqNum) {
+            _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: preloaded)
+            _impl.stateMachine.emit(
+                .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded)
+            )
+            _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
+            return ChildWorkflowHandle(
+                idempotencyKey: idempotencyKey,
+                _result: { [codec = _impl.codec] in
+                    try _decodeOutput(CW.Output.self, from: preloaded, codec: codec)
+                }
+            )
+        }
+
+        // Slow path: child not yet scheduled — emit the command synchronously and
+        // return a handle. The caller does NOT suspend here; only result() suspends.
+        let inputBuffer = try _impl.codec.encode(input)
+        let childDeadlineAt: Date? = options.maxDuration.map { _impl.activationTime.addingDuration($0) }
+
+        _impl.stateMachine.emit(
+            .scheduleChildWorkflow(
+                name: CW.workflowName,
+                queue: options.queue,
+                input: inputBuffer,
+                seqNum: seqNum,
+                idempotencyKey: idempotencyKey,
+                priority: options.priority,
+                maxAttempts: options.maxAttempts,
+                fairnessKey: options.fairnessKey,
+                fairnessWeight: options.fairnessWeight,
+                retryStrategy: options.retryStrategy,
+                scheduledAt: options.delayUntil,
+                deadlineAt: childDeadlineAt,
+                parentClosePolicy: options.parentClosePolicy,
+                description: options.id
+            )
+        )
+
+        // Capture what result() needs without leaking the parent type W.
+        let impl = _impl
+        let cwName = CW.workflowName
+
+        return ChildWorkflowHandle(
+            idempotencyKey: idempotencyKey,
+            _result: {
+                // Lazily called when the caller awaits result().
+                // suspendActivity parks the continuation so drain() can resume it
+                // once the child completes. If result() is never called (fire-and-forget),
+                // no continuation is registered and the completion is a no-op.
+                let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
+                    (cont: CheckedContinuation<ByteBuffer, any Error>) in
+                    impl.stateMachine.suspendActivity(seqNum: seqNum, continuation: cont)
+                }
+                impl.cacheCheckpoint(seqNum: seqNum, name: cwName, buffer: resultBuffer)
+                impl.stateMachine.emit(
+                    .writeCheckpoint(seqNum: seqNum, name: cwName, value: resultBuffer)
+                )
+                impl.stateMachine.emit(.childWorkflowCompleted(name: cwName, seqNum: seqNum))
+                return try _decodeOutput(CW.Output.self, from: resultBuffer, codec: impl.codec)
+            }
+        )
+    }
 
     /// Enqueues a child workflow and suspends until it completes, then returns its result.
     ///
@@ -1330,72 +1836,36 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         options: ChildWorkflowOptions = .init(),
         input: CW.Input
     ) async throws -> CW.Output where CW.Output: Decodable {
-        let seqNum = _impl.nextSeqNum()
+        try await startChildWorkflow(type, options: options, input: input).result()
+    }
+}
 
-        // Fast path 1: checkpoint cache (result from a prior activation)
-        if let cached = _impl.checkpointCache[seqNum] {
-            return try _impl.codec.decode(CW.Output.self, from: cached)
-        }
+// MARK: - ChildWorkflowHandle
 
-        // Fast path 2a: child workflow terminated with FAILED or CANCELLED in a prior activation.
-        if let nonSuccess = _impl.stateMachine.preloadedNonCompletion(for: seqNum) {
-            throw WorkflowError(workflowName: CW.workflowName, state: nonSuccess.state.taskStatus)
-        }
+/// A handle returned by ``WorkflowContext/startChildWorkflow(_:options:input:)``.
+///
+/// Awaiting ``result()`` is optional — the child runs independently until a
+/// terminal state regardless of whether the parent awaits. This enables
+/// fire-and-forget dispatch and sliding-window patterns where `continueAsNew`
+/// is called while children are still in-flight.
+///
+/// > Important: `result()` must be called from within the workflow’s serial
+/// > executor context. Do not store the handle and call `result()` from an
+/// > unstructured `Task {}`.
+public struct ChildWorkflowHandle<CW: Workflow>: Sendable {
 
-        // Fast path 2: pre-loaded result (child completed in a prior activation).
-        // loadCompletedChildActivities covers child workflows too (same parent_task_id JOIN).
-        // A checkpoint is written here so subsequent replays use fast path 1.
-        if let preloaded = _impl.stateMachine.preloadedResult(for: seqNum) {
-            _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: preloaded)
-            _impl.stateMachine.emit(
-                .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: preloaded)
-            )
-            _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
-            return try _impl.codec.decode(CW.Output.self, from: preloaded)
-        }
+    /// The stable idempotency key: `"<parentRunUUID>:<seqNum>"`.
+    /// Same format used by `loadCompletedChildActivities` to route results.
+    public let idempotencyKey: String
 
-        // Slow path: child not yet complete — emit command and suspend via continuation.
-        let inputBuffer = try _impl.codec.encode(input)
-        // Use caller-supplied ID if set; otherwise derive a stable key from
-        // the workflow task UUID and call-site sequence number.
-        let idempotencyKey = options.id ?? "\(_impl.taskUUID):\(seqNum)"
-        // Note: options.headers forwarding intentionally omitted from the command —
-        // the worker injects parent context headers when enqueuing the child task.
+    // Closures capture the activation context without exposing the parent’s generic type W.
+    let _result: @Sendable () async throws -> CW.Output
 
-        let childDeadlineAt: Date? = options.maxDuration.map { _impl.activationTime.addingDuration($0) }
-        _impl.stateMachine.emit(
-            .scheduleChildWorkflow(
-                name: CW.workflowName,
-                queue: options.queue,
-                input: inputBuffer,
-                seqNum: seqNum,
-                idempotencyKey: idempotencyKey,
-                priority: options.priority,
-                maxAttempts: options.maxAttempts,
-                fairnessKey: options.fairnessKey,
-                fairnessWeight: options.fairnessWeight,
-                retryStrategy: options.retryStrategy,
-                scheduledAt: options.delayUntil,
-                deadlineAt: childDeadlineAt,
-                parentClosePolicy: options.parentClosePolicy
-            )
-        )
-
-        do {
-            let resultBuffer: ByteBuffer = try await withCheckedThrowingContinuation {
-                (cont: CheckedContinuation<ByteBuffer, any Error>) in
-                _impl.stateMachine.suspendActivity(seqNum: seqNum, continuation: cont)
-            }
-            // Slow path: continuation resumed — child completed in this activation.
-            // Write a checkpoint so replays use fast path 1.
-            _impl.cacheCheckpoint(seqNum: seqNum, name: CW.workflowName, buffer: resultBuffer)
-            _impl.stateMachine.emit(
-                .writeCheckpoint(seqNum: seqNum, name: CW.workflowName, value: resultBuffer)
-            )
-            _impl.stateMachine.emit(.childWorkflowCompleted(name: CW.workflowName, seqNum: seqNum))
-            return try _impl.codec.decode(CW.Output.self, from: resultBuffer)
-        } catch let signal as _ActivityFailureSignal {
-            throw WorkflowError(workflowName: CW.workflowName, state: signal.state.taskStatus)
-        }
+    /// Awaits the child’s terminal result.
+    ///
+    /// - Returns: The child’s output on `COMPLETED`.
+    /// - Throws: `WorkflowError` when the child reached `FAILED` or `CANCELLED`.
+    public func result() async throws -> CW.Output {
+        try await _result()
     }
 }

@@ -243,6 +243,10 @@ public func withWorker<T: Sendable>(
     activityContainers: [any ActivityContainerProtocol] = [],
     activities: [any Activity] = [],
     metricsFactory: (any MetricsFactory)? = nil,
+    /// Override the history-size threshold at which `context.suggestContinueAsNew`
+    /// becomes `true`. Defaults to the worker default (`10_000`). Pass a small
+    /// value in tests that exercise the suggestion property directly.
+    historyWarningThreshold: Int = 10_000,
     _ work: @Sendable () async throws -> T
 ) async throws -> T {
     let notifier = StrandNotifier(
@@ -258,7 +262,8 @@ public func withWorker<T: Sendable>(
             activityConcurrency: concurrency * 2,
             pollInterval: .milliseconds(20),
             fatalOnLeaseTimeout: false,
-            notifyJitter: .zero
+            notifyJitter: .zero,
+            historyWarningThreshold: historyWarningThreshold
         ),
         notifier: notifier,
         workflows: workflows,

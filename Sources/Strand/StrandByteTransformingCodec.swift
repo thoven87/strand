@@ -28,8 +28,6 @@ public import NIOCore
 ///               • not an envelope    → return nil (plain JSON, pre-migration row)
 /// ```
 ///
-/// This is the Strand equivalent of Temporal’s `Payload.Metadata["encoding"]`
-/// and `Payload.Metadata["encryption-key-id"]`.
 public struct StrandPayload: Codable, Sendable {
     /// Identifies the encoding, e.g. `"binary/encrypted+aes-gcm"` or
     /// `"binary/compressed+zstd"`.  Must be unique per codec implementation.

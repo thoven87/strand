@@ -124,6 +124,10 @@ struct TaskDetailResponse: Codable, Sendable {
     /// Human-readable description supplied at enqueue time via
     /// `ActivityOptions.description` / `WorkflowOptions.description`.  `null` if not set.
     let description: String?
+    /// Root task UUID for `continueAsNew` chains (`first_task_id`).
+    /// `nil` when this task is the chain root or not part of a chain.
+    /// Use `/chain` to retrieve all members of the chain.
+    let firstTaskId: UUID?
 
     init(from row: TaskDetailRow) {
         id = row.id
@@ -142,6 +146,7 @@ struct TaskDetailResponse: Codable, Sendable {
         parentTaskId = row.parentTaskId
         workflowId = row.workflowId
         description = row.description
+        firstTaskId = row.firstTaskId
         scheduling = row.schedulingMetadata.map {
             SchedulingInfoResponse(
                 scheduleName: $0.scheduledBy,
@@ -154,6 +159,38 @@ struct TaskDetailResponse: Codable, Sendable {
     }
 }
 extension TaskDetailResponse: ResponseCodable {}
+
+struct ChainMemberResponse: Codable, Sendable {
+    let id: UUID
+    let name: String
+    let queue: String
+    let state: TaskStatus
+    /// `nil` for the chain root; non-nil UUID for all continuations.
+    let firstTaskId: UUID?
+    let createdAt: Date
+    let completedAt: Date?
+    /// 1-based run number within the chain (1 = first/oldest run).
+    let runNumber: Int
+    /// `true` when this entry represents a run (child workflow continueAsNew hop)
+    /// rather than a task (root workflow continueAsNew).
+    let isRunEntry: Bool
+    /// For run-based entries: the `strand.runs.id` of this specific hop.
+    let runID: UUID?
+
+    init(from row: ChainMemberRow) {
+        id = row.id
+        name = row.name
+        queue = row.queue
+        state = row.state.taskStatus
+        firstTaskId = row.firstTaskId
+        createdAt = row.createdAt
+        completedAt = row.completedAt
+        runNumber = row.runNumber
+        isRunEntry = row.isRunEntry
+        runID = row.runID
+    }
+}
+extension ChainMemberResponse: ResponseCodable {}
 
 struct RunResponse: Codable, Sendable {
     let id: UUID
@@ -168,6 +205,8 @@ struct RunResponse: Codable, Sendable {
     let availableAt: Date
     let failureReason: String?  // raw JSON
     let heartbeatDetails: String?  // raw JSON — live progress written by heartbeat()
+    /// Input params stored when this run was created.
+    let params: String?  // raw JSON
 
     init(from row: RunSummaryRow) {
         id = row.id
@@ -182,6 +221,7 @@ struct RunResponse: Codable, Sendable {
         availableAt = row.availableAt
         failureReason = row.failureBuffer.map { String(buffer: $0) }
         heartbeatDetails = row.heartbeatDetailsBuffer.map { String(buffer: $0) }
+        params = row.paramsBuffer.map { String(buffer: $0) }
     }
 }
 

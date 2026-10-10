@@ -86,6 +86,9 @@ package struct TaskDetailRow: Sendable {
     /// `WorkflowOptions.description` at enqueue time.  Stored in the
     /// `strand.tasks.description` column.  `nil` if not set.
     package let description: String?
+    /// Root task UUID for `continueAsNew` chains. `nil` when this task IS the
+    /// root (or is not part of a chain). Walk the full chain via `listChain`.
+    package let firstTaskId: UUID?
 }
 
 extension TaskDetailRow {
@@ -108,6 +111,41 @@ extension TaskDetailRow {
         schedulingMetadata = try col.next()!.decode(SchedulingMetadata?.self, context: .default)
         workflowId = try col.next()!.decode(String?.self, context: .default)
         description = try col.next()!.decode(String?.self, context: .default)
+        firstTaskId = try col.next()!.decode(UUID?.self, context: .default)
+    }
+}
+
+/// One member of a `continueAsNew` chain, returned by ``ManagementQueries/listChain``.
+package struct ChainMemberRow: Sendable {
+    package let id: UUID
+    package let name: String
+    package let queue: String
+    package let state: TaskState
+    package let firstTaskId: UUID?
+    package let createdAt: Date
+    package let completedAt: Date?
+    /// 1-based position in the chain, ordered by creation time.
+    package let runNumber: Int
+    /// `true` when this entry represents a `strand.runs` row (child workflow continueAsNew hop)
+    /// rather than a `strand.tasks` row (root workflow continueAsNew task).
+    package let isRunEntry: Bool
+    /// Run ID for run-based entries; `nil` for task-based entries.
+    package let runID: UUID?
+}
+
+extension ChainMemberRow {
+    package init(row: PostgresRow) throws {
+        var col = row.makeIterator()
+        id = try col.next()!.decode(UUID.self, context: .default)
+        name = try col.next()!.decode(String.self, context: .default)
+        queue = try col.next()!.decode(String.self, context: .default)
+        state = try col.next()!.decode(TaskState.self, context: .default)
+        firstTaskId = try col.next()!.decode(UUID?.self, context: .default)
+        createdAt = try col.next()!.decode(Date.self, context: .default)
+        completedAt = try col.next()!.decode(Date?.self, context: .default)
+        runNumber = try col.next()!.decode(Int.self, context: .default)
+        isRunEntry = try col.next()!.decode(Bool.self, context: .default)
+        runID = try col.next()!.decode(UUID?.self, context: .default)
     }
 }
 
@@ -125,6 +163,8 @@ package struct RunSummaryRow: Sendable {
     package let availableAt: Date
     package let failureBuffer: ByteBuffer?  // raw JSON BYTEA
     package let heartbeatDetailsBuffer: ByteBuffer?  // raw JSON BYTEA
+    /// Input params stored when the run was created. Nil for runs created before
+    package let paramsBuffer: ByteBuffer?
 }
 
 extension RunSummaryRow {
@@ -142,6 +182,7 @@ extension RunSummaryRow {
         availableAt = try col.next()!.decode(Date.self, context: .default)
         failureBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
         heartbeatDetailsBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
+        paramsBuffer = try col.next()!.decode(ByteBuffer?.self, context: .default)
     }
 }
 
@@ -421,13 +462,94 @@ package enum ManagementQueries {
             """
             SELECT id, name, queue, params, state, attempt, max_attempts,
                    created_at, first_run_at, completed_at, result, cancelled_at,
-                   kind, parent_task_id, scheduling_metadata, idempotency_key, description
+                   kind, parent_task_id, scheduling_metadata, idempotency_key, description,
+                   first_task_id
             FROM strand.tasks WHERE id = \(taskID) AND namespace_id = \(namespaceID)
             """,
             logger: logger
         )
         guard let row = try await stream.first(where: { _ in true }) else { return nil }
         return try TaskDetailRow(row: row)
+    }
+
+    /// Returns all tasks in the same `continueAsNew` chain as `taskID`, ordered by
+    /// creation time with a 1-based `run_number`.
+    ///
+    /// Works whether `taskID` is the chain root (`first_task_id IS NULL`) or any
+    /// continuation (`first_task_id = rootID`). Tasks not part of any chain return
+    /// a single-element array containing only themselves.
+    package static func listChain(
+        on client: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> [ChainMemberRow] {
+        let stream = try await client.query(
+            """
+            WITH
+            -- Resolve the chain root (task-based chain via first_task_id)
+            chain_root AS (
+                SELECT COALESCE(first_task_id, id) AS root_id,
+                       first_task_id
+                FROM   strand.tasks
+                WHERE  id           = \(taskID)
+                  AND  namespace_id = \(namespaceID)
+            ),
+            -- Count sibling tasks in a root-workflow continueAsNew chain
+            sibling_count AS (
+                SELECT COUNT(*) AS n
+                FROM   strand.tasks t
+                JOIN   chain_root r ON (t.id = r.root_id OR t.first_task_id = r.root_id)
+                WHERE  t.namespace_id = \(namespaceID)
+            ),
+            -- Count runs for a child-workflow continueAsNew (single task, multiple runs)
+            run_count AS (
+                SELECT COUNT(*) AS n
+                FROM   strand.runs
+                WHERE  task_id      = \(taskID)
+                  AND  namespace_id = \(namespaceID)
+            )
+            -- Task-based chain: root workflow called continueAsNew (creates new tasks)
+            SELECT t.id,
+                   t.name,
+                   t.queue,
+                   t.state,
+                   t.first_task_id,
+                   t.created_at,
+                   t.completed_at,
+                   ROW_NUMBER() OVER (ORDER BY t.created_at)::int AS run_number,
+                   FALSE                                           AS is_run_entry,
+                   NULL::uuid                                      AS run_id
+            FROM   strand.tasks t
+            JOIN   chain_root r ON (t.id = r.root_id OR t.first_task_id = r.root_id)
+            WHERE  t.namespace_id = \(namespaceID)
+              AND  (SELECT n FROM sibling_count) > 1
+            UNION ALL
+            -- Run-based chain: child workflow called continueAsNew (reuses task, multiple runs)
+            SELECT t.id,
+                   t.name,
+                   t.queue,
+                   r.state,
+                   t.first_task_id,
+                   r.created_at,
+                   r.finished_at,
+                   ROW_NUMBER() OVER (ORDER BY r.created_at)::int AS run_number,
+                   TRUE                                            AS is_run_entry,
+                   r.id                                            AS run_id
+            FROM   strand.tasks t
+            JOIN   strand.runs  r ON r.task_id      = t.id
+                                  AND r.namespace_id = t.namespace_id
+            WHERE  t.id          = \(taskID)
+              AND  t.namespace_id = \(namespaceID)
+              AND  (SELECT n FROM sibling_count) = 1
+              AND  (SELECT n FROM run_count)     > 1
+            ORDER  BY created_at
+            """,
+            logger: logger
+        )
+        var rows: [ChainMemberRow] = []
+        for try await row in stream { rows.append(try ChainMemberRow(row: row)) }
+        return rows
     }
 
     // MARK: - Runs
@@ -443,10 +565,10 @@ package enum ManagementQueries {
             """
             SELECT id, attempt, state, worker_id, sdk_version,
                    started_at, finished_at, lease_expires_at, created_at, available_at,
-                   failure_reason, heartbeat_details
+                   failure_reason, heartbeat_details, params
             FROM strand.runs
             WHERE task_id = \(taskID) AND namespace_id = \(namespaceID)
-            ORDER BY attempt DESC
+            ORDER BY attempt DESC, created_at ASC
             """,
             logger: logger
         )

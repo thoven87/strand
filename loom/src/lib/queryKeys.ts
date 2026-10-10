@@ -19,6 +19,8 @@ export const qk = {
             ["tasks", "trace", namespace, taskId] as const,
         activity: (namespace: string, name: string) =>
             ["tasks", "activity", namespace, name] as const,
+        chain: (namespace: string, queue: string, taskId: string) =>
+            ["tasks", "chain", namespace, queue, taskId] as const,
     },
     runs: {
         list: (namespace: string, queue: string, taskId: string) =>
