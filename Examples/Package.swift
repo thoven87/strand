@@ -1,9 +1,9 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.4
 import PackageDescription
 
 let package = Package(
     name: "StrandExamples",
-    platforms: [.macOS(.v26)],
+    platforms: [.macOS(.v27)],
     dependencies: [
         .package(path: ".."),
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.32.2"),
@@ -68,6 +68,26 @@ let package = Package(
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ],
             path: "Sources/HackerNewsSummary"
+        ),
+        .executableTarget(
+            name: "ChildWorkflowContinueAsNew",
+            dependencies: [
+                .product(name: "Strand", package: "strand"),
+                .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+            ],
+            path: "Sources/ChildWorkflowContinueAsNew"
+        ),
+        .executableTarget(
+            name: "BatchSlidingWindow",
+            dependencies: [
+                .product(name: "Strand", package: "strand"),
+                .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+            ],
+            path: "Sources/BatchSlidingWindow"
         ),
     ],
     swiftLanguageModes: [.v6]

@@ -250,6 +250,27 @@ extension WorkflowRegistration {
                 // Record the emission in workflow history so it appears in the trace view.
                 let emitData = try! JSON.encode(WorkflowStateQueries.NamedEventData(eventName: eventName))
                 record(.eventEmitted, emitData)
+            case .signalExternalWorkflow(let targetTaskID, let signalName, let payload):
+                // Non-suspending cross-workflow signal. Inserts into strand.workflow_signals
+                // for the target workflow. At-least-once: re-executes on replay.
+                try await WorkflowStateQueries.insertSignal(
+                    on: exec.postgres,
+                    taskID: targetTaskID,
+                    namespaceID: exec.namespace,
+                    signalName: signalName,
+                    payloadBuffer: payload,
+                    logger: exec.logger
+                )
+                // Record the emission in workflow history for auditability.
+                record(
+                    .signalSent,
+                    try! JSON.encode(
+                        WorkflowStateQueries.SignalSentData(
+                            target: targetTaskID.uuidString,
+                            signal: signalName
+                        )
+                    )
+                )
             default:
                 break
             }
@@ -361,7 +382,8 @@ extension WorkflowRegistration {
             case .scheduleActivity, .startTimer, .awaitEvent, .scheduleChildWorkflow:
                 return true
             case .writeCheckpoint, .recordVersionMarker, .timerFired, .eventReceived, .eventWaitTimedOut,
-                .conditionMet, .conditionTimedOut, .emitEvent, .activityCompleted, .childWorkflowCompleted:
+                .conditionMet, .conditionTimedOut, .emitEvent, .activityCompleted, .childWorkflowCompleted,
+                .signalExternalWorkflow:
                 return false
             }
         }
@@ -427,7 +449,9 @@ extension WorkflowRegistration {
                             rateLimitIntervalMs: rlParams?.intervalMs,
                             rateLimitKey: rlParams?.slotKey,
                             rateLimitBurstSlots: rlParams?.burstSlots ?? 0,
-                            description: options.description
+                            // options.id is the display label (not idempotency key) in the
+                            // workflow context — mirrors ChildWorkflowOptions.id semantics.
+                            description: options.id ?? options.description
                         )
                     )
                     childHistoryItems.append(
@@ -670,7 +694,8 @@ extension WorkflowRegistration {
                     let childRetryStrategy,
                     let childScheduledAt,
                     let childDeadlineAt,
-                    let childParentClosePolicy
+                    let childParentClosePolicy,
+                    let childDescription
                 ):
                     let targetQueue = childQueue ?? exec.queue
                     pendingChildren.append(
@@ -698,7 +723,7 @@ extension WorkflowRegistration {
                             rateLimitIntervalMs: nil,
                             rateLimitKey: nil,
                             rateLimitBurstSlots: 0,
-                            description: nil
+                            description: childDescription  // from ChildWorkflowOptions.id — display label only
                         )
                     )
                     childHistoryItems.append(
@@ -711,18 +736,18 @@ extension WorkflowRegistration {
                     )
 
                 case .writeCheckpoint, .recordVersionMarker, .timerFired, .eventReceived, .eventWaitTimedOut,
-                    .conditionMet, .conditionTimedOut, .activityCompleted, .childWorkflowCompleted:
+                    .conditionMet, .conditionTimedOut, .activityCompleted, .childWorkflowCompleted,
+                    .signalExternalWorkflow:
                     break  // processed in step-2 (non-suspending, not enqueued as child tasks)
                 }
             }
 
-            // ── 5. Batch-enqueue all children + event_waits + run-state transition ──────────
+            // ── 5. Batch-enqueue all children + run-state transition ────────────────────────
             // One Postgres transaction for N children using true batch SQL:
             //   • multi-row VALUES INSERT for tasks (one round-trip)
             //   • multi-row VALUES INSERT for runs (one round-trip)
-            //   • unnest-based INSERT for event_waits (one round-trip)
             //   • pg_notify per distinct child queue (new tasks only)
-            //   • atomic task_completions count → PENDING or WAITING
+            //   • atomic task_completions count + has_buffered_completion → PENDING or WAITING
             if !pendingChildren.isEmpty {
                 try await Queries.enqueueChildTasksBatch(
                     on: exec.postgres,
@@ -918,27 +943,19 @@ extension WorkflowRegistration {
         // suspension came from sleep/waitForEvent which already wrote its own DB update.
 
         // ── 7. Partial-completion re-wait ───────────────────────────────────────────────
-        // The handler resumed some (but not all) children in a `withThrowingTaskGroup`
-        // batch and is parked waiting for the rest. No new schedule commands were emitted.
-        // Transition to WAITING so the next child completion can wake this run through the
-        // `event_waits` registered during the original dispatch.
+        // The handler is parked on a continuation but emitted no new schedule commands —
+        // e.g. it's waiting for an activity that hasn't completed yet.  Transition to
+        // WAITING so emitTaskCompletionSignal can wake this run when the child finishes.
         //
-        // The atomic CTE also checks for already-completed children (missed wakeups) and
-        // goes directly to PENDING in that case.
-        //
-        // This check is safe on the fresh path: `hasPendingContinuations &&
-        // scheduleCommands.isEmpty` cannot both be true there — any parked continuation
-        // on the fresh path must have emitted a .scheduleActivity / .awaitEvent command.
+        // If has_buffered_completion is set, a child finished while this activation
+        // was running; go PENDING immediately so the completion is not missed.
+        // Child completions wake this run via emitTaskCompletionSignal → parent_task_id,
+        // not through event_waits rows.
         if activation.stateMachine.hasPendingContinuations
             && scheduleCommands.isEmpty
             && !activation.stateMachine.hasUnsatisfiedConditions
         {
-            // Steps 7+7B share one transaction so the run stays RUNNING until
-            // all writes are durable. READ COMMITTED gives step 7B a fresh snapshot
-            // so it sees task_completions commits that step 7 missed.
             try await exec.postgres.withTransaction(logger: exec.logger) { conn in
-                // ── flushWrites content ─────────────────────────────────────────────────────────────────────────
-                // Version markers must commit before the run becomes claimable.
                 if !pendingVersionMarkers.isEmpty {
                     try await WorkflowStateQueries.batchWriteVersionMarkers(
                         on: conn,
@@ -976,33 +993,22 @@ extension WorkflowRegistration {
                         logger: exec.logger
                     )
                 }
-                // ── Step 7: partial-completion re-wait ────────────────────────────────
+                // Transition: go PENDING if has_buffered_completion is set (a child
+                // completed while this activation was RUNNING and flagged us), otherwise
+                // go WAITING until emitTaskCompletionSignal wakes us atomically.
                 try await conn.query(
                     """
                     WITH
-                    missed AS (
-                        SELECT ew.child_task_id
-                        FROM strand.event_waits ew
-                        JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
-                        WHERE ew.run_id        = \(claimed.runID)
-                          AND ew.child_task_id IS NOT NULL
-                    ),
-                    del_orphans AS (
-                        DELETE FROM strand.event_waits ew
-                        USING missed m
-                        WHERE ew.run_id        = \(claimed.runID)
-                          AND ew.child_task_id = m.child_task_id
-                    ),
                     run_upd AS (
                         UPDATE strand.runs
-                        SET state            = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
-                                                   THEN \(TaskState.pending)
-                                                   ELSE \(TaskState.waiting) END,
-                            available_at     = CASE WHEN (SELECT COUNT(*) FROM missed) > 0 OR has_buffered_completion
-                                                   THEN NOW()
-                                                   ELSE available_at END,
+                        SET state               = CASE WHEN has_buffered_completion
+                                                       THEN \(TaskState.pending)
+                                                       ELSE \(TaskState.waiting) END,
+                            available_at        = CASE WHEN has_buffered_completion
+                                                       THEN NOW()
+                                                       ELSE available_at END,
                             has_buffered_completion = FALSE,
-                            lease_expires_at = NULL
+                            lease_expires_at    = NULL
                         WHERE id = \(claimed.runID)
                         RETURNING state
                     )
@@ -1013,53 +1019,6 @@ extension WorkflowRegistration {
                     """,
                     logger: exec.logger
                 )
-                // ── Step 7B: snapshot-isolation recovery ────────────────────────────
-                // Each statement in a READ COMMITTED transaction gets a fresh snapshot,
-                // so this sees task_completions rows committed concurrently with step 7.
-                let recoveryStream = try await conn.query(
-                    """
-                    WITH
-                    missed AS (
-                        SELECT ew.child_task_id
-                        FROM strand.event_waits ew
-                        JOIN strand.task_completions tc ON tc.task_id = ew.child_task_id
-                        WHERE ew.run_id        = \(claimed.runID)
-                          AND ew.child_task_id IS NOT NULL
-                    ),
-                    del_orphans AS (
-                        DELETE FROM strand.event_waits ew
-                        USING missed m
-                        WHERE ew.run_id        = \(claimed.runID)
-                          AND ew.child_task_id = m.child_task_id
-                    ),
-                    run_upd AS (
-                        UPDATE strand.runs
-                        SET state        = \(TaskState.pending),
-                            available_at = NOW(),
-                            lease_expires_at = NULL
-                        WHERE id    = \(claimed.runID)
-                          AND state = \(TaskState.waiting)
-                          AND (SELECT COUNT(*) FROM missed) > 0
-                        RETURNING id
-                    )
-                    UPDATE strand.tasks
-                    SET state = \(TaskState.pending)
-                    FROM run_upd
-                    WHERE strand.tasks.id           = \(claimed.taskID)
-                      AND strand.tasks.namespace_id = \(exec.namespace)
-                    RETURNING strand.tasks.id
-                    """,
-                    logger: exec.logger
-                )
-                if try await recoveryStream.first(where: { _ in true }) != nil {
-                    exec.logger.debug(
-                        "partial-completion recovery: snapshot-isolation race detected — run set to PENDING",
-                        metadata: [
-                            "strand.task_id": .stringConvertible(claimed.taskID),
-                            "strand.run_id": .stringConvertible(claimed.runID),
-                        ]
-                    )
-                }
             }
             pendingVersionMarkers.removeAll()
             pendingCheckpoints.removeAll()
@@ -1117,6 +1076,16 @@ extension WorkflowRegistration {
         executor: StrandWorkflowExecutor,
         activation: _WorkflowActivation<W>
     ) {
+        // Warn when the workflow exits with signal/update handlers still in progress.
+        // Strand's current signal model is synchronous so this is always 0 today;
+        // the check is an invariant guard and is ready for future async handlers.
+        let pending = activation.pendingHandlerCount
+        if pending > 0 {
+            activation.logger.warning(
+                "[Strand] Workflow exiting with \(pending) handler(s) still running. Drain first: context.condition { _ in context.allHandlersFinished }. Suppress: .unfinishedPolicy = .abandon.",
+                metadata: ["strand.pending_handlers": "\(pending)"]
+            )
+        }
         cache.remove(taskID)
         handlerTask.cancel()
         activation.stateMachine.cancelPending()

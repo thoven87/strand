@@ -200,6 +200,21 @@ struct TaskRoutes {
             )
         }
 
+        // GET /api/:namespace/queues/:queue/tasks/:taskID/chain
+        // Returns all members of the continueAsNew chain that contains this task,
+        // ordered chronologically with a 1-based runNumber.
+        // A task that is not part of any chain returns a single-element array.
+        router.get("queues/:queue/tasks/:taskID/chain") { _, ctx -> [ChainMemberResponse] in
+            let taskID = try ctx.parameters.require("taskID", as: UUID.self)
+            let rows = try await ManagementQueries.listChain(
+                on: self.postgres,
+                namespaceID: ctx.namespaceID,
+                taskID: taskID,
+                logger: self.client.logger
+            )
+            return rows.map(ChainMemberResponse.init)
+        }
+
         router.post("queues/:queue/tasks/:taskID/cancel") { _, ctx -> SimpleResponse in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
             try await self.client.cancelTask(id: taskID, namespaceID: ctx.namespaceID)
@@ -346,12 +361,25 @@ struct TaskRoutes {
         router.get("tasks/:taskID/trace") { _, ctx -> [TraceSpanResponse] in
             let taskID = try ctx.parameters.require("taskID", as: UUID.self)
 
-            // 1. Task-level spans (WORKFLOW, ACTIVITY) from trace_spans — always
-            //    written atomically inside enqueueTask / completeRun / failRun CTEs.
+            // 1. Task-level spans (WORKFLOW, ACTIVITY) from trace_spans.
+            //
+            // Root tasks have root_task_id = task_id so a direct lookup works.
+            // Child tasks (e.g. SlidingWindowWorkflow inside a BatchWorkflow) have
+            // root_task_id pointing to the root ancestor. Resolve the actual
+            // root_task_id from any span that belongs to this task, then fetch
+            // the complete tree rooted there.
+            let resolvedRootID =
+                try await TraceSpanQueries.resolveRootTaskID(
+                    on: self.postgres,
+                    namespaceID: ctx.namespaceID,
+                    taskID: taskID,
+                    logger: self.client.logger
+                ) ?? taskID
+
             let spanRows = try await TraceSpanQueries.getTraceSpans(
                 on: self.postgres,
                 namespaceID: ctx.namespaceID,
-                rootTaskID: taskID,
+                rootTaskID: resolvedRootID,
                 logger: self.client.logger
             )
             guard !spanRows.isEmpty else {

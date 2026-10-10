@@ -336,6 +336,33 @@ public func == <Root, Value: Codable & Sendable>(
 /// // Type-safe call site:
 /// try await handle.signal(OrderWorkflow.Pause.self)
 /// ```
+/// Policy controlling what happens when a workflow exits while a signal or
+/// update handler is still in progress.
+///
+/// Assign this on a per-handler basis via the `unfinishedPolicy` requirement
+/// on ``WorkflowSignal`` and ``WorkflowUpdateDefinition``.
+public struct HandlerUnfinishedPolicy: Sendable, Equatable {
+    package enum Kind: Sendable, Equatable {
+        case warnAndAbandon
+        case abandon
+    }
+    package let kind: Kind
+    private init(_ kind: Kind) { self.kind = kind }
+
+    /// Log a warning when the workflow exits with this handler still running.
+    ///
+    /// This is the default. The warning names the handler and suggests
+    /// `condition { context.allHandlersFinished }` as the remedy.
+    public static let warnAndAbandon = HandlerUnfinishedPolicy(.warnAndAbandon)
+
+    /// Silently abandon this handler when the workflow exits.
+    ///
+    /// Use when it is expected and acceptable for the handler to be
+    /// interrupted by workflow completion — for example a fire-and-forget
+    /// notification signal that need not complete before CAN.
+    public static let abandon = HandlerUnfinishedPolicy(.abandon)
+}
+
 @_documentation(visibility: internal)
 public protocol WorkflowSignal {
     /// The workflow type that owns this signal.
@@ -347,6 +374,10 @@ public protocol WorkflowSignal {
     /// Signal name used for dispatch. Defaults to the type name lowercased.
     static var signalName: String { get }
 
+    /// What to do when the workflow exits while this handler is still running.
+    /// Defaults to ``HandlerUnfinishedPolicy/warnAndAbandon``.
+    static var unfinishedPolicy: HandlerUnfinishedPolicy { get }
+
     /// Apply the signal to the workflow struct.
     static func apply(to workflow: inout W, input: Input)
 }
@@ -356,6 +387,7 @@ extension WorkflowSignal {
     public static var signalName: String {
         String(describing: Self.self).lowercased()
     }
+    public static var unfinishedPolicy: HandlerUnfinishedPolicy { .warnAndAbandon }
 }
 
 // MARK: - WorkflowQuery
@@ -439,6 +471,9 @@ public protocol WorkflowUpdateDefinition {
     associatedtype Output: Sendable
     /// Update name used for dispatch. Defaults to the function name (camelCase).
     static var updateName: String { get }
+    /// What to do when the workflow exits while this handler is still running.
+    /// Defaults to ``HandlerUnfinishedPolicy/warnAndAbandon``.
+    static var unfinishedPolicy: HandlerUnfinishedPolicy { get }
     /// Applies the update to the workflow struct and returns a result.
     static func apply(to workflow: inout W, input: Input) throws -> Output
 }
@@ -450,6 +485,7 @@ extension WorkflowUpdateDefinition {
         let s = String(describing: Self.self)
         return s.prefix(1).lowercased() + s.dropFirst()
     }
+    public static var unfinishedPolicy: HandlerUnfinishedPolicy { .warnAndAbandon }
 }
 
 // MARK: - WorkflowUpdateError
@@ -717,11 +753,18 @@ public struct ChildWorkflowOptions: Sendable {
     /// Equivalent to ``WorkflowOptions/maxDuration`` for top-level workflows.
     public var maxDuration: Duration?
 
-    /// Explicit identifier for this child workflow execution.
+    /// Human-readable display label for this child workflow.
     ///
-    /// Used for deduplication: if a child workflow with this key already exists the
-    /// existing task is returned instead of creating a new one.
-    /// When `nil` (default) Strand auto-generates `"<parentTaskID>:<seqNum>"`.
+    /// When set, this string is stored in `strand.tasks.description` and shown
+    /// as the workflow label in the Loom UI. It does **not** change the
+    /// idempotency key — Strand always derives that from `"<parentTaskUUID>:<seqNum>"`
+    /// so that `loadCompletedChildActivities` can extract the sequence number
+    /// and route the result back to the correct continuation on replay.
+    ///
+    /// Using this field for deduplication (e.g. "only start one billing child")
+    /// is **not** supported: only one child per seqNum can exist per parent run
+    /// by construction, and the auto-generated key already ensures idempotent
+    /// replay across activations.
     public var id: String?
 
     /// What happens to this child workflow when the parent fails or is cancelled.

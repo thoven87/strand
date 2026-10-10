@@ -94,3 +94,38 @@ swift run DevServer
 # Then in a separate terminal:
 cd loom && npm run dev   # → http://localhost:5173
 ```
+
+### [ChildWorkflowContinueAsNew](ChildWorkflowContinueAsNew/)
+
+A parent spawns one child; the child calls `continueAsNew` four times then returns
+a final result. The parent is re-activated exactly once. Demonstrates:
+
+- Child workflow `continueAsNew` chains (5 runs, each with zero prior history)
+- Parent transparency — intermediate hops are invisible to the parent
+- Each `continueAsNew` hop resets history to zero, keeping `loadCompletedChildActivities` O(1) per activation
+- The Chain tab in Loom showing all 5 runs linked with run numbers
+
+```bash
+cd Examples
+swift run ChildWorkflowContinueAsNew
+```
+
+### [BatchSlidingWindow](BatchSlidingWindow/)
+
+`BatchWorkflow` counts 12 fake records, divides them into 2 partitions, and fans
+out to parallel `SlidingWindowWorkflow` children. Each child throttles dispatch to
+at most 2 concurrent processors and calls `continueAsNew` between pages to keep
+history small. Demonstrates:
+
+- **Cross-workflow signals**: `RecordProcessorWorkflow` notifies `SlidingWindowWorkflow`
+  via `context.signalExternalWorkflow(SlidingWindowWorkflow.RecordCompleted, taskID: parentID, payload: id)`
+- **`context.startChildWorkflow` fire-and-forget** with `parentClosePolicy: .abandon` so children survive `continueAsNew`
+- **`@WorkflowSignal` handler** mutating in-flight workflow state (`activeRecords`)
+- **`context.condition` throttling** — blocks until `activeCount < windowSize`
+- **`context.continueAsNew`** resetting history between pages
+- **Parallel child fan-out** via `withThrowingTaskGroup`
+
+```bash
+cd Examples
+swift run BatchSlidingWindow
+```

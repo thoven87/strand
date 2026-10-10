@@ -163,6 +163,58 @@ public struct WorkerOptions: Sendable {
     /// Default: ``JSONCodec`` (plain JSON, no encryption).
     public var codec: any StrandCodec
 
+    /// Whether `context.logger` emits records while the workflow is replaying.
+    ///
+    /// Workflow handlers re-execute from the beginning on every activation, so
+    /// leaving this disabled (the default) means each log statement appears exactly
+    /// once across all activations of a run. Enable it to follow replay step-by-step
+    /// when debugging. See ``WorkflowContext/logger``.
+    ///
+    /// Default: `false`.
+    public var enableLoggingInReplay: Bool
+
+    /// History size at which Strand emits a `warning` suggesting `continueAsNew`.
+    ///
+    /// Strand counts one history event per significant lifecycle transition
+    /// (activity scheduled, activity started, activity completed, timer, signal …).
+    /// A typical activity contributes ~3 events; a workflow with N sequential
+    /// activities accumulates ~3N events.
+    ///
+    /// On every non-cached fresh activation the worker runs three O(N) operations:
+    ///
+    /// | Operation | Cost per event |
+    /// |---|---|
+    /// | `getCheckpointStates` | ~0.27 µs (index scan) |
+    /// | `loadCompletedChildActivities` | ~0.006 ms (with LATERAL index) |
+    /// | In-memory replay | ~0.1 ms (Swift concurrency overhead) |
+    ///
+    /// Measured at 1,694 events (564 checkpoints) on a local Postgres instance:
+    /// the total overhead is ~60 ms — negligible. At **10,000 events** it reaches
+    /// ~350 ms; at **50,000** it reaches ~1.8 s. Both are well within the default
+    /// 120-second claim timeout, but the trend is linear and leaves no room for
+    /// degraded conditions.
+    ///
+    /// ## Threshold choice
+    ///
+    /// `10_000` is a conservative default. Raise it if your workflows legitimately
+    /// need more history (e.g. 1 M-item fan-out with very small payloads); lower it
+    /// for tighter latency budgets.
+    ///
+    /// ## Suppressing the warning
+    ///
+    /// Set to `Int.max` to disable entirely. To fix the root cause:
+    ///
+    /// ```swift
+    /// // At a natural break point in your workflow handler:
+    /// if context.historyEventCount > 5_000 {
+    ///     try await context.condition { _ in context.allHandlersFinished }
+    ///     try context.continueAsNew(input: .continuing(from: accumulatedState))
+    /// }
+    /// ```
+    ///
+    /// Default: `10_000`.
+    public var historyWarningThreshold: Int
+
     public init(
         queue: String = "default",
         namespace: String = "default",
@@ -179,7 +231,9 @@ public struct WorkerOptions: Sendable {
         wakeCompletedWaitingLimit: Int = 500,
         maxInfraFailures: Int = 10,
         onError: (@Sendable (any Error) async -> Void)? = nil,
-        codec: any StrandCodec = JSONCodec()
+        codec: any StrandCodec = JSONCodec(),
+        historyWarningThreshold: Int = 10_000,
+        enableLoggingInReplay: Bool = false
     ) {
         self.queue = queue
         self.namespace = namespace
@@ -197,6 +251,8 @@ public struct WorkerOptions: Sendable {
         self.maxInfraFailures = maxInfraFailures
         self.onError = onError
         self.codec = codec
+        self.historyWarningThreshold = historyWarningThreshold
+        self.enableLoggingInReplay = enableLoggingInReplay
     }
 }
 
@@ -1016,10 +1072,10 @@ public struct StrandWorker: Service {
                 do {
                     if claimed.parentWorkflowID != nil {
                         // ── Child workflow ────────────────────────────────────────────────
-                        // Reuse the same task_id so the parent's event_wait (child_task_id)
-                        // keeps tracking this task. The parent stays
-                        // WAITING; when the chain terminates with a real result, completeRun
-                        // fires emitTaskCompletionSignal and the parent receives it.
+                        // Reuse the same task_id so the parent's wakeup path stays intact.
+                        // emitTaskCompletionSignal locates the parent via parent_task_id
+                        // and transitions it WAITING → PENDING when the chain terminates
+                        // with a real result.
                         try await Queries.continueChildWorkflowAsNew(
                             on: postgres,
                             namespaceID: signal.namespaceID,

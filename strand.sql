@@ -300,6 +300,21 @@ CREATE INDEX IF NOT EXISTS strand_tasks_ns_id_desc_idx
     ON strand.tasks (namespace_id, queue, id DESC)
     WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'CONTINUED_AS_NEW');
 
+-- listTasks for terminal states (COMPLETED, FAILED, CANCELLED) uses ORDER BY id DESC
+-- with an optional cursor. The partial index above excludes terminal rows, so those
+-- queries fall back to a full namespace PK scan. This non-partial index lets the
+-- planner walk tasks in id DESC order for any state including terminal ones.
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_id_all_idx
+    ON strand.tasks (namespace_id, id DESC);
+
+-- listQueueStats / queueStats rootOnly=true path: counts root-workflow tasks per
+-- (namespace, queue, state). strand_tasks_ns_queue_state_idx covers (namespace, queue,
+-- state) but not parent_task_id IS NULL, forcing a heap fetch per matched row. This
+-- partial index pre-filters to root tasks so the COUNT is an index-only scan.
+CREATE INDEX IF NOT EXISTS strand_tasks_ns_queue_state_root_idx
+    ON strand.tasks (namespace_id, queue, state)
+    WHERE parent_task_id IS NULL;
+
 -- Parent-child lineage: "show all activities spawned by this workflow"
 CREATE INDEX IF NOT EXISTS strand_tasks_parent_idx
     ON strand.tasks (parent_task_id)
@@ -477,6 +492,11 @@ CREATE TABLE IF NOT EXISTS strand.runs (
     finished_at TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    -- Input params stored when the run was created.
+    -- Populated for every new run (initial, continueAsNew hop, retry).
+    -- NULL for runs created before this column was added.
+    params      BYTEA,
+
     -- Composite PK includes created_at (the partition key).
     CONSTRAINT strand_runs_pkey  PRIMARY KEY (id, created_at),
     CONSTRAINT strand_runs_kind  CHECK (kind IN ('WORKFLOW', 'ACTIVITY')),
@@ -533,6 +553,15 @@ CREATE INDEX IF NOT EXISTS strand_runs_task_idx
     ON strand.runs (task_id)
     WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
 
+-- loadCompletedChildActivities LATERAL: for each child task find its latest run
+-- attempt via `WHERE task_id = t.id ORDER BY attempt DESC LIMIT 1`. Without a
+-- composite index the planner falls back to a sequential scan of each monthly
+-- partition for every child task — O(N × partitions) instead of O(N × log M).
+-- The correlated `created_at >= t.created_at` filter in the LATERAL prunes
+-- pre-task partitions; this index makes the remaining partition lookup instant.
+CREATE INDEX IF NOT EXISTS strand_runs_task_attempt_idx
+    ON strand.runs (task_id, attempt DESC);
+
 -- Workers detail page — recent task list.
 -- Enables a point scan on (namespace_id, worker_id) sorted by started_at DESC so
 -- the top-50 recent runs are fetched without touching the rest of the partition.
@@ -540,6 +569,11 @@ CREATE INDEX IF NOT EXISTS strand_runs_task_idx
 CREATE INDEX IF NOT EXISTS strand_runs_worker_started_idx
     ON strand.runs (namespace_id, worker_id, started_at DESC)
     WHERE worker_id IS NOT NULL;
+
+-- listCheckpoints dashboard query uses `WHERE run_id = $1`; the PK is (task_id, seq_num)
+-- so without this index the query falls back to a sequential scan of the entire table.
+CREATE INDEX IF NOT EXISTS strand_checkpoints_run_id_idx
+    ON strand.checkpoints (run_id);
 
 -- Workers list page — 5-minute completed-recently window.
 -- The listWorkers query splits into a UNION ALL: RUNNING arm uses
@@ -622,6 +656,12 @@ CREATE TABLE IF NOT EXISTS strand.events (
 -- and the events page list (ordered newest first per name).
 CREATE INDEX IF NOT EXISTS strand_events_name_idx
     ON strand.events (namespace_id, queue, name, created_at DESC);
+
+-- listEventsGlobal without queue/name filters: ORDER BY created_at DESC with LIMIT.
+-- strand_events_name_idx requires (queue, name) to be fixed before it can range-scan
+-- on created_at; without this index the unfiltered path does a full namespace scan + sort.
+CREATE INDEX IF NOT EXISTS strand_events_ns_created_idx
+    ON strand.events (namespace_id, created_at DESC);
 -- GIN index enabling efficient `payload @> predicate` containment checks at
 -- event emission time. Sparse: only non-trivial payloads (not empty object)
 -- are indexed — most events have real content.
@@ -679,6 +719,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS strand_event_triggers_emission_task_idx
 --
 -- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS infra_failure_count SMALLINT NOT NULL DEFAULT 0;
 -- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS heartbeat_details BYTEA;
+-- ALTER TABLE strand.runs ADD COLUMN IF NOT EXISTS params BYTEA;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS heartbeat_timeout_seconds INTEGER;
 -- ALTER TABLE strand.tasks ADD COLUMN IF NOT EXISTS backfill_id UUID REFERENCES strand.backfills(id) ON DELETE SET NULL;
 -- ALTER TABLE strand.backfills ADD COLUMN IF NOT EXISTS schedule_id UUID REFERENCES strand.schedules(id) ON DELETE SET NULL;

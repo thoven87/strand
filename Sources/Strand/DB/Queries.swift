@@ -225,10 +225,10 @@ enum Queries {
                 try await conn.query(
                     """
                     INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at, priority,
-                                           fairness_key, fairness_weight, kind)
+                                           fairness_key, fairness_weight, kind, params)
                     VALUES (\(namespaceID), \(runID), \(taskID), \(queue), 1, \(TaskState.pending),
                             COALESCE(\(scheduledAt), NOW()), \(priority),
-                            \(fairnessKey), \(fairnessWeight), \(kind))
+                            \(fairnessKey), \(fairnessWeight), \(kind), \(paramsBuffer))
                     """,
                     logger: logger
                 )
@@ -632,7 +632,7 @@ enum Queries {
                 runInterp.appendLiteral(
                     "INSERT INTO strand.runs "
                         + "(namespace_id, id, task_id, queue, attempt, state, "
-                        + "available_at, priority, fairness_key, fairness_weight, kind) VALUES "
+                        + "available_at, priority, fairness_key, fairness_weight, kind, params) VALUES "
                 )
                 for (i, item) in newItems.enumerated() {
                     if i > 0 { runInterp.appendLiteral(", ") }
@@ -656,6 +656,8 @@ enum Queries {
                     runInterp.appendInterpolation(fairnessWeight)
                     runInterp.appendLiteral(", ")
                     try runInterp.appendInterpolation(kind)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(item.paramsBuffer)
                     runInterp.appendLiteral(")")
                 }
                 try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
@@ -769,9 +771,8 @@ enum Queries {
     ///   2. One multi-row `VALUES` INSERT for all tasks (idempotent via `ON CONFLICT DO NOTHING`)
     ///   3. One multi-row `VALUES` INSERT for genuinely new runs
     ///   4. `pg_notify` per distinct new child queue (via `notifyWorkers`)
-    ///   5. One `unnest`-based INSERT for all `event_waits` (idempotent)
-    ///   6. `task_completions` count — if any child already done: delete its `event_wait`,
-    ///      set parent to PENDING + notify; otherwise set parent to WAITING.
+    ///   5. `task_completions` count + has_buffered_completion check:
+    ///      if child already completed or flag set → PENDING; otherwise → WAITING.
     ///
     /// - Returns: `(seqNum, taskID)` pairs in the same order as `children`.
     @discardableResult
@@ -874,7 +875,7 @@ enum Queries {
                 runInterp.appendLiteral(
                     "INSERT INTO strand.runs "
                         + "(namespace_id, id, task_id, queue, attempt, state, "
-                        + "available_at, priority, fairness_key, fairness_weight, kind) VALUES "
+                        + "available_at, priority, fairness_key, fairness_weight, kind, params) VALUES "
                 )
                 for (i, child) in newChildren.enumerated() {
                     if i > 0 { runInterp.appendLiteral(", ") }
@@ -898,6 +899,8 @@ enum Queries {
                     runInterp.appendInterpolation(child.fairnessWeight)
                     runInterp.appendLiteral(", ")
                     try runInterp.appendInterpolation(child.kind)
+                    runInterp.appendLiteral(", ")
+                    runInterp.appendInterpolation(child.paramsBuffer)
                     runInterp.appendLiteral(")")
                 }
                 try await conn.query(PostgresQuery(stringInterpolation: runInterp), logger: logger)
@@ -996,83 +999,49 @@ enum Queries {
                 return (seqNum: child.seqNum, taskID: taskID)
             }
 
-            // ── 7. Register event_waits for all children — one unnest statement ─────────
-            // unnest zips the two arrays row-by-row: one INSERT for all N children.
-            // [Int] encodes as int8[]; Postgres silently casts to the int4 column.
-            //
-            // namespace_id MUST be included: omitting it gives DEFAULT='default',
-            // which breaks cross-namespace isolation and causes emitTaskCompletionSignal
-            // to mis-match or leave orphaned rows when the parent namespace differs.
-            let ewSeqNums = result.map { $0.seqNum }
-            let ewChildIDs = result.map { $0.taskID }
-            try await conn.query(
-                """
-                INSERT INTO strand.event_waits
-                    (namespace_id, task_id, run_id, queue, seq_num, child_task_id, timeout_at)
-                SELECT \(namespaceID), \(parentTaskID), \(parentRunID), \(parentQueue),
-                       u.seq_num, u.child_task_id, NULL
-                FROM unnest(\(ewSeqNums), \(ewChildIDs)) AS u(seq_num, child_task_id)
-                ON CONFLICT (run_id, seq_num) DO UPDATE
-                    SET child_task_id  = EXCLUDED.child_task_id,
-                        namespace_id   = EXCLUDED.namespace_id,
-                        timeout_at     = NULL
-                """,
-                logger: logger
-            )
-
             // ── 8. Atomic completion-check + parent-run state transition ─────────────
             //
-            // State decision:
-            //   • ALL batch children completed → PENDING: delete orphaned event_waits, wake.
-            //   • SOME children still running  → WAITING: park until emitTaskCompletionSignal fires.
+            // State decision (in priority order):
+            //   • ALL batch children completed → PENDING: child finished before this
+            //     transaction, possibly because emitTaskCompletionSignal already set
+            //     has_buffered_completion. Wake immediately.
+            //   • has_buffered_completion set → PENDING: a child completed while this
+            //     activation was RUNNING; the flag was set by emitTaskCompletionSignal.
+            //   • Neither → WAITING: park until emitTaskCompletionSignal atomically
+            //     transitions this run to PENDING via the parent_task_id FK path.
             //
-            // The completion count and del_orphans must share the same READ COMMITTED snapshot.
-            // Idempotency-hit children can complete while this transaction is open; if del_orphans
-            // used a newer snapshot than the count check it could delete all event_waits while
-            // allDone was still false — leaving the parent WAITING with no event_waits and no
-            // future notifications (permanently stuck).  A single MATERIALIZED CTE closes the gap.
-            //
-            // Guard: AND state != SLEEPING
-            //   Prevents overwriting a SLEEPING state that .awaitEvent / sleep already set
-            //   in the same applyScheduleCommands loop.
+            // emitTaskCompletionSignal uses parent_task_id to find and wake the parent
+            // directly, making the event_waits row unnecessary for child-activity wakeup.
             let childTaskIDs = result.map { $0.taskID }
             let totalChildren = result.count
             let transitionStream = try await conn.query(
                 """
                 WITH
                 completed AS MATERIALIZED (
-                    -- Read task_completions ONCE; result is shared by del_orphans and all_done
-                    -- so both use the identical committed snapshot — eliminating the TOCTOU race.
+                    -- Read task_completions ONCE; result is shared by all_done.
                     SELECT task_id
                     FROM strand.task_completions
                     WHERE task_id = ANY(\(childTaskIDs))
-                ),
-                del_orphans AS (
-                    -- Remove event_waits for children that already have completions.
-                    DELETE FROM strand.event_waits ew
-                    USING completed c
-                    WHERE ew.run_id        = \(parentRunID)
-                      AND ew.child_task_id = c.task_id
                 ),
                 all_done AS (
                     SELECT (SELECT COUNT(*) FROM completed) = \(totalChildren) AS v
                 ),
                 r AS (
                     UPDATE strand.runs
-                    SET state        = CASE WHEN (SELECT v FROM all_done)
+                    SET state        = CASE WHEN (SELECT v FROM all_done) OR has_buffered_completion
                                            THEN \(TaskState.pending)
                                            ELSE \(TaskState.waiting) END,
-                        available_at = CASE WHEN (SELECT v FROM all_done) THEN NOW() ELSE available_at END,
+                        available_at = CASE WHEN (SELECT v FROM all_done) OR has_buffered_completion
+                                           THEN NOW() ELSE available_at END,
+                        has_buffered_completion = FALSE,
                         lease_expires_at = NULL
                     WHERE id    = \(parentRunID)
                       AND state != \(TaskState.sleeping)  -- do not overwrite named-event / timer sleep
-                    RETURNING id
+                    RETURNING id, state  -- state used by task_upd so both tables stay in sync
                 ),
                 task_upd AS (
                     UPDATE strand.tasks
-                    SET state = CASE WHEN (SELECT v FROM all_done)
-                                     THEN \(TaskState.pending)
-                                     ELSE \(TaskState.waiting) END
+                    SET state = (SELECT state FROM r)
                     FROM r WHERE strand.tasks.id = \(parentTaskID)
                 )
                 SELECT (SELECT v FROM all_done)
@@ -1213,10 +1182,8 @@ enum Queries {
                 FROM claimed c WHERE t.id = c.task_id
             ),
             trace_upd AS (
-                -- Inline RUNNING state into the claim CTE so trace_spans stays
-                -- consistent with strand.runs atomically — eliminates the old
-                -- post-claim try? loop that could leave span state stale when
-                -- the worker processed multiple tasks concurrently.
+                -- Update trace_spans inside the claim CTE so the RUNNING state
+                -- is written to trace_spans and strand.runs atomically.
                 -- trace_spans.id is TEXT; c.task_id is UUID — ::text cast required.
                 UPDATE strand.trace_spans
                 SET state      = \(WorkflowSpanState.running),
@@ -1688,10 +1655,12 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at, priority,
-                                       fairness_key, fairness_weight, heartbeat_details)
-                SELECT namespace_id, \(newRunID), task_id, queue, \(nextAttempt), \(newState), \(wakeAt),
-                       priority, fairness_key, fairness_weight, heartbeat_details
-                FROM strand.runs WHERE id = \(runID)
+                                       fairness_key, fairness_weight, heartbeat_details, params)
+                SELECT r.namespace_id, \(newRunID), r.task_id, r.queue, \(nextAttempt), \(newState), \(wakeAt),
+                       r.priority, r.fairness_key, r.fairness_weight, r.heartbeat_details, t.params
+                FROM strand.runs r
+                JOIN strand.tasks t ON t.id = r.task_id
+                WHERE r.id = \(runID)
                 """,
                 logger: logger
             )
@@ -2213,9 +2182,8 @@ enum Queries {
     }
 
     /// Client overload — delegates to the connection overload; also extends the claim
-    /// lease when requested.  Both writes share a single connection checkout so that
-    /// the checkpoint INSERT and the lease extension are issued on the same connection,
-    /// halving the number of pool checkouts compared to the old two-call approach.
+    /// lease when requested. Both writes share a single connection checkout so the
+    /// checkpoint INSERT and the lease extension are issued atomically.
     static func setCheckpointState(
         on client: PostgresClient,
         namespaceID: String,
@@ -3065,9 +3033,9 @@ enum Queries {
     ///      `run_id` and is untouched).
     ///   4. Inserts a fresh `PENDING` run for the same task.
     ///
-    /// The parent remains `WAITING` (its `event_waits.child_task_id` still points to
-    /// `taskID`). When the chain finally calls `completeRun` with a real result,
-    /// `emitTaskCompletionSignal` fires and the parent receives the correct value.
+    /// The parent remains `WAITING`; when the chain finally calls `completeRun`
+    /// with a real result, `emitTaskCompletionSignal` locates the parent via
+    /// `parent_task_id` and transitions it to PENDING.
     ///
     /// The entire operation is one atomic CTE. If the CAS check
     /// (`state = RUNNING AND version = currentVersion`) fails (race / duplicate),
@@ -3116,24 +3084,30 @@ enum Queries {
                 WHERE task_id      = (SELECT task_id FROM complete_run)
                   AND namespace_id = \(namespaceID)
             ),
-            del_signals AS (
-                DELETE FROM strand.workflow_signals
-                WHERE task_id      = (SELECT task_id FROM complete_run)
-                  AND namespace_id = \(namespaceID)
-            ),
+            -- NOTE: workflow_signals is intentionally NOT deleted here.
+            -- Signals from fire-and-forget children (parentClosePolicy: .abandon)
+            -- that complete concurrently with the continueAsNew may arrive between
+            -- insertSignal and continueChildWorkflowAsNew's transaction commit.
+            -- Deleting them here would silently discard those signals, leaving the
+            -- new run waiting forever for a RecordCompleted that already fired.
+            -- The new run's _activate applies any pending signals via the
+            -- pending_sigs check → resumeActivation → applyAndPersistSignals.
+            -- Signal handlers are idempotent (check Set membership before acting),
+            -- so carrying over signals from the old run is safe.
             del_event_waits AS (
-                -- Remove the child's OWN event_waits (activities / timers it was
-                -- waiting for). The parent's event_wait is on the parent's run_id
-                -- and is not touched.
+                -- Remove the child workflow's OWN event_waits (waitForEvent
+                -- subscriptions it registered while running). These are keyed on
+                -- the child's task_id, not the parent's run_id, so the parent's
+                -- wakeup path (parent_task_id → emitTaskCompletionSignal) is unaffected.
                 DELETE FROM strand.event_waits
                 WHERE task_id = (SELECT task_id FROM complete_run)
             ),
             new_run AS (
                 INSERT INTO strand.runs
                     (id, namespace_id, task_id, queue, attempt, state,
-                     available_at, created_at, priority, fairness_key, fairness_weight, kind)
+                     available_at, created_at, priority, fairness_key, fairness_weight, kind, params)
                 SELECT \(newRunID), \(namespaceID), id, queue, 1, 'PENDING',
-                       NOW(), NOW(), priority, fairness_key, fairness_weight, kind
+                       NOW(), NOW(), priority, fairness_key, fairness_weight, kind, \(newInput)
                 FROM reset_task
                 RETURNING namespace_id, queue
             )
@@ -3210,14 +3184,14 @@ enum Queries {
             all_desc AS (
                 -- Direct children of rootTaskID
                 SELECT id, state, queue, priority, fairness_key, fairness_weight,
-                       attempt, max_attempts, kind, parent_task_id, created_at
+                       attempt, max_attempts, kind, parent_task_id, created_at, params
                 FROM   strand.tasks
                 WHERE  parent_task_id = \(rootTaskID)
                   AND  namespace_id   = \(namespaceID)
                 UNION ALL
                 -- Grandchildren and deeper
                 SELECT t.id, t.state, t.queue, t.priority, t.fairness_key, t.fairness_weight,
-                       t.attempt, t.max_attempts, t.kind, t.parent_task_id, t.created_at
+                       t.attempt, t.max_attempts, t.kind, t.parent_task_id, t.created_at, t.params
                 FROM   strand.tasks t
                 JOIN   all_desc d ON t.parent_task_id = d.id
             ),
@@ -3270,7 +3244,7 @@ enum Queries {
                 INSERT INTO strand.runs
                     (namespace_id, id, task_id, queue, attempt, state,
                      available_at, priority, fairness_key, fairness_weight,
-                     kind, parent_task_id)
+                     kind, parent_task_id, params)
                 SELECT \(namespaceID),
                        strand.gen_uuid_v7(),
                        tr.id,
@@ -3282,7 +3256,8 @@ enum Queries {
                        tr.fairness_key,
                        tr.fairness_weight,
                        tr.kind,
-                       tr.parent_task_id
+                       tr.parent_task_id,
+                       tr.params
                 FROM   to_reset tr
                 RETURNING queue
             ),
@@ -3387,7 +3362,7 @@ enum Queries {
                 """
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
                                        priority, fairness_key, fairness_weight,
-                                       kind, parent_task_id, heartbeat_details)
+                                       kind, parent_task_id, heartbeat_details, params)
                 SELECT namespace_id, \(newRunID), id, queue, \(nextAttempt), \(TaskState.pending), NOW(),
                        priority, fairness_key, fairness_weight,
                        kind, parent_task_id,
@@ -3399,7 +3374,8 @@ enum Queries {
                                   WHERE r.task_id = t.id
                                   ORDER BY r.attempt DESC LIMIT 1)
                             ELSE NULL
-                       END
+                       END,
+                       t.params
                 FROM strand.tasks t WHERE t.id = \(taskID) AND t.namespace_id = \(namespaceID)
                 """,
                 logger: logger
@@ -3517,9 +3493,9 @@ enum Queries {
             try await conn.query(
                 """
                 INSERT INTO strand.runs (namespace_id, id, task_id, queue, attempt, state, available_at,
-                                        priority, fairness_key, fairness_weight, kind)
+                                        priority, fairness_key, fairness_weight, kind, params)
                 VALUES (\(namespaceID), \(newRunID), \(newTaskID), \(queue), 1, \(TaskState.pending), NOW(),
-                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind))
+                        \(priority), \(fairnessKey), \(fairnessWeight), \(kind), \(params))
                 """,
                 logger: logger
             )
@@ -3547,21 +3523,20 @@ enum Queries {
 
     // MARK: - Task completion signals
 
-    /// Persists the child completion and signals any waiting parent workflow.
+    /// Records a child task completion and atomically wakes the parent workflow.
     ///
-    /// 1. **Insert** into `strand.task_completions` (idempotent via ON CONFLICT DO NOTHING).
-    /// 2. **Flag** RUNNING parents via `has_buffered_completion = TRUE`; step-7 detects
-    ///    this at the end of the parent's current activation and transitions to PENDING.
-    /// 3. **Notify** workers for WAITING/SLEEPING parents so the poll loop can call
-    ///    `wakeCompletedWaiting`.  RUNNING parents receive no notify here because
-    ///    step-7's own deferred `notifyWorkers` fires after its transaction commits.
+    /// Three cases based on the parent run's state at the moment this executes:
+    ///   - **WAITING / SLEEPING**: transition directly to PENDING + pg_notify.
+    ///     The parent_task_id FK on strand.tasks is used to locate the parent —
+    ///     this is structurally durable and never requires an event_waits row.
+    ///   - **RUNNING** (mid-activation): set `has_buffered_completion = TRUE`.
+    ///     The activation's exit path sees the flag and goes PENDING instead of
+    ///     WAITING, so the completion is never missed.
+    ///   - **PENDING / COMPLETED / other**: no-op — the parent will process the
+    ///     result on its next activation via `loadCompletedChildActivities`.
     ///
-    /// The parent run state is owned exclusively by:
-    ///   - step-7 `withTransaction`  (RUNNING → WAITING/PENDING)
-    ///   - `wakeCompletedWaiting`    (WAITING → PENDING, from poll loop)
-    ///   - External callers          (cancelTask, etc.)
-    ///
-    /// Must be called inside an existing transaction (`conn`).
+    /// Called inside `completeRun`'s and `failRun`'s transaction so that the
+    /// child completion and the parent wakeup are written atomically.
     static func emitTaskCompletionSignal(
         conn: PostgresConnection,
         namespaceID: String,
@@ -3581,64 +3556,72 @@ enum Queries {
                         result       = EXCLUDED.result,
                         completed_at = NOW()
                 -- Allow a successful manual retry to overwrite a terminal failure.
-                -- In normal flow this conflict never fires (each task completes once).
-                -- When an operator retries an activity that hit maxAttempts, the new
-                -- COMPLETED signal must win so the parent workflow sees the success on
-                -- its next activation instead of replaying the stale FAILED sentinel.
                 WHERE strand.task_completions.state IN (\(TaskState.failed), \(TaskState.cancelled))
                   AND EXCLUDED.state = \(TaskState.completed)
             ),
+            -- Find the parent workflow's current active run via the immutable parent_task_id FK.
+            -- Using parent_task_id instead of event_waits means the wakeup can never be lost
+            -- due to a missing or prematurely-deleted event_waits row.
+            parent_run AS MATERIALIZED (
+                SELECT r.id        AS run_id,
+                       r.task_id   AS parent_task_id,
+                       r.queue,
+                       r.state
+                FROM   strand.tasks child
+                JOIN   strand.runs  r ON r.task_id      = child.parent_task_id
+                WHERE  child.id          = \(taskID)
+                  AND  child.parent_task_id IS NOT NULL
+                  AND  r.namespace_id   = \(namespaceID)
+                  AND  r.state IN (\(TaskState.waiting), \(TaskState.sleeping), \(TaskState.running))
+            ),
+            -- WAITING/SLEEPING parent: flip directly to PENDING — atomic and durable.
+            -- The parent's activation holds no lock at this point so the UPDATE is safe.
+            wake_parent_run AS (
+                UPDATE strand.runs r
+                SET    state             = \(TaskState.pending),
+                       available_at      = NOW(),
+                       lease_expires_at  = NULL
+                FROM   parent_run pr
+                WHERE  r.id    = pr.run_id
+                  AND  pr.state IN (\(TaskState.waiting), \(TaskState.sleeping))
+                RETURNING pr.queue, pr.parent_task_id
+            ),
+            wake_parent_task AS (
+                UPDATE strand.tasks
+                SET state = \(TaskState.pending)
+                FROM wake_parent_run
+                WHERE strand.tasks.id = wake_parent_run.parent_task_id
+            ),
+            -- RUNNING parent: the activation holds the runs row lock — setting state here would
+            -- deadlock. Flag it instead; the activation's exit path checks has_buffered_completion
+            -- and transitions to PENDING before releasing the lock.
             flag_running AS (
-                -- Parent is RUNNING (mid-activation): set has_buffered_completion so
-                -- the parent's step-7 withTransaction detects the child at the end of
-                -- its current activation and transitions to PENDING.
-                -- The parent's activation holds the runs row lock — do NOT try to
-                -- modify runs.state here to avoid lock-order conflicts.
                 UPDATE strand.runs r
                 SET    has_buffered_completion = TRUE
-                FROM   strand.event_waits ew
-                WHERE  ew.child_task_id = \(taskID)
-                  AND  r.id             = ew.run_id
-                  AND  r.state          = \(TaskState.running)
-                  AND  r.namespace_id   = \(namespaceID)
-            ),
-            notif AS (
-                -- Collect the parent queue for WAITING/SLEEPING parents so workers
-                -- can run wakeCompletedWaiting and transition them to PENDING.
-                -- RUNNING parents are excluded: step-7's deferred notifyWorkers fires
-                -- after its own transaction commits.
-                SELECT r.queue, r.namespace_id
-                FROM   strand.event_waits ew
-                JOIN   strand.runs r ON r.id = ew.run_id
-                WHERE  ew.child_task_id = \(taskID)
-                  AND  r.state IN (\(TaskState.waiting), \(TaskState.sleeping))
-                  AND  r.namespace_id   = \(namespaceID)
-                LIMIT 1
+                FROM   parent_run pr
+                WHERE  r.id    = pr.run_id
+                  AND  pr.state = \(TaskState.running)
             )
-            SELECT pg_notify(\(StrandChannels.tasks), namespace_id || '/' || queue)
-            FROM notif
+            SELECT pg_notify(\(StrandChannels.tasks), \(namespaceID) || '/' || queue)
+            FROM   wake_parent_run
             """,
             logger: logger
         )
     }
 
-    /// Transitions WAITING workflow runs to PENDING when their child activities have
-    /// completed.  Called from each worker's poll loop immediately before `claimTasks`.
+    /// Safety-net sweep: transitions WAITING workflow runs to PENDING when
+    /// `has_buffered_completion` is set.
     ///
-    /// A WAITING run has no active activation, so there is no concurrent writer:
-    /// this is the only code path that makes WAITING → PENDING transitions.
-    /// `FOR UPDATE SKIP LOCKED` lets multiple workers process different runs in
-    /// parallel without contention.
+    /// Promotes WAITING parent workflows to PENDING when their children complete.
     ///
-    /// Two predicates are OR-ed to catch all stuck-WAITING cases:
-    ///   1. event_waits JOIN task_completions — child completed while parent was already
-    ///      WAITING; the normal path.  emitTaskCompletionSignal sends pg_notify to
-    ///      trigger this eagerly, but the poll loop also calls this as a safety net.
-    ///   2. has_buffered_completion = TRUE — a child completed while the parent was
-    ///      RUNNING (flag_running set the flag) but the subsequent activation left the
-    ///      run WAITING with the flag still set.  This should be impossible under
-    ///      normal row-locking semantics, but serves as defence-in-depth for any
-    ///      edge case not yet anticipated.
+    /// `emitTaskCompletionSignal` sets `has_buffered_completion` on the parent run
+    /// when a child finishes while the parent is mid-activation (RUNNING). The
+    /// activation holds the row lock, so the state cannot be flipped directly at
+    /// that moment. The activation's own exit path clears the flag and goes PENDING
+    /// in the common case; this sweep is the fallback for any run that still has the
+    /// flag set — e.g. the activation crashed between the child completion and its
+    /// own state transition.
+    ///
     /// Connection overload — SQL lives here; used inside the shared pollLoop connection.
     static func wakeCompletedWaiting(
         on conn: PostgresConnection,
@@ -3661,17 +3644,7 @@ enum Queries {
                 WHERE  r.namespace_id = \(namespaceID)
                   AND  r.queue        = \(queue)
                   AND  r.state        = \(TaskState.waiting)
-                  AND  r.created_at  >= DATE_TRUNC('month', NOW()) - INTERVAL '1 month'
-                  AND  (
-                      r.has_buffered_completion
-                      OR EXISTS (
-                          SELECT 1
-                          FROM   strand.event_waits ew
-                          JOIN   strand.task_completions tc ON tc.task_id = ew.child_task_id
-                          WHERE  ew.run_id        = r.id
-                            AND  ew.child_task_id IS NOT NULL
-                      )
-                  )
+                  AND  r.has_buffered_completion = TRUE
                 ORDER BY r.id
                 LIMIT \(limit)
                 FOR UPDATE SKIP LOCKED

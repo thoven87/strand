@@ -112,6 +112,12 @@ export interface TaskDetail {
     workflowId: string | null;
     /** Human-readable description set at enqueue time. null if not set. */
     description: string | null;
+    /**
+     * Root task UUID for continueAsNew chains.
+     * null when this task IS the chain root or is not part of a chain.
+     * Non-null means this task is a continuation of a prior run.
+     */
+    firstTaskId: string | null;
     scheduling: {
         scheduleName: string | null;
         scheduleId: string | null;
@@ -121,6 +127,24 @@ export interface TaskDetail {
         /** ISO 8601 offset string from the schedule pattern, e.g. "P3DT15H". null when offset is zero. */
         scheduleOffset: string | null;
     } | null;
+}
+
+/** One member of a continueAsNew chain, returned by GET …/chain. */
+export interface ChainMember {
+    id: string;
+    name: string;
+    queue: string;
+    state: TaskStatus;
+    /** null for the chain root; the root task UUID for all continuations. */
+    firstTaskId: string | null;
+    createdAt: string;
+    completedAt: string | null;
+    /** 1-based position in the chain, ordered chronologically. */
+    runNumber: number;
+    /** true when this entry is a run row (child workflow continueAsNew hop) */
+    isRunEntry: boolean;
+    /** For run-based entries: the strand.runs.id UUID of this hop */
+    runID: string | null;
 }
 
 export interface CursorPage<T> {
@@ -144,6 +168,8 @@ export interface Run {
     availableAt: string | null;
     createdAt: string;
     failureReason: string | null; // raw JSON string
+    /** Input params stored when this run was created (null for pre-migration runs). */
+    params: string | null; // raw JSON
 }
 
 export interface Checkpoint {

@@ -285,16 +285,26 @@ package enum WorkflowStateQueries {
     /// The idempotency_key format is `"\(parentTaskID):\(seqNum)"` where seqNum is a
     /// decimal integer string. The prefix is stripped and parsed to recover the integer
     /// key used by the executor's `preloadedResults` / `preloadedNonCompletions` maps.
+    ///
+    /// - Note: The LATERAL subquery on `strand.runs` includes `AND created_at >= t.created_at`
+    ///   as a correlated partition-pruning predicate. Because `strand.runs` is partitioned
+    ///   monthly by `created_at`, omitting this filter causes PostgreSQL to scan every
+    ///   partition for each child task. The predicate is always logically true (a run cannot
+    ///   be created before its task) but lets the planner eliminate all older partitions.
     package static func loadCompletedChildActivities(
         on conn: PostgresConnection,
         parentTaskID: UUID,
+        parentRunID: UUID,
         logger: Logger
     ) async throws -> [(
         seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
         state: TaskState, kind: TaskKind, name: String,
         startedAt: Date?, runAttempt: Int, workerID: String?
     )] {
-        let prefix = "\(parentTaskID):"
+        // Scope the prefix to the run UUID so that continueAsNew runs — which
+        // share the same task UUID but have a fresh run UUID — never load children
+        // from prior runs whose seqNums collide with the new run's seqNums.
+        let prefix = "\(parentRunID):"
         let prefixPattern = prefix + "%"
         let stream = try await conn.query(
             """
@@ -306,7 +316,8 @@ package enum WorkflowStateQueries {
             LEFT JOIN LATERAL (
                 SELECT failure_reason, started_at, attempt, worker_id
                 FROM strand.runs
-                WHERE task_id = t.id
+                WHERE task_id    = t.id
+                  AND created_at >= t.created_at  -- partition pruning: no run exists before its task
                 ORDER BY attempt DESC LIMIT 1
             ) r ON true
             WHERE t.parent_task_id = \(parentTaskID)
@@ -352,13 +363,16 @@ package enum WorkflowStateQueries {
     package static func loadCompletedChildActivities(
         on postgres: PostgresClient,
         parentTaskID: UUID,
+        parentRunID: UUID,
         logger: Logger
     ) async throws -> [(
         seqNum: Int, result: ByteBuffer?, failureReason: ByteBuffer?,
         state: TaskState, kind: TaskKind, name: String,
         startedAt: Date?, runAttempt: Int, workerID: String?
     )] {
-        try await postgres.withConnection { try await loadCompletedChildActivities(on: $0, parentTaskID: parentTaskID, logger: logger) }
+        try await postgres.withConnection {
+            try await loadCompletedChildActivities(on: $0, parentTaskID: parentTaskID, parentRunID: parentRunID, logger: logger)
+        }
     }
 
     // MARK: - nextHistorySeq
@@ -415,6 +429,7 @@ package enum WorkflowStateQueries {
         case childWorkflowStarted = "CHILD_WORKFLOW_STARTED"
         case childWorkflowCompleted = "CHILD_WORKFLOW_COMPLETED"
         case eventEmitted = "EVENT_EMITTED"  // ctx.emitEvent(...)
+        case signalSent = "SIGNAL_SENT"  // ctx.signalExternalWorkflow(...)
         /// Workflow closed cooperatively after receiving a REQUEST_CANCEL from its parent.
         /// Written in `applyScheduleCommands` when the handler exits via `CancellationError`.
         case workflowCancelled = "WORKFLOW_CANCELLED"
@@ -553,6 +568,17 @@ package enum WorkflowStateQueries {
     /// JSON shape: `{"error":"..."}`.
     package struct WorkflowFailedData: Encodable {
         package let error: String
+    }
+
+    /// Payload for `SIGNAL_SENT`.
+    ///
+    /// JSON shape: `{"target":"<UUID>","signal":"RecordCompleted"}`.
+    /// Written when a workflow calls `context.signalExternalWorkflow(...)` to
+    /// notify another workflow. The `target` is the `strand.tasks.id` of the
+    /// receiving workflow; `signal` is the registered signal name.
+    package struct SignalSentData: Encodable {
+        package let target: String  // UUID string of the target workflow task
+        package let signal: String  // registered signal name
     }
 
     /// Appends a single event to this workflow's history log.

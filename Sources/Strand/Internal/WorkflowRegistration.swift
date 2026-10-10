@@ -187,12 +187,13 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         //
         // Error eviction: if _activate throws (e.g. a DB error inside
         // applyScheduleCommands), the inner do-catch also evicts.  Without this,
-        // the handler Task stays parked on continuations for activities that were
-        // never durably committed (rolled-back transaction), so the next retry's
-        // resumeActivation finds no completed children, the handler can't advance,
-        // step 7 produces WAITING with zero event_waits, and the workflow is
-        // permanently stuck until a worker restart clears the in-memory cache.
-        // evictOne is idempotent — safe to call from both paths simultaneously.
+        // the handler Task stays parked on a continuation for an activity whose
+        // schedule was never durably committed (rolled-back transaction).  On the
+        // next retry resumeActivation finds no completed result for that seqNum,
+        // the handler can't advance, step 7 transitions the run to WAITING, and
+        // the workflow is permanently stuck until the worker process restarts and
+        // clears the in-memory cache.  evictOne is idempotent — safe to call from
+        // both paths simultaneously.
         try await withTaskCancellationHandler {
             do {
                 return try await _activate(claimed: claimed, exec: exec, cache: cache)
@@ -279,6 +280,27 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // Count of events written before this activation — exposed via ctx.historyEventCount.
         let historyEventCount = historySeq - 1
         let isFirstActivation = historySeq == 1
+
+        // Warn when the workflow's history is approaching a size where activation
+        // overhead becomes measurable. Fires on the fresh path only (cache miss /
+        // crash recovery) because that is the expensive O(N) replay path.
+        if historyEventCount > 0
+            && historyEventCount >= exec.options.historyWarningThreshold
+        {
+            exec.logger.warning(
+                "workflow history is large — call context.continueAsNew() at a safe point to reset history and keep activations fast",
+                metadata: [
+                    "strand.task_id": .stringConvertible(claimed.taskID),
+                    "strand.task_name": .string(claimed.taskName),
+                    "strand.history_event_count": .stringConvertible(historyEventCount),
+                    "strand.warning_threshold": .stringConvertible(exec.options.historyWarningThreshold),
+                    "strand.suggestion": .string(
+                        "if context.suggestContinueAsNew { "
+                            + "try context.continueAsNew(input: nextInput) }"
+                    ),
+                ]
+            )
+        }
         if isFirstActivation {
             try await WorkflowStateQueries.appendHistory(
                 on: exec.postgres,
@@ -293,7 +315,17 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         }
 
         // ── 3. Signals ────────────────────────────────────────────────────────────
-        try await applyAndPersistSignals(to: &workflowState, exec: exec, claimed: claimed, historySeq: &historySeq)
+        // Signals are applied before the activation object is constructed.
+        // Use a local counter; since signal handlers are synchronous the net
+        // effect is always 0, so activation.pendingHandlerCount starts at 0.
+        var _priorActivationHandlerCount = 0
+        try await applyAndPersistSignals(
+            to: &workflowState,
+            exec: exec,
+            claimed: claimed,
+            pendingHandlerCount: &_priorActivationHandlerCount,
+            historySeq: &historySeq
+        )
 
         // ── 4. Pre-load results the executor needs for fast-path replay ───────────
         let executor = StrandWorkflowExecutor()
@@ -304,6 +336,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         let completedChildren = try await WorkflowStateQueries.loadCompletedChildActivities(
             on: exec.postgres,
             parentTaskID: claimed.taskID,
+            parentRunID: claimed.runID,
             logger: exec.logger
         )
         stateMachine.resolveCompleted(completedChildren)
@@ -333,6 +366,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             postgres: exec.postgres,
             logger: exec.logger,
             codec: exec.options.codec,
+            enableLoggingInReplay: exec.options.enableLoggingInReplay,
             executor: executor,
             stateMachine: stateMachine,
             stateBox: stateBox,
@@ -341,7 +375,8 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             versionMarkerCache: versionMarkerCache,
             namespace: exec.namespace,
             activationTime: activationTime,
-            historyEventCount: historyEventCount
+            historyEventCount: historyEventCount,
+            suggestContinueAsNew: historyEventCount >= exec.options.historyWarningThreshold / 2
         )
         let context = WorkflowContext<W>(activation: activation)
         let input = try exec.options.codec.decode(W.Input.self, from: claimed.paramsBuffer)
@@ -476,9 +511,30 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             logger: exec.logger
         )
         let historyEventCount = historySeq - 1
-        // Refresh the history event count on each cached re-activation so
-        // ctx.historyEventCount reflects accumulated events across all prior activations.
+        // Refresh the history event count and suggestion flag on each cached
+        // re-activation so ctx.historyEventCount and ctx.suggestContinueAsNew
+        // always reflect accumulated events across all prior activations.
         cached.activation.historyEventCount = historyEventCount
+        cached.activation.suggestContinueAsNew =
+            historyEventCount >= exec.options.historyWarningThreshold / 2
+
+        // Warn on the resume path too — the handler is cached but the history still grows.
+        // Emit at most once per activation (not every event) by checking the threshold here.
+        if historyEventCount >= exec.options.historyWarningThreshold {
+            exec.logger.warning(
+                "workflow history is large — call context.continueAsNew() at a safe point to reset history and keep activations fast",
+                metadata: [
+                    "strand.task_id": .stringConvertible(claimed.taskID),
+                    "strand.task_name": .string(claimed.taskName),
+                    "strand.history_event_count": .stringConvertible(historyEventCount),
+                    "strand.warning_threshold": .stringConvertible(exec.options.historyWarningThreshold),
+                    "strand.suggestion": .string(
+                        "if context.suggestContinueAsNew { "
+                            + "try context.continueAsNew(input: nextInput) }"
+                    ),
+                ]
+            )
+        }
 
         // ── External checkpoint refresh ──────────────────────────────────────────
         // `client.markVersion` writes checkpoints directly to the DB without sending
@@ -510,13 +566,25 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             }
         }
 
-        // ── Signals ───────────────────────────────────────────────
-        try await applyAndPersistSignals(to: &stateBox.value, exec: exec, claimed: claimed, historySeq: &historySeq)
-
         // ── Completed children ──────────────────────────────────────────────────
+        // Signals are applied either BEFORE or AFTER drain() depending on whether
+        // activity continuations are being resumed:
+        //
+        //  • No activity completions (timer/signal/event wakeup): apply signals BEFORE
+        //    drain so the handler sees them immediately when it resumes from sleep/wait.
+        //
+        //  • Activity completions present: apply signals AFTER drain.
+        //    Reason: Swift’s `mutating async` stores a value copy of `self` in the
+        //    coroutine frame. When an activity continuation is resumed and drain()
+        //    runs the handler, the coroutine RESTORES its frame copy to stateBox.value,
+        //    overwriting any modifications made by applyAndPersistSignals. Applying
+        //    signals after the drain means they modify the post-restore stateBox, and
+        //    the subsequent evaluateAndResumeFirstSatisfiedCondition reads the correct
+        //    signal-applied state (condition resumes use live stateBox, no write-back).
         let completedChildren = try await WorkflowStateQueries.loadCompletedChildActivities(
             on: exec.postgres,
             parentTaskID: claimed.taskID,
+            parentRunID: claimed.runID,
             logger: exec.logger
         )
 
@@ -524,7 +592,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // The crash-recovery (fresh) path reads them from there via fast path 2
         // (resolveCompleted → preloadedResults), so writing them again to
         // strand.checkpoints is redundant.  We still extend the claim so that
-        // activations processing many simultaneous completions don't expire.
+        // activations processing many simultaneous completions don’t expire.
         if !completedChildren.isEmpty {
             try await Queries.extendClaim(
                 on: exec.postgres,
@@ -540,6 +608,20 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         // results enable fast-path-2 for any sibling activities that also completed
         // concurrently but whose continuations are not yet parked.
         activation.stateMachine.resolveCompleted(completedChildren)
+
+        // Apply signals BEFORE drain when no activity continuations are being resumed
+        // (timer / event / signal-only wakeup). The handler resumes from a sleep or
+        // wait continuation and must see the signal state immediately; there is no
+        // frame write-back for these resume types.
+        if completedChildren.isEmpty {
+            try await applyAndPersistSignals(
+                to: &stateBox.value,
+                exec: exec,
+                claimed: claimed,
+                pendingHandlerCount: &activation.pendingHandlerCount,
+                historySeq: &historySeq
+            )
+        }
 
         // CHILD_WORKFLOW_COMPLETED history is written by the step-2 loop — see _activate.
 
@@ -628,9 +710,30 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
             cached.task.cancel()
         }
 
-        // ── Drain + conditions ────────────────────────────────────────────────
+        // ── Drain ─────────────────────────────────────────────────────────────
+        // Run the handler from its current suspension point. Any activity/timer/event
+        // continuations resumed above are executed here. The handler may reach a new
+        // condition suspension, at which point drain() returns.
         executor.drain()
         while activation.stateMachine.resumeExpiredConditions() { executor.drain() }
+
+        // Apply signals AFTER drain when activity continuations were resumed.
+        // The drain() above caused the coroutine frame write-back (restoring any
+        // stale frame values to stateBox). Now signals are applied to the
+        // post-write-back stateBox, and the evaluateAndResumeFirstSatisfiedCondition
+        // loop below uses live stateBox reads (condition resumes have no write-back)
+        // so the handler sees the correct signal-applied state.
+        if !completedChildren.isEmpty {
+            try await applyAndPersistSignals(
+                to: &stateBox.value,
+                exec: exec,
+                claimed: claimed,
+                pendingHandlerCount: &activation.pendingHandlerCount,
+                historySeq: &historySeq
+            )
+        }
+
+        // ── Conditions ────────────────────────────────────────────────────────
         while activation.stateMachine.evaluateAndResumeFirstSatisfiedCondition() { executor.drain() }
 
         // ── Local activity execution loop ─────────────────────────────────────
@@ -671,6 +774,7 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
         to state: inout W,
         exec: _WorkerExec,
         claimed: ClaimedTask,
+        pendingHandlerCount: inout Int,
         historySeq: inout Int
     ) async throws {
         let signals = try await WorkflowStateQueries.loadPendingSignals(
@@ -686,6 +790,10 @@ struct WorkflowRegistration<W: Workflow>: Sendable {
 
         let codec = exec.options.codec
         for signal in signals {
+            // Track this handler for allHandlersFinished / HandlerUnfinishedPolicy.
+            pendingHandlerCount += 1
+            defer { pendingHandlerCount -= 1 }
+
             if let correlationID = signal.updateCorrelationID {
                 do {
                     if let result = try _StrandCodecContext.$codec.withValue(

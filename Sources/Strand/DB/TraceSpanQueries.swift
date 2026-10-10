@@ -592,6 +592,33 @@ package enum TraceSpanQueries {
         )
     }
 
+    /// Returns the `root_task_id` for any span that belongs to `taskID`.
+    /// Returns `nil` when no span exists for this task (task not yet indexed).
+    /// Used by the trace route to resolve a child task’s root before fetching
+    /// the full tree — child tasks have `root_task_id ≠ task_id`.
+    package static func resolveRootTaskID(
+        on postgres: PostgresClient,
+        namespaceID: String,
+        taskID: UUID,
+        logger: Logger
+    ) async throws -> UUID? {
+        let stream = try await postgres.query(
+            """
+            SELECT root_task_id
+            FROM   strand.trace_spans
+            WHERE  namespace_id = \(namespaceID)
+              AND  task_id      = \(taskID)
+            LIMIT  1
+            """,
+            logger: logger
+        )
+        for try await row in stream {
+            var col = row.makeIterator()
+            return try col.next()!.decode(UUID.self, context: .default)
+        }
+        return nil
+    }
+
     /// Returns all spans for a trace tree ordered by `queued_at`.
     /// Replaces `traceTask` + `executionHistorySpansForTrace` — one index scan.
     package static func getTraceSpans(

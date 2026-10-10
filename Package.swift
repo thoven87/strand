@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "strand",
-    platforms: [.macOS(.v26)],
+    platforms: [.macOS(.v27)],
     products: [
         .library(name: "Strand", targets: ["Strand"]),
         .library(name: "StrandServer", targets: ["StrandServer"]),
@@ -55,6 +55,7 @@ let package = Package(
                     package: "swift-otel-semantic-conventions"
                 ),
                 .product(name: "DequeModule", package: "swift-collections"),
+                .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
                 .product(name: "CompressNIO", package: "compress-nio"),
                 .product(name: "ExtrasBase64", package: "swift-extras-base64"),
@@ -62,7 +63,7 @@ let package = Package(
             swiftSettings: [
                 // Non-isolated async functions run on a generic executor, not the caller's actor.
                 // SE-0461
-                .enableUpcomingFeature("NonisolatedNonSendingByDefault"),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
                 // Imports are internal by default — prevents leaking internals to callers.
                 // SE-0409
                 .enableUpcomingFeature("InternalImportsByDefault"),

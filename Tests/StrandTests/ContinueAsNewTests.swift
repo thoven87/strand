@@ -65,12 +65,91 @@ private struct InfiniteWorkflow: Workflow {
     }
 }
 
+// ── SuggestWorkflow ————————————————————————————————————————————
+// Runs one activity then returns whether suggestContinueAsNew was true on the
+// second activation (the first activation always starts with historyEventCount=0).
+// First activation writes WORKFLOW_STARTED + ACTIVITY_SCHEDULED (~2 events) and
+// parks; the second activation starts with historyEventCount ≈ 2 and is where
+// we observe the suggestion.
+// Used by: suggestContinueAsNewFiresAtHalfThreshold
+
+private struct SuggestPing: Activity {
+    typealias Input = String
+    typealias Output = String
+    static let name = "suggest-ping"
+    func run(input: String, context: ActivityContext) async throws -> String { input }
+}
+
+private struct SuggestWorkflow: Workflow {
+    typealias Input = StrandVoid  // no input needed
+    typealias Output = Bool  // was suggestContinueAsNew true on the second activation?
+
+    mutating func run(
+        context: WorkflowContext<Self>,
+        input: StrandVoid
+    ) async throws -> Bool {
+        // One activity — causes a second activation when it completes.
+        _ = try await context.runActivity(SuggestPing.self, input: "ping")
+        // Second activation: historyEventCount ≈ 2 (WORKFLOW_STARTED + ACTIVITY_SCHEDULED).
+        // With historyWarningThreshold=4, threshold/2=2, so suggestContinueAsNew = (2 >= 2) = true.
+        // With the default threshold of 10_000, 2 < 5_000, so it is false.
+        return context.suggestContinueAsNew
+    }
+}
+
 // MARK: - Test suite
 
 @Suite("Integration — Continue-as-new", .tags(.integration), .serialized)
 struct ContinueAsNewTests {
 
-    // ── 1 ───────────────────────────────────────────────────────────────────
+    // ── 0 ─────────────────────────────────────────────────────────────────────────
+    // context.suggestContinueAsNew is false for fresh workflows (historyEventCount=0)
+    // and becomes true when historyEventCount >= historyWarningThreshold / 2.
+    //
+    // We use historyWarningThreshold=4 so the half-threshold is 2. After one activity
+    // completes the parent's historyEventCount on the second activation is ≈2, making
+    // suggestContinueAsNew true. With the default threshold (10_000, half=5_000), the
+    // same count of 2 leaves it false.
+    @Test("suggestContinueAsNew is false below threshold and true at or above half-threshold")
+    func suggestContinueAsNewThreshold() async throws {
+        try await withTestEnvironment { client in
+            // Low threshold: historyWarningThreshold=4 → half=2 → should be true after 1 activity
+            let suggested = try await withWorker(
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [SuggestWorkflow.self],
+                activities: [SuggestPing()],
+                historyWarningThreshold: 4
+            ) {
+                let handle = try await client.startWorkflow(
+                    SuggestWorkflow.self,
+                    input: StrandVoid()
+                )
+                return try await handle.result(timeout: .seconds(10))
+            }
+            #expect(suggested == true, "expected suggestContinueAsNew=true with threshold=4")
+
+            // Default threshold (10_000): historyEventCount≈2 is far below half=5_000
+            let suggestedDefault = try await withWorker(
+                postgres: client.postgres,
+                queueName: client.queueName,
+                logger: client.logger,
+                workflows: [SuggestWorkflow.self],
+                activities: [SuggestPing()]
+                // historyWarningThreshold defaults to 10_000
+            ) {
+                let handle = try await client.startWorkflow(
+                    SuggestWorkflow.self,
+                    input: StrandVoid()
+                )
+                return try await handle.result(timeout: .seconds(10))
+            }
+            #expect(suggestedDefault == false, "expected suggestContinueAsNew=false with default threshold")
+        }
+    }
+
+    // ── 1 ─────────────────────────────────────────────────────────────────────────
     // A workflow that calls continueAsNew once produces a new PENDING task and
     // marks the old one CONTINUED_AS_NEW. The new task is then claimed by the
     // worker and runs to completion.

@@ -287,10 +287,10 @@ public struct ActivityOptions: Sendable {
 
 /// Cancellation coordination for a running activity.
 ///
-/// Upgrades the old `Mutex<Bool>` flag to a four-state machine so activity code
-/// can `await waitForCancellation()` instead of polling `isCancelled` in a loop.
+/// A four-state machine that lets activity code suspend on `waitForCancellation()`
+/// rather than polling `isCancelled` in a loop. Illegal transitions `fatalError`.
 ///
-/// Allowed transitions (illegal transitions `fatalError`):
+/// Allowed transitions:
 ///   `.active` → `.waiting` (waitForCancellation suspends)
 ///   `.active` → `.cancelled` (cancel() before wait)
 ///   `.waiting` → `.cancelled` (cancel() while waiting)

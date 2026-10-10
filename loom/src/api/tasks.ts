@@ -1,5 +1,6 @@
 import { api } from "./client";
 import type {
+    ChainMember,
     CursorPage,
     EnqueueResult,
     RetryOptions,
@@ -88,6 +89,17 @@ export const getChildTasks = (
             {
                 params: opts,
             },
+        )
+        .then((r) => r.data);
+
+export const getTaskChain = (
+    namespace: string,
+    queue: string,
+    taskId: string,
+): Promise<ChainMember[]> =>
+    api
+        .get<ChainMember[]>(
+            `/api/${namespace}/queues/${queue}/tasks/${taskId}/chain`,
         )
         .then((r) => r.data);
 
