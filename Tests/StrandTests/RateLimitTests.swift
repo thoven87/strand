@@ -76,7 +76,69 @@ private func fetchAvailableAt(
     return result
 }
 
-// MARK: - Tests
+// MARK: - Unit tests
+
+/// Pure in-process tests for `RateLimit.slotParams` — no database required.
+///
+/// Uses GitHub's Search API limit (30 req/min authenticated) as a concrete,
+/// publicly documented example:
+///   base interval = 60,000 ms / 30 = 2,000 ms per slot
+///
+/// The batch scenario — fetching detail records for each of 50 search results
+/// in one dispatch — is realistic: search returns 50 items, the next step
+/// calls the detail endpoint for every item (50 outbound calls).
+@Suite("RateLimit.slotParams — units scaling")
+struct RateLimitSlotParamsTests {
+
+    // GitHub Search API (authenticated): 30 requests / minute.
+    // One search request per dispatch → interval = 60,000 ms / 30 = 2,000 ms.
+    @Test("units=1 produces the base intervalMs")
+    func unitsOneIsBaseInterval() {
+        let rl = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github")!
+        let params = rl.slotParams(for: "SearchReposActivity")
+        #expect(params.intervalMs == 2_000)
+        #expect(params.slotKey == "github")
+    }
+
+    // Fetching detail records for each of the 50 search results = 50 API calls
+    // per dispatch.  units=50 advances the cursor by 50 × 2,000 ms = 100,000 ms,
+    // so the bucket correctly throttles the next activity by the full cost.
+    @Test("units=50 scales intervalMs by 50, same shared bucket")
+    func unitsFiftyScalesInterval() {
+        let rl = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 50)!
+        let params = rl.slotParams(for: "FetchRepoDetailsBatchActivity")
+        #expect(params.intervalMs == 100_000)
+        #expect(params.slotKey == "github")   // sharedKey is unchanged by units
+    }
+
+    // A single-call dispatch (units=1) and a 50-call batch dispatch (units=50)
+    // must drain from the same "github" bucket so their combined load is correctly
+    // accounted for.
+    @Test("units=1 and units=50 resolve to the same slot key")
+    func unitsDontChangeSlotKey() {
+        let single = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 1)!
+        let batch  = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 50)!
+        #expect(single.slotParams(for: "A").slotKey == batch.slotParams(for: "B").slotKey)
+    }
+
+    @Test("units clamped to 1: zero or negative units treated as 1")
+    func unitsClampedToOne() {
+        let rl = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 0)!
+        #expect(rl.units == 1)
+        #expect(rl.slotParams(for: "A").intervalMs == 2_000)
+    }
+
+    @Test("per-key bucket: units scales intervalMs without changing the key prefix")
+    func unitsWithPerKeyBucket() {
+        let rl = RateLimit(limit: 10, period: .seconds(1), key: "customer:42", units: 5)!
+        let params = rl.slotParams(for: "PaymentActivity")
+        // base = 1,000 ms / 10 = 100 ms; × 5 units = 500 ms
+        #expect(params.intervalMs == 500)
+        #expect(params.slotKey == "PaymentActivity:customer:42")
+    }
+}
+
+// MARK: - Integration tests
 
 @Suite("Integration — Rate limiting", .tags(.integration), .serialized)
 struct RateLimitTests {
@@ -389,6 +451,66 @@ struct RateLimitTests {
             #expect(
                 atC2b.timeIntervalSince(atC2a) >= 4.5,
                 "c2 second should be ~5 s after c2 first"
+            )
+        }
+    }
+
+    // ── 7 ────────────────────────────────────────────────────────────────────────────────
+    // units > 1: a high-unit dispatch must advance the shared-bucket cursor
+    // by N × intervalMs rather than 1 × intervalMs.
+    //
+    // Setup: all three tasks share the same sharedKey (unique per test run).
+    //   e1 — units=1,  limit=1/10s: immediate; cursor → NOW+10 s
+    //   e2 — units=5,  limit=1/10s: available ≈ NOW+10 s; cursor → NOW+60 s
+    //   e3 — units=1,  limit=1/10s: available ≈ NOW+60 s
+    //
+    // Gap e2→e3 must be ~50 s (5 × 10 s), proving the units=5 dispatch consumed
+    // five slots’ worth of budget from the shared bucket.
+    @Test("units > 1: dispatch consumes N slots from the shared bucket")
+    func unitsConsumeMultipleSlots() async throws {
+        try await withTestEnvironment { client in
+            // Unique key so this test’s bucket doesn’t bleed into other runs.
+            let key = "units-test-\(UUID().uuidString)"
+            let single = RateLimit(limit: 1, period: .seconds(10), sharedKey: key)!
+            let five   = RateLimit(limit: 1, period: .seconds(10), sharedKey: key, units: 5)!
+
+            let e1 = try await client.enqueueActivity(
+                EchoActivity.self, input: .init(value: "1"), options: .init(rateLimit: single)
+            )
+            let e2 = try await client.enqueueActivity(
+                EchoActivity.self, input: .init(value: "2"), options: .init(rateLimit: five)
+            )
+            let e3 = try await client.enqueueActivity(
+                EchoActivity.self, input: .init(value: "3"), options: .init(rateLimit: single)
+            )
+
+            let dates = try await fetchAvailableAt(
+                postgres: client.postgres,
+                taskIDs: [e1.taskID, e2.taskID, e3.taskID],
+                logger: client.logger
+            )
+
+            let at1 = try #require(dates[e1.taskID])
+            let at2 = try #require(dates[e2.taskID])
+            let at3 = try #require(dates[e3.taskID])
+            let now = Date.now
+
+            // e1: first in a cold bucket — immediately available.
+            #expect(at1 <= now.addingTimeInterval(0.5), "e1 should be immediate")
+
+            // e2: delayed by one single-unit interval from e1 (~10 s).
+            let gap12 = at2.timeIntervalSince(at1)
+            #expect(
+                gap12 >= 9.0 && gap12 <= 11.0,
+                "gap e1→e2 should be ~10 s (1 unit × 10 s), got \(gap12) s"
+            )
+
+            // e3: delayed by five intervals from e2 (~50 s) because units=5
+            // advanced the cursor by 5 × 10 s = 50 s.
+            let gap23 = at3.timeIntervalSince(at2)
+            #expect(
+                gap23 >= 49.0 && gap23 <= 51.0,
+                "gap e2→e3 should be ~50 s (5 units × 10 s), got \(gap23) s"
             )
         }
     }

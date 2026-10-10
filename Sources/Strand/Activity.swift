@@ -120,14 +120,25 @@ public struct RateLimit: Sendable {
     /// per-interval drip begins.  Default `0` = no burst.
     public var burst: Int
 
+    /// Number of rate-limit tokens this dispatch consumes from the shared bucket.
+    /// Default `1` = one dispatch charges one slot.  Set to the number of
+    /// external API calls made inside the activity so the bucket stays
+    /// calibrated to actual outbound call volume rather than dispatch count.
+    ///
+    /// Example: a batch activity that calls a third-party API 50 times per run
+    /// should set `units: 50` so the cursor advances 50× further on each
+    /// dispatch, correctly throttling peer activities on the same bucket.
+    public var units: Int
+
     /// Returns `nil` when `limit` is not positive; no crash.
-    public init?(limit: Double, period: Duration = .seconds(1), key: String? = nil, sharedKey: String? = nil, burst: Int = 0) {
+    public init?(limit: Double, period: Duration = .seconds(1), key: String? = nil, sharedKey: String? = nil, burst: Int = 0, units: Int = 1) {
         guard limit > 0 else { return nil }
         self.limit = limit
         self.period = period
         self.key = key
         self.sharedKey = sharedKey
         self.burst = burst
+        self.units = max(1, units)
     }
 
     // MARK: - Internal
@@ -139,11 +150,11 @@ public struct RateLimit: Sendable {
     ///   or as the prefix in `"ActivityName:entityKey"` (per-entity bucket).
     /// - Returns: `slotKey` — the row key in `strand.rate_limit_slots`;
     ///   `intervalMs` — milliseconds between consecutive slots,
-    ///   derived from `period / limit` and clamped to at least 1 ms;
+    ///   derived from `(period / limit) × units` and clamped to at least 1 ms;
     ///   `burstSlots` — number of tasks eligible for immediate dispatch.
     internal func slotParams(for activityName: String) -> (slotKey: String, intervalMs: Int, burstSlots: Int) {
         let slotKey = sharedKey ?? key.map { "\(activityName):\($0)" } ?? activityName
-        let intervalMs = max(1, Int(Double(period.milliseconds) / limit))
+        let intervalMs = max(1, Int(Double(period.milliseconds) / limit)) * units
         return (slotKey: slotKey, intervalMs: intervalMs, burstSlots: max(0, burst))
     }
 }
