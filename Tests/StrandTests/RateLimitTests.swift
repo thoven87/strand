@@ -108,7 +108,7 @@ struct RateLimitSlotParamsTests {
         let rl = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 50)!
         let params = rl.slotParams(for: "FetchRepoDetailsBatchActivity")
         #expect(params.intervalMs == 100_000)
-        #expect(params.slotKey == "github")   // sharedKey is unchanged by units
+        #expect(params.slotKey == "github")  // sharedKey is unchanged by units
     }
 
     // A single-call dispatch (units=1) and a 50-call batch dispatch (units=50)
@@ -117,8 +117,82 @@ struct RateLimitSlotParamsTests {
     @Test("units=1 and units=50 resolve to the same slot key")
     func unitsDontChangeSlotKey() {
         let single = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 1)!
-        let batch  = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 50)!
+        let batch = RateLimit(limit: 30, period: .minutes(1), sharedKey: "github", units: 50)!
         #expect(single.slotParams(for: "A").slotKey == batch.slotParams(for: "B").slotKey)
+    }
+
+    // keyed factory: closure
+    // keyed(limit:period:by:) with a typed closure derives the slot key from the
+    // activity's input at enqueue time instead of requiring it at the call site.
+    @Test("keyed factory: closure derives slot key from typed input")
+    func keyedClosureDrivesSlotKey() {
+        struct UserInput: Sendable { let userID: String }
+
+        let rl = RateLimit.keyed(limit: 30, period: .minutes(1)) {
+            (input: UserInput) in input.userID
+        }!
+
+        let resolved = rl.resolving(input: UserInput(userID: "user-42"))
+        let params = resolved.slotParams(for: "ProcessPayment")
+        // slot key = "ProcessPayment:user-42"  (no sharedKey, so activity-name prefix applies)
+        #expect(params.slotKey == "ProcessPayment:user-42")
+        #expect(params.intervalMs == 2_000)
+    }
+
+    // keyed factory: KeyPath (non-optional)
+    @Test("keyed factory: non-optional KeyPath derives slot key from typed input")
+    func keyedKeyPathNonOptional() {
+        struct UserInput: Sendable { let userID: String }
+
+        let rl = RateLimit.keyed(limit: 30, period: .minutes(1), by: \UserInput.userID)!
+
+        let resolved = rl.resolving(input: UserInput(userID: "user-99"))
+        #expect(resolved.slotParams(for: "A").slotKey == "A:user-99")
+    }
+
+    // keyed factory: KeyPath (optional) — nil value falls back to global bucket
+    @Test("keyed factory: optional KeyPath falls back to global bucket when nil")
+    func keyedKeyPathOptional() {
+        struct PageInput: Sendable { let officeID: String? }
+
+        let rl = RateLimit.keyed(limit: 30, period: .minutes(1), by: \PageInput.officeID)!
+
+        // Non-nil value → per-entity bucket
+        let resolvedSome = rl.resolving(input: PageInput(officeID: "office-7"))
+        #expect(resolvedSome.slotParams(for: "SyncPage").slotKey == "SyncPage:office-7")
+
+        // Nil value → global bucket (activity-name key, no partition)
+        let resolvedNil = rl.resolving(input: PageInput(officeID: nil))
+        #expect(resolvedNil.slotParams(for: "SyncPage").slotKey == "SyncPage")
+    }
+
+    // keyed + sharedKey — extractor partitions WITHIN the shared bucket
+    @Test("keyed factory: extractor partitions within a sharedKey bucket")
+    func keyedWithSharedKey() {
+        struct TenantInput: Sendable { let tenantID: String }
+
+        // Two different activity types, same sharedKey, same extractor.
+        let rl = RateLimit.keyed(limit: 100, period: .minutes(1), sharedKey: "api") {
+            (input: TenantInput) in input.tenantID
+        }!
+
+        // sharedKey wins over the derived key for the bucket PREFIX,
+        // but the partition is appended: "api:tenant-A".
+        let paramsA = rl.resolving(input: TenantInput(tenantID: "tenant-A")).slotParams(for: "ActivityX")
+        let paramsB = rl.resolving(input: TenantInput(tenantID: "tenant-B")).slotParams(for: "ActivityY")
+
+        // Different tenants → different slot keys despite different activity names.
+        #expect(paramsA.slotKey == "api:tenant-A")
+        #expect(paramsB.slotKey == "api:tenant-B")
+        #expect(paramsA.slotKey != paramsB.slotKey)
+    }
+
+    // resolving(input:) is a no-op when no extractor is present
+    @Test("resolving(input:) is a no-op without a keyExtractor")
+    func resolvingNoOpWithoutExtractor() {
+        let rl = RateLimit(limit: 30, period: .minutes(1), key: "static-key")!
+        let resolved = rl.resolving(input: "anything")
+        #expect(resolved.slotParams(for: "A").slotKey == "A:static-key")
     }
 
     @Test("units clamped to 1: zero or negative units treated as 1")
@@ -472,16 +546,22 @@ struct RateLimitTests {
             // Unique key so this test’s bucket doesn’t bleed into other runs.
             let key = "units-test-\(UUID().uuidString)"
             let single = RateLimit(limit: 1, period: .seconds(10), sharedKey: key)!
-            let five   = RateLimit(limit: 1, period: .seconds(10), sharedKey: key, units: 5)!
+            let five = RateLimit(limit: 1, period: .seconds(10), sharedKey: key, units: 5)!
 
             let e1 = try await client.enqueueActivity(
-                EchoActivity.self, input: .init(value: "1"), options: .init(rateLimit: single)
+                EchoActivity.self,
+                input: .init(value: "1"),
+                options: .init(rateLimit: single)
             )
             let e2 = try await client.enqueueActivity(
-                EchoActivity.self, input: .init(value: "2"), options: .init(rateLimit: five)
+                EchoActivity.self,
+                input: .init(value: "2"),
+                options: .init(rateLimit: five)
             )
             let e3 = try await client.enqueueActivity(
-                EchoActivity.self, input: .init(value: "3"), options: .init(rateLimit: single)
+                EchoActivity.self,
+                input: .init(value: "3"),
+                options: .init(rateLimit: single)
             )
 
             let dates = try await fetchAvailableAt(
@@ -511,6 +591,63 @@ struct RateLimitTests {
             #expect(
                 gap23 >= 49.0 && gap23 <= 51.0,
                 "gap e2→e3 should be ~50 s (5 units × 10 s), got \(gap23) s"
+            )
+        }
+    }
+
+    // ── 8 ────────────────────────────────────────────────────────────────────────────────
+    // keyExtractor: two activities with DIFFERENT inputs derive DIFFERENT slot keys
+    // from the same RateLimit declaration, landing in independent per-entity buckets.
+    //
+    // Setup: one shared RateLimit created with .keyed(..., by: \EchoInput.value).
+    //        Each of the three enqueues passes a different EchoInput.value.
+    //
+    // Expected available_at schedule (limit: 1/10 s, each input is its own bucket):
+    //   e1 (value: "a") → immediate       bucket "EchoActivity:a"
+    //   e2 (value: "b") → immediate       bucket "EchoActivity:b"  (independent)
+    //   e3 (value: "a") → ~10 s delayed   bucket "EchoActivity:a"  (same as e1)
+    @Test("keyExtractor: different inputs land in independent per-entity buckets")
+    func keyExtractorCreatesPerEntityBuckets() async throws {
+        try await withTestEnvironment { client in
+            let rl = RateLimit.keyed(limit: 1, period: .seconds(10), by: \EchoInput.value)!
+
+            let e1 = try await client.enqueueActivity(
+                EchoActivity.self,
+                input: .init(value: "a"),
+                options: .init(rateLimit: rl)
+            )
+            let e2 = try await client.enqueueActivity(
+                EchoActivity.self,
+                input: .init(value: "b"),
+                options: .init(rateLimit: rl)
+            )
+            // Same input value as e1 — should share e1’s bucket and be delayed.
+            let e3 = try await client.enqueueActivity(
+                EchoActivity.self,
+                input: .init(value: "a"),
+                options: .init(rateLimit: rl)
+            )
+
+            let dates = try await fetchAvailableAt(
+                postgres: client.postgres,
+                taskIDs: [e1.taskID, e2.taskID, e3.taskID],
+                logger: client.logger
+            )
+
+            let at1 = try #require(dates[e1.taskID])
+            let at2 = try #require(dates[e2.taskID])
+            let at3 = try #require(dates[e3.taskID])
+            let now = Date.now
+
+            // e1 and e2 have different keys — both immediately available.
+            #expect(at1 <= now.addingTimeInterval(0.5), "e1 (bucket \"a\") should be immediate")
+            #expect(at2 <= now.addingTimeInterval(0.5), "e2 (bucket \"b\") should be immediate")
+
+            // e3 shares e1’s bucket — delayed ~10 s.
+            let gap13 = at3.timeIntervalSince(at1)
+            #expect(
+                gap13 >= 9.0 && gap13 <= 11.0,
+                "e3 should be ~10 s after e1 (same bucket \"a\"), got \(gap13) s"
             )
         }
     }
