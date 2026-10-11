@@ -104,7 +104,8 @@ public struct StrandClient: Sendable {
         input: A.Input,
         options: ActivityOptions = .init()
     ) async throws -> EnqueueResult {
-        let rlParams = options.rateLimit.map { $0.slotParams(for: A.name) }
+        // Resolve any dynamic key extractor while the typed input is still available.
+        let rlParams = options.rateLimit.map { $0.resolving(input: input).slotParams(for: A.name) }
         let resolvedID = options.id ?? A.generateActivityID()
         return try await _enqueue(
             queue: options.queue ?? queueName,

@@ -902,6 +902,10 @@ public struct WorkflowContext<W: Workflow>: Sendable {
         // throw CancellationError here rather than scheduling a new activity that would
         // never be needed. Fast paths above are unaffected — already-completed work replays.
         try Task.checkCancellation()
+        // Resolve any dynamic rate-limit key while the typed input is still available.
+        // WorkflowScheduling only has a ByteBuffer at that point, so this is the
+        // last moment a KeyPath / closure extractor can be evaluated.
+        let resolvedOptions = options.resolvingRateLimit(input)
         let inputBuffer = try _impl.codec.encode(input)
         // Idempotency key is always derived from the run UUID and sequence number.
         // Run UUID (not task UUID) scopes the key to this run so that continueAsNew
@@ -921,7 +925,7 @@ public struct WorkflowContext<W: Workflow>: Sendable {
             .scheduleActivity(
                 name: A.name,
                 input: inputBuffer,
-                options: options,
+                options: resolvedOptions,
                 seqNum: seqNum,
                 idempotencyKey: idempotencyKey
             )
@@ -1867,5 +1871,23 @@ public struct ChildWorkflowHandle<CW: Workflow>: Sendable {
     /// - Throws: `WorkflowError` when the child reached `FAILED` or `CANCELLED`.
     public func result() async throws -> CW.Output {
         try await _result()
+    }
+}
+
+// MARK: - fileprivate helpers
+
+extension ActivityOptions {
+    /// Returns a copy of these options with the rate-limit key resolved from
+    /// `input` via `RateLimit.keyExtractor`, or `self` unchanged when no
+    /// extractor is set.
+    ///
+    /// Only needed in `WorkflowContext.runActivity`, which must pass a fully
+    /// resolved `ActivityOptions` into the `WorkflowCommand` — the typed input
+    /// is unavailable once it has been encoded to a `ByteBuffer`.
+    fileprivate func resolvingRateLimit(_ input: any Sendable) -> ActivityOptions {
+        guard rateLimit?.keyExtractor != nil else { return self }
+        var copy = self
+        copy.rateLimit?.resolve(input: input)
+        return copy
     }
 }
